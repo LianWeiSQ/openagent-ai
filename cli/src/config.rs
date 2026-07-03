@@ -76,16 +76,21 @@ fn config_show(args: &[String]) -> CliRunResult {
     let session_root = value_for(args, &["--session-root"])
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace.join(".openagent/sessions"));
+    let openai = resolve_provider_config("openai", args).ok();
     let payload = json!({
         "workspace": workspace.to_string_lossy(),
         "env_file": env_file.to_string_lossy(),
         "auth_file": auth_file_from_args(args).to_string_lossy(),
         "session_root": session_root.to_string_lossy(),
         "openai": {
-            "base_url": env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
-            "model": env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
-            "wire_api": env::var("OPENAI_WIRE_API").unwrap_or_else(|_| DEFAULT_WIRE_API.to_string()),
-            "api_key": if env::var("OPENAI_API_KEY").is_ok_and(|value| !value.is_empty()) {"set"} else {"missing"},
+            "base_url": openai.as_ref().map(|config| config.base_url.as_str()).unwrap_or(DEFAULT_BASE_URL),
+            "base_url_source": openai.as_ref().map(|config| config.base_url_source.as_str()).unwrap_or("default"),
+            "model": openai.as_ref().map(|config| config.model.as_str()).unwrap_or(DEFAULT_MODEL),
+            "model_source": openai.as_ref().map(|config| config.model_source.as_str()).unwrap_or("default"),
+            "wire_api": openai.as_ref().map(|config| config.wire_api.as_str()).unwrap_or(DEFAULT_WIRE_API),
+            "wire_api_source": openai.as_ref().map(|config| config.wire_api_source.as_str()).unwrap_or("default"),
+            "api_key": if openai.as_ref().is_some_and(|config| config.api_key.is_some()) {"set"} else {"missing"},
+            "api_key_source": openai.as_ref().and_then(|config| config.api_key_source.as_deref()),
             "max_steps": env::var("OPENAGENT_APP_MAX_STEPS").unwrap_or_else(|_| DEFAULT_MAX_STEPS.to_string()),
         },
         "app_bridge": {

@@ -1,10 +1,12 @@
 use super::*;
+use openagent_mcp::{discover_mcp_server_tools, mcp_json_rpc};
 
 #[derive(Clone, Debug)]
 pub(super) struct McpRuntime {
     pub(super) manager: RemoteMcpManager,
     pub(super) descriptors: BTreeMap<String, RemoteMcpToolDescriptor>,
     pub(super) snapshot: Value,
+    pub(super) workspace: PathBuf,
 }
 
 pub(super) fn load_mcp_runtime(
@@ -15,17 +17,19 @@ pub(super) fn load_mcp_runtime(
         return Ok(None);
     };
     let config = load_mcp_config(&source)?;
+    let workspace = workspace_from_args(args);
     if !config.enabled() {
         return Ok(Some(McpRuntime {
             manager: RemoteMcpManager::new(config),
             descriptors: BTreeMap::new(),
             snapshot: json!({}),
+            workspace,
         }));
     }
     let mut manager = RemoteMcpManager::new(config.clone());
     let mut descriptors_by_name = BTreeMap::new();
     for server in config.servers.iter().filter(|server| server.enabled) {
-        let (transport, tools) = discover_mcp_server_tools(server)?;
+        let (transport, tools) = discover_mcp_server_tools(server, &workspace)?;
         let descriptors = build_tool_descriptors_from_values(server, &tools);
         for descriptor in &descriptors {
             toolkit
@@ -46,6 +50,7 @@ pub(super) fn load_mcp_runtime(
         manager,
         descriptors: descriptors_by_name,
         snapshot,
+        workspace,
     }))
 }
 
@@ -56,89 +61,6 @@ fn mcp_runtime_source(args: &[String]) -> Option<String> {
             let path = mcp_config_path(args);
             path.exists().then(|| path.to_string_lossy().to_string())
         })
-}
-
-pub(crate) fn discover_mcp_server_tools(
-    server: &RemoteMcpServerConfig,
-) -> Result<(McpTransport, Vec<Value>), String> {
-    let mut errors = Vec::new();
-    for transport in transport_candidates(server.transport) {
-        match mcp_json_rpc(server, transport, "tools/list", json!({})) {
-            Ok(value) => {
-                let tools = value
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                return Ok((transport, tools));
-            }
-            Err(error) => errors.push(format!("{}: {error}", transport.as_str())),
-        }
-    }
-    Err(format!(
-        "MCP tools/list failed for server '{}': {}",
-        server.name,
-        errors.join("; ")
-    ))
-}
-
-fn mcp_json_rpc(
-    server: &RemoteMcpServerConfig,
-    transport: McpTransport,
-    method: &str,
-    params: Value,
-) -> Result<Value, String> {
-    let timeout = Duration::from_millis(server.timeout_ms);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|error| error.to_string())?;
-    let mut request = client
-        .post(&server.url)
-        .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream")
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": format!("openagent-{}", now_ms_cli()),
-            "method": method,
-            "params": params,
-        }));
-    for (key, value) in &server.headers {
-        request = request.header(key, value);
-    }
-    let response = request
-        .send()
-        .map_err(|error| format!("{} request failed: {error}", transport.as_str()))?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let raw = response
-        .text()
-        .map_err(|error| format!("MCP response read failed: {error}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "HTTP {}: {}",
-            status.as_u16(),
-            summarize_http_error_body(&raw, &content_type)
-        ));
-    }
-    let value = if content_type.contains("text/event-stream") {
-        parse_sse_json_values(&raw)?
-            .into_iter()
-            .find(|item| item.get("result").is_some() || item.get("error").is_some())
-            .ok_or_else(|| "MCP SSE response did not contain a JSON-RPC result".to_string())?
-    } else {
-        serde_json::from_str::<Value>(&raw)
-            .map_err(|error| format!("MCP response was not JSON: {error}"))?
-    };
-    if let Some(error) = value.get("error") {
-        return Err(format!("MCP JSON-RPC error: {}", stable_json_dumps(error)));
-    }
-    Ok(value.get("result").cloned().unwrap_or(value))
 }
 
 pub(super) fn execute_mcp_tool(
@@ -161,6 +83,7 @@ pub(super) fn execute_mcp_tool(
             "name": descriptor.original_name,
             "arguments": tool_call.input.clone(),
         }),
+        &runtime.workspace,
     ) {
         Ok(value) => normalize_tool_call_result(descriptor, Some(transport), &value),
         Err(error) => {

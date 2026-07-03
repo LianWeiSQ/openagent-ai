@@ -62,8 +62,8 @@
     "errors": {
       "invalid_headers": "MCP headers must be an object.",
       "invalid_tools": "MCP tools filter must be an object with allow/deny arrays.",
-      "invalid_transport": "MCP server 'bad' has unsupported transport 'websocket'. Supported values are auto, http, sse.",
-      "invalid_type": "MCP server 'bad' only supports type='remote', 'streamableHttp', or 'sse' in v1."
+      "invalid_transport": "MCP server 'bad' has unsupported transport 'websocket'. Supported values are auto, http, sse, stdio.",
+      "invalid_type": "MCP server 'bad' is missing a non-empty command."
     },
     "parsed": {
       "refresh_ttl_s": 12.5,
