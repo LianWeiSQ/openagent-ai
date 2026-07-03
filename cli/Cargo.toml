@@ -8,8 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 openagent-core.workspace = true
+openagent-app-server-client.workspace = true
 openagent-http-runtime = { path = "../runtime/http" }
-openagent-mcp = { path = "../src/mcp" }
+openagent-mcp.workspace = true
 openagent-protocol.workspace = true
 openagent-provider.workspace = true
 openagent-session.workspace = true
@@ -19,6 +20,7 @@ openagent-tui.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 
 [lib]
 path = "src/cli.rs"
