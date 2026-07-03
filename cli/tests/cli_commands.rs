@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -11,6 +12,8 @@ use std::{
 };
 
 use openagent_cli::cli_commands_fixture;
+use openagent_protocol::{ChatMessage, Role};
+use openagent_session::{FileSessionStore, Session, StartRunOptions};
 use serde_json::{Value, json};
 
 type MockServer = thread::JoinHandle<Result<(), String>>;
@@ -33,38 +36,51 @@ fn binary_default_smoke_prints_command_name() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn binary_doctor_json_smoke_uses_environment() -> Result<(), Box<dyn Error>> {
+    let (port, server) = serve_http_once_on_free_port(
+        "application/json",
+        json!({"data": [{"id": "gpt-test"}]}).to_string(),
+    )?;
     let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
         .args(["doctor", "--format", "json"])
         .env_clear()
         .env("OPENAI_API_KEY", "secret")
-        .env("OPENAI_BASE_URL", "http://gateway.test")
+        .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
         .env("OPENAI_MODEL", "gpt-test")
         .env("OPENAI_WIRE_API", "responses")
-        .env("OPENAGENT_DOCTOR_MODEL_ENDPOINT_OK", "1")
-        .env(
-            "OPENAGENT_DOCTOR_MODEL_ENDPOINT_MESSAGE",
-            "http://gateway.test/v1/models",
-        )
         .output()?;
     assert!(output.status.success());
+    server
+        .join()
+        .expect("doctor server thread")
+        .expect("doctor response");
     let stdout = String::from_utf8(output.stdout)?;
     let payload: Value = serde_json::from_str(&stdout)?;
     assert_eq!(payload["provider"], "openai");
-    assert_eq!(payload["base_url"], "http://gateway.test");
+    assert_eq!(payload["base_url"], format!("http://127.0.0.1:{port}"));
     assert_eq!(payload["model_endpoint_ok"], true);
+    assert_eq!(payload["configured_model_available"], true);
+    assert!(
+        payload["model_endpoint_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("/models"))
+    );
     assert!(!stdout.contains("secret"));
     Ok(())
 }
 
 #[test]
 fn binary_doctor_json_respects_cli_model_overrides() -> Result<(), Box<dyn Error>> {
+    let (port, server) = serve_http_once_on_free_port(
+        "application/json",
+        json!({"data": [{"id": "gpt-cli"}]}).to_string(),
+    )?;
     let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
         .args([
             "doctor",
             "--format",
             "json",
             "--base-url",
-            "http://cli.test",
+            &format!("http://127.0.0.1:{port}"),
             "--model",
             "gpt-cli",
             "--wire-api",
@@ -76,17 +92,86 @@ fn binary_doctor_json_respects_cli_model_overrides() -> Result<(), Box<dyn Error
         .env("OPENAI_BASE_URL", "http://env.test")
         .env("OPENAI_MODEL", "gpt-env")
         .env("OPENAI_WIRE_API", "responses")
-        .env("OPENAGENT_DOCTOR_MODEL_ENDPOINT_OK", "1")
-        .env("OPENAGENT_DOCTOR_MODEL_ENDPOINT_MESSAGE", "cli probe")
         .output()?;
     assert!(output.status.success());
+    server
+        .join()
+        .expect("doctor override server thread")
+        .expect("doctor override response");
     let stdout = String::from_utf8(output.stdout)?;
     let payload: Value = serde_json::from_str(&stdout)?;
-    assert_eq!(payload["base_url"], "http://cli.test");
+    assert_eq!(payload["base_url"], format!("http://127.0.0.1:{port}"));
+    assert_eq!(payload["base_url_source"], "cli");
     assert_eq!(payload["model"], "gpt-cli");
     assert_eq!(payload["wire_api"], "chat");
     assert_eq!(payload["api_key_set"], true);
     assert!(!stdout.contains("cli-secret"));
+    Ok(())
+}
+
+#[test]
+fn binary_run_uses_auth_file_provider_config_without_skip_doctor() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-auth-provider-run")?;
+    let auth_path = temp.join("auth.json");
+    let (port, server) = serve_http_responses_on_free_port(vec![
+        json_response_body(json!({"data": [{"id": "gpt-auth"}]})),
+        json_response_body(json!({
+            "choices": [{
+                "message": {"content": "pong"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })),
+    ])?;
+    fs::write(
+        &auth_path,
+        serde_json::to_string_pretty(&json!({
+            "providers": {
+                "openai": {
+                    "provider": "openai",
+                    "type": "api",
+                    "api_key": "auth-secret",
+                    "base_url": format!("http://127.0.0.1:{port}"),
+                    "model": "gpt-auth",
+                    "wire_api": "chat"
+                }
+            }
+        }))?,
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--auth-file",
+            path_str(&auth_path),
+            "--format",
+            "json",
+            "Reply",
+            "pong",
+        ])
+        .env_clear()
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server
+        .join()
+        .expect("provider config server thread")
+        .expect("provider config responses");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("auth-secret"));
+    let events = stdout
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(events.iter().any(|event| {
+        event["method"] == "turn/completed"
+            && event["params"]["final_answer"] == "pong"
+            && event["params"]["source"] == "openai:chat"
+    }));
+
+    let _ = fs::remove_dir_all(temp);
     Ok(())
 }
 
@@ -102,6 +187,7 @@ fn binary_help_smoke_covers_legacy_command_surface() -> Result<(), Box<dyn Error
         "web",
         "client",
         "attach",
+        "terminal",
         "session",
         "models",
         "stats",
@@ -141,6 +227,284 @@ fn binary_help_smoke_covers_legacy_command_surface() -> Result<(), Box<dyn Error
             "run help should expose OpenCode parity flag {opencode_flag}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn binary_terminal_runs_remote_bridge_command() -> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let temp = temp_dir("openagent-cli-terminal")?;
+    let workspace = temp.join("workspace");
+    let nested = workspace.join("nested");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&nested)?;
+    let mut server = spawn_openagent_server(port, &workspace, &session_root)?;
+    wait_for_attach(port)?;
+
+    let url = format!("http://127.0.0.1:{port}");
+    let text = run_openagent_vec(vec![
+        "terminal".to_string(),
+        "--server-url".to_string(),
+        url.clone(),
+        "--server-token".to_string(),
+        "secret".to_string(),
+        "--command".to_string(),
+        "printf cli-terminal-ok".to_string(),
+    ])?;
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert_eq!(String::from_utf8(text.stdout)?, "cli-terminal-ok");
+
+    let json_output = run_openagent_vec(vec![
+        "terminal".to_string(),
+        "--server-url".to_string(),
+        url,
+        "--server-token".to_string(),
+        "secret".to_string(),
+        "--cwd".to_string(),
+        nested.to_string_lossy().to_string(),
+        "--timeout-ms".to_string(),
+        "5000".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--".to_string(),
+        "pwd".to_string(),
+    ])?;
+    assert!(
+        json_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&json_output.stdout)?;
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["cwd_relative"], "nested");
+    assert_eq!(payload["exit_code"], 0);
+    assert!(
+        payload["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("nested"))
+    );
+
+    let _ = server.kill();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_mcp_remote_lifecycle_controls_app_bridge() -> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let temp = temp_dir("openagent-cli-remote-mcp")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    let openagent_dir = workspace.join(".openagent");
+    fs::create_dir_all(&openagent_dir)?;
+    fs::create_dir_all(&session_root)?;
+    let server_script = temp.join("stdio_mcp_server.py");
+    fs::write(&server_script, stdio_mcp_server_script())?;
+    fs::write(
+        openagent_dir.join("mcp.json"),
+        format!(
+            r#"{{
+              "mcpServers": {{
+                "local-tools": {{
+                  "command": "python3",
+                  "args": ["{}"],
+                  "enabled": false,
+                  "timeout_ms": 5000
+                }}
+              }}
+            }}"#,
+            server_script.display()
+        ),
+    )?;
+    let mut server = spawn_openagent_server(port, &workspace, &session_root)?;
+    wait_for_attach(port)?;
+
+    let url = format!("http://127.0.0.1:{port}");
+    let base = vec![
+        "--server-url".to_string(),
+        url.clone(),
+        "--server-token".to_string(),
+        "secret".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+
+    let mut list_args = vec!["mcp".to_string(), "list".to_string()];
+    list_args.extend(base.clone());
+    let list = run_openagent_vec(list_args)?;
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_payload: Value = serde_json::from_slice(&list.stdout)?;
+    assert_eq!(list_payload["remote"], true);
+    assert_eq!(list_payload["servers"][0]["name"], "local-tools");
+    assert_eq!(list_payload["servers"][0]["enabled"], false);
+    assert_eq!(list_payload["servers"][0]["lifecycle_status"], "stopped");
+
+    let mut start_args = vec![
+        "mcp".to_string(),
+        "start".to_string(),
+        "local-tools".to_string(),
+    ];
+    start_args.extend(base.clone());
+    let start = run_openagent_vec(start_args)?;
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let start_payload: Value = serde_json::from_slice(&start.stdout)?;
+    assert_eq!(start_payload["servers"][0]["lifecycle_status"], "running");
+    assert_eq!(start_payload["servers"][0]["enabled"], false);
+    let lifecycle_pid = start_payload["servers"][0]["lifecycle_pid"]
+        .as_u64()
+        .ok_or("missing lifecycle pid")?;
+
+    let mut enable_args = vec![
+        "mcp".to_string(),
+        "enable".to_string(),
+        "local-tools".to_string(),
+    ];
+    enable_args.extend(base.clone());
+    let enable = run_openagent_vec(enable_args)?;
+    assert!(
+        enable.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    let enable_payload: Value = serde_json::from_slice(&enable.stdout)?;
+    assert_eq!(enable_payload["servers"][0]["enabled"], true);
+    assert_eq!(enable_payload["servers"][0]["lifecycle_status"], "running");
+    assert_eq!(
+        enable_payload["servers"][0]["lifecycle_pid"],
+        json!(lifecycle_pid)
+    );
+
+    let mut test_args = vec![
+        "mcp".to_string(),
+        "test".to_string(),
+        "local-tools".to_string(),
+    ];
+    test_args.extend(base.clone());
+    let test = run_openagent_vec(test_args)?;
+    assert!(
+        test.status.success(),
+        "{}",
+        String::from_utf8_lossy(&test.stderr)
+    );
+    let test_payload: Value = serde_json::from_slice(&test.stdout)?;
+    assert_eq!(test_payload["servers"][0]["tool_count"], 1);
+    assert_eq!(test_payload["servers"][0]["selected_transport"], "stdio");
+    assert_eq!(
+        test_payload["servers"][0]["lifecycle_pid"],
+        json!(lifecycle_pid)
+    );
+
+    let mut stop_args = vec![
+        "mcp".to_string(),
+        "stop".to_string(),
+        "local-tools".to_string(),
+    ];
+    stop_args.extend(base);
+    let stop = run_openagent_vec(stop_args)?;
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let stop_payload: Value = serde_json::from_slice(&stop.stdout)?;
+    assert_eq!(stop_payload["servers"][0]["lifecycle_status"], "stopped");
+
+    let _ = server.kill();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_mcp_test_uses_local_mcp_config_alias_once() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-mcp-test-alias")?;
+    let workspace = temp.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let mcp_config = temp.join("mcp.json");
+    let server_script = temp.join("stdio_mcp_server.py");
+    fs::write(&server_script, stdio_mcp_server_script())?;
+    fs::write(
+        &mcp_config,
+        format!(
+            r#"{{
+              "mcpServers": {{
+                "local-tools": {{
+                  "command": "python3",
+                  "args": ["{}"],
+                  "enabled": false,
+                  "timeout_ms": 5000
+                }}
+              }}
+            }}"#,
+            server_script.display()
+        ),
+    )?;
+
+    let output = run_openagent_vec(vec![
+        "mcp".to_string(),
+        "test".to_string(),
+        "local-tools".to_string(),
+        "--mcp-config".to_string(),
+        path_str(&mcp_config).to_string(),
+        "--workspace".to_string(),
+        path_str(&workspace).to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ])?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["name"], "local-tools");
+    assert_eq!(payload["server"]["status"], "connected");
+    assert_eq!(payload["server"]["selected_transport"], "stdio");
+    assert_eq!(payload["server"]["tool_count"], 1);
+    assert_eq!(
+        payload["config_path"].as_str().unwrap_or_default(),
+        path_str(&mcp_config)
+    );
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_mcp_lifecycle_rejects_local_config_without_app_bridge() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-mcp-lifecycle-local-config")?;
+    let mcp_config = temp.join("mcp.json");
+    fs::write(
+        &mcp_config,
+        r#"{"mcpServers":{"local-tools":{"command":"python3","args":["server.py"]}}}"#,
+    )?;
+
+    let output = run_openagent_vec(vec![
+        "mcp".to_string(),
+        "start".to_string(),
+        "local-tools".to_string(),
+        "--mcp-config".to_string(),
+        path_str(&mcp_config).to_string(),
+    ])?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("App Bridge lifecycle registry"), "{stderr}");
+    assert!(stderr.contains("--server-url <url>"), "{stderr}");
+    assert!(!stderr.contains("Connection refused"), "{stderr}");
+
+    let _ = fs::remove_dir_all(temp);
     Ok(())
 }
 
@@ -314,6 +678,125 @@ fn binary_config_auth_and_mcp_file_flows_work_without_python() -> Result<(), Box
     assert!(doctor.status.success());
     let doctor_payload: Value = serde_json::from_slice(&doctor.stdout)?;
     assert_eq!(doctor_payload["server_count"], 1);
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_session_checkpoints_and_restore_revert_workspace_and_transcript()
+-> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-session-restore")?;
+    let session_root = temp.join("sessions");
+    let workspace = temp.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("note.txt"), "before")?;
+
+    let store = FileSessionStore::new(&session_root);
+    let mut session = Session::new("restore_session", &workspace);
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "restore_run".to_string(),
+                trace_id: "restore_trace".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+    let first = ChatMessage {
+        role: Role::User,
+        content: "first".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_restore_1"))]),
+    };
+    session.add(first.clone());
+    store
+        .append_message(&session, &first, "restore_run", 0)
+        .expect("first message appends");
+    let checkpoint = store
+        .create_checkpoint(
+            "restore_session",
+            "restore_run",
+            &workspace,
+            "manual",
+            Some("msg_restore_1"),
+            None,
+            Some(1),
+        )
+        .expect("checkpoint creates");
+
+    fs::write(workspace.join("note.txt"), "after")?;
+    fs::write(workspace.join("new.txt"), "new")?;
+    let second = ChatMessage {
+        role: Role::User,
+        content: "second".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_restore_2"))]),
+    };
+    session.add(second.clone());
+    store
+        .append_message(&session, &second, "restore_run", 1)
+        .expect("second message appends");
+    store
+        .save_state(&session, Some("restore_run"))
+        .expect("state saves");
+
+    let checkpoints = run_openagent(
+        [
+            "session",
+            "checkpoints",
+            "restore_session",
+            "--session-root",
+            path_str(&session_root),
+            "--format",
+            "json",
+        ],
+        None,
+    )?;
+    assert!(checkpoints.status.success());
+    let checkpoints_payload: Value = serde_json::from_slice(&checkpoints.stdout)?;
+    assert_eq!(checkpoints_payload["checkpoint_count"], 1);
+    assert_eq!(
+        checkpoints_payload["checkpoints"][0]["checkpoint_id"],
+        checkpoint.checkpoint_id
+    );
+
+    let restore = run_openagent(
+        [
+            "session",
+            "restore",
+            "restore_session",
+            &checkpoint.checkpoint_id,
+            "--session-root",
+            path_str(&session_root),
+            "--format",
+            "json",
+        ],
+        None,
+    )?;
+    assert!(
+        restore.status.success(),
+        "{}",
+        String::from_utf8(restore.stderr)?
+    );
+    let restore_payload: Value = serde_json::from_slice(&restore.stdout)?;
+    assert_eq!(restore_payload["restored"], true);
+    assert_eq!(fs::read_to_string(workspace.join("note.txt"))?, "before");
+    assert!(!workspace.join("new.txt").exists());
+
+    let restored_messages = store
+        .list_messages_with_parts("restore_session", None, None)
+        .expect("restored messages load");
+    assert_eq!(restored_messages.len(), 1);
+    assert_eq!(restored_messages[0].info.id, "msg_restore_1");
 
     let _ = fs::remove_dir_all(temp);
     Ok(())
@@ -701,7 +1184,7 @@ fn binary_agent_registry_exposes_builtin_subagents() -> Result<(), Box<dyn Error
     );
     let payload: Value = serde_json::from_slice(&list.stdout)?;
     let agents = payload["agents"].as_array().ok_or("missing agents")?;
-    for id in ["build", "general", "explore", "plan"] {
+    for id in ["build", "general", "explore", "scout", "plan"] {
         assert!(agents.iter().any(|agent| agent["id"] == id), "missing {id}");
     }
 
@@ -731,6 +1214,160 @@ fn binary_agent_registry_exposes_builtin_subagents() -> Result<(), Box<dyn Error
             .as_str()
             .is_some_and(|value| value.contains("Read-only"))
     );
+    let scout = agents
+        .iter()
+        .find(|agent| agent["id"] == "scout")
+        .ok_or("missing scout")?;
+    assert_eq!(scout["permission"], "READONLY");
+    assert_eq!(
+        scout["tools"],
+        json!([
+            "web_fetch",
+            "read",
+            "glob",
+            "grep",
+            "ls",
+            "code_search",
+            "skill",
+            "todoread"
+        ])
+    );
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_agent_registry_loads_opencode_markdown_agents() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-opencode-agent-md")?;
+    let session_root = temp.join("sessions");
+    let agent_dir = temp.join(".opencode/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("markdown-research.md"),
+        r#"---
+id: markdown-research
+name: Markdown Research
+description: OpenCode markdown research agent
+mode: subagent
+permission: READONLY
+tools:
+  - read
+model: markdown-child-model
+steps: 2
+temperature: 0.31
+top_p: 0.73
+reasoning_effort: medium
+color: cyan
+---
+You are the CLI Markdown research subagent.
+"#,
+    )?;
+    fs::write(
+        agent_dir.join("disabled-worker.md"),
+        r#"---
+id: disabled-worker
+name: Disabled Worker
+mode: subagent
+disable: true
+---
+Disabled prompt.
+"#,
+    )?;
+
+    let list = run_openagent(
+        [
+            "agent",
+            "list",
+            "--workspace",
+            path_str(&temp),
+            "--format",
+            "json",
+        ],
+        None,
+    )?;
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&list.stdout)?;
+    let agents = payload["agents"].as_array().ok_or("missing agents")?;
+    let markdown = agents
+        .iter()
+        .find(|agent| agent["id"] == "markdown-research")
+        .ok_or("missing markdown agent")?;
+    assert_eq!(markdown["name"], "Markdown Research");
+    assert_eq!(markdown["steps"], 2);
+    assert_eq!(markdown["temperature"], 0.31);
+    assert_eq!(markdown["top_p"], 0.73);
+    assert_eq!(markdown["color"], "cyan");
+    assert_eq!(markdown["model_options"]["reasoning_effort"], "medium");
+    assert!(!agents.iter().any(|agent| agent["id"] == "disabled-worker"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--permission",
+            "FULL",
+            "--format",
+            "json",
+            "delegate",
+            "markdown",
+        ])
+        .env_clear()
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_markdown","name":"task","input":{"description":"Markdown task","prompt":"Run the markdown subagent.","subagent_type":"markdown-research"}}]"#,
+        )
+        .env("OPENAGENT_MOCK_SUBAGENT_ANSWER", "markdown child answer")
+        .env("OPENAGENT_MOCK_ANSWER", "parent final")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = events
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/completed" && event["params"]["name"] == "task"
+        })
+        .ok_or("missing markdown task completion")?;
+    let child_session_id = completed["params"]["metadata"]["session_id"]
+        .as_str()
+        .ok_or("missing child session id")?;
+    assert_eq!(
+        completed["params"]["metadata"]["model_options"]["reasoning_effort"],
+        "medium"
+    );
+    let child_state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root
+            .join(child_session_id)
+            .join("state.latest.json"),
+    )?)?;
+    assert!(child_state["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"] == "You are the CLI Markdown research subagent."
+        })
+    }));
+    assert_eq!(child_state["metadata"]["temperature"], 0.31);
+    assert_eq!(child_state["metadata"]["top_p"], 0.73);
+    assert_eq!(
+        child_state["metadata"]["model_options"]["reasoning_effort"],
+        "medium"
+    );
+    assert_eq!(child_state["metadata"]["color"], "cyan");
 
     let _ = fs::remove_dir_all(temp);
     Ok(())
@@ -827,6 +1464,406 @@ fn binary_run_executes_task_subagent_tool() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn binary_run_enforces_agent_task_permissions() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-task-permissions")?;
+    let session_root = temp.join("sessions");
+    let agent_dir = temp.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("limited-build.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "limited-build",
+            "name": "Limited Build",
+            "description": "Primary agent that can only launch allowed-worker.",
+            "mode": "primary",
+            "permission": {
+                "ruleset": "FULL",
+                "task": {
+                    "*": "deny",
+                    "allowed-worker": "allow"
+                }
+            },
+            "tools": ["task"]
+        }))?,
+    )?;
+    for id in ["allowed-worker", "blocked-worker"] {
+        fs::write(
+            agent_dir.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&json!({
+                "id": id,
+                "name": id,
+                "description": format!("{id} subagent"),
+                "mode": "subagent",
+                "permission": "READONLY",
+                "prompt": format!("You are {id}."),
+                "tools": ["read"],
+                "max_steps": 2
+            }))?,
+        )?;
+    }
+
+    let denied = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--agent",
+            "limited-build",
+            "--permission",
+            "FULL",
+            "--format",
+            "json",
+            "try",
+            "blocked",
+        ])
+        .env_clear()
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_blocked","name":"task","input":{"description":"Blocked task","prompt":"Should not run.","subagent_type":"blocked-worker"}}]"#,
+        )
+        .env("OPENAGENT_MOCK_ANSWER", "parent handled denial")
+        .output()?;
+    assert!(
+        denied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    let denied_events = String::from_utf8(denied.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let failed = denied_events
+        .iter()
+        .find(|event| event["method"] == "item/toolCall/failed")
+        .ok_or("missing denied task failure")?;
+    assert_eq!(failed["params"]["name"], "task");
+    assert_eq!(failed["params"]["metadata"]["permission_action"], "deny");
+    assert_eq!(
+        failed["params"]["metadata"]["permission_pattern"],
+        "blocked-worker"
+    );
+    assert!(
+        !session_root.exists()
+            || !fs::read_dir(&session_root)?.flatten().any(|entry| {
+                let state_path = entry.path().join("state.latest.json");
+                let Ok(raw) = fs::read_to_string(state_path) else {
+                    return false;
+                };
+                let Ok(state) = serde_json::from_str::<Value>(&raw) else {
+                    return false;
+                };
+                state["metadata"]["subagent"].as_bool().unwrap_or(false)
+            })
+    );
+
+    let allowed = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--agent",
+            "limited-build",
+            "--permission",
+            "FULL",
+            "--format",
+            "json",
+            "try",
+            "allowed",
+        ])
+        .env_clear()
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_allowed","name":"task","input":{"description":"Allowed task","prompt":"Run allowed.","subagent_type":"allowed-worker"}}]"#,
+        )
+        .env("OPENAGENT_MOCK_SUBAGENT_ANSWER", "allowed child answer")
+        .env("OPENAGENT_MOCK_ANSWER", "parent handled allowed")
+        .output()?;
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let allowed_events = String::from_utf8(allowed.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = allowed_events
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/completed" && event["params"]["name"] == "task"
+        })
+        .ok_or("missing allowed task completion")?;
+    assert_eq!(
+        completed["params"]["metadata"]["subagent_type"],
+        "allowed-worker"
+    );
+    assert!(
+        completed["params"]["output"]
+            .as_str()
+            .is_some_and(|output| {
+                output.contains("<task id=") && output.contains("allowed child answer")
+            })
+    );
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_run_invokes_subagent_with_at_mention() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-at-subagent")?;
+    let session_root = temp.join("sessions");
+    let agent_dir = temp.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("allowed-worker.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "allowed-worker",
+            "name": "Allowed Worker",
+            "description": "Manual at-mention worker",
+            "mode": "subagent",
+            "permission": "READONLY",
+            "prompt": "You are the manual worker.",
+            "tools": ["read"],
+            "max_steps": 2
+        }))?,
+    )?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--permission",
+            "FULL",
+            "--format",
+            "json",
+            "@allowed-worker",
+            "Handle this directly.",
+        ])
+        .env_clear()
+        .env("OPENAGENT_MOCK_SUBAGENT_ANSWER", "manual child answer")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = events
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/completed" && event["params"]["name"] == "task"
+        })
+        .ok_or("missing manual task completion")?;
+    assert_eq!(completed["params"]["manual"], true);
+    assert_eq!(
+        completed["params"]["metadata"]["subagent_type"],
+        "allowed-worker"
+    );
+    assert!(
+        completed["params"]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("manual child answer"))
+    );
+    let turn = events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .ok_or("missing completed turn")?;
+    assert_eq!(turn["params"]["source"], "manual_subagent");
+    assert_eq!(turn["params"]["tool_calls"], 1);
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_run_auto_routes_prompt_to_matching_subagent_description() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-auto-subagent")?;
+    let session_root = temp.join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--permission",
+            "FULL",
+            "--format",
+            "json",
+            "Research",
+            "external",
+            "dependency",
+            "docs",
+            "before",
+            "coding.",
+        ])
+        .env_clear()
+        .env("OPENAGENT_MOCK_SUBAGENT_ANSWER", "auto scout child answer")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = events
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/completed" && event["params"]["name"] == "task"
+        })
+        .ok_or("missing auto task completion")?;
+    assert_eq!(completed["params"]["manual"], false);
+    assert_eq!(completed["params"]["auto"], true);
+    assert_eq!(completed["params"]["auto_route"]["subagent_type"], "scout");
+    assert_eq!(completed["params"]["metadata"]["subagent_type"], "scout");
+    assert_eq!(completed["params"]["metadata"]["task_depth"], 1);
+    assert!(
+        completed["params"]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("auto scout child answer"))
+    );
+    let child_session_id = completed["params"]["metadata"]["session_id"]
+        .as_str()
+        .ok_or("missing child session id")?;
+    let child_state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root
+            .join(child_session_id)
+            .join("state.latest.json"),
+    )?)?;
+    assert_eq!(child_state["metadata"]["agent_profile"]["id"], "scout");
+    assert_eq!(
+        child_state["metadata"]["parent_tool_call_id"],
+        "auto_task_scout"
+    );
+    let turn = events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .ok_or("missing completed turn")?;
+    assert_eq!(turn["params"]["source"], "auto_subagent");
+    assert_eq!(turn["params"]["tool_calls"], 1);
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_run_executes_subagent_in_isolated_workspace() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-isolated-subagent")?;
+    let session_root = temp.join("sessions");
+    let agent_dir = temp.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(temp.join("parent.txt"), "parent\n")?;
+    fs::write(
+        agent_dir.join("isolated-writer.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "isolated-writer",
+            "name": "Isolated Writer",
+            "description": "Write-capable subagent that runs in an isolated workspace.",
+            "mode": "subagent",
+            "permission": "FULL",
+            "prompt": "You write only inside your assigned workspace.",
+            "tools": ["write"],
+            "workspace_isolation": true,
+            "max_steps": 3
+        }))?,
+    )?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--permission",
+            "FULL",
+            "--format",
+            "json",
+            "@isolated-writer",
+            "Write isolated.txt.",
+        ])
+        .env_clear()
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_write_isolated","name":"write","input":{"file_path":"isolated.txt","content":"child\n"}}]"#,
+        )
+        .env("OPENAGENT_MOCK_ANSWER", "isolated child final")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = events
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/completed" && event["params"]["name"] == "task"
+        })
+        .ok_or_else(|| format!("missing isolated task completion: {events:?}"))?;
+    assert_eq!(
+        completed["params"]["metadata"]["workspace_isolation"]["enabled"],
+        true
+    );
+    assert_eq!(
+        completed["params"]["metadata"]["workspace_isolation"]["method"],
+        "directory_copy"
+    );
+    let child_workspace = PathBuf::from(
+        completed["params"]["metadata"]["workspace_isolation"]["workspace"]
+            .as_str()
+            .ok_or("missing isolated workspace")?,
+    );
+    assert_ne!(child_workspace, temp);
+    assert!(!temp.join("isolated.txt").exists());
+    assert_eq!(
+        fs::read_to_string(child_workspace.join("isolated.txt"))?,
+        "child\n"
+    );
+    let child_session_id = completed["params"]["metadata"]["session_id"]
+        .as_str()
+        .ok_or("missing child session id")?;
+    let child_state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root
+            .join(child_session_id)
+            .join("state.latest.json"),
+    )?)?;
+    assert_eq!(
+        child_state["workspace"],
+        child_workspace.to_string_lossy().to_string()
+    );
+    assert_eq!(
+        child_state["metadata"]["workspace_isolation"]["source_workspace"],
+        completed["params"]["metadata"]["workspace_isolation"]["source_workspace"]
+    );
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn binary_run_discovers_and_executes_remote_mcp_tool() -> Result<(), Box<dyn Error>> {
     let temp = temp_dir("openagent-cli-mcp-loop")?;
     let session_root = temp.join("sessions");
@@ -891,6 +1928,80 @@ fn binary_run_discovers_and_executes_remote_mcp_tool() -> Result<(), Box<dyn Err
     assert_eq!(completed["params"]["metadata"]["backend"], "mcp");
     assert!(events.iter().any(|event| {
         event["method"] == "turn/completed" && event["params"]["final_answer"] == "mcp complete"
+    }));
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_run_discovers_and_executes_stdio_mcp_tool() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-stdio-mcp-loop")?;
+    let session_root = temp.join("sessions");
+    let mcp_config = temp.join("mcp.json");
+    let server_script = temp.join("stdio_mcp_server.py");
+    fs::write(&server_script, stdio_mcp_server_script())?;
+    fs::write(
+        &mcp_config,
+        format!(
+            r#"{{
+              "mcpServers": {{
+                "arbor-review": {{
+                  "command": "python3",
+                  "args": ["{}"],
+                  "enabled": true,
+                  "timeout_ms": 5000
+                }}
+              }}
+            }}"#,
+            server_script.display()
+        ),
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--mcp-config",
+            path_str(&mcp_config),
+            "--format",
+            "json",
+            "call",
+            "mcp",
+        ])
+        .env_clear()
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_mcp","name":"mcp_tool_arbor_review_arbor_review","input":{"text":"hi"}}]"#,
+        )
+        .env("OPENAGENT_MOCK_ANSWER", "stdio mcp complete")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = events
+        .iter()
+        .find(|event| event["method"] == "item/toolCall/completed")
+        .ok_or("missing stdio mcp tool completion")?;
+    assert_eq!(
+        completed["params"]["name"],
+        "mcp_tool_arbor_review_arbor_review"
+    );
+    assert_eq!(completed["params"]["output"], "stdio MCP echo hi");
+    assert_eq!(completed["params"]["metadata"]["backend"], "mcp");
+    assert_eq!(completed["params"]["metadata"]["mcp_transport"], "stdio");
+    assert!(events.iter().any(|event| {
+        event["method"] == "turn/completed"
+            && event["params"]["final_answer"] == "stdio mcp complete"
     }));
 
     let _ = fs::remove_dir_all(temp);
@@ -1491,6 +2602,24 @@ fn serve_http_once_with_listener(
     })
 }
 
+fn serve_http_responses_on_free_port(
+    responses: Vec<String>,
+) -> Result<(u16, MockServer), Box<dyn Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let server = thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let _ = read_http_request_body(&mut stream)?;
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    });
+    Ok((port, server))
+}
+
 fn serve_dripping_sse_provider() -> Result<(u16, MockServer), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -1584,6 +2713,82 @@ fn serve_mcp_json_rpc(expected_requests: usize) -> Result<(u16, MockServer), Box
         Ok(())
     });
     Ok((port, server))
+}
+
+fn stdio_mcp_server_script() -> &'static str {
+    r#"import json
+import sys
+
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.decode("utf-8").strip()
+        if not line:
+            break
+        key, _, value = line.partition(":")
+        headers[key.lower()] = value.strip()
+    length = int(headers["content-length"])
+    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+
+
+def write_message(value):
+    raw = json.dumps(value).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(raw))
+    sys.stdout.buffer.write(raw)
+    sys.stdout.buffer.flush()
+
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "stdio-test", "version": "0.0.0"},
+            },
+        })
+    elif method == "tools/list":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {
+                "tools": [{
+                    "name": "arbor_review",
+                    "title": "Arbor Review",
+                    "description": "Review text",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                }],
+            },
+        })
+    elif method == "tools/call":
+        text = message.get("params", {}).get("arguments", {}).get("text", "")
+        write_message({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {
+                "content": [{"type": "text", "text": "stdio MCP echo " + text}],
+                "isError": False,
+            },
+        })
+    elif method == "shutdown":
+        write_message({"jsonrpc": "2.0", "id": message.get("id"), "result": {}})
+    elif method == "exit":
+        break
+"#
 }
 
 fn read_http_request_body(stream: &mut std::net::TcpStream) -> Result<String, String> {

@@ -1,6 +1,6 @@
 //! App Bridge client-side state for the Rust rewrite.
 
-use std::{collections::BTreeSet, path::Path, time::Duration};
+use std::{collections::BTreeSet, io::Read, path::Path, time::Duration};
 
 use openagent_app_server::AppEvent;
 use serde_json::{Value, json};
@@ -22,6 +22,7 @@ pub fn protocol_crate_name() -> &'static str {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RemoteEventKey {
+    EventId(String),
     Global(u64),
     Turn {
         turn_id: String,
@@ -237,8 +238,16 @@ impl RemoteRuntimeClient {
         self.json("GET", "/api/health", None)
     }
 
+    pub fn protocol(&self) -> Result<Value, String> {
+        self.json("GET", "/api/protocol", None)
+    }
+
     pub fn models(&self) -> Result<Value, String> {
         self.json("GET", "/api/models", None)
+    }
+
+    pub fn provider_health(&self) -> Result<Value, String> {
+        self.json("GET", "/api/models?check=true", None)
     }
 
     pub fn agents(&self) -> Result<Value, String> {
@@ -340,8 +349,37 @@ impl RemoteRuntimeClient {
         )
     }
 
+    pub fn start_turn_async(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        mut extra: Value,
+    ) -> Result<Value, String> {
+        if !extra.is_object() {
+            extra = json!({});
+        }
+        extra["async"] = json!(true);
+        self.start_turn(session_id, prompt, extra)
+    }
+
     pub fn interrupt_turn(&self, turn_id: &str) -> Result<Value, String> {
         self.json("POST", &format!("/api/turns/{turn_id}/interrupt"), None)
+    }
+
+    pub fn turns(&self) -> Result<Value, String> {
+        self.json("GET", "/api/turns", None)
+    }
+
+    pub fn turns_for_session(&self, session_id: &str) -> Result<Value, String> {
+        self.json(
+            "GET",
+            &format!("/api/turns?session_id={}", quote_path(session_id)),
+            None,
+        )
+    }
+
+    pub fn turn_status(&self, turn_id: &str) -> Result<Value, String> {
+        self.json("GET", &format!("/api/turns/{turn_id}"), None)
     }
 
     pub fn update_session(&self, session_id: &str, body: Value) -> Result<Value, String> {
@@ -359,6 +397,36 @@ impl RemoteRuntimeClient {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default())
+    }
+
+    pub fn tasks(&self, session_id: &str) -> Result<Vec<Value>, String> {
+        let payload = self.tasks_payload(session_id)?;
+        Ok(payload
+            .get("tasks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub fn tasks_payload(&self, session_id: &str) -> Result<Value, String> {
+        let payload = self.json("GET", &format!("/api/sessions/{session_id}/tasks"), None)?;
+        Ok(payload)
+    }
+
+    pub fn run_task(&self, session_id: &str, task_id: &str, extra: Value) -> Result<Value, String> {
+        self.json(
+            "POST",
+            &format!("/api/sessions/{session_id}/tasks/{task_id}/run"),
+            Some(extra),
+        )
+    }
+
+    pub fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<Value, String> {
+        self.json(
+            "POST",
+            &format!("/api/sessions/{session_id}/tasks/{task_id}/cancel"),
+            None,
+        )
     }
 
     pub fn share_session(&self, session_id: &str) -> Result<Value, String> {
@@ -385,6 +453,58 @@ impl RemoteRuntimeClient {
         self.json("POST", &format!("/api/sessions/{session_id}/redo"), None)
     }
 
+    pub fn terminal_run(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, String> {
+        let mut body = json!({"command": command});
+        if let Some(cwd) = cwd {
+            body["cwd"] = json!(cwd.to_string_lossy());
+        }
+        if let Some(timeout_ms) = timeout_ms {
+            body["timeout_ms"] = json!(timeout_ms);
+        }
+        self.json("POST", "/api/terminal/run", Some(body))
+    }
+
+    pub fn mcp_status(&self, refresh: bool) -> Result<Value, String> {
+        let path = if refresh {
+            "/api/mcp?refresh=true"
+        } else {
+            "/api/mcp"
+        };
+        self.json("GET", path, None)
+    }
+
+    pub fn mcp_server_test(&self, name: &str) -> Result<Value, String> {
+        self.json(
+            "POST",
+            &format!("/api/mcp/servers/{}/test", quote_path(name)),
+            None,
+        )
+    }
+
+    pub fn mcp_server_lifecycle(&self, name: &str, action: &str) -> Result<Value, String> {
+        if !matches!(action, "start" | "stop" | "restart") {
+            return Err(format!("unsupported MCP lifecycle action: {action}"));
+        }
+        self.json(
+            "POST",
+            &format!("/api/mcp/servers/{}/{}", quote_path(name), action),
+            None,
+        )
+    }
+
+    pub fn mcp_server_update(&self, name: &str, body: Value) -> Result<Value, String> {
+        self.json(
+            "PATCH",
+            &format!("/api/mcp/servers/{}", quote_path(name)),
+            Some(body),
+        )
+    }
+
     pub fn turn_events(&self, turn_id: &str, last_event_id: u64) -> Result<Vec<Value>, String> {
         let path = if last_event_id == 0 {
             format!("/api/turns/{turn_id}/events")
@@ -396,6 +516,74 @@ impl RemoteRuntimeClient {
 
     pub fn global_events(&self, last_event_id: u64) -> Result<Vec<Value>, String> {
         self.sse_events(&format!("/api/events?last_event_id={last_event_id}"))
+    }
+
+    pub fn global_events_live(
+        &self,
+        last_event_id: u64,
+        live_timeout: Duration,
+    ) -> Result<Vec<Value>, String> {
+        self.sse_events_live(
+            &format!(
+                "/api/events?last_event_id={last_event_id}&live_timeout_ms={}",
+                live_timeout.as_millis()
+            ),
+            live_timeout,
+        )
+    }
+
+    pub fn global_events_live_stream<F>(
+        &self,
+        last_event_id: u64,
+        live_timeout: Duration,
+        on_event: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(Value) -> Result<(), String>,
+    {
+        self.sse_events_live_stream(
+            &format!(
+                "/api/events?last_event_id={last_event_id}&live_timeout_ms={}",
+                live_timeout.as_millis()
+            ),
+            live_timeout,
+            on_event,
+        )
+    }
+
+    pub fn turn_events_live(
+        &self,
+        turn_id: &str,
+        last_event_id: u64,
+        live_timeout: Duration,
+    ) -> Result<Vec<Value>, String> {
+        self.sse_events_live(
+            &format!(
+                "/api/turns/{turn_id}/events?last_event_id={last_event_id}&live_timeout_ms={}",
+                live_timeout.as_millis()
+            ),
+            live_timeout,
+        )
+    }
+
+    pub fn turn_events_live_stream<F>(
+        &self,
+        turn_id: &str,
+        last_event_id: u64,
+        live_timeout: Duration,
+        on_event: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(Value) -> Result<(), String>,
+    {
+        self.sse_events_live_stream(
+            &format!(
+                "/api/turns/{turn_id}/events?last_event_id={last_event_id}&live_timeout_ms={}",
+                live_timeout.as_millis()
+            ),
+            live_timeout,
+            on_event,
+        )
     }
 
     pub fn respond_approval(&self, payload: &Value) -> Result<Value, String> {
@@ -442,10 +630,68 @@ impl RemoteRuntimeClient {
         parse_sse_response_lines(&raw.lines().collect::<Vec<_>>())
     }
 
+    pub fn sse_events_live(
+        &self,
+        path: &str,
+        live_timeout: Duration,
+    ) -> Result<Vec<Value>, String> {
+        let padded = live_timeout.saturating_add(Duration::from_secs(1));
+        let timeout = if self.timeout > padded {
+            self.timeout
+        } else {
+            padded
+        };
+        let raw = self.text_with_options("GET", path, None, Some("text/event-stream"), timeout)?;
+        parse_sse_response_lines(&raw.lines().collect::<Vec<_>>())
+    }
+
+    pub fn sse_events_live_stream<F>(
+        &self,
+        path: &str,
+        live_timeout: Duration,
+        on_event: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(Value) -> Result<(), String>,
+    {
+        let padded = live_timeout.saturating_add(Duration::from_secs(1));
+        let timeout = if self.timeout > padded {
+            self.timeout
+        } else {
+            padded
+        };
+        let response =
+            self.send_with_options("GET", path, None, Some("text/event-stream"), timeout)?;
+        read_sse_response_stream(response, on_event)
+    }
+
     pub fn text(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, String> {
+        self.text_with_options(method, path, body, None, self.timeout)
+    }
+
+    fn text_with_options(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        accept: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let response = self.send_with_options(method, path, body, accept, timeout)?;
+        response.text().map_err(|error| error.to_string())
+    }
+
+    fn send_with_options(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        accept: Option<&str>,
+        timeout: Duration,
+    ) -> Result<reqwest::blocking::Response, String> {
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
-            .timeout(self.timeout)
+            .timeout(timeout)
             .build()
             .map_err(|error| error.to_string())?;
         let url = join_server_url(&self.server_url, path);
@@ -472,6 +718,9 @@ impl RemoteRuntimeClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
         let response = request.send().map_err(|error| {
             format!(
                 "{method} {} failed: {error}",
@@ -479,6 +728,9 @@ impl RemoteRuntimeClient {
             )
         })?;
         let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
         let content_type = response
             .headers()
             .get("content-type")
@@ -486,15 +738,78 @@ impl RemoteRuntimeClient {
             .unwrap_or_default()
             .to_string();
         let raw = response.text().map_err(|error| error.to_string())?;
-        if !status.is_success() {
-            return Err(format!(
-                "server returned HTTP {} for {method} {path}: {}",
-                status.as_u16(),
-                summarize_http_error_body(&raw, &content_type)
-            ));
-        }
-        Ok(raw)
+        Err(format!(
+            "server returned HTTP {} for {method} {path}: {}",
+            status.as_u16(),
+            summarize_http_error_body(&raw, &content_type)
+        ))
     }
+}
+
+pub fn read_sse_response_stream<R, F>(mut reader: R, mut on_event: F) -> Result<(), String>
+where
+    R: Read,
+    F: FnMut(Value) -> Result<(), String>,
+{
+    let mut raw = String::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("SSE read failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        raw.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        while let Some(index) = sse_frame_end(&raw) {
+            let frame = raw[..index].to_string();
+            let drain_to = if raw[index..].starts_with("\r\n\r\n") {
+                index + 4
+            } else {
+                index + 2
+            };
+            raw.drain(..drain_to);
+            if let Some(event) = parse_sse_frame_json(&frame)? {
+                on_event(event)?;
+            }
+        }
+    }
+    if !raw.trim().is_empty()
+        && let Some(event) = parse_sse_frame_json(&raw)?
+    {
+        on_event(event)?;
+    }
+    Ok(())
+}
+
+fn sse_frame_end(raw: &str) -> Option<usize> {
+    match (raw.find("\r\n\r\n"), raw.find("\n\n")) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(index), None) | (None, Some(index)) => Some(index),
+        (None, None) => None,
+    }
+}
+
+fn parse_sse_frame_json(frame: &str) -> Result<Option<Value>, String> {
+    let mut data_lines = Vec::new();
+    for line in frame.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let data = data_lines.join("\n");
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    parse_sse_data(trimmed).map(Some)
 }
 
 pub fn parse_sse_response_lines(lines: &[&str]) -> Result<Vec<Value>, String> {
@@ -578,7 +893,13 @@ pub fn app_event_from_value(payload: &Value, default_sequence: u64) -> Result<Ap
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let global_sequence = payload.get("global_sequence").and_then(Value::as_u64);
+    let event_id = payload
+        .get("event_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     Ok(AppEvent {
+        event_id,
         sequence,
         method,
         params,
@@ -617,6 +938,11 @@ pub fn event_session_id(event: &AppEvent) -> String {
 
 #[must_use]
 pub fn remote_event_key(event: &AppEvent, default_turn_id: &str) -> RemoteEventKey {
+    if let Some(event_id) = event.event_id.as_deref()
+        && !event_id.is_empty()
+    {
+        return RemoteEventKey::EventId(event_id.to_string());
+    }
     if let Some(global_sequence) = event.global_sequence {
         return RemoteEventKey::Global(global_sequence);
     }
@@ -630,6 +956,7 @@ pub fn remote_event_key(event: &AppEvent, default_turn_id: &str) -> RemoteEventK
 #[must_use]
 pub fn remote_event_key_value(key: &RemoteEventKey) -> Value {
     match key {
+        RemoteEventKey::EventId(event_id) => json!(["event_id", event_id]),
         RemoteEventKey::Global(sequence) => json!(["global", sequence]),
         RemoteEventKey::Turn {
             turn_id,
@@ -656,6 +983,7 @@ pub fn app_bridge_client_fixture() -> Value {
         &json!({
             "sequence": 4,
             "global_sequence": 12,
+            "event_id": "app_evt:session_existing:turn_remote:4",
             "method": "turn/completed",
             "params": {
                 "thread_id": "session_existing",
@@ -669,6 +997,7 @@ pub fn app_bridge_client_fixture() -> Value {
         99,
     )
     .unwrap_or_else(|_| AppEvent {
+        event_id: None,
         sequence: 0,
         method: String::new(),
         params: json!({}),
@@ -679,6 +1008,7 @@ pub fn app_bridge_client_fixture() -> Value {
     let mut remote_turn = RemoteTurnRecord::new("turn_remote", "session_existing");
     let remote_events = vec![
         AppEvent {
+            event_id: Some("app_evt:session_existing:turn_remote:1".to_string()),
             sequence: 1,
             global_sequence: Some(10),
             method: "turn/started".to_string(),
@@ -686,6 +1016,7 @@ pub fn app_bridge_client_fixture() -> Value {
             created_at_ms: 1_781_842_000_301,
         },
         AppEvent {
+            event_id: Some("app_evt:session_existing:turn_remote:2".to_string()),
             sequence: 2,
             global_sequence: Some(11),
             method: "turn/approval_requested".to_string(),
@@ -698,6 +1029,7 @@ pub fn app_bridge_client_fixture() -> Value {
             created_at_ms: 1_781_842_000_302,
         },
         AppEvent {
+            event_id: Some("app_evt:session_existing:turn_remote:3".to_string()),
             sequence: 3,
             global_sequence: None,
             method: "turn/approval_resolved".to_string(),
@@ -716,6 +1048,7 @@ pub fn app_bridge_client_fixture() -> Value {
         .map(|event| remote_turn.append_event(event))
         .collect::<Vec<_>>();
     let duplicate_result = remote_turn.append_event(AppEvent {
+        event_id: Some("app_evt:session_existing:turn_remote:1".to_string()),
         sequence: 1,
         global_sequence: Some(10),
         method: "turn/started".to_string(),
@@ -752,8 +1085,14 @@ pub fn app_bridge_client_fixture() -> Value {
         "request_shapes": {
             "start_session": request_shape("POST", "/api/sessions", Some(json!({"cwd": "/tmp/openagent-rust-rewrite-fixture-goal11/workspace"}))),
             "start_turn": request_shape("POST", "/api/sessions/session_existing/turns", Some(json!({"input": "hello"}))),
+            "turns": request_shape("GET", "/api/turns?session_id=session_existing", None),
             "interrupt": request_shape("POST", "/api/turns/turn_remote/interrupt", Some(json!({}))),
             "approval": request_shape("POST", "/api/turns/turn_remote/approvals/approval_1", Some(json!({"action": "deny"}))),
+            "terminal_run": request_shape("POST", "/api/terminal/run", Some(json!({"command": "printf terminal-ok", "cwd": "/tmp/openagent-rust-rewrite-fixture-goal11/workspace", "timeout_ms": 1000}))),
+            "mcp_status": request_shape("GET", "/api/mcp?refresh=true", None),
+            "mcp_start": request_shape("POST", "/api/mcp/servers/local-tools/start", None),
+            "mcp_test": request_shape("POST", "/api/mcp/servers/local-tools/test", None),
+            "mcp_enable": request_shape("PATCH", "/api/mcp/servers/local-tools", Some(json!({"enabled": true}))),
             "control_next": request_shape("GET", "/tui/control/next?timeout=0.25", None),
             "control_response": request_shape("POST", "/tui/control/response", Some(json!({"ok": true, "result": {"applied": true}}))),
         },
@@ -820,11 +1159,133 @@ impl EmptyStringExt for String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        error::Error,
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use serde_json::json;
+
     use super::*;
 
     #[test]
     fn links_to_protocol_crate() {
         assert_eq!(crate_name(), "openagent-app-server-client");
         assert_eq!(protocol_crate_name(), "openagent-protocol");
+    }
+
+    #[test]
+    fn live_sse_stream_callback_receives_event_before_response_finishes()
+    -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let mut request = String::new();
+            let mut buffer = [0_u8; 512];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .map_err(|error| error.to_string())?;
+                if read == 0 {
+                    return Err("client closed before request completed".to_string());
+                }
+                request.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if request.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            if !request.starts_with("GET /api/events?last_event_id=0&live_timeout_ms=1200 ") {
+                return Err(format!("unexpected request line: {request}"));
+            }
+            if !request.contains("Authorization: Bearer secret")
+                && !request.contains("authorization: Bearer secret")
+            {
+                return Err(format!("missing bearer auth: {request}"));
+            }
+            if !request.contains("Accept: text/event-stream")
+                && !request.contains("accept: text/event-stream")
+            {
+                return Err(format!("missing SSE accept: {request}"));
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\nconnection: close\r\n\r\n",
+                )
+                .map_err(|error| error.to_string())?;
+            write_sse_event(
+                &mut stream,
+                json!({
+                    "event_id": "evt_stream_delta",
+                    "sequence": 1,
+                    "global_sequence": 1,
+                    "method": "item/agentMessage/delta",
+                    "params": {"delta": "streamed early"},
+                    "created_at_ms": 1,
+                }),
+            )?;
+            stream.flush().map_err(|error| error.to_string())?;
+            thread::sleep(Duration::from_millis(700));
+            write_sse_event(
+                &mut stream,
+                json!({
+                    "event_id": "evt_completed",
+                    "sequence": 2,
+                    "global_sequence": 2,
+                    "method": "turn/completed",
+                    "params": {"status": "completed", "final_answer": "streamed early"},
+                    "created_at_ms": 2,
+                }),
+            )?;
+            stream.flush().map_err(|error| error.to_string())?;
+            Ok(())
+        });
+
+        let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+            .with_auth(RemoteAuth::bearer("secret"));
+        let (sender, receiver) = mpsc::channel();
+        let start = Instant::now();
+        let client_thread = thread::spawn(move || {
+            client.global_events_live_stream(0, Duration::from_millis(1200), |event| {
+                sender
+                    .send((
+                        event["method"].as_str().unwrap_or_default().to_string(),
+                        start.elapsed(),
+                    ))
+                    .map_err(|error| error.to_string())
+            })
+        });
+
+        let (first_method, first_elapsed) = receiver.recv_timeout(Duration::from_millis(400))?;
+        assert_eq!(first_method, "item/agentMessage/delta");
+        assert!(
+            first_elapsed < Duration::from_millis(400),
+            "first event was not delivered incrementally: {first_elapsed:?}"
+        );
+        let (second_method, _) = receiver.recv_timeout(Duration::from_millis(1200))?;
+        assert_eq!(second_method, "turn/completed");
+        let client_result = client_thread
+            .join()
+            .map_err(|_| "client thread panicked".to_string())?;
+        assert!(client_result.is_ok(), "{client_result:?}");
+        let server_result = server
+            .join()
+            .map_err(|_| "server thread panicked".to_string())?;
+        assert!(server_result.is_ok(), "{server_result:?}");
+        Ok(())
+    }
+
+    fn write_sse_event(stream: &mut impl Write, event: serde_json::Value) -> Result<(), String> {
+        writeln!(
+            stream,
+            "event: {}",
+            event["method"].as_str().unwrap_or("message")
+        )
+        .map_err(|error| error.to_string())?;
+        writeln!(stream, "data: {event}\n").map_err(|error| error.to_string())
     }
 }

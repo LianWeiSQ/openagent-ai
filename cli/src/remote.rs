@@ -1,5 +1,9 @@
 use super::*;
 
+use openagent_app_server_client::{
+    RemoteAuth as AppBridgeRemoteAuth, RemoteRuntimeClient as AppBridgeRuntimeClient,
+};
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct RemoteAuth {
     token: Option<String>,
@@ -17,6 +21,23 @@ pub(super) fn remote_auth_from_args(args: &[String]) -> RemoteAuth {
         username: value_for(args, &["--username", "-u"]),
         password: value_for(args, &["--password", "-p"]),
     }
+}
+
+fn app_bridge_auth(auth: &RemoteAuth) -> AppBridgeRemoteAuth {
+    if let Some(token) = auth.token.as_deref().filter(|value| !value.is_empty()) {
+        return AppBridgeRemoteAuth::bearer(token);
+    }
+    if let Some(password) = auth.password.as_deref().filter(|value| !value.is_empty()) {
+        return AppBridgeRemoteAuth::basic(
+            auth.username.as_deref().unwrap_or("openagent"),
+            password,
+        );
+    }
+    AppBridgeRemoteAuth::default()
+}
+
+pub(super) fn app_bridge_client(server_url: &str, auth: &RemoteAuth) -> AppBridgeRuntimeClient {
+    AppBridgeRuntimeClient::new(server_url).with_auth(app_bridge_auth(auth))
 }
 
 pub(super) fn remote_select_session(
@@ -134,13 +155,17 @@ fn remote_turn_events(
     turn_id: &str,
     last_event_id: u64,
 ) -> Result<Vec<Value>, String> {
-    let path = if last_event_id > 0 {
-        format!("/api/turns/{turn_id}/events?last_event_id={last_event_id}")
-    } else {
-        format!("/api/turns/{turn_id}/events")
-    };
-    let raw = http_text_with_auth("GET", server_url, &path, auth, None)?;
-    openagent_http_runtime::parse_sse_response_lines(&raw.lines().collect::<Vec<_>>())
+    let mut events = Vec::new();
+    app_bridge_client(server_url, auth).turn_events_live_stream(
+        turn_id,
+        last_event_id,
+        remote_attach_poll_duration(),
+        |event| {
+            events.push(event);
+            Ok(())
+        },
+    )?;
+    Ok(events)
 }
 
 pub(super) fn remote_events_for_payload(
@@ -207,6 +232,15 @@ fn remote_attach_wait_seconds() -> u64 {
         .unwrap_or(30)
 }
 
+fn remote_attach_poll_duration() -> Duration {
+    let millis = env::var("OPENAGENT_ATTACH_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(250)
+        .clamp(250, 5_000);
+    Duration::from_millis(millis)
+}
+
 fn app_event_sequence(event: &Value) -> u64 {
     event
         .get("sequence")
@@ -215,7 +249,20 @@ fn app_event_sequence(event: &Value) -> u64 {
         .unwrap_or_default()
 }
 
+fn app_event_global_sequence(event: &Value) -> u64 {
+    event
+        .get("global_sequence")
+        .or_else(|| event.get("sequence"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
 fn app_event_dedupe_key(event: &Value) -> Option<String> {
+    if let Some(event_id) = event.get("event_id").and_then(Value::as_str)
+        && !event_id.is_empty()
+    {
+        return Some(format!("event_id:{event_id}"));
+    }
     Some(format!(
         "{}:{}:{}",
         app_event_sequence(event),
@@ -254,6 +301,20 @@ fn remote_list_sessions(server_url: &str, auth: &RemoteAuth) -> Result<Vec<Value
         .unwrap_or_default())
 }
 
+fn remote_tasks_payload(
+    server_url: &str,
+    auth: &RemoteAuth,
+    session_id: &str,
+) -> Result<Value, String> {
+    http_json_with_auth(
+        "GET",
+        server_url,
+        &format!("/api/sessions/{session_id}/tasks"),
+        auth,
+        None,
+    )
+}
+
 fn remote_sessions_text(sessions: &[Value]) -> String {
     if sessions.is_empty() {
         return "Remote sessions: none\n".to_string();
@@ -290,6 +351,68 @@ fn remote_sessions_text(sessions: &[Value]) -> String {
         text.push_str(&format!("  ... {} more\n", sessions.len() - 20));
     }
     text
+}
+
+fn remote_tasks_text(payload: &Value) -> String {
+    let session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let tree = payload
+        .get("tree")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("tasks").and_then(Value::as_array));
+    let Some(tasks) = tree else {
+        return format!("Remote tasks for {session_id}: none\n");
+    };
+    if tasks.is_empty() {
+        return format!("Remote tasks for {session_id}: none\n");
+    }
+    let mut text = format!("Remote tasks for {session_id}:\n");
+    for task in tasks {
+        append_remote_task_text(&mut text, task, 1);
+    }
+    text
+}
+
+fn append_remote_task_text(text: &mut String, task: &Value, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let id = task
+        .get("session_id")
+        .or_else(|| task.get("task_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let title = task
+        .get("title")
+        .or_else(|| task.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or("task");
+    let status = task
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let subagent = task
+        .get("subagent_type")
+        .or_else(|| task.get("agent"))
+        .and_then(Value::as_str)
+        .unwrap_or("subagent");
+    let background = task
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let depth_value = task
+        .get("task_depth")
+        .and_then(Value::as_u64)
+        .unwrap_or(depth as u64);
+    let marker = if background { " background" } else { "" };
+    text.push_str(&format!(
+        "{indent}- {id}  [{status}] {subagent}  depth={depth_value}{marker}  {title}\n"
+    ));
+    if let Some(children) = task.get("children").and_then(Value::as_array) {
+        for child in children {
+            append_remote_task_text(text, child, depth + 1);
+        }
+    }
 }
 
 fn http_json(
@@ -443,6 +566,168 @@ pub(super) fn tui_command(args: &[String]) -> CliRunResult {
     interactive_local_loop(args)
 }
 
+pub(super) fn terminal_command(args: &[String]) -> CliRunResult {
+    if args.iter().any(|arg| is_help_flag(arg)) {
+        return ok_text(terminal_help());
+    }
+    let server_url = value_for(args, &["--server-url", "--attach"])
+        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+    let format = value_for(args, &["--format"]).unwrap_or_else(|| "text".to_string());
+    if !matches!(format.as_str(), "text" | "json") {
+        return err_text(2, "openagent terminal --format must be text or json");
+    }
+    let timeout_ms = match value_for(args, &["--timeout-ms"]) {
+        Some(value) => match value.parse::<u64>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => return err_text(2, "--timeout-ms must be an integer"),
+        },
+        None => None,
+    };
+    let Some(command) = terminal_command_text(args) else {
+        return err_text(
+            2,
+            "openagent terminal requires --command or command arguments after --",
+        );
+    };
+    let cwd = value_for(args, &["--cwd", "--workspace", "--dir"]).map(PathBuf::from);
+    let client_timeout = Duration::from_millis(
+        timeout_ms
+            .unwrap_or(10_000)
+            .saturating_add(1_000)
+            .max(5_000),
+    );
+    let client = AppBridgeRuntimeClient::new(server_url)
+        .with_auth(app_bridge_auth(&remote_auth_from_args(args)))
+        .with_timeout(client_timeout);
+    let payload = match client.terminal_run(&command, cwd.as_deref(), timeout_ms) {
+        Ok(payload) => payload,
+        Err(error) => return err_text(1, error),
+    };
+    let exit_code = terminal_exit_code(&payload);
+    if format == "json" {
+        return CliRunResult {
+            exit_code,
+            stdout: format!("{}\n", stable_json_dumps(&payload)),
+            stderr: String::new(),
+        };
+    }
+    CliRunResult {
+        exit_code,
+        stdout: payload
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        stderr: payload
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+fn terminal_command_text(args: &[String]) -> Option<String> {
+    value_for(args, &["--command"]).or_else(|| {
+        let positionals = positional_args(
+            args,
+            &[
+                "--server-url",
+                "--attach",
+                "--server-token",
+                "--server-token-env",
+                "--username",
+                "-u",
+                "--password",
+                "-p",
+                "--cwd",
+                "--workspace",
+                "--dir",
+                "--timeout-ms",
+                "--format",
+                "--command",
+            ],
+        );
+        let command = positionals.join(" ");
+        (!command.trim().is_empty()).then_some(command)
+    })
+}
+
+fn terminal_exit_code(payload: &Value) -> i32 {
+    if payload
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return 0;
+    }
+    payload
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .unwrap_or(1)
+}
+
+fn remote_terminal_run_text(
+    url: &str,
+    auth: &RemoteAuth,
+    command: &str,
+    cwd: Option<&Path>,
+) -> Result<String, String> {
+    let client = AppBridgeRuntimeClient::new(url)
+        .with_auth(app_bridge_auth(auth))
+        .with_timeout(Duration::from_secs(31));
+    let payload = client.terminal_run(command, cwd, None)?;
+    Ok(terminal_payload_text(&payload))
+}
+
+fn terminal_payload_text(payload: &Value) -> String {
+    let command = payload
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("terminal");
+    let exit_code = payload
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let cwd = payload
+        .get("cwd_relative")
+        .or_else(|| payload.get("cwd"))
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    let mut text = format!("Terminal `{command}` in {cwd} exited {exit_code}\n");
+    if let Some(stdout) = payload.get("stdout").and_then(Value::as_str)
+        && !stdout.is_empty()
+    {
+        text.push_str(stdout);
+        if !stdout.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    if let Some(stderr) = payload.get("stderr").and_then(Value::as_str)
+        && !stderr.is_empty()
+    {
+        text.push_str("[stderr]\n");
+        text.push_str(stderr);
+        if !stderr.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    text
+}
+
+fn slash_terminal_command(command: &str) -> Option<&str> {
+    ["/terminal", "/term"].into_iter().find_map(|prefix| {
+        if command == prefix {
+            return Some("");
+        }
+        command
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .map(str::trim)
+    })
+}
+
 pub(super) fn attach_command(args: &[String]) -> CliRunResult {
     if args.iter().any(|arg| is_help_flag(arg)) {
         return ok_text(attach_help());
@@ -566,7 +851,7 @@ fn interactive_remote_loop(args: &[String], url: &str, auth: &RemoteAuth) -> Cli
     }
     let mut last_turn_id: Option<String> = None;
     let mut stdout = format!(
-        "OpenAgent remote attach: {url}\nCommands: /sessions, /resume <id>, /new, /fork, /interrupt [turn_id], /exit\n"
+        "OpenAgent remote attach: {url}\nCommands: /sessions, /tasks, /task <id>, /terminal <command>, /resume <id>, /new, /fork, /interrupt [turn_id], /exit\n"
     );
     if let Ok(sessions) = remote_list_sessions(url, auth) {
         stdout.push_str(&remote_sessions_text(&sessions));
@@ -591,6 +876,37 @@ fn interactive_remote_loop(args: &[String], url: &str, auth: &RemoteAuth) -> Cli
             match remote_list_sessions(url, auth) {
                 Ok(sessions) => stdout.push_str(&remote_sessions_text(&sessions)),
                 Err(error) => return err_text(1, error),
+            }
+            continue;
+        }
+        if prompt == "/tasks" {
+            let Some(session_id) = current_session.as_deref() else {
+                stdout.push_str("No current session. Use /new or /resume <session_id>.\n");
+                continue;
+            };
+            match remote_tasks_payload(url, auth, session_id) {
+                Ok(payload) => stdout.push_str(&remote_tasks_text(&payload)),
+                Err(error) => return err_text(1, error),
+            }
+            continue;
+        }
+        if let Some(command) = slash_terminal_command(prompt) {
+            if command.is_empty() {
+                stdout.push_str("Usage: /terminal <command>\n");
+            } else {
+                match remote_terminal_run_text(url, auth, command, None) {
+                    Ok(text) => stdout.push_str(&text),
+                    Err(error) => return err_text(1, error),
+                }
+            }
+            continue;
+        }
+        if let Some(task_id) = prompt.strip_prefix("/task ").map(str::trim) {
+            if task_id.is_empty() {
+                stdout.push_str("Usage: /task <task_session_id>\n");
+            } else {
+                current_session = Some(task_id.to_string());
+                stdout.push_str(&format!("Current task session: {task_id}\n"));
             }
             continue;
         }
@@ -733,7 +1049,7 @@ impl RemoteTerminalHandler {
     fn filter_new_events(&mut self, events: Vec<Value>) -> Vec<Value> {
         let mut output = Vec::new();
         for event in events {
-            let sequence = app_event_sequence(&event);
+            let sequence = app_event_global_sequence(&event);
             if sequence > self.last_global_event_id {
                 self.last_global_event_id = sequence;
             }
@@ -768,15 +1084,15 @@ impl openagent_tui::TerminalEventHandler for RemoteTerminalHandler {
     }
 
     fn poll_app_events(&mut self) -> Result<Vec<Value>, String> {
-        let raw = http_text_with_auth(
-            "GET",
-            &self.url,
-            &format!("/api/events?last_event_id={}", self.last_global_event_id),
-            &self.auth,
-            None,
+        let mut events = Vec::new();
+        app_bridge_client(&self.url, &self.auth).global_events_live_stream(
+            self.last_global_event_id,
+            remote_attach_poll_duration(),
+            |event| {
+                events.push(event);
+                Ok(())
+            },
         )?;
-        let events =
-            openagent_http_runtime::parse_sse_response_lines(&raw.lines().collect::<Vec<_>>())?;
         Ok(self.filter_new_events(events))
     }
 
@@ -827,6 +1143,29 @@ impl openagent_tui::TerminalEventHandler for RemoteTerminalHandler {
         if command == "/sessions" {
             let sessions = remote_list_sessions(&self.url, &self.auth)?;
             return Ok(tui_lines("status", remote_sessions_text(&sessions), false));
+        }
+        if command == "/tasks" {
+            let session_id = self.ensure_session()?;
+            let payload = remote_tasks_payload(&self.url, &self.auth, &session_id)?;
+            return Ok(tui_lines("status", remote_tasks_text(&payload), false));
+        }
+        if let Some(command) = slash_terminal_command(command) {
+            if command.is_empty() {
+                return Ok(tui_lines("warning", "usage: /terminal <command>", true));
+            }
+            let text = remote_terminal_run_text(&self.url, &self.auth, command, None)?;
+            return Ok(tui_lines("terminal", text, false));
+        }
+        if let Some(task_id) = command.strip_prefix("/task ").map(str::trim) {
+            if task_id.is_empty() {
+                return Ok(tui_lines("warning", "usage: /task <task_session_id>", true));
+            }
+            self.current_session = Some(task_id.to_string());
+            return Ok(tui_lines(
+                "status",
+                format!("current task session: {task_id}"),
+                true,
+            ));
         }
         if let Some(session_id) = command.strip_prefix("/resume ").map(str::trim) {
             if session_id.is_empty() {
@@ -900,7 +1239,7 @@ impl openagent_tui::TerminalEventHandler for RemoteTerminalHandler {
         }
         Ok(tui_lines(
             "status",
-            "commands: /sessions, /resume <id>, /new, /fork, /interrupt [turn_id], /exit",
+            "commands: /sessions, /tasks, /task <id>, /terminal <command>, /resume <id>, /new, /fork, /interrupt [turn_id], /exit",
             false,
         ))
     }
@@ -964,4 +1303,217 @@ fn tui_lines(
     text.lines()
         .map(|line| openagent_tui::TimelineLine::new(kind, line.to_string(), important))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openagent_tui::TerminalEventHandler;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+        time::Duration,
+    };
+
+    #[test]
+    fn remote_tasks_text_renders_nested_background_tree() {
+        let payload = json!({
+            "session_id": "session_root",
+            "tree": [{
+                "session_id": "subtask_outer",
+                "title": "Outer work",
+                "status": "completed",
+                "subagent_type": "outer",
+                "task_depth": 1,
+                "background": false,
+                "children": [{
+                    "session_id": "subtask_inner",
+                    "title": "Inner background work",
+                    "status": "queued",
+                    "subagent_type": "inner",
+                    "task_depth": 2,
+                    "background": true,
+                    "children": []
+                }]
+            }]
+        });
+
+        let rendered = remote_tasks_text(&payload);
+
+        assert!(rendered.contains("Remote tasks for session_root"));
+        assert!(rendered.contains("subtask_outer  [completed] outer  depth=1"));
+        assert!(rendered.contains("subtask_inner  [queued] inner  depth=2 background"));
+        assert!(rendered.contains("Inner background work"));
+    }
+
+    #[test]
+    fn remote_task_command_switches_current_session_to_task() {
+        let mut handler = RemoteTerminalHandler {
+            url: "http://127.0.0.1:1".to_string(),
+            auth: RemoteAuth::default(),
+            workspace: PathBuf::from("."),
+            current_session: Some("session_root".to_string()),
+            last_turn_id: None,
+            last_global_event_id: 0,
+            pending_events: Vec::new(),
+            seen_events: BTreeSet::new(),
+        };
+
+        let lines = TerminalEventHandler::handle_command(&mut handler, "/task subtask_inner")
+            .expect("task command should not hit network");
+
+        assert_eq!(handler.current_session.as_deref(), Some("subtask_inner"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.contains("current task session: subtask_inner"))
+        );
+    }
+
+    #[test]
+    fn remote_terminal_command_runs_through_app_bridge_client() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
+        let port = listener.local_addr().expect("mock server addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("POST /api/terminal/run "));
+            assert!(request.contains("authorization: Bearer secret"));
+            assert!(request.contains("printf tui-terminal-ok"));
+            let body = json!({
+                "command": "printf tui-terminal-ok",
+                "workspace": "/tmp/workspace",
+                "cwd": "/tmp/workspace",
+                "cwd_relative": ".",
+                "success": true,
+                "exit_code": 0,
+                "stdout": "tui-terminal-ok",
+                "stderr": "",
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let mut handler = RemoteTerminalHandler {
+            url: format!("http://127.0.0.1:{port}"),
+            auth: RemoteAuth {
+                token: Some("secret".to_string()),
+                username: None,
+                password: None,
+            },
+            workspace: PathBuf::from("."),
+            current_session: None,
+            last_turn_id: None,
+            last_global_event_id: 0,
+            pending_events: Vec::new(),
+            seen_events: BTreeSet::new(),
+        };
+
+        let lines =
+            TerminalEventHandler::handle_command(&mut handler, "/terminal printf tui-terminal-ok")
+                .expect("terminal command should run");
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.kind == "terminal" && line.text.contains("tui-terminal-ok") })
+        );
+        server.join().expect("mock server thread");
+    }
+
+    #[test]
+    fn remote_terminal_poll_app_events_uses_app_bridge_live_stream() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
+        let port = listener.local_addr().expect("mock server addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let request = read_http_request(&mut stream);
+            assert!(
+                request.starts_with("GET /api/events?last_event_id=0&live_timeout_ms=250 "),
+                "{request}"
+            );
+            assert!(request.contains("authorization: Bearer secret"));
+            assert!(request.contains("accept: text/event-stream"));
+            let event = json!({
+                "event_id": "evt_live_delta",
+                "sequence": 1,
+                "global_sequence": 7,
+                "method": "item/agentMessage/delta",
+                "params": {"session_id": "session_live", "turn_id": "turn_live", "delta": "live delta"},
+                "created_at_ms": 1,
+            });
+            let body = format!("event: item/agentMessage/delta\ndata: {event}\n\n: ping\n\n");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let mut handler = RemoteTerminalHandler {
+            url: format!("http://127.0.0.1:{port}"),
+            auth: RemoteAuth {
+                token: Some("secret".to_string()),
+                username: None,
+                password: None,
+            },
+            workspace: PathBuf::from("."),
+            current_session: None,
+            last_turn_id: None,
+            last_global_event_id: 0,
+            pending_events: Vec::new(),
+            seen_events: BTreeSet::new(),
+        };
+
+        let events = TerminalEventHandler::poll_app_events(&mut handler)
+            .expect("poll should use live SSE client");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["method"], "item/agentMessage/delta");
+        assert_eq!(handler.last_global_event_id, 7);
+        server.join().expect("mock server thread");
+    }
+
+    fn read_http_request(stream: &mut impl Read) -> String {
+        let mut raw = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).expect("read request");
+            if count == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buffer[..count]);
+            if request_is_complete(&raw) {
+                break;
+            }
+        }
+        String::from_utf8(raw).expect("request utf8")
+    }
+
+    fn request_is_complete(raw: &[u8]) -> bool {
+        let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let header_end = header_end + 4;
+        let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_default();
+        raw.len() >= header_end + content_length
+    }
 }

@@ -109,6 +109,227 @@ pub(super) fn provider_env_value(provider: &str, field: &str) -> Option<String> 
     env::var(env_name).ok().filter(|value| !value.is_empty())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedProviderConfig {
+    pub(super) provider: String,
+    pub(super) provider_label: String,
+    pub(super) api_key_env: String,
+    pub(super) api_key: Option<String>,
+    pub(super) api_key_source: Option<String>,
+    pub(super) base_url: String,
+    pub(super) base_url_source: String,
+    pub(super) model: String,
+    pub(super) model_source: String,
+    pub(super) wire_api: String,
+    pub(super) wire_api_source: String,
+    pub(super) native: bool,
+    pub(super) requires_api_key: bool,
+}
+
+pub(super) fn resolve_provider_config(
+    provider: &str,
+    args: &[String],
+) -> Result<ResolvedProviderConfig, String> {
+    let provider = normalize_provider(Some(provider))?;
+    let env_mapping = default_env_mapping(&provider)?;
+    let auth_record = provider_auth_record_from_args(&provider, args);
+    let env_file_values = provider_env_file_values(args);
+    let api_key_env = env_mapping
+        .get("api_key")
+        .cloned()
+        .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+    let api_key = resolve_provider_field(
+        "api_key",
+        &["--api-key"],
+        &api_key_env,
+        &env_file_values,
+        auth_record.as_ref(),
+        args,
+        None,
+    );
+    let base_url_env = env_mapping
+        .get("base_url")
+        .cloned()
+        .unwrap_or_else(|| "OPENAI_BASE_URL".to_string());
+    let default_base_url = provider_default_base_url(&provider)
+        .ok()
+        .flatten()
+        .or_else(|| (provider == "anthropic").then(|| "https://api.anthropic.com/v1".to_string()))
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    let base_url = resolve_provider_field(
+        "base_url",
+        &["--base-url"],
+        &base_url_env,
+        &env_file_values,
+        auth_record.as_ref(),
+        args,
+        Some(default_base_url),
+    )
+    .expect("base_url has a default");
+    let model_env = env_mapping
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| "OPENAI_MODEL".to_string());
+    let default_model = provider_default_model(&provider)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let model = resolve_provider_field(
+        "model",
+        &["--model", "-m"],
+        &model_env,
+        &env_file_values,
+        auth_record.as_ref(),
+        args,
+        Some(default_model),
+    )
+    .expect("model has a default");
+    let wire_api_env = env_mapping
+        .get("wire_api")
+        .cloned()
+        .unwrap_or_else(|| "OPENAI_WIRE_API".to_string());
+    let default_wire_api = if provider == "anthropic" {
+        "messages".to_string()
+    } else {
+        DEFAULT_WIRE_API.to_string()
+    };
+    let wire_api = resolve_provider_field(
+        "wire_api",
+        &["--wire-api"],
+        &wire_api_env,
+        &env_file_values,
+        auth_record.as_ref(),
+        args,
+        Some(default_wire_api),
+    )
+    .expect("wire_api has a default");
+    Ok(ResolvedProviderConfig {
+        provider_label: provider_label(&provider).unwrap_or_else(|_| provider.clone()),
+        api_key_env,
+        api_key: api_key.as_ref().map(|field| field.value.clone()),
+        api_key_source: api_key.map(|field| field.source),
+        base_url: base_url.value,
+        base_url_source: base_url.source,
+        model: model.value,
+        model_source: model.source,
+        wire_api: wire_api.value,
+        wire_api_source: wire_api.source,
+        native: provider == "anthropic",
+        requires_api_key: provider_requires_api_key(&provider).unwrap_or(true),
+        provider,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedProviderField {
+    value: String,
+    source: String,
+}
+
+fn resolve_provider_field(
+    field: &str,
+    arg_keys: &[&str],
+    env_name: &str,
+    env_file_values: &BTreeMap<String, String>,
+    auth_record: Option<&Value>,
+    args: &[String],
+    default: Option<String>,
+) -> Option<ResolvedProviderField> {
+    value_for(args, arg_keys)
+        .filter(|value| !value.is_empty())
+        .map(|value| ResolvedProviderField {
+            value,
+            source: "cli".to_string(),
+        })
+        .or_else(|| {
+            env::var(env_name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| ResolvedProviderField {
+                    value,
+                    source: "env".to_string(),
+                })
+        })
+        .or_else(|| {
+            env_file_values
+                .get(env_name)
+                .cloned()
+                .map(|value| ResolvedProviderField {
+                    value,
+                    source: "env_file".to_string(),
+                })
+        })
+        .or_else(|| {
+            auth_record
+                .and_then(|record| record.get(field))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| ResolvedProviderField {
+                    value: value.to_string(),
+                    source: "auth_file".to_string(),
+                })
+        })
+        .or_else(|| {
+            default.map(|value| ResolvedProviderField {
+                value,
+                source: "default".to_string(),
+            })
+        })
+}
+
+fn provider_auth_record_from_args(provider: &str, args: &[String]) -> Option<Value> {
+    let auth = read_json_file(&auth_file_from_args(args));
+    auth.get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get(provider))
+        .cloned()
+}
+
+fn provider_env_file_values(args: &[String]) -> BTreeMap<String, String> {
+    provider_env_file_path(args)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|raw| parse_env_file_values(&raw))
+        .unwrap_or_default()
+}
+
+fn provider_env_file_path(args: &[String]) -> Option<PathBuf> {
+    value_for(args, &["--env-file"])
+        .or_else(|| env::var("OPENAGENT_ENV_FILE").ok())
+        .map(PathBuf::from)
+}
+
+fn parse_env_file_values(raw: &str) -> BTreeMap<String, String> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            if let Some(stripped) = line.strip_prefix("export ") {
+                line = stripped.trim();
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|item| item.strip_suffix('"'))
+                .or_else(|| {
+                    value
+                        .strip_prefix('\'')
+                        .and_then(|item| item.strip_suffix('\''))
+                })
+                .unwrap_or(value)
+                .to_string();
+            Some((key.to_string(), value))
+        })
+        .filter(|(_, value)| !value.is_empty())
+        .collect()
+}
+
 pub(super) fn default_model_for_provider(provider: &str) -> String {
     if provider == "openai" {
         DEFAULT_MODEL.to_string()
@@ -141,7 +362,7 @@ pub(super) fn auth_file_from_args(args: &[String]) -> PathBuf {
 }
 
 pub(super) fn mcp_config_path(args: &[String]) -> PathBuf {
-    value_for(args, &["--config"])
+    value_for(args, &["--mcp-config", "--config"])
         .or_else(|| env::var("OPENAGENT_MCP_CONFIG").ok())
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_from_args(args).join(".openagent/mcp.json"))
@@ -237,9 +458,7 @@ pub(super) fn parse_headers(headers: &[String]) -> Map<String, Value> {
 }
 
 pub(super) fn mcp_public_servers(config: &Value) -> Vec<Value> {
-    config
-        .get("mcp")
-        .and_then(Value::as_object)
+    mcp_servers_object(config)
         .map(|servers| {
             servers
                 .iter()
@@ -250,10 +469,25 @@ pub(super) fn mcp_public_servers(config: &Value) -> Vec<Value> {
 }
 
 pub(super) fn mcp_public_server(name: &str, server: &Value) -> Value {
-    let transport = server
-        .get("transport")
+    let server_type = server
+        .get("type")
         .and_then(Value::as_str)
-        .unwrap_or("auto");
+        .unwrap_or_else(|| {
+            if server.get("command").is_some() {
+                "local"
+            } else {
+                "remote"
+            }
+        });
+    let transport =
+        server
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or(if server_type == "local" {
+                "stdio"
+            } else {
+                "auto"
+            });
     let headers = server
         .get("headers")
         .and_then(Value::as_object)
@@ -264,17 +498,60 @@ pub(super) fn mcp_public_server(name: &str, server: &Value) -> Value {
                 .collect::<Map<_, _>>()
         })
         .unwrap_or_default();
+    let command = public_mcp_command(server);
+    let url = redact_url(server.get("url").and_then(Value::as_str).unwrap_or(""));
+    let endpoint = if command.is_empty() {
+        url.clone()
+    } else {
+        command.join(" ")
+    };
     json!({
         "name": name,
-        "url": redact_url(server.get("url").and_then(Value::as_str).unwrap_or("")),
+        "type": server_type,
+        "url": url,
+        "command": command,
+        "endpoint": endpoint,
         "enabled": server.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         "transport": transport,
         "configured_transport": transport,
         "selected_transport": null,
-        "timeout_ms": server.get("timeout_ms").and_then(Value::as_u64).unwrap_or(30_000),
+        "timeout_ms": server
+            .get("timeout_ms")
+            .or_else(|| server.get("timeout"))
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000),
         "header_names": headers.keys().cloned().collect::<Vec<_>>(),
         "headers": headers,
     })
+}
+
+fn mcp_servers_object(config: &Value) -> Option<&Map<String, Value>> {
+    config
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .or_else(|| {
+            config
+                .get("mcp")
+                .and_then(|mcp| mcp.get("servers"))
+                .and_then(Value::as_object)
+        })
+        .or_else(|| config.get("mcp").and_then(Value::as_object))
+}
+
+fn public_mcp_command(server: &Value) -> Vec<String> {
+    let mut command = match server.get("command") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        Some(Value::String(value)) => vec![value.clone()],
+        _ => Vec::new(),
+    };
+    if let Some(args) = server.get("args").and_then(Value::as_array) {
+        command.extend(args.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    command
 }
 
 pub(super) fn redact_url(url: &str) -> String {

@@ -5,6 +5,18 @@ pub(super) fn mcp_command(args: &[String]) -> CliRunResult {
     if args.is_empty() || args.iter().any(|arg| is_help_flag(arg)) {
         return ok_text(mcp_help());
     }
+    if !mcp_remote_requested(args) && args[0] == "test" && mcp_local_config_requested(&args[1..]) {
+        return mcp_test(&args[1..]);
+    }
+    if mcp_remote_requested(args) && mcp_local_config_requested(&args[1..]) {
+        return err_text(2, mcp_remote_ignores_local_config_message(&args[0]));
+    }
+    if mcp_lifecycle_command(&args[0]) && mcp_local_config_requested(&args[1..]) {
+        return err_text(2, mcp_lifecycle_requires_app_bridge_message(&args[0]));
+    }
+    if mcp_remote_requested(args) || mcp_remote_only_command(&args[0]) {
+        return mcp_remote_command(args);
+    }
     match args[0].as_str() {
         "add" => mcp_add(&args[1..]),
         "list" | "ls" => mcp_list(&args[1..]),
@@ -18,14 +30,267 @@ pub(super) fn mcp_command(args: &[String]) -> CliRunResult {
     }
 }
 
+fn mcp_remote_requested(args: &[String]) -> bool {
+    value_for(args, &["--server-url", "--attach"]).is_some()
+}
+
+fn mcp_local_config_requested(args: &[String]) -> bool {
+    value_for(args, &["--mcp-config", "--config", "--workspace", "--dir"]).is_some()
+}
+
+fn mcp_lifecycle_command(command: &str) -> bool {
+    matches!(command, "start" | "stop" | "restart" | "enable" | "disable")
+}
+
+fn mcp_remote_only_command(command: &str) -> bool {
+    matches!(
+        command,
+        "test" | "start" | "stop" | "restart" | "enable" | "disable"
+    )
+}
+
+fn mcp_lifecycle_requires_app_bridge_message(command: &str) -> String {
+    format!(
+        "mcp {command} uses the App Bridge lifecycle registry and cannot run directly from --mcp-config/--config.\n\
+         Start the Rust App Bridge with the desired workspace/config, then run:\n\
+         openagent mcp {command} <server> --server-url <url> --server-token <token>\n\
+         For one-shot local connectivity, use: openagent mcp test <server> --mcp-config <file>"
+    )
+}
+
+fn mcp_remote_ignores_local_config_message(command: &str) -> String {
+    format!(
+        "mcp {command} with --server-url/--attach uses the App Bridge server workspace/config; local --mcp-config/--config/--workspace/--dir cannot be applied client-side.\n\
+         Start the Rust App Bridge with the desired workspace/config, then retry without the local config flag."
+    )
+}
+
+fn mcp_remote_command(args: &[String]) -> CliRunResult {
+    let command = args[0].as_str();
+    let rest = &args[1..];
+    let server_url = value_for(rest, &["--server-url", "--attach"])
+        .or_else(|| value_for(args, &["--server-url", "--attach"]))
+        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+    let client = remote::app_bridge_client(&server_url, &remote_auth_from_args(rest));
+    let refresh = has_flag(rest, &["--refresh", "--check"]) || command == "doctor";
+    let result = match command {
+        "list" | "ls" | "doctor" => client.mcp_status(refresh),
+        "show" | "debug" => {
+            let Some(name) = mcp_remote_server_name(rest, command) else {
+                return err_text(2, format!("mcp {command} requires a server name"));
+            };
+            client
+                .mcp_status(refresh)
+                .map(|payload| mcp_remote_show_payload(&server_url, &name, payload))
+        }
+        "test" => {
+            let Some(name) = mcp_remote_server_name(rest, command) else {
+                return err_text(2, "mcp test requires a server name");
+            };
+            client.mcp_server_test(&name)
+        }
+        "start" | "stop" | "restart" => {
+            let Some(name) = mcp_remote_server_name(rest, command) else {
+                return err_text(2, format!("mcp {command} requires a server name"));
+            };
+            client.mcp_server_lifecycle(&name, command)
+        }
+        "enable" | "disable" => {
+            let Some(name) = mcp_remote_server_name(rest, command) else {
+                return err_text(2, format!("mcp {command} requires a server name"));
+            };
+            client.mcp_server_update(&name, json!({"enabled": command == "enable"}))
+        }
+        other => {
+            return err_text(
+                2,
+                format!("mcp {other} does not support --server-url/--attach yet"),
+            );
+        }
+    };
+    let payload = match result {
+        Ok(payload) => mcp_remote_payload(&server_url, payload),
+        Err(error) => return err_text(1, error),
+    };
+    if value_for(rest, &["--format"]).as_deref() == Some("json") {
+        CliRunResult::ok_json(&payload)
+    } else if command == "show" || command == "debug" {
+        mcp_remote_show_text(&payload)
+    } else {
+        ok_text(mcp_remote_status_text(&payload))
+    }
+}
+
+fn mcp_remote_server_name(args: &[String], command: &str) -> Option<String> {
+    positional_args(args, &mcp_remote_value_flags())
+        .into_iter()
+        .find(|value| value != command)
+}
+
+fn mcp_remote_value_flags() -> Vec<&'static str> {
+    vec![
+        "--server-url",
+        "--attach",
+        "--server-token",
+        "--server-token-env",
+        "--username",
+        "-u",
+        "--password",
+        "-p",
+        "--format",
+        "--mcp-config",
+        "--config",
+        "--workspace",
+        "--dir",
+    ]
+}
+
+fn mcp_remote_payload(server_url: &str, payload: Value) -> Value {
+    match payload {
+        Value::Object(mut object) => {
+            object.insert("remote".to_string(), json!(true));
+            object.insert("server_url".to_string(), json!(server_url));
+            Value::Object(object)
+        }
+        other => json!({"remote": true, "server_url": server_url, "payload": other}),
+    }
+}
+
+fn mcp_remote_show_payload(server_url: &str, name: &str, payload: Value) -> Value {
+    let server = payload
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| {
+            servers
+                .iter()
+                .find(|server| server["name"].as_str() == Some(name))
+                .cloned()
+        });
+    json!({
+        "remote": true,
+        "server_url": server_url,
+        "name": name,
+        "server": server,
+        "found": server.is_some(),
+        "mcp": payload,
+    })
+}
+
+fn mcp_remote_show_text(payload: &Value) -> CliRunResult {
+    let Some(server) = payload.get("server").filter(|value| !value.is_null()) else {
+        return err_text(
+            1,
+            format!(
+                "MCP server not found: {}",
+                payload["name"].as_str().unwrap_or_default()
+            ),
+        );
+    };
+    ok_text(format!(
+        "{} {} {} tools={} lifecycle={} pid={}",
+        server["name"].as_str().unwrap_or("mcp"),
+        server["status"].as_str().unwrap_or("-"),
+        server["selected_transport"]
+            .as_str()
+            .or_else(|| server["transport"].as_str())
+            .unwrap_or("-"),
+        server["tool_count"].as_u64().unwrap_or(0),
+        server["lifecycle_status"].as_str().unwrap_or("-"),
+        server["lifecycle_pid"]
+            .as_u64()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ))
+}
+
+fn mcp_remote_status_text(payload: &Value) -> String {
+    let servers = payload
+        .get("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if servers.is_empty() {
+        return "No MCP servers configured".to_string();
+    }
+    let rows = servers
+        .iter()
+        .map(|server| {
+            vec![
+                server["name"].as_str().unwrap_or("").to_string(),
+                if server["enabled"].as_bool().unwrap_or(false) {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                },
+                server["status"].as_str().unwrap_or("-").to_string(),
+                server["selected_transport"]
+                    .as_str()
+                    .or_else(|| server["transport"].as_str())
+                    .unwrap_or("-")
+                    .to_string(),
+                server["tool_count"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                server["lifecycle_status"]
+                    .as_str()
+                    .unwrap_or("-")
+                    .to_string(),
+                server["lifecycle_pid"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                mcp_remote_endpoint_label(server),
+            ]
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Remote MCP Servers ({})\n{}",
+        payload["server_url"].as_str().unwrap_or(DEFAULT_SERVER_URL),
+        render_table(
+            &[
+                "Name",
+                "Enabled",
+                "Status",
+                "Transport",
+                "Tools",
+                "Lifecycle",
+                "PID",
+                "Endpoint",
+            ],
+            &rows,
+        )
+    )
+}
+
+fn mcp_remote_endpoint_label(server: &Value) -> String {
+    if let Some(command) = server["command"].as_str().filter(|value| !value.is_empty()) {
+        let args_count = server["args_count"].as_u64().unwrap_or_default();
+        if args_count == 0 {
+            command.to_string()
+        } else {
+            format!("{command} +{args_count}")
+        }
+    } else if server["remote_url_configured"].as_bool().unwrap_or(false) {
+        "remote URL".to_string()
+    } else {
+        "-".to_string()
+    }
+}
+
 fn mcp_add(args: &[String]) -> CliRunResult {
     let positionals = positional_args(
         args,
         &[
+            "--mcp-config",
             "--config",
             "--workspace",
             "--dir",
             "--url",
+            "--command",
+            "--arg",
+            "--env",
+            "--cwd",
             "--transport",
             "--header",
             "--timeout-ms",
@@ -35,21 +300,42 @@ fn mcp_add(args: &[String]) -> CliRunResult {
     let Some(name) = positionals.first() else {
         return err_text(2, "mcp add requires a server name");
     };
-    let Some(url) = value_for(args, &["--url"]) else {
-        return err_text(2, "mcp add requires --url");
-    };
+    let url = value_for(args, &["--url"]);
+    let command = value_for(args, &["--command"]);
+    if url.is_none() && command.is_none() {
+        return err_text(2, "mcp add requires --url or --command");
+    }
     let config_path = mcp_config_path(args);
     let mut config = read_json_file(&config_path);
     let servers = ensure_object_field(&mut config, "mcp");
     let headers = parse_headers(&values_for(args, &["--header"]));
-    let server = json!({
-        "type": "remote",
-        "url": url,
-        "transport": value_for(args, &["--transport"]).unwrap_or_else(|| "auto".to_string()),
-        "enabled": !has_flag(args, &["--disabled"]),
-        "timeout_ms": value_for(args, &["--timeout-ms"]).and_then(|value| value.parse::<u64>().ok()).unwrap_or(30_000),
-        "headers": headers,
-    });
+    let server = if let Some(command) = command {
+        let mut command_parts = vec![command];
+        command_parts.extend(values_for(args, &["--arg"]));
+        let mut server = json!({
+            "type": "local",
+            "command": command_parts,
+            "transport": "stdio",
+            "enabled": !has_flag(args, &["--disabled"]),
+            "timeout_ms": value_for(args, &["--timeout-ms"]).and_then(|value| value.parse::<u64>().ok()).unwrap_or(30_000),
+            "environment": parse_headers(&values_for(args, &["--env"])),
+        });
+        if let Some(cwd) = value_for(args, &["--cwd"])
+            && let Some(object) = server.as_object_mut()
+        {
+            object.insert("cwd".to_string(), json!(cwd));
+        }
+        server
+    } else {
+        json!({
+            "type": "remote",
+            "url": url.unwrap_or_default(),
+            "transport": value_for(args, &["--transport"]).unwrap_or_else(|| "auto".to_string()),
+            "enabled": !has_flag(args, &["--disabled"]),
+            "timeout_ms": value_for(args, &["--timeout-ms"]).and_then(|value| value.parse::<u64>().ok()).unwrap_or(30_000),
+            "headers": headers,
+        })
+    };
     servers.insert(name.clone(), server);
     let public_server = mcp_public_server(name, servers.get(name).unwrap_or(&Value::Null));
     if let Err(error) = write_json_file(&config_path, &config) {
@@ -101,14 +387,21 @@ fn mcp_list(args: &[String]) -> CliRunResult {
                     } else {
                         headers
                     },
-                    server["url"].as_str().unwrap_or("").to_string(),
+                    server["endpoint"].as_str().unwrap_or("").to_string(),
                 ]
             })
             .collect::<Vec<_>>();
         ok_text(format!(
             "MCP Servers\n{}",
             render_table(
-                &["Name", "Enabled", "Transport", "Timeout", "Headers", "URL"],
+                &[
+                    "Name",
+                    "Enabled",
+                    "Transport",
+                    "Timeout",
+                    "Headers",
+                    "Endpoint"
+                ],
                 &rows
             )
         ))
@@ -116,16 +409,22 @@ fn mcp_list(args: &[String]) -> CliRunResult {
 }
 
 fn mcp_show(args: &[String]) -> CliRunResult {
-    let positionals = positional_args(args, &["--config", "--workspace", "--dir", "--format"]);
+    let positionals = positional_args(
+        args,
+        &[
+            "--mcp-config",
+            "--config",
+            "--workspace",
+            "--dir",
+            "--format",
+        ],
+    );
     let Some(name) = positionals.first() else {
         return err_text(2, "mcp show requires a server name");
     };
     let config_path = mcp_config_path(args);
     let config = read_json_file(&config_path);
-    let server = config
-        .get("mcp")
-        .and_then(Value::as_object)
-        .and_then(|servers| servers.get(name));
+    let server = mcp_server_from_config(&config, name);
     let Some(server) = server else {
         return err_text(1, format!("MCP server not found: {name}"));
     };
@@ -136,13 +435,113 @@ fn mcp_show(args: &[String]) -> CliRunResult {
         ok_text(format!(
             "{} {}",
             name,
-            payload["server"]["url"].as_str().unwrap_or("")
+            payload["server"]["endpoint"].as_str().unwrap_or("")
         ))
     }
 }
 
+fn mcp_test(args: &[String]) -> CliRunResult {
+    let positionals = positional_args(
+        args,
+        &[
+            "--mcp-config",
+            "--config",
+            "--workspace",
+            "--dir",
+            "--format",
+        ],
+    );
+    let Some(name) = positionals.first() else {
+        return err_text(2, "mcp test requires a server name");
+    };
+    let config_path = mcp_config_path(args);
+    let config = if config_path.exists() {
+        match load_mcp_config(&config_path.to_string_lossy()) {
+            Ok(config) => config,
+            Err(error) => return err_text(1, error),
+        }
+    } else {
+        return err_text(
+            1,
+            format!("MCP config file not found: {}", config_path.display()),
+        );
+    };
+    let Some(server) = config
+        .servers
+        .iter()
+        .find(|server| server.name == *name)
+        .cloned()
+    else {
+        return err_text(1, format!("MCP server not found: {name}"));
+    };
+    let workspace = workspace_from_args(args);
+    let mut manager = RemoteMcpManager::new(config);
+    let tested_at = Some(now_ms_cli() as f64 / 1000.0);
+    let result = match discover_mcp_server_tools(&server, &workspace) {
+        Ok((transport, tools)) => {
+            let descriptors = build_tool_descriptors_from_values(&server, &tools);
+            let tool_count = descriptors.len();
+            let _ = manager.set_server_tools(
+                &server.name,
+                Some(transport),
+                "connected",
+                tested_at,
+                descriptors,
+            );
+            Ok(tool_count)
+        }
+        Err(error) => {
+            let _ = manager.set_server_error(&server.name, "failed", error.clone(), tested_at);
+            Err(error)
+        }
+    };
+    let snapshot = serde_json::to_value(manager.snapshot()).unwrap_or_else(|_| json!({}));
+    let server_payload = snapshot
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| {
+            servers
+                .iter()
+                .find(|server| server["name"].as_str() == Some(name))
+                .cloned()
+        })
+        .unwrap_or_else(|| json!({"name": name, "status": "unknown"}));
+    let payload = json!({
+        "config_path": config_path.to_string_lossy(),
+        "workspace": workspace.to_string_lossy(),
+        "name": name,
+        "ok": result.is_ok(),
+        "server": server_payload,
+        "error": result.as_ref().err(),
+    });
+    if value_for(args, &["--format"]).as_deref() == Some("json") {
+        return if result.is_ok() {
+            CliRunResult::ok_json(&payload)
+        } else {
+            CliRunResult {
+                exit_code: 1,
+                stdout: format!("{}\n", stable_json_dumps(&payload)),
+                stderr: String::new(),
+            }
+        };
+    }
+    match result {
+        Ok(tool_count) => ok_text(format!("MCP server {name} connected: {tool_count} tool(s)")),
+        Err(error) => err_text(1, format!("MCP server {name} failed: {error}")),
+    }
+}
+
 fn mcp_remove(args: &[String]) -> CliRunResult {
-    let positionals = positional_args(args, &["--config", "--workspace", "--dir", "--format"]);
+    let positionals = positional_args(
+        args,
+        &[
+            "--mcp-config",
+            "--config",
+            "--workspace",
+            "--dir",
+            "--format",
+        ],
+    );
     let Some(name) = positionals.first() else {
         return err_text(2, "mcp remove requires a server name");
     };
@@ -175,6 +574,7 @@ fn mcp_auth(args: &[String]) -> CliRunResult {
             let positionals = positional_args(
                 &args[1..],
                 &[
+                    "--mcp-config",
                     "--config",
                     "--workspace",
                     "--dir",
@@ -223,6 +623,7 @@ fn mcp_auth_login(args: &[String]) -> CliRunResult {
     let positionals = positional_args(
         args,
         &[
+            "--mcp-config",
             "--config",
             "--workspace",
             "--dir",
@@ -305,6 +706,7 @@ fn mcp_auth_callback(args: &[String]) -> CliRunResult {
     let positionals = positional_args(
         args,
         &[
+            "--mcp-config",
             "--config",
             "--workspace",
             "--dir",
@@ -367,7 +769,16 @@ fn mcp_auth_callback(args: &[String]) -> CliRunResult {
 }
 
 fn mcp_logout(args: &[String]) -> CliRunResult {
-    let positionals = positional_args(args, &["--config", "--workspace", "--dir", "--format"]);
+    let positionals = positional_args(
+        args,
+        &[
+            "--mcp-config",
+            "--config",
+            "--workspace",
+            "--dir",
+            "--format",
+        ],
+    );
     let Some(name) = positionals.first() else {
         return err_text(2, "mcp logout requires a server name");
     };
@@ -401,11 +812,12 @@ fn mcp_doctor(args: &[String]) -> CliRunResult {
         openagent_mcp::McpConfig::default()
     };
     let refresh = has_flag(args, &["--refresh"]);
+    let workspace = workspace_from_args(args);
     let mut manager = RemoteMcpManager::new(config.clone());
     let mut refresh_error = None::<String>;
     if refresh {
         for server in config.servers.iter().filter(|server| server.enabled) {
-            match discover_mcp_server_tools(server) {
+            match discover_mcp_server_tools(server, &workspace) {
                 Ok((transport, tools)) => {
                     let descriptors = build_tool_descriptors_from_values(server, &tools);
                     let _ = manager.set_server_tools(
@@ -448,18 +860,44 @@ fn mcp_doctor(args: &[String]) -> CliRunResult {
 }
 
 fn mcp_debug(args: &[String]) -> CliRunResult {
-    let positionals = positional_args(args, &["--config", "--workspace", "--dir", "--format"]);
+    let positionals = positional_args(
+        args,
+        &[
+            "--mcp-config",
+            "--config",
+            "--workspace",
+            "--dir",
+            "--format",
+        ],
+    );
     let Some(name) = positionals.first() else {
         return err_text(2, "mcp debug requires a server name");
     };
     let config_path = mcp_config_path(args);
     let config = read_json_file(&config_path);
-    let server = config
-        .get("mcp")
-        .and_then(Value::as_object)
-        .and_then(|servers| servers.get(name));
+    let server = mcp_server_from_config(&config, name);
     let Some(server) = server else {
         return err_text(1, format!("MCP server not found: {name}"));
     };
     CliRunResult::ok_json(&json!({"server": mcp_public_server(name, server)}))
+}
+
+fn mcp_server_from_config<'a>(config: &'a Value, name: &str) -> Option<&'a Value> {
+    config
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .and_then(|servers| servers.get(name))
+        .or_else(|| {
+            config
+                .get("mcp")
+                .and_then(|mcp| mcp.get("servers"))
+                .and_then(Value::as_object)
+                .and_then(|servers| servers.get(name))
+        })
+        .or_else(|| {
+            config
+                .get("mcp")
+                .and_then(Value::as_object)
+                .and_then(|servers| servers.get(name))
+        })
 }

@@ -9,6 +9,8 @@ pub(super) fn session_command(args: &[String]) -> CliRunResult {
         "export" => session_export(&args[1..]),
         "import" => session_import(&args[1..]),
         "share" => session_share(&args[1..]),
+        "checkpoints" | "checkpoint" => session_checkpoints(&args[1..]),
+        "restore" | "revert" => session_restore(&args[1..]),
         "delete" | "rm" => session_delete(&args[1..]),
         _ => err_text(2, format!("unknown session command: {}", args[0])),
     }
@@ -178,6 +180,157 @@ fn session_delete(args: &[String]) -> CliRunResult {
     CliRunResult::ok_json(&json!({"session_id": session_id, "removed": removed}))
 }
 
+fn session_checkpoints(args: &[String]) -> CliRunResult {
+    let positionals = positional_args(
+        args,
+        &["--workspace", "--dir", "--session-root", "--format"],
+    );
+    let root = session_root_from_args(args);
+    let session_id = if let Some(session_id) = positionals.first() {
+        session_id.clone()
+    } else {
+        match latest_session_id(&root) {
+            Some(session_id) => session_id,
+            None => return err_text(2, "session checkpoints requires a session id"),
+        }
+    };
+    if !valid_session_id(&session_id) {
+        return err_text(2, "Invalid session id");
+    }
+    let checkpoints = read_jsonl_file(&root.join(&session_id).join("checkpoints/index.jsonl"));
+    let payload = json!({
+        "session_id": session_id,
+        "checkpoint_count": checkpoints.len(),
+        "checkpoints": checkpoints,
+    });
+    if value_for(args, &["--format"]).as_deref() == Some("json") {
+        return CliRunResult::ok_json(&payload);
+    }
+    let mut text = render_key_values(
+        "Session Checkpoints",
+        &[
+            (
+                "Session",
+                payload["session_id"].as_str().unwrap_or("-").to_string(),
+            ),
+            ("Count", checkpoints.len().to_string()),
+        ],
+    );
+    if !checkpoints.is_empty() {
+        let rows = checkpoints
+            .iter()
+            .map(|checkpoint| {
+                vec![
+                    checkpoint
+                        .get("checkpoint_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-")
+                        .to_string(),
+                    checkpoint
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-")
+                        .to_string(),
+                    checkpoint
+                        .get("step_index")
+                        .and_then(Value::as_u64)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    checkpoint
+                        .get("file_count")
+                        .and_then(Value::as_u64)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        text.push_str("\n\n");
+        text.push_str(&render_table(
+            &["Checkpoint", "Kind", "Step", "Files"],
+            &rows,
+        ));
+    }
+    ok_text(text)
+}
+
+fn session_restore(args: &[String]) -> CliRunResult {
+    let positionals = positional_args(
+        args,
+        &["--workspace", "--dir", "--session-root", "--format"],
+    );
+    if positionals.len() < 2 {
+        return err_text(2, "session restore requires <session_id> <checkpoint_id>");
+    }
+    let session_id = &positionals[0];
+    let checkpoint_id = &positionals[1];
+    if !valid_session_id(session_id) {
+        return err_text(2, "Invalid session id");
+    }
+    let root = session_root_from_args(args);
+    let store = FileSessionStore::new(root);
+    let mut session = match store.load_session(session_id) {
+        Ok(session) => session,
+        Err(error) => return err_text(1, format!("failed to load session: {error}")),
+    };
+    let checkpoint = match store.load_checkpoint(session_id, checkpoint_id) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return err_text(1, format!("failed to load checkpoint: {error}")),
+    };
+    let run_id = new_cli_id("restore");
+    if let Err(error) =
+        store.restore_checkpoint(session_id, &run_id, &session.directory, checkpoint_id)
+    {
+        return err_text(1, format!("failed to restore checkpoint: {error}"));
+    }
+    if checkpoint.message_id.is_some()
+        && let Err(error) = store.truncate_messages_after(
+            session_id,
+            &run_id,
+            SessionForkBoundary {
+                message_id: checkpoint.message_id.clone(),
+                part_id: checkpoint.part_id.clone(),
+            },
+        )
+    {
+        return err_text(1, format!("failed to truncate session transcript: {error}"));
+    }
+    session.metadata.insert(
+        "revert".to_string(),
+        json!({
+            "checkpoint_id": checkpoint_id,
+            "message_id": checkpoint.message_id,
+            "part_id": checkpoint.part_id,
+            "restored_at_ms": now_ms_cli(),
+        }),
+    );
+    if let Ok(messages) = store.materialized_chat_messages(&session) {
+        session.messages = messages;
+    }
+    if let Err(error) = store.save_state(&session, Some(&run_id)) {
+        return err_text(1, format!("failed to save restored session: {error}"));
+    }
+    let payload = json!({
+        "session_id": session_id,
+        "checkpoint_id": checkpoint_id,
+        "workspace": session.directory.to_string_lossy(),
+        "restored": true,
+        "message_count": session.messages.len(),
+    });
+    if value_for(args, &["--format"]).as_deref() == Some("json") {
+        CliRunResult::ok_json(&payload)
+    } else {
+        ok_text(render_key_values(
+            "Session Restore",
+            &[
+                ("Session", session_id.to_string()),
+                ("Checkpoint", checkpoint_id.to_string()),
+                ("Restored", "true".to_string()),
+                ("Messages", session.messages.len().to_string()),
+            ],
+        ))
+    }
+}
+
 pub(super) fn latest_session_id(root: &Path) -> Option<String> {
     let mut sessions = fs::read_dir(root)
         .ok()?
@@ -202,6 +355,19 @@ pub(super) fn latest_session_id(root: &Path) -> Option<String> {
         .collect::<Vec<_>>();
     sessions.sort_by_key(|item| std::cmp::Reverse(item.0));
     sessions.into_iter().map(|(_, id)| id).next()
+}
+
+fn read_jsonl_file(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .ok()
+        .into_iter()
+        .flat_map(|raw| {
+            raw.lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 pub(super) fn share_session(

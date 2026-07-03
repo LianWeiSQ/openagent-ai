@@ -4,7 +4,10 @@ use super::tool::{
     question_answers_from_json, value_to_answer_string,
 };
 use super::*;
-use openagent_tools::TASK_TOOL_ID;
+use openagent_tools::{
+    TASK_TOOL_ID, TaskSubagentRoute, benchmark_mode_value_allows_shell_command,
+    prepare_isolated_workspace, select_task_subagent_for_prompt,
+};
 
 #[derive(Debug)]
 pub(super) struct AgentLoopOutcome {
@@ -76,11 +79,22 @@ pub(super) fn run_agent_loop(
         finish_reason: Some("mcp_discovery_error".to_string()),
         paused: false,
     })?;
-    register_task_tool(&mut toolkit.registry, &task_subagent_descriptors(args));
+    let benchmark_mode_disables_subagents = benchmark_mode_disables_cli_subagents();
+    let subagent_descriptors = if benchmark_mode_disables_subagents {
+        Vec::new()
+    } else {
+        task_subagent_descriptors(args, agent_profile, Some(session))
+    };
+    if !benchmark_mode_disables_subagents {
+        register_task_tool(&mut toolkit.registry, &subagent_descriptors);
+    }
     let tools = filter_tools_for_agent(toolkit.get_all_tools("local"), agent_profile);
     let mut ctx = ToolContext::new(workspace)
         .with_session_id(session.id.clone())
-        .with_permission_ruleset(permission_ruleset.clone())
+        .with_permission_manager(permission_manager_for_agent(
+            permission_ruleset.clone(),
+            agent_profile,
+        ))
         .with_dangerously_skip_permissions(skip_permissions);
     if let Some(answers) = configured_question_answers(args) {
         ctx.set_question_answers(answers);
@@ -137,8 +151,174 @@ pub(super) fn run_agent_loop(
         approval_always = approval_always_patterns(session);
     }
 
+    if let Some(route) = direct_subagent_route(prompt, &subagent_descriptors) {
+        let tool_call = route.tool_call.clone();
+        let route_source = route.source;
+        let route_metadata = route.metadata.clone();
+        total_tool_calls += 1;
+        let assistant_index = session.messages.len() as u64;
+        let assistant_message_id = cli_message_id(assistant_index);
+        let step_start_checkpoint = create_step_checkpoint(
+            store,
+            &session.id,
+            run_id,
+            workspace,
+            1,
+            "step_start",
+            &assistant_message_id,
+        );
+        record_step_started(
+            store,
+            &session.id,
+            run_id,
+            1,
+            step_start_checkpoint.as_deref(),
+        );
+        emit_run_event(
+            &mut events,
+            json!({
+                "method": "item/toolCall/started",
+                "params": {
+                    "session_id": session.id.clone(),
+                    "run_id": run_id,
+                    "step": 1,
+                    "call_id": tool_call.call_id.clone(),
+                    "name": tool_call.name.clone(),
+                    "input": tool_call.input.clone(),
+                    "manual": route.manual,
+                    "auto": route.auto,
+                    "auto_route": route_metadata.clone(),
+                }
+            }),
+            event_sink,
+        );
+        let mut assistant =
+            assistant_message_for_provider_step(String::new(), &[tool_call.clone()]);
+        assistant.metadata.insert(
+            "message_id".to_string(),
+            json!(assistant_message_id.clone()),
+        );
+        if let Some(checkpoint_id) = step_start_checkpoint.as_deref() {
+            assistant
+                .metadata
+                .insert("snapshot_start".to_string(), json!(checkpoint_id));
+        }
+        assistant.metadata.insert("step".to_string(), json!(1));
+        session.add(assistant.clone());
+        store
+            .append_message(session, &assistant, run_id, assistant_index)
+            .map_err(|error| AgentLoopError {
+                message: format!("failed to record {route_source} call: {error}"),
+                events: events.clone(),
+                steps: 1,
+                finish_reason: Some("store_error".to_string()),
+                paused: false,
+            })?;
+        let tool_result = execute_loop_tool_call(
+            &toolkit,
+            mcp_runtime.as_ref(),
+            &tool_call,
+            &mut ctx,
+            TaskExecutionContext {
+                args,
+                workspace,
+                provider,
+                model_id,
+                session,
+                store,
+                run_id,
+                max_steps,
+                permission_ruleset: permission_ruleset.clone(),
+                skip_permissions,
+            },
+        );
+        let failed = tool_result.error.is_some();
+        emit_run_event(
+            &mut events,
+            json!({
+                "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
+                "params": {
+                    "session_id": session.id.clone(),
+                    "run_id": run_id,
+                    "step": 1,
+                    "call_id": tool_call.call_id.clone(),
+                    "name": tool_call.name.clone(),
+                    "output": tool_result.output.clone(),
+                    "error": tool_result.error.clone(),
+                    "metadata": tool_result.metadata.clone(),
+                    "manual": route.manual,
+                    "auto": route.auto,
+                    "auto_route": route_metadata.clone(),
+                }
+            }),
+            event_sink,
+        );
+        let mut tool_message = chat_message(
+            Role::Tool,
+            tool_result.error.as_ref().map_or_else(
+                || tool_result.output.clone(),
+                |error| format!("Tool failed: {error}"),
+            ),
+        );
+        tool_message.name = Some(tool_call.name.clone());
+        tool_message.tool_call_id = Some(tool_call.call_id.clone());
+        tool_message
+            .metadata
+            .insert("tool_result".to_string(), json!(tool_result));
+        tool_message.metadata.insert(
+            "assistant_message_id".to_string(),
+            json!(assistant_message_id.clone()),
+        );
+        tool_message.metadata.insert("step".to_string(), json!(1));
+        let tool_index = session.messages.len() as u64;
+        session.add(tool_message.clone());
+        store
+            .append_message(session, &tool_message, run_id, tool_index)
+            .map_err(|error| AgentLoopError {
+                message: format!("failed to record {route_source} result: {error}"),
+                events: events.clone(),
+                steps: 1,
+                finish_reason: Some("store_error".to_string()),
+                paused: false,
+            })?;
+        let final_answer = tool_result
+            .error
+            .clone()
+            .unwrap_or_else(|| tool_result.output.clone());
+        finalize_step_checkpoint(
+            store,
+            &session.id,
+            run_id,
+            workspace,
+            1,
+            &assistant_message_id,
+            step_start_checkpoint.as_deref(),
+        );
+        record_step_finished(
+            store,
+            &session.id,
+            run_id,
+            1,
+            if failed { "tool_error" } else { "stop" },
+            total_tool_calls,
+            &total_usage,
+        );
+        return Ok(AgentLoopOutcome {
+            answer: final_answer,
+            usage: total_usage,
+            source: route_source.to_string(),
+            events,
+            steps: 1,
+            tool_calls: total_tool_calls,
+            finish_reason: if failed { "tool_error" } else { "stop" }.to_string(),
+        });
+    }
+
     for step in 1..=max_steps {
         let mut streamed_events = Vec::new();
+        let assistant_index = session.messages.len() as u64;
+        let assistant_message_id = cli_message_id(assistant_index);
+        record_step_started(store, &session.id, run_id, step, None);
         let provider_messages = store
             .materialized_chat_messages(session)
             .unwrap_or_else(|_| session.messages.clone());
@@ -170,6 +350,7 @@ pub(super) fn run_agent_loop(
             &provider_messages,
             &tools,
             Some(&mut on_provider_stream),
+            agent_profile,
         )
         .map_err(|message| AgentLoopError {
             message,
@@ -225,8 +406,6 @@ pub(super) fn run_agent_loop(
                 })?;
         }
 
-        let assistant_index = session.messages.len() as u64;
-        let assistant_message_id = cli_message_id(assistant_index);
         let mut assistant_message =
             assistant_message_for_provider_step(step_text, &provider_result.tool_calls);
         assistant_message.metadata.insert(
@@ -268,6 +447,15 @@ pub(super) fn run_agent_loop(
             });
         }
 
+        let step_start_checkpoint = create_step_checkpoint(
+            store,
+            &session.id,
+            run_id,
+            workspace,
+            step,
+            "step_start",
+            &assistant_message_id,
+        );
         for tool_call in provider_result.tool_calls {
             total_tool_calls += 1;
             emit_run_event(
@@ -627,6 +815,15 @@ pub(super) fn run_agent_loop(
                 })?;
         }
 
+        finalize_step_checkpoint(
+            store,
+            &session.id,
+            run_id,
+            workspace,
+            step,
+            &assistant_message_id,
+            step_start_checkpoint.as_deref(),
+        );
         record_step_finished(
             store,
             &session.id,
@@ -645,6 +842,86 @@ pub(super) fn run_agent_loop(
         finish_reason: Some("max_steps".to_string()),
         paused: false,
     })
+}
+
+fn manual_subagent_tool_call(prompt: &str) -> Option<ToolCall> {
+    let trimmed = prompt.trim_start();
+    let rest = trimmed.strip_prefix('@')?;
+    let (subagent_type, task_prompt) = rest.split_once(char::is_whitespace)?;
+    let subagent_type = subagent_type.trim();
+    let task_prompt = task_prompt.trim();
+    if subagent_type.is_empty()
+        || task_prompt.is_empty()
+        || !subagent_type
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(ToolCall {
+        name: TASK_TOOL_ID.to_string(),
+        input: json!({
+            "description": format!("@{subagent_type}"),
+            "prompt": task_prompt,
+            "subagent_type": subagent_type,
+        }),
+        call_id: format!("manual_task_{subagent_type}"),
+    })
+}
+
+struct DirectSubagentRoute {
+    tool_call: ToolCall,
+    source: &'static str,
+    manual: bool,
+    auto: bool,
+    metadata: Value,
+}
+
+fn direct_subagent_route(
+    prompt: &str,
+    subagents: &[TaskSubagentDescriptor],
+) -> Option<DirectSubagentRoute> {
+    if let Some(tool_call) = manual_subagent_tool_call(prompt) {
+        return Some(DirectSubagentRoute {
+            tool_call,
+            source: "manual_subagent",
+            manual: true,
+            auto: false,
+            metadata: Value::Null,
+        });
+    }
+    let route = select_task_subagent_for_prompt(subagents, prompt)?;
+    Some(DirectSubagentRoute {
+        tool_call: auto_subagent_tool_call(prompt, &route),
+        source: "auto_subagent",
+        manual: false,
+        auto: true,
+        metadata: json!({
+            "subagent_type": route.subagent_id.clone(),
+            "score": route.score,
+            "matched_terms": route.matched_terms.clone(),
+        }),
+    })
+}
+
+fn benchmark_mode_disables_cli_subagents() -> bool {
+    std::env::var("OPENAGENT_BENCHMARK_MODE")
+        .ok()
+        .as_deref()
+        .is_some_and(benchmark_mode_value_allows_shell_command)
+}
+
+fn auto_subagent_tool_call(prompt: &str, route: &TaskSubagentRoute) -> ToolCall {
+    ToolCall {
+        name: TASK_TOOL_ID.to_string(),
+        input: json!({
+            "description": format!("Auto-routed to {}", route.subagent_id),
+            "prompt": prompt,
+            "subagent_type": route.subagent_id.clone(),
+            "command": "auto_route",
+        }),
+        call_id: format!("auto_task_{}", route.subagent_id),
+    }
 }
 
 struct TaskExecutionContext<'a> {
@@ -771,6 +1048,72 @@ fn execute_task_tool_call(
         },
         None => Session::new(new_cli_id("subtask"), task_context.workspace),
     };
+    let mut workspace_isolation = None;
+    if let Some(existing) = task_id.as_deref() {
+        if let Err(error) = validate_task_resume_session(
+            &child_session,
+            task_context.session,
+            &child_profile,
+            &subagent_type,
+            existing,
+        ) {
+            return task_tool_error(
+                tool_call,
+                &error,
+                BTreeMap::from([
+                    ("subagent_type".to_string(), json!(subagent_type)),
+                    ("task_id".to_string(), json!(existing)),
+                ]),
+            );
+        }
+    }
+    if task_id.is_none()
+        && task_workspace_isolation_requested(input, child_profile.workspace_isolation)
+    {
+        match prepare_isolated_workspace(
+            task_context.workspace,
+            task_context.store.root.join("isolated_workspaces"),
+            &child_session.id,
+        ) {
+            Ok(isolation) => {
+                child_session.directory = PathBuf::from(&isolation.workspace);
+                workspace_isolation = Some(isolation);
+            }
+            Err(error) => {
+                return task_tool_error(
+                    tool_call,
+                    &format!("failed to prepare isolated workspace: {error}"),
+                    BTreeMap::from([("subagent_type".to_string(), json!(subagent_type))]),
+                );
+            }
+        }
+    }
+    if let Some(error) = subagent_task_governance_error(task_context.session, &child_profile) {
+        return task_tool_error(
+            tool_call,
+            &error,
+            BTreeMap::from([
+                ("tool".to_string(), json!(TASK_TOOL_ID)),
+                ("subagent_type".to_string(), json!(subagent_type)),
+                ("status".to_string(), json!("failed")),
+                (
+                    "task_depth".to_string(),
+                    json!(child_task_depth(task_context.session)),
+                ),
+                (
+                    "max_task_depth".to_string(),
+                    json!(max_subagent_depth_cli()),
+                ),
+                (
+                    "task_lineage_subagents".to_string(),
+                    json!(parent_task_lineage(task_context.session)),
+                ),
+            ]),
+        );
+    }
+    let task_depth = child_task_depth(task_context.session);
+    let task_root_id = task_root_session_id(task_context.session);
+    let task_lineage_subagents = child_task_lineage(task_context.session, &child_profile.id);
     let child_run_id = new_cli_id("run");
     let trace_id = new_cli_id("trace");
     child_session.status = SessionStatus::Running;
@@ -783,6 +1126,25 @@ fn execute_task_tool_call(
     child_session
         .metadata
         .insert("model".to_string(), json!(child_model.clone()));
+    child_session.metadata.insert(
+        "model_options".to_string(),
+        json!(child_profile.model_options.clone()),
+    );
+    if let Some(temperature) = child_profile.temperature {
+        child_session
+            .metadata
+            .insert("temperature".to_string(), json!(temperature));
+    }
+    if let Some(top_p) = child_profile.top_p {
+        child_session
+            .metadata
+            .insert("top_p".to_string(), json!(top_p));
+    }
+    if let Some(color) = child_profile.color.as_deref() {
+        child_session
+            .metadata
+            .insert("color".to_string(), json!(color));
+    }
     child_session
         .metadata
         .insert("subagent".to_string(), json!(true));
@@ -793,6 +1155,21 @@ fn execute_task_tool_call(
     child_session.metadata.insert(
         "parent_session_id".to_string(),
         json!(task_context.session.id.clone()),
+    );
+    child_session.metadata.insert(
+        "task_parent_session_id".to_string(),
+        json!(task_context.session.id.clone()),
+    );
+    child_session.metadata.insert(
+        "task_root_session_id".to_string(),
+        json!(task_root_id.clone()),
+    );
+    child_session
+        .metadata
+        .insert("task_depth".to_string(), json!(task_depth));
+    child_session.metadata.insert(
+        "task_lineage_subagents".to_string(),
+        json!(task_lineage_subagents.clone()),
     );
     child_session
         .metadata
@@ -813,9 +1190,28 @@ fn execute_task_tool_call(
             .metadata
             .insert("task_command".to_string(), json!(command));
     }
+    if let Some(isolation) = workspace_isolation.as_ref() {
+        child_session
+            .metadata
+            .insert("workspace_isolation".to_string(), json!(isolation));
+    }
     child_session
         .metadata
         .insert("permission".to_string(), json!(child_permission.as_str()));
+    if task_id.is_some() {
+        let resume_count = child_session
+            .metadata
+            .get("task_resume_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .saturating_add(1);
+        child_session
+            .metadata
+            .insert("task_resume_count".to_string(), json!(resume_count));
+        child_session
+            .metadata
+            .insert("task_resumed_at_ms".to_string(), json!(now_ms_cli()));
+    }
     let child_max_steps = child_profile.max_steps.unwrap_or(task_context.max_steps);
     if let Err(error) = task_context.store.start_run(
         &mut child_session,
@@ -864,10 +1260,11 @@ fn execute_task_tool_call(
     }
 
     let mut child_event_sink: Option<&mut dyn FnMut(&Value)> = None;
+    let child_workspace = child_session.directory.clone();
     let child_loop_result = run_agent_loop(
         AgentLoopRequest {
             args: task_context.args,
-            workspace: task_context.workspace,
+            workspace: &child_workspace,
             provider: &child_provider,
             model_id: &child_model,
             session: &mut child_session,
@@ -913,27 +1310,48 @@ fn execute_task_tool_call(
                 None,
             );
             let output = render_task_output(&child_session.id, "completed", &result.answer);
+            let mut metadata = BTreeMap::from([
+                ("tool".to_string(), json!(TASK_TOOL_ID)),
+                ("title".to_string(), json!(description)),
+                ("subagent_type".to_string(), json!(subagent_type)),
+                ("task_id".to_string(), json!(child_session.id.clone())),
+                ("session_id".to_string(), json!(child_session.id.clone())),
+                ("run_id".to_string(), json!(child_run_id)),
+                ("status".to_string(), json!("completed")),
+                ("provider".to_string(), json!(child_provider)),
+                ("model".to_string(), json!(child_model)),
+                (
+                    "model_options".to_string(),
+                    json!(child_profile.model_options.clone()),
+                ),
+                ("task_depth".to_string(), json!(task_depth)),
+                (
+                    "task_root_session_id".to_string(),
+                    json!(task_root_id.clone()),
+                ),
+                (
+                    "task_parent_session_id".to_string(),
+                    json!(task_context.session.id.clone()),
+                ),
+                (
+                    "task_lineage_subagents".to_string(),
+                    json!(task_lineage_subagents.clone()),
+                ),
+                ("steps".to_string(), json!(result.steps)),
+                ("tool_calls".to_string(), json!(result.tool_calls)),
+                (
+                    "agent_profile".to_string(),
+                    agent_profile_public_value(&child_profile),
+                ),
+            ]);
+            if let Some(isolation) = workspace_isolation.as_ref() {
+                metadata.insert("workspace_isolation".to_string(), json!(isolation));
+            }
             ToolResult {
                 call_id: tool_call.call_id.clone(),
                 output,
                 error: None,
-                metadata: BTreeMap::from([
-                    ("tool".to_string(), json!(TASK_TOOL_ID)),
-                    ("title".to_string(), json!(description)),
-                    ("subagent_type".to_string(), json!(subagent_type)),
-                    ("task_id".to_string(), json!(child_session.id.clone())),
-                    ("session_id".to_string(), json!(child_session.id.clone())),
-                    ("run_id".to_string(), json!(child_run_id)),
-                    ("status".to_string(), json!("completed")),
-                    ("provider".to_string(), json!(child_provider)),
-                    ("model".to_string(), json!(child_model)),
-                    ("steps".to_string(), json!(result.steps)),
-                    ("tool_calls".to_string(), json!(result.tool_calls)),
-                    (
-                        "agent_profile".to_string(),
-                        agent_profile_public_value(&child_profile),
-                    ),
-                ]),
+                metadata,
             }
         }
         Err(error) => {
@@ -971,10 +1389,107 @@ fn execute_task_tool_call(
                     ),
                     ("provider".to_string(), json!(child_provider)),
                     ("model".to_string(), json!(child_model)),
+                    (
+                        "model_options".to_string(),
+                        json!(child_profile.model_options.clone()),
+                    ),
+                    ("task_depth".to_string(), json!(task_depth)),
+                    ("task_root_session_id".to_string(), json!(task_root_id)),
+                    (
+                        "task_parent_session_id".to_string(),
+                        json!(task_context.session.id.clone()),
+                    ),
+                    (
+                        "task_lineage_subagents".to_string(),
+                        json!(task_lineage_subagents),
+                    ),
                     ("paused".to_string(), json!(error.paused)),
                 ]),
             )
         }
+    }
+}
+
+fn validate_task_resume_session(
+    child_session: &Session,
+    parent_session: &Session,
+    profile: &RunAgentProfile,
+    requested_subagent_type: &str,
+    task_id: &str,
+) -> Result<(), String> {
+    if !child_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!("task session {task_id} is not a subagent task"));
+    }
+    let parent_id = child_session
+        .metadata
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if parent_id != parent_session.id {
+        return Err("task does not belong to parent session".to_string());
+    }
+    let stored_agent = child_session
+        .metadata
+        .get("agent")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            child_session
+                .metadata
+                .get("task_subagent_type")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default();
+    if !stored_agent.is_empty()
+        && stored_agent != profile.id
+        && stored_agent != requested_subagent_type
+    {
+        return Err(format!(
+            "task session {task_id} belongs to subagent {stored_agent}, not {}",
+            profile.id
+        ));
+    }
+    match child_session
+        .metadata
+        .get("task_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "queued" | "running" | "canceled" => {
+            return Err(format!(
+                "task session {task_id} cannot be resumed while task status is {}",
+                child_session
+                    .metadata
+                    .get("task_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ));
+        }
+        _ => {}
+    }
+    if matches!(
+        child_session.status,
+        SessionStatus::Running | SessionStatus::Paused | SessionStatus::Compacting
+    ) {
+        return Err(format!(
+            "task session {task_id} cannot be resumed while session status is {}",
+            task_session_status_text(&child_session.status)
+        ));
+    }
+    Ok(())
+}
+
+fn task_session_status_text(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "idle",
+        SessionStatus::Running => "running",
+        SessionStatus::Paused => "paused",
+        SessionStatus::Stop => "stop",
+        SessionStatus::Compacting => "compacting",
     }
 }
 
@@ -986,6 +1501,14 @@ fn task_input_string(input: &Value, key: &str) -> Result<String, String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| format!("task tool requires non-empty {key}"))
+}
+
+fn task_workspace_isolation_requested(input: &Value, profile_default: bool) -> bool {
+    input
+        .get("isolate_workspace")
+        .or_else(|| input.get("workspace_isolation"))
+        .and_then(Value::as_bool)
+        .unwrap_or(profile_default)
 }
 
 fn task_tool_error(
@@ -1307,6 +1830,98 @@ fn emit_run_event(
         emit(&event);
     }
     events.push(event);
+}
+
+fn create_step_checkpoint(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    workspace: &Path,
+    step: u64,
+    kind: &str,
+    message_id: &str,
+) -> Option<String> {
+    store
+        .create_checkpoint(
+            session_id,
+            run_id,
+            workspace,
+            kind,
+            Some(message_id),
+            None,
+            Some(step),
+        )
+        .ok()
+        .map(|checkpoint| checkpoint.checkpoint_id)
+}
+
+fn finalize_step_checkpoint(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    workspace: &Path,
+    step: u64,
+    message_id: &str,
+    start_checkpoint_id: Option<&str>,
+) {
+    let Some(end_checkpoint_id) = create_step_checkpoint(
+        store, session_id, run_id, workspace, step, "step_end", message_id,
+    ) else {
+        return;
+    };
+    let _ = store.append_part(
+        session_id,
+        run_id,
+        "context",
+        SessionPartOptions {
+            message_id: Some(message_id.to_string()),
+            content: Some(json!({
+                "kind": "checkpoint",
+                "snapshot_start": start_checkpoint_id,
+                "snapshot_end": end_checkpoint_id,
+            })),
+            attributes: BTreeMap::from([
+                ("kind".to_string(), json!("checkpoint")),
+                ("snapshot_start".to_string(), json!(start_checkpoint_id)),
+                ("snapshot_end".to_string(), json!(end_checkpoint_id.clone())),
+            ]),
+            step_index: Some(step),
+            status: "completed".to_string(),
+            ..SessionPartOptions::default()
+        },
+    );
+    if let Some(start_checkpoint_id) = start_checkpoint_id {
+        let _ = store.append_checkpoint_patch_part(
+            session_id,
+            run_id,
+            message_id,
+            start_checkpoint_id,
+            &end_checkpoint_id,
+            Some(step),
+        );
+    }
+}
+
+fn record_step_started(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    step: u64,
+    checkpoint_id: Option<&str>,
+) {
+    let _ = store.record_event(
+        session_id,
+        run_id,
+        "step.started",
+        SessionEventOptions {
+            kind: "step".to_string(),
+            attributes: BTreeMap::from([
+                ("step".to_string(), json!(step)),
+                ("checkpoint_id".to_string(), json!(checkpoint_id)),
+            ]),
+            ..SessionEventOptions::default()
+        },
+    );
 }
 
 fn record_step_finished(

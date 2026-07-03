@@ -230,6 +230,10 @@ pub(super) fn root_help() -> String {
         ("run", "run an agent prompt without opening the TUI"),
         ("tui", "start the terminal UI"),
         ("attach", "attach to a running App Bridge server"),
+        (
+            "terminal",
+            "run a workspace-scoped command through App Bridge",
+        ),
         ("serve", "start the local App Bridge HTTP server"),
         ("web", "start the browser console server"),
         ("client", "send a prompt to a running App Bridge server"),
@@ -248,7 +252,7 @@ pub(super) fn root_help() -> String {
     let integrations = [
         ("auth", "manage provider credentials"),
         ("providers", "provider credential alias for auth"),
-        ("mcp", "manage remote MCP servers"),
+        ("mcp", "manage local and remote MCP servers"),
         ("approval", "inspect or answer queued approval requests"),
         ("question", "inspect or answer queued question requests"),
     ];
@@ -314,7 +318,7 @@ pub(super) fn run_help() -> String {
     let input = [
         ("--command <name>", "render a custom command template"),
         ("-f, --file <path>", "attach a file; repeatable"),
-        ("--mcp-config <path-or-json>", "enable remote MCP tools"),
+        ("--mcp-config <path-or-json>", "enable MCP tools"),
         (
             "--answer <text>",
             "pre-answer a queued question; repeatable",
@@ -395,7 +399,14 @@ pub(super) fn client_help() -> &'static str {
 
 pub(super) fn attach_help() -> &'static str {
     "Usage: openagent attach <url> [options]\n\n\
-     Options: --workspace <path>, -s/--session <id>, -c/--continue, --fork, --format <text|json>, --skip-health-check, --server-token <token>, --server-token-env <name>, -u/--username <name>, -p/--password <password>"
+     Options: --workspace <path>, -s/--session <id>, -c/--continue, --fork, --format <text|json>, --skip-health-check, --server-token <token>, --server-token-env <name>, -u/--username <name>, -p/--password <password>\n\
+     Interactive commands: /sessions, /tasks, /task <id>, /resume <id>, /new, /fork, /interrupt [turn_id], /exit"
+}
+
+pub(super) fn terminal_help() -> &'static str {
+    "Usage: openagent terminal [options] -- <command...>\n\n\
+     Options: --server-url <url>, --attach <url>, --server-token <token>, --server-token-env <name>, -u/--username <name>, -p/--password <password>, --cwd <path>, --timeout-ms <n>, --command <text>, --format <text|json>\n\
+     Runs through the App Bridge /api/terminal/run endpoint and is scoped to the server workspace."
 }
 
 pub(super) fn doctor_help() -> &'static str {
@@ -409,11 +420,13 @@ pub(super) fn models_help() -> &'static str {
 }
 
 pub(super) fn session_help() -> &'static str {
-    "Usage: openagent session <list|export|import|share|delete> [options]\n\n\
+    "Usage: openagent session <list|export|import|share|checkpoints|restore|delete> [options]\n\n\
      list:   --session-root <path>, --format <table|json>, --max-count <n>\n\
      export: --session-root <path>, --sanitize [session_id]\n\
      import: --session-root <path> <file-or-url>\n\
      share:  --session-root <path> [session_id]\n\
+     checkpoints: --session-root <path>, --format <table|json> [session_id]\n\
+     restore: --session-root <path> <session_id> <checkpoint_id>\n\
      delete: --session-root <path> <session_id>"
 }
 
@@ -444,8 +457,11 @@ pub(super) fn auth_help(command_name: &str) -> String {
 }
 
 pub(super) fn mcp_help() -> &'static str {
-    "Usage: openagent mcp <list|show|add|remove|auth|logout|doctor|debug> [options]\n\n\
-     add: name --url <url> --transport <auto|http|sse> --header KEY=VALUE --timeout-ms <n> --disabled --config <file>\n\
+    "Usage: openagent mcp <list|show|add|remove|auth|logout|doctor|debug|test|start|stop|restart|enable|disable> [options]\n\n\
+     add remote: name --url <url> --transport <auto|http|sse> --header KEY=VALUE --timeout-ms <n> --disabled --mcp-config <file>\n\
+     add local:  name --command <program> --arg <value> --env KEY=VALUE --cwd <dir> --timeout-ms <n> --disabled --mcp-config <file>\n\
+     local one-shot test: test <name> --mcp-config <file> --workspace <dir>\n\
+     App Bridge lifecycle: list|show|doctor|test|start|stop|restart|enable|disable --server-url <url> --server-token <token>\n\
      auth: list|status|login|set-token|callback\n\
      doctor/debug: --refresh --format <table|json>"
 }

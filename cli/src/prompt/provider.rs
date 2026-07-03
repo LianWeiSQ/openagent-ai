@@ -16,6 +16,7 @@ pub(super) fn call_provider_for_run(
     messages: &[ChatMessage],
     tools: &[ToolSchema],
     stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    agent_profile: Option<&RunAgentProfile>,
 ) -> Result<ProviderRunResult, String> {
     if subagent_profile_id(messages).is_some()
         && let Ok(answer) = env::var("OPENAGENT_MOCK_SUBAGENT_ANSWER")
@@ -73,8 +74,36 @@ pub(super) fn call_provider_for_run(
             messages,
             tools,
             stream_sink,
+            agent_profile,
         )
     }
+}
+
+fn apply_agent_model_options_to_payload(payload: &mut Value, profile: Option<&RunAgentProfile>) {
+    let Some(profile) = profile else {
+        return;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    for (key, value) in &profile.model_options {
+        if provider_payload_option_allowed(key) {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(temperature) = profile.temperature {
+        object.insert("temperature".to_string(), json!(temperature));
+    }
+    if let Some(top_p) = profile.top_p {
+        object.insert("top_p".to_string(), json!(top_p));
+    }
+}
+
+fn provider_payload_option_allowed(key: &str) -> bool {
+    !matches!(
+        key,
+        "model" | "messages" | "input" | "tools" | "tool_choice" | "stream"
+    )
 }
 
 fn subagent_profile_id(messages: &[ChatMessage]) -> Option<&str> {
@@ -103,6 +132,7 @@ fn call_openai_compatible_provider(
     messages: &[ChatMessage],
     tools: &[ToolSchema],
     mut stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    agent_profile: Option<&RunAgentProfile>,
 ) -> Result<ProviderRunResult, String> {
     let base_url = provider_base_url(provider, args);
     if is_synthetic_endpoint(&base_url) {
@@ -145,6 +175,7 @@ fn call_openai_compatible_provider(
         }
         (join_url(&base_url, "responses"), payload)
     };
+    apply_agent_model_options_to_payload(&mut payload, agent_profile);
     if let Some(max_tokens) =
         value_for(args, &["--max-output-tokens"]).and_then(|value| value.parse::<u64>().ok())
         && let Some(object) = payload.as_object_mut()
@@ -159,17 +190,14 @@ fn call_openai_compatible_provider(
             json!(max_tokens),
         );
     }
-    let mut request = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .header("content-type", "application/json");
-    if stream {
-        request = request.header("accept", "text/event-stream");
-    }
-    let response = request
-        .json(&payload)
-        .send()
-        .map_err(|error| format!("provider request failed: {error}"))?;
+    let response = send_provider_request_with_retries(
+        &client,
+        &endpoint,
+        &api_key,
+        &payload,
+        stream,
+        provider_request_retries(args),
+    )?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -253,6 +281,60 @@ fn call_openai_compatible_provider(
     }
 }
 
+fn send_provider_request_with_retries(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    api_key: &str,
+    payload: &Value,
+    stream: bool,
+    max_retries: u64,
+) -> Result<reqwest::blocking::Response, String> {
+    let mut attempt = 0_u64;
+    loop {
+        let mut request = client
+            .post(endpoint)
+            .bearer_auth(api_key)
+            .header("content-type", "application/json");
+        if stream {
+            request = request.header("accept", "text/event-stream");
+        }
+        match request.json(payload).send() {
+            Ok(response) => return Ok(response),
+            Err(_) if attempt < max_retries => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(500 * attempt));
+            }
+            Err(error) => return Err(format!("provider request failed: {error}")),
+        }
+    }
+}
+
+fn provider_request_retries(args: &[String]) -> u64 {
+    value_for(args, &["--provider-retries"])
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            env::var("OPENAGENT_PROVIDER_RETRIES")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or_else(|| {
+            if env::var("OPENAGENT_BENCHMARK_MODE")
+                .ok()
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "terminal-bench" | "terminal_bench" | "terminalbench"
+                    )
+                })
+                .unwrap_or(false)
+            {
+                3
+            } else {
+                1
+            }
+        })
+}
+
 fn call_anthropic_provider(
     args: &[String],
     api_key: &str,
@@ -267,8 +349,7 @@ fn call_anthropic_provider(
         .build()
         .map_err(|error| error.to_string())?;
     let mut config = AnthropicLanguageModelConfig::new(api_key, model_id);
-    config.base_url =
-        value_for(args, &["--base-url"]).or_else(|| provider_env_value("anthropic", "base_url"));
+    config.base_url = Some(provider_base_url("anthropic", args));
     let stream = provider_streaming_enabled(args);
     let mut payload = build_anthropic_payload(&config, None, messages, tools, None, None, None);
     if let Some(object) = payload.as_object_mut() {
@@ -419,26 +500,6 @@ fn provider_streaming_enabled(args: &[String]) -> bool {
         })
 }
 
-pub(super) fn parse_sse_json_values(raw: &str) -> Result<Vec<Value>, String> {
-    let mut values = Vec::new();
-    let mut data_lines = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            flush_sse_json_value(&mut data_lines, &mut values)?;
-            continue;
-        }
-        if line.starts_with(':') {
-            continue;
-        }
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.trim_start().to_string());
-        }
-    }
-    flush_sse_json_value(&mut data_lines, &mut values)?;
-    Ok(values)
-}
-
 fn read_sse_json_values_stream<R, F>(mut reader: R, mut on_value: F) -> Result<(), String>
 where
     R: Read,
@@ -520,25 +581,6 @@ fn parse_sse_frame_json(frame: &str) -> Result<Option<Value>, String> {
     serde_json::from_str(trimmed)
         .map(Some)
         .map_err(|error| format!("provider SSE data was not JSON: {error}"))
-}
-
-fn flush_sse_json_value(
-    data_lines: &mut Vec<String>,
-    values: &mut Vec<Value>,
-) -> Result<(), String> {
-    if data_lines.is_empty() {
-        return Ok(());
-    }
-    let data = data_lines.join("\n");
-    data_lines.clear();
-    let trimmed = data.trim();
-    if trimmed.is_empty() || trimmed == "[DONE]" {
-        return Ok(());
-    }
-    let value: Value = serde_json::from_str(trimmed)
-        .map_err(|error| format!("provider SSE data was not JSON: {error}"))?;
-    values.push(value);
-    Ok(())
 }
 
 fn openai_stream_text_delta(wire_api: &str, chunk: &Value) -> Option<ProviderStreamEvent> {
@@ -837,14 +879,15 @@ fn mock_tool_calls_from_env() -> Result<Option<Vec<ToolCall>>, String> {
 }
 
 fn provider_api_key(provider: &str, args: &[String]) -> Option<String> {
-    value_for(args, &["--api-key"]).or_else(|| provider_env_value(provider, "api_key"))
+    resolve_provider_config(provider, args)
+        .ok()
+        .and_then(|config| config.api_key)
 }
 
 fn provider_base_url(provider: &str, args: &[String]) -> String {
-    value_for(args, &["--base-url"])
-        .or_else(|| provider_env_value(provider, "base_url"))
-        .or_else(|| provider_default_base_url(provider).ok().flatten())
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+    resolve_provider_config(provider, args)
+        .map(|config| config.base_url)
+        .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
 }
 
 fn is_synthetic_endpoint(base_url: &str) -> bool {
@@ -855,13 +898,7 @@ fn is_synthetic_endpoint(base_url: &str) -> bool {
 }
 
 fn provider_wire_api(provider: &str, args: &[String]) -> String {
-    value_for(args, &["--wire-api"])
-        .or_else(|| provider_env_value(provider, "wire_api"))
-        .unwrap_or_else(|| {
-            if provider == "anthropic" {
-                "messages".to_string()
-            } else {
-                DEFAULT_WIRE_API.to_string()
-            }
-        })
+    resolve_provider_config(provider, args)
+        .map(|config| config.wire_api)
+        .unwrap_or_else(|_| DEFAULT_WIRE_API.to_string())
 }

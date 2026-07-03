@@ -9,14 +9,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use openagent_core::{PermissionManager, permission_rule};
 use openagent_mcp::{
-    McpTransport, RemoteMcpManager, RemoteMcpServerConfig, RemoteMcpToolDescriptor,
-    bridge_tool_output, build_tool_descriptors_from_values, load_mcp_config, mcp_tool_definition,
-    normalize_tool_call_result, sanitize_mcp_observation_value, transport_candidates,
-    unavailable_tool_result,
+    McpTransport, RemoteMcpManager, RemoteMcpToolDescriptor, bridge_tool_output,
+    build_tool_descriptors_from_values, load_mcp_config, mcp_tool_definition,
+    normalize_tool_call_result, sanitize_mcp_observation_value, unavailable_tool_result,
 };
 use openagent_protocol::ToolResult;
-use openagent_protocol::{ChatMessage, PermissionRuleset, Role, ToolCall, ToolSchema, Usage};
+use openagent_protocol::{
+    ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolSchema, Usage,
+};
 use openagent_provider::{
     AnthropicLanguageModelConfig, OpenAiLanguageModelConfig, ProviderStreamEvent, anthropic_model,
     build_anthropic_payload, build_openai_chat_payload, build_openai_responses_payload,
@@ -26,10 +28,13 @@ use openagent_provider::{
     provider_label, provider_requires_api_key, summarize_http_error_body,
 };
 use openagent_session::{
-    FileSessionStore, Session, SessionEventOptions, SessionPartOptions, SessionStatus,
-    StartRunOptions,
+    FileSessionStore, Session, SessionEventOptions, SessionForkBoundary, SessionPartOptions,
+    SessionStatus, StartRunOptions,
 };
-use openagent_tools::{TaskSubagentDescriptor, ToolContext, Toolkit, register_task_tool};
+use openagent_tools::{
+    TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor, ToolContext, Toolkit,
+    register_task_tool, task_subagent_is_visible,
+};
 use serde_json::{Map, Value, json};
 
 mod agents;
@@ -69,7 +74,7 @@ use prompt::{run_prompt_command, run_prompt_command_with_events, split_answer_it
 use remote::{
     attach_command, http_runtime_command, remote_auth_from_args, remote_events_for_payload,
     remote_select_session, remote_select_session_with_auth, remote_start_turn,
-    remote_start_turn_with_auth, text_from_app_events, tui_command,
+    remote_start_turn_with_auth, terminal_command, text_from_app_events, tui_command,
 };
 use sessions::{
     latest_session_id, session_command, session_export, session_import, session_list, share_session,
@@ -99,6 +104,7 @@ const RUN_POSITIONAL_VALUE_FLAGS: &[&str] = &[
     "--workspace",
     "--dir",
     "--config",
+    "--env-file",
     "--auth-file",
     "--base-url",
     "--session-root",
@@ -178,6 +184,7 @@ pub fn run_cli_command(argv: &[String]) -> CliRunResult {
         "serve" => http_runtime_command(&argv[1..], false, serve_help()),
         "web" => http_runtime_command(&argv[1..], true, web_help()),
         "attach" => attach_command(&argv[1..]),
+        "terminal" => terminal_command(&argv[1..]),
         "run" => run_prompt_command(&argv[1..]),
         "client" => client_command(&argv[1..]),
         "session" => session_command(&argv[1..]),
