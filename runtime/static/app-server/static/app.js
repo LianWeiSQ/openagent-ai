@@ -4,6 +4,7 @@ const state = {
   pendingApproval: null,
   pendingQuestion: null,
   source: null,
+  seenEvents: new Set(),
   textNodes: new Map(),
 };
 
@@ -11,6 +12,7 @@ const els = {
   health: document.querySelector("#health-pill"),
   model: document.querySelector("#model-pill"),
   sessions: document.querySelector("#session-list"),
+  tasks: document.querySelector("#task-list"),
   title: document.querySelector("#active-session-title"),
   prompt: document.querySelector("#prompt-input"),
   run: document.querySelector("#run-turn"),
@@ -62,6 +64,7 @@ async function boot() {
   await refreshHealth();
   await refreshModels();
   await refreshSessions();
+  await refreshTasks();
   els.newSession.addEventListener("click", createSession);
   els.run.addEventListener("click", runTurn);
   els.clear.addEventListener("click", clearTimeline);
@@ -128,6 +131,7 @@ async function selectSession(sessionId) {
   els.detailSession.textContent = sessionId;
   els.detailStatus.textContent = data.session.status || "idle";
   await refreshSessions();
+  await refreshTasks(sessionId);
 }
 
 async function runTurn() {
@@ -157,6 +161,7 @@ async function runTurn() {
     } else {
       streamTurn(state.activeTurnId);
     }
+    await refreshTasks(state.activeSessionId);
   } catch (error) {
     els.run.disabled = false;
     els.turnState.textContent = "failed";
@@ -179,6 +184,9 @@ function streamTurn(turnId) {
 }
 
 function handleAppEvent(appEvent) {
+  const key = eventKey(appEvent);
+  if (state.seenEvents.has(key)) return;
+  state.seenEvents.add(key);
   const { method, params } = appEvent;
   els.turnState.textContent = method;
   els.detailStatus.textContent = method.includes("failed") ? "failed" : method.includes("completed") ? "completed" : "running";
@@ -195,6 +203,7 @@ function handleAppEvent(appEvent) {
     clearApproval();
     clearQuestion();
     if (state.source) state.source.close();
+    refreshTasks(state.activeSessionId);
   }
   if (method === "turn/interrupted") {
     els.run.disabled = false;
@@ -204,6 +213,7 @@ function handleAppEvent(appEvent) {
     clearApproval();
     clearQuestion();
     if (state.source) state.source.close();
+    refreshTasks(state.activeSessionId);
   }
   if (method === "turn/approval_requested") {
     showApproval(params.approval);
@@ -217,9 +227,135 @@ function handleAppEvent(appEvent) {
   if (method === "item/question/resolved") {
     clearQuestion();
   }
+  if (method === "item/toolCall/completed" || method === "item/toolCall/failed") {
+    const metadata = params.metadata || {};
+    if (metadata.tool === "task" || params.name === "task") {
+      refreshTasks(state.activeSessionId);
+    }
+  }
 
   const severity = method.includes("warning") ? "warning" : method.includes("failed") || method.includes("error") ? "error" : "";
   addEventRow(method, summarizeParams(params), severity, classForMethod(method));
+}
+
+function eventKey(appEvent) {
+  if (appEvent.event_id) return `event:${appEvent.event_id}`;
+  if (appEvent.global_sequence) return `global:${appEvent.global_sequence}`;
+  if (appEvent.sequence) {
+    const params = appEvent.params || {};
+    return `turn:${params.session_id || params.thread_id || ""}:${params.turn_id || params.run_id || ""}:${appEvent.sequence}:${appEvent.method}`;
+  }
+  return `${appEvent.method}:${JSON.stringify(appEvent.params || {})}`;
+}
+
+async function refreshTasks(sessionId = state.activeSessionId) {
+  if (!els.tasks) return;
+  els.tasks.replaceChildren();
+  if (!sessionId) {
+    const empty = document.createElement("div");
+    empty.className = "task-empty";
+    empty.textContent = "选择会话后显示任务";
+    els.tasks.append(empty);
+    return;
+  }
+  try {
+    const data = await getJSON(`/api/sessions/${encodeURIComponent(sessionId)}/tasks`);
+    const tree = data.tree || data.tasks || [];
+    if (!tree.length) {
+      const empty = document.createElement("div");
+      empty.className = "task-empty";
+      empty.textContent = "暂无 subagent 任务";
+      els.tasks.append(empty);
+      return;
+    }
+    const list = document.createElement("div");
+    list.className = "task-tree";
+    tree.forEach((task) => list.append(renderTaskNode(task, 0)));
+    els.tasks.append(list);
+  } catch (error) {
+    const row = document.createElement("div");
+    row.className = "task-empty error";
+    row.textContent = error.message;
+    els.tasks.append(row);
+  }
+}
+
+function renderTaskNode(task, depth) {
+  const wrap = document.createElement("div");
+  wrap.className = "task-node";
+  wrap.style.setProperty("--task-depth", depth);
+  const row = document.createElement("div");
+  row.className = `task-row ${taskStatusClass(task.status)}`;
+  const main = document.createElement("button");
+  main.type = "button";
+  main.className = "task-open";
+  main.addEventListener("click", () => selectSession(task.session_id || task.task_id));
+  main.innerHTML = `
+    <span class="task-title">${escapeHTML(task.title || task.description || task.subagent_type || "task")}</span>
+    <span class="task-meta">${escapeHTML(task.subagent_type || "subagent")} · ${escapeHTML(task.status || "unknown")}${task.background ? " · bg" : ""}</span>
+  `;
+  row.append(main);
+  if (task.background && task.status === "queued") {
+    const run = document.createElement("button");
+    run.type = "button";
+    run.className = "task-action";
+    run.textContent = "Run";
+    run.addEventListener("click", (event) => {
+      event.stopPropagation();
+      runBackgroundTask(task);
+    });
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "task-action danger";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", (event) => {
+      event.stopPropagation();
+      cancelBackgroundTask(task);
+    });
+    row.append(run, cancel);
+  }
+  wrap.append(row);
+  (task.children || []).forEach((child) => wrap.append(renderTaskNode(child, depth + 1)));
+  return wrap;
+}
+
+function taskStatusClass(status = "") {
+  if (status === "queued") return "queued";
+  if (status === "running") return "running";
+  if (status === "failed" || status === "canceled") return "failed";
+  if (status === "completed") return "completed";
+  return "";
+}
+
+async function runBackgroundTask(task) {
+  const parent = task.parent_session_id || task.task_parent_session_id || state.activeSessionId;
+  const taskId = task.session_id || task.task_id;
+  if (!parent || !taskId) return;
+  try {
+    const data = await postJSON(
+      `/api/sessions/${encodeURIComponent(parent)}/tasks/${encodeURIComponent(taskId)}/run`,
+      {},
+    );
+    if (Array.isArray(data.result?.events)) data.result.events.forEach(handleAppEvent);
+    await refreshTasks(state.activeSessionId);
+  } catch (error) {
+    addEventRow("task/run_failed", error.message, "error");
+  }
+}
+
+async function cancelBackgroundTask(task) {
+  const parent = task.parent_session_id || task.task_parent_session_id || state.activeSessionId;
+  const taskId = task.session_id || task.task_id;
+  if (!parent || !taskId) return;
+  try {
+    await postJSON(
+      `/api/sessions/${encodeURIComponent(parent)}/tasks/${encodeURIComponent(taskId)}/cancel`,
+      {},
+    );
+    await refreshTasks(state.activeSessionId);
+  } catch (error) {
+    addEventRow("task/cancel_failed", error.message, "error");
+  }
 }
 
 function renderTextDelta(event) {
@@ -400,6 +536,7 @@ function questionSummary(question) {
 
 function clearTimeline() {
   state.textNodes.clear();
+  state.seenEvents.clear();
   els.timeline.innerHTML = `
     <div class="empty-state">
       <div class="empty-title">等待任务开始</div>

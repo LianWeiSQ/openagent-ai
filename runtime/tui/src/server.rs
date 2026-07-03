@@ -180,6 +180,237 @@ impl AppBridgeTerminalHandler {
             true,
         )])
     }
+
+    fn handle_mcp_command(&mut self, command: &str) -> Result<Vec<TimelineLine>, String> {
+        let rest = command
+            .strip_prefix("/mcp")
+            .map(str::trim)
+            .unwrap_or_default();
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        let action = parts.first().copied().unwrap_or("list");
+        let refresh =
+            matches!(action, "doctor" | "refresh") || parts.iter().any(|part| *part == "--refresh");
+        match action {
+            "" | "list" | "ls" | "doctor" | "refresh" => {
+                let payload = self.client.mcp_status(refresh)?;
+                Ok(mcp_status_lines(self.client.server_url(), &payload))
+            }
+            "show" | "debug" => {
+                let Some(name) = mcp_command_server_name(&parts, action) else {
+                    return Ok(vec![TimelineLine::new(
+                        "warning",
+                        format!("usage: /mcp {action} <server>"),
+                        true,
+                    )]);
+                };
+                let payload = self.client.mcp_status(refresh)?;
+                Ok(mcp_show_lines(self.client.server_url(), &name, &payload))
+            }
+            "test" => {
+                let Some(name) = mcp_command_server_name(&parts, action) else {
+                    return Ok(vec![TimelineLine::new(
+                        "warning",
+                        "usage: /mcp test <server>",
+                        true,
+                    )]);
+                };
+                let payload = self.client.mcp_server_test(&name)?;
+                Ok(mcp_status_lines(self.client.server_url(), &payload))
+            }
+            "start" | "stop" | "restart" => {
+                let Some(name) = mcp_command_server_name(&parts, action) else {
+                    return Ok(vec![TimelineLine::new(
+                        "warning",
+                        format!("usage: /mcp {action} <server>"),
+                        true,
+                    )]);
+                };
+                let payload = self.client.mcp_server_lifecycle(&name, action)?;
+                let mut lines = vec![TimelineLine::new(
+                    "status",
+                    format!("mcp {action} {name}"),
+                    true,
+                )];
+                lines.extend(mcp_status_lines(self.client.server_url(), &payload));
+                Ok(lines)
+            }
+            "enable" | "disable" => {
+                let Some(name) = mcp_command_server_name(&parts, action) else {
+                    return Ok(vec![TimelineLine::new(
+                        "warning",
+                        format!("usage: /mcp {action} <server>"),
+                        true,
+                    )]);
+                };
+                let payload = self
+                    .client
+                    .mcp_server_update(&name, json!({"enabled": action == "enable"}))?;
+                let mut lines = vec![TimelineLine::new(
+                    "status",
+                    format!("mcp {action} {name}"),
+                    true,
+                )];
+                lines.extend(mcp_status_lines(self.client.server_url(), &payload));
+                Ok(lines)
+            }
+            "help" => Ok(vec![TimelineLine::new(
+                "status",
+                "usage: /mcp [list|doctor|show <server>|test <server>|start <server>|stop <server>|restart <server>|enable <server>|disable <server>]",
+                true,
+            )]),
+            _ => Ok(vec![TimelineLine::new(
+                "warning",
+                format!("unknown MCP command: /mcp {action}"),
+                true,
+            )]),
+        }
+    }
+}
+
+fn mcp_command_server_name(parts: &[&str], action: &str) -> Option<String> {
+    parts
+        .iter()
+        .copied()
+        .skip(1)
+        .filter(|part| !part.starts_with("--"))
+        .find(|part| *part != action)
+        .map(ToString::to_string)
+}
+
+fn mcp_status_lines(server_url: &str, payload: &Value) -> Vec<TimelineLine> {
+    let servers = payload
+        .get("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if servers.is_empty() {
+        return vec![TimelineLine::new(
+            "status",
+            format!("mcp servers: none ({server_url})"),
+            false,
+        )];
+    }
+    let mut lines = vec![TimelineLine::new(
+        "status",
+        format!("mcp servers: {} ({server_url})", servers.len()),
+        true,
+    )];
+    lines.extend(
+        servers
+            .iter()
+            .map(|server| TimelineLine::new("mcp", mcp_server_summary(server), true)),
+    );
+    lines
+}
+
+fn mcp_show_lines(server_url: &str, name: &str, payload: &Value) -> Vec<TimelineLine> {
+    let server = payload
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| {
+            servers
+                .iter()
+                .find(|server| server.get("name").and_then(Value::as_str) == Some(name))
+        });
+    let Some(server) = server else {
+        return vec![TimelineLine::new(
+            "warning",
+            format!("mcp server not found: {name} ({server_url})"),
+            true,
+        )];
+    };
+    let mut lines = vec![TimelineLine::new(
+        "mcp",
+        format!("mcp server: {}", mcp_server_summary(server)),
+        true,
+    )];
+    let tools = server
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !tools.is_empty() {
+        lines.push(TimelineLine::new(
+            "mcp",
+            format!(
+                "tools: {}",
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .or_else(|| tool.get("title").and_then(Value::as_str))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            false,
+        ));
+    }
+    lines
+}
+
+fn mcp_server_summary(server: &Value) -> String {
+    format!(
+        "{} enabled={} status={} transport={} tools={} lifecycle={} pid={} endpoint={}",
+        server.get("name").and_then(Value::as_str).unwrap_or("mcp"),
+        if server
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "yes"
+        } else {
+            "no"
+        },
+        server.get("status").and_then(Value::as_str).unwrap_or("-"),
+        server
+            .get("selected_transport")
+            .and_then(Value::as_str)
+            .or_else(|| server.get("transport").and_then(Value::as_str))
+            .unwrap_or("-"),
+        server
+            .get("tool_count")
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        server
+            .get("lifecycle_status")
+            .and_then(Value::as_str)
+            .unwrap_or("-"),
+        server
+            .get("lifecycle_pid")
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        mcp_endpoint_label(server),
+    )
+}
+
+fn mcp_endpoint_label(server: &Value) -> String {
+    if let Some(command) = server
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        let args_count = server
+            .get("args_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if args_count == 0 {
+            command.to_string()
+        } else {
+            format!("{command} +{args_count}")
+        }
+    } else if server
+        .get("remote_url_configured")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "remote URL".to_string()
+    } else {
+        "-".to_string()
+    }
 }
 
 impl TerminalEventHandler for AppBridgeTerminalHandler {
@@ -557,6 +788,9 @@ impl TerminalEventHandler for AppBridgeTerminalHandler {
             let matches = fuzzy_find_files(&self.workspace, query, 20);
             return Ok(file_picker_lines(query, &matches));
         }
+        if command == "/mcp" || command.starts_with("/mcp ") {
+            return self.handle_mcp_command(command);
+        }
         if command == "/models" || command.starts_with("/models ") {
             let model_id = command.strip_prefix("/models ").map(str::trim);
             if let Some(model_id) = model_id.filter(|value| !value.is_empty()) {
@@ -626,7 +860,7 @@ impl TerminalEventHandler for AppBridgeTerminalHandler {
         }
         Ok(vec![TimelineLine::new(
             "status",
-            "commands: /sessions [query], /resume <id>, /transcript [limit], /rename <title>, /new, /fork, /children, /parent, /archive, /delete, /share, /unshare, /compact, /status, /files [query], /attach <path[:range]>, /models [id], /agents, /agent <id>, /variant <name>, /thinking <level>, /themes [name], /theme-scheme [system|light|dark|cycle], /config, /keybinds, /interrupt [turn_id], /allow, /deny, /answer, /dismiss, /exit",
+            "commands: /sessions [query], /resume <id>, /transcript [limit], /rename <title>, /new, /fork, /children, /parent, /archive, /delete, /share, /unshare, /compact, /status, /files [query], /attach <path[:range]>, /mcp [list|show|test|start|stop|restart|enable|disable], /models [id], /agents, /agent <id>, /variant <name>, /thinking <level>, /themes [name], /theme-scheme [system|light|dark|cycle], /config, /keybinds, /interrupt [turn_id], /allow, /deny, /answer, /dismiss, /exit",
             false,
         )])
     }

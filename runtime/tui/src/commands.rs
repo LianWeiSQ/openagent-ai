@@ -88,6 +88,10 @@ pub(crate) const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/usage", "show token and cost totals"),
     ("/warnings", "show aggregated runtime warnings"),
     ("/tool-details [on|off]", "toggle tool metadata details"),
+    (
+        "/mcp [list|show|doctor|test|start|stop|restart|enable|disable]",
+        "inspect and control App Bridge MCP servers",
+    ),
     ("/editor", "edit prompt in an external editor"),
     ("/stash <draft>", "stash a draft prompt"),
     ("/unstash", "restore the latest stashed prompt"),

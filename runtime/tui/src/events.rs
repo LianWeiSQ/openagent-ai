@@ -11,6 +11,11 @@ use crate::{
 };
 
 pub(crate) fn event_identity_key(event: &Value) -> String {
+    if let Some(event_id) = event.get("event_id").and_then(Value::as_str)
+        && !event_id.is_empty()
+    {
+        return format!("event_id:{event_id}");
+    }
     let method = event
         .get("method")
         .and_then(Value::as_str)
