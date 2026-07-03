@@ -1,9 +1,11 @@
 //! Session, trace, and observability crate for the Rust rewrite.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    env,
     fs::{self, OpenOptions},
-    io::Write,
+    hash::{DefaultHasher, Hash, Hasher},
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -29,6 +31,9 @@ const DEFAULT_MAX_EVENTS: u64 = 500;
 const DEFAULT_TRACE_MAX_EVENTS: u64 = 2000;
 const DEFAULT_INPUT_PREVIEW_CHARS: usize = 2048;
 const DEFAULT_FIELD_PREVIEW_CHARS: usize = 4096;
+const BENCHMARK_MODE_ENV: &str = "OPENAGENT_BENCHMARK_MODE";
+const CHECKPOINT_MAX_FILE_BYTES_ENV: &str = "OPENAGENT_CHECKPOINT_MAX_FILE_BYTES";
+const DEFAULT_BENCHMARK_CHECKPOINT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const SENSITIVE_KEY_MARKERS: &[&str] = &[
     "api_key",
     "apikey",
@@ -190,6 +195,10 @@ pub struct SessionStateRecord {
     pub status: SessionStatus,
     pub updated_at_ms: u64,
     pub messages: Vec<StoredMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages_v2: Vec<MessageWithParts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_source: Option<String>,
     pub todos: Vec<TodoItem>,
     pub metadata: BTreeMap<String, Value>,
 }
@@ -211,6 +220,56 @@ pub struct RunSummaryRecord {
     pub total_output_tokens: u64,
     pub total_cost: f64,
     pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CheckpointFileEntry {
+    pub path: String,
+    pub kind: String,
+    pub size_bytes: u64,
+    pub fingerprint: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SessionCheckpointRecord {
+    pub schema_version: String,
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub kind: String,
+    pub workspace: String,
+    pub timestamp_ms: u64,
+    pub message_id: Option<String>,
+    pub part_id: Option<String>,
+    pub step_index: Option<u64>,
+    pub file_count: u64,
+    pub total_bytes: u64,
+    pub files: Vec<CheckpointFileEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CheckpointDiffEntry {
+    pub path: String,
+    pub change: String,
+    pub before: Option<CheckpointFileEntry>,
+    pub after: Option<CheckpointFileEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CheckpointDiffRecord {
+    pub schema_version: String,
+    pub before_checkpoint_id: String,
+    pub after_checkpoint_id: String,
+    pub added: u64,
+    pub modified: u64,
+    pub deleted: u64,
+    pub entries: Vec<CheckpointDiffEntry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct SessionForkBoundary {
+    pub message_id: Option<String>,
+    pub part_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -436,10 +495,18 @@ impl FileSessionStore {
         let status = options.status;
         let step_index = options.step_index;
         let timestamp_ms = options.timestamp_ms.unwrap_or_else(now_ms);
+        let seq = next_seq(&parts_path)?;
+        let part_id = options.part_id.unwrap_or_else(|| {
+            let owner_id = message_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(run_id);
+            stable_part_id(owner_id, seq, part_type)
+        });
         let payload = SessionPartRecord {
             schema_version: "openagent.session_part.v1".to_string(),
-            part_id: options.part_id.unwrap_or_else(|| new_id("part")),
-            seq: next_seq(&parts_path)?,
+            part_id,
+            seq,
             part_type: part_type.to_string(),
             timestamp_ms,
             session_id: session_id.to_string(),
@@ -544,8 +611,12 @@ impl FileSessionStore {
         let info = MessageInfo {
             id: message_id.to_string(),
             session_id: session.id.clone(),
+            parent_message_id: parent_message_id_from_session(session, index),
+            seq: Some(index),
             role: message.role.clone(),
             created_at_ms: timestamp_ms,
+            updated_at_ms: Some(timestamp_ms),
+            completed_at_ms: Some(timestamp_ms),
             run_id: Some(run_id.to_string()),
             step_index: step_index_from_metadata(&metadata),
             status: MessageStatus::Completed,
@@ -598,8 +669,12 @@ impl FileSessionStore {
             let info = MessageInfo {
                 id: message_id.to_string(),
                 session_id: session.id.clone(),
+                parent_message_id: parent_message_id_from_session(session, index),
+                seq: Some(index),
                 role: Role::Tool,
                 created_at_ms: timestamp_ms,
+                updated_at_ms: Some(timestamp_ms),
+                completed_at_ms: Some(timestamp_ms),
                 run_id: Some(run_id.to_string()),
                 step_index: step_index_from_metadata(&message.metadata),
                 status: if message_tool_error(message).is_some() {
@@ -656,10 +731,15 @@ impl FileSessionStore {
     ) -> SessionResult<Vec<MessageWithParts>> {
         let mut messages = Vec::<MessageWithParts>::new();
         let mut index_by_id = BTreeMap::<String, usize>::new();
+        let mut removed_messages = BTreeSet::<String>::new();
+        let mut removed_parts = BTreeSet::<String>::new();
         for value in read_jsonl(&self.transcript_path(session_id))? {
             match value.get("schema_version").and_then(Value::as_str) {
                 Some("openagent.message.v2") => {
                     let record: StoredMessageV2 = serde_json::from_value(value)?;
+                    if removed_messages.contains(&record.info.id) {
+                        continue;
+                    }
                     index_by_id.insert(record.info.id.clone(), messages.len());
                     messages.push(MessageWithParts {
                         info: record.info,
@@ -668,16 +748,38 @@ impl FileSessionStore {
                 }
                 Some("openagent.message_part.v2") => {
                     let record: StoredMessagePartV2 = serde_json::from_value(value)?;
+                    if removed_messages.contains(&record.part.message_id)
+                        || removed_parts.contains(&record.part.id)
+                    {
+                        continue;
+                    }
                     if let Some(index) = index_by_id.get(&record.part.message_id).copied() {
                         messages[index].parts.push(record.part);
+                    }
+                }
+                Some("openagent.message_tombstone.v2") => {
+                    if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
+                        removed_messages.insert(message_id.to_string());
+                    }
+                }
+                Some("openagent.message_part_tombstone.v2") => {
+                    if let Some(part_id) = value.get("part_id").and_then(Value::as_str) {
+                        removed_parts.insert(part_id.to_string());
                     }
                 }
                 _ => {}
             }
         }
+        messages.retain(|message| !removed_messages.contains(&message.info.id));
         for message in &mut messages {
+            message
+                .parts
+                .retain(|part| !removed_parts.contains(&part.id));
             message.parts.sort_by_key(|part| part.seq);
         }
+        normalize_message_lineage(&mut messages);
+        apply_compaction_boundaries(&mut messages);
+        mark_incomplete_tool_parts_interrupted(&mut messages);
         Ok(messages)
     }
 
@@ -729,8 +831,12 @@ impl FileSessionStore {
             let info = MessageInfo {
                 id: message_id.clone(),
                 session_id: session_id.to_string(),
+                parent_message_id: None,
+                seq: Some(index),
                 role: message.role.clone(),
                 created_at_ms: timestamp_ms,
+                updated_at_ms: Some(timestamp_ms),
+                completed_at_ms: Some(timestamp_ms),
                 run_id: run_id.clone(),
                 step_index: step_index_from_metadata(&metadata),
                 status: if message.role == Role::Tool && message_tool_error(&message).is_some() {
@@ -866,6 +972,9 @@ impl FileSessionStore {
     }
 
     pub fn save_state(&self, session: &Session, run_id: Option<&str>) -> SessionResult<()> {
+        let messages_v2 = self
+            .list_messages_with_parts(&session.id, None, None)
+            .unwrap_or_default();
         let state = SessionStateRecord {
             schema_version: "openagent.session_state.v1".to_string(),
             session_id: session.id.clone(),
@@ -879,6 +988,8 @@ impl FileSessionStore {
                 .enumerate()
                 .map(|(index, message)| stored_message(message, index as u64))
                 .collect(),
+            messages_v2: messages_v2.clone(),
+            message_source: (!messages_v2.is_empty()).then(|| "transcript_v2".to_string()),
             todos: session.todos.clone(),
             metadata: session.metadata.clone(),
         };
@@ -892,24 +1003,29 @@ impl FileSessionStore {
             self.reconstruct_state_from_transcript(session_id)?
                 .ok_or_else(|| format!("Session state not found: {session_id}"))?
         };
-        let messages = state
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        serde_json::from_value::<ChatMessage>(item.clone())
-                            .ok()
-                            .or_else(|| {
-                                serde_json::from_value::<StoredMessage>(item.clone())
-                                    .ok()
-                                    .map(chat_message_from_stored)
-                            })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let projected_messages = self.list_messages_with_parts(session_id, None, None)?;
+        let messages = if projected_messages.is_empty() {
+            state
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            serde_json::from_value::<ChatMessage>(item.clone())
+                                .ok()
+                                .or_else(|| {
+                                    serde_json::from_value::<StoredMessage>(item.clone())
+                                        .ok()
+                                        .map(chat_message_from_stored)
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            message_parts_to_chat_messages(&projected_messages)
+        };
         let todos = state
             .get("todos")
             .and_then(Value::as_array)
@@ -953,6 +1069,509 @@ impl FileSessionStore {
             .into_iter()
             .map(|value| serde_json::from_value::<SessionPartRecord>(value).map_err(Into::into))
             .collect()
+    }
+
+    pub fn create_checkpoint(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        workspace: &Path,
+        kind: &str,
+        message_id: Option<&str>,
+        part_id: Option<&str>,
+        step_index: Option<u64>,
+    ) -> SessionResult<SessionCheckpointRecord> {
+        let seq = next_seq(&self.checkpoints_index_path(session_id))?;
+        let checkpoint_id = format!("ckpt_{}_{}", now_ms(), seq);
+        let checkpoint_dir = self.checkpoint_dir(session_id, &checkpoint_id);
+        let files_dir = self.checkpoint_files_dir(session_id, &checkpoint_id);
+        fs::create_dir_all(&files_dir)?;
+        let mut files = Vec::new();
+        snapshot_workspace(workspace, workspace, &files_dir, &mut files)?;
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        let total_bytes = files.iter().map(|file| file.size_bytes).sum();
+        let record = SessionCheckpointRecord {
+            schema_version: "openagent.checkpoint.v1".to_string(),
+            checkpoint_id: checkpoint_id.clone(),
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            kind: kind.to_string(),
+            workspace: workspace.to_string_lossy().to_string(),
+            timestamp_ms: now_ms(),
+            message_id: message_id.map(ToString::to_string),
+            part_id: part_id.map(ToString::to_string),
+            step_index,
+            file_count: files.len() as u64,
+            total_bytes,
+            files,
+        };
+        write_json(&checkpoint_dir.join("checkpoint.json"), &record)?;
+        append_jsonl(&self.checkpoints_index_path(session_id), &record)?;
+        append_jsonl(
+            &self.transcript_path(session_id),
+            &json!({
+                "schema_version": "openagent.checkpoint.v1",
+                "checkpoint": record,
+            }),
+        )?;
+        let _ = self.record_event(
+            session_id,
+            run_id,
+            "checkpoint.created",
+            SessionEventOptions {
+                kind: "checkpoint".to_string(),
+                attributes: BTreeMap::from([
+                    ("checkpoint_id".to_string(), json!(checkpoint_id)),
+                    ("checkpoint_kind".to_string(), json!(kind)),
+                    ("message_id".to_string(), json!(message_id)),
+                    ("part_id".to_string(), json!(part_id)),
+                    ("step".to_string(), json!(step_index)),
+                    ("file_count".to_string(), json!(record.file_count)),
+                    ("total_bytes".to_string(), json!(record.total_bytes)),
+                ]),
+                ..SessionEventOptions::default()
+            },
+        );
+        Ok(record)
+    }
+
+    pub fn load_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> SessionResult<SessionCheckpointRecord> {
+        let path = self
+            .checkpoint_dir(session_id, checkpoint_id)
+            .join("checkpoint.json");
+        let value = fs::read_to_string(&path)?;
+        serde_json::from_str::<SessionCheckpointRecord>(&value).map_err(Into::into)
+    }
+
+    pub fn diff_checkpoints(
+        &self,
+        session_id: &str,
+        before_checkpoint_id: &str,
+        after_checkpoint_id: &str,
+    ) -> SessionResult<CheckpointDiffRecord> {
+        let before = self.load_checkpoint(session_id, before_checkpoint_id)?;
+        let after = self.load_checkpoint(session_id, after_checkpoint_id)?;
+        Ok(diff_checkpoint_records(&before, &after))
+    }
+
+    pub fn restore_checkpoint(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        workspace: &Path,
+        checkpoint_id: &str,
+    ) -> SessionResult<SessionCheckpointRecord> {
+        let checkpoint = self.load_checkpoint(session_id, checkpoint_id)?;
+        restore_workspace_snapshot(
+            workspace,
+            &self.checkpoint_files_dir(session_id, checkpoint_id),
+            &checkpoint,
+        )?;
+        append_jsonl(
+            &self.transcript_path(session_id),
+            &json!({
+                "schema_version": "openagent.revert.v1",
+                "session_id": session_id,
+                "run_id": run_id,
+                "checkpoint_id": checkpoint_id,
+                "message_id": checkpoint.message_id,
+                "part_id": checkpoint.part_id,
+                "timestamp_ms": now_ms(),
+            }),
+        )?;
+        let _ = self.record_event(
+            session_id,
+            run_id,
+            "checkpoint.restored",
+            SessionEventOptions {
+                kind: "checkpoint".to_string(),
+                attributes: BTreeMap::from([
+                    ("checkpoint_id".to_string(), json!(checkpoint_id)),
+                    (
+                        "message_id".to_string(),
+                        json!(checkpoint.message_id.clone()),
+                    ),
+                    ("part_id".to_string(), json!(checkpoint.part_id.clone())),
+                ]),
+                ..SessionEventOptions::default()
+            },
+        );
+        Ok(checkpoint)
+    }
+
+    pub fn append_checkpoint_patch_part(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        message_id: &str,
+        before_checkpoint_id: &str,
+        after_checkpoint_id: &str,
+        step_index: Option<u64>,
+    ) -> SessionResult<Option<MessagePart>> {
+        let diff = self.diff_checkpoints(session_id, before_checkpoint_id, after_checkpoint_id)?;
+        if diff.entries.is_empty() {
+            return Ok(None);
+        }
+        let content = serde_json::to_value(&diff)?;
+        let part = self.append_part(
+            session_id,
+            run_id,
+            "patch",
+            SessionPartOptions {
+                message_id: Some(message_id.to_string()),
+                content: Some(content),
+                attributes: BTreeMap::from([
+                    (
+                        "before_checkpoint_id".to_string(),
+                        json!(before_checkpoint_id),
+                    ),
+                    (
+                        "after_checkpoint_id".to_string(),
+                        json!(after_checkpoint_id),
+                    ),
+                    ("added".to_string(), json!(diff.added)),
+                    ("modified".to_string(), json!(diff.modified)),
+                    ("deleted".to_string(), json!(diff.deleted)),
+                ]),
+                step_index,
+                status: "completed".to_string(),
+                ..SessionPartOptions::default()
+            },
+        )?;
+        let _ = self.record_event(
+            session_id,
+            run_id,
+            "patch.detected",
+            SessionEventOptions {
+                kind: "patch".to_string(),
+                attributes: BTreeMap::from([
+                    ("part_id".to_string(), json!(part.part_id.clone())),
+                    ("message_id".to_string(), json!(message_id)),
+                    (
+                        "before_checkpoint_id".to_string(),
+                        json!(before_checkpoint_id),
+                    ),
+                    (
+                        "after_checkpoint_id".to_string(),
+                        json!(after_checkpoint_id),
+                    ),
+                    ("change_count".to_string(), json!(diff.entries.len() as u64)),
+                ]),
+                ..SessionEventOptions::default()
+            },
+        );
+        Ok(self
+            .get_message_with_parts(session_id, message_id)?
+            .and_then(|message| {
+                message
+                    .parts
+                    .into_iter()
+                    .find(|item| item.id == part.part_id)
+            }))
+    }
+
+    pub fn append_compaction_boundary(
+        &self,
+        session: &mut Session,
+        run_id: &str,
+        summary: &str,
+        compacted_until_message_id: &str,
+    ) -> SessionResult<String> {
+        let message_id = format!("msg_compaction_{}", now_ms());
+        let index = session.messages.len() as u64;
+        let mut metadata = BTreeMap::from([
+            ("message_id".to_string(), json!(message_id.clone())),
+            (
+                "compacted_until_message_id".to_string(),
+                json!(compacted_until_message_id),
+            ),
+        ]);
+        metadata.insert("kind".to_string(), json!("compaction_boundary"));
+        let info = MessageInfo {
+            id: message_id.clone(),
+            session_id: session.id.clone(),
+            parent_message_id: parent_message_id_from_session(session, index),
+            seq: Some(index),
+            role: Role::System,
+            created_at_ms: now_ms(),
+            updated_at_ms: Some(now_ms()),
+            completed_at_ms: Some(now_ms()),
+            run_id: Some(run_id.to_string()),
+            step_index: None,
+            status: MessageStatus::Completed,
+            metadata,
+        };
+        append_jsonl(
+            &self.transcript_path(&session.id),
+            &StoredMessageV2 {
+                schema_version: "openagent.message.v2".to_string(),
+                index,
+                info,
+            },
+        )?;
+        self.append_message_part_v2(
+            &session.id,
+            MessagePart {
+                id: stable_part_id(&message_id, 1, "text"),
+                message_id: message_id.clone(),
+                session_id: session.id.clone(),
+                seq: 1,
+                kind: MessagePartKind::Text,
+                status: MessageStatus::Completed,
+                content: json!(summary),
+                attributes: BTreeMap::from([("role".to_string(), json!("system"))]),
+                timestamp_ms: now_ms(),
+                run_id: Some(run_id.to_string()),
+                step_index: None,
+            },
+        )?;
+        self.append_message_part_v2(
+            &session.id,
+            MessagePart {
+                id: stable_part_id(&message_id, 2, "compaction"),
+                message_id: message_id.clone(),
+                session_id: session.id.clone(),
+                seq: 2,
+                kind: MessagePartKind::Compaction,
+                status: MessageStatus::Completed,
+                content: json!({
+                    "summary": summary,
+                    "compacted_until_message_id": compacted_until_message_id,
+                }),
+                attributes: BTreeMap::from([(
+                    "compacted_until_message_id".to_string(),
+                    json!(compacted_until_message_id),
+                )]),
+                timestamp_ms: now_ms(),
+                run_id: Some(run_id.to_string()),
+                step_index: None,
+            },
+        )?;
+        session.add(ChatMessage {
+            role: Role::System,
+            content: summary.to_string(),
+            name: None,
+            tool_call_id: None,
+            metadata: BTreeMap::from([
+                ("message_id".to_string(), json!(message_id.clone())),
+                ("kind".to_string(), json!("compaction_boundary")),
+                (
+                    "compacted_until_message_id".to_string(),
+                    json!(compacted_until_message_id),
+                ),
+            ]),
+        });
+        let _ = self.record_event(
+            &session.id,
+            run_id,
+            "compaction.boundary",
+            SessionEventOptions {
+                kind: "compaction".to_string(),
+                attributes: BTreeMap::from([
+                    ("message_id".to_string(), json!(message_id.clone())),
+                    (
+                        "compacted_until_message_id".to_string(),
+                        json!(compacted_until_message_id),
+                    ),
+                    ("summary_chars".to_string(), json!(summary.chars().count())),
+                ]),
+                ..SessionEventOptions::default()
+            },
+        );
+        Ok(message_id)
+    }
+
+    pub fn truncate_messages_after(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        boundary: SessionForkBoundary,
+    ) -> SessionResult<()> {
+        let messages = self.load_v2_messages_from_transcript(session_id)?;
+        let Some(boundary_message_id) = boundary.message_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(boundary_index) = messages
+            .iter()
+            .position(|message| message.info.id == boundary_message_id)
+        else {
+            return Ok(());
+        };
+        if let Some(part_id) = boundary.part_id.as_deref() {
+            if let Some(part_index) = messages[boundary_index]
+                .parts
+                .iter()
+                .position(|part| part.id == part_id)
+            {
+                for part in messages[boundary_index].parts.iter().skip(part_index + 1) {
+                    self.append_part_tombstone(
+                        session_id,
+                        run_id,
+                        &part.message_id,
+                        Some(&part.id),
+                    )?;
+                }
+            }
+        }
+        for message in messages.iter().skip(boundary_index + 1) {
+            self.append_message_tombstone(session_id, run_id, &message.info.id)?;
+        }
+        Ok(())
+    }
+
+    pub fn fork_session(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        workspace: impl Into<PathBuf>,
+        boundary: Option<SessionForkBoundary>,
+    ) -> SessionResult<Session> {
+        let workspace = workspace.into();
+        let source = self.load_session(source_session_id)?;
+        let mut messages = self.list_messages_with_parts(source_session_id, None, None)?;
+        if let Some(boundary) = boundary
+            && let Some(message_id) = boundary.message_id.as_deref()
+            && let Some(index) = messages
+                .iter()
+                .position(|message| message.info.id == message_id)
+        {
+            messages.truncate(index + 1);
+            if let Some(part_id) = boundary.part_id.as_deref()
+                && let Some(message) = messages.last_mut()
+                && let Some(part_index) = message.parts.iter().position(|part| part.id == part_id)
+            {
+                message.parts.truncate(part_index + 1);
+            }
+        }
+        let mut remapped = Vec::new();
+        for (message_index, mut message) in messages.into_iter().enumerate() {
+            let old_message_id = message.info.id.clone();
+            let new_message_id = format!("msg_{}_{}", target_session_id, message_index);
+            message.info.id = new_message_id.clone();
+            message.info.session_id = target_session_id.to_string();
+            message
+                .info
+                .metadata
+                .insert("message_id".to_string(), json!(new_message_id.clone()));
+            message
+                .info
+                .metadata
+                .insert("forked_from_message_id".to_string(), json!(old_message_id));
+            for (part_index, part) in message.parts.iter_mut().enumerate() {
+                part.id = format!(
+                    "prt_{}_{}_{}",
+                    target_session_id,
+                    message_index,
+                    part_index + 1
+                );
+                part.message_id = new_message_id.clone();
+                part.session_id = target_session_id.to_string();
+                part.seq = part_index as u64 + 1;
+            }
+            remapped.push(message);
+        }
+        fs::create_dir_all(self.session_dir(target_session_id))?;
+        write_json(
+            &self.session_json_path(target_session_id),
+            &json!({
+                "schema_version": "openagent.session.v1",
+                "session_id": target_session_id,
+                "workspace": workspace.to_string_lossy().to_string(),
+                "status": "idle",
+                "created_at_ms": now_ms(),
+                "updated_at_ms": now_ms(),
+                "forked_from": source_session_id,
+            }),
+        )?;
+        for (index, message) in remapped.iter().enumerate() {
+            append_jsonl(
+                &self.transcript_path(target_session_id),
+                &StoredMessageV2 {
+                    schema_version: "openagent.message.v2".to_string(),
+                    index: index as u64,
+                    info: message.info.clone(),
+                },
+            )?;
+            for part in &message.parts {
+                self.append_message_part_v2(target_session_id, part.clone())?;
+            }
+        }
+        let mut session = Session::new(target_session_id.to_string(), workspace);
+        session.todos = source.todos;
+        session.metadata = source.metadata;
+        session
+            .metadata
+            .insert("forked_from".to_string(), json!(source_session_id));
+        session.messages = message_parts_to_chat_messages(&remapped);
+        self.save_state(&session, None)?;
+        Ok(session)
+    }
+
+    fn append_message_tombstone(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        message_id: &str,
+    ) -> SessionResult<()> {
+        append_jsonl(
+            &self.transcript_path(session_id),
+            &json!({
+                "schema_version": "openagent.message_tombstone.v2",
+                "session_id": session_id,
+                "run_id": run_id,
+                "message_id": message_id,
+                "timestamp_ms": now_ms(),
+            }),
+        )?;
+        let _ = self.record_event(
+            session_id,
+            run_id,
+            "message.removed",
+            SessionEventOptions {
+                kind: "message".to_string(),
+                attributes: BTreeMap::from([("message_id".to_string(), json!(message_id))]),
+                ..SessionEventOptions::default()
+            },
+        );
+        Ok(())
+    }
+
+    fn append_part_tombstone(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        message_id: &str,
+        part_id: Option<&str>,
+    ) -> SessionResult<()> {
+        append_jsonl(
+            &self.transcript_path(session_id),
+            &json!({
+                "schema_version": "openagent.message_part_tombstone.v2",
+                "session_id": session_id,
+                "run_id": run_id,
+                "message_id": message_id,
+                "part_id": part_id,
+                "timestamp_ms": now_ms(),
+            }),
+        )?;
+        let _ = self.record_event(
+            session_id,
+            run_id,
+            "message_part.removed",
+            SessionEventOptions {
+                kind: "message".to_string(),
+                attributes: BTreeMap::from([
+                    ("message_id".to_string(), json!(message_id)),
+                    ("part_id".to_string(), json!(part_id)),
+                ]),
+                ..SessionEventOptions::default()
+            },
+        );
+        Ok(())
     }
 
     pub fn write_run_summary(
@@ -1125,6 +1744,22 @@ impl FileSessionStore {
 
     fn summary_path(&self, session_id: &str, run_id: &str) -> PathBuf {
         self.run_dir(session_id, run_id).join("summary.json")
+    }
+
+    fn checkpoints_dir(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("checkpoints")
+    }
+
+    fn checkpoint_dir(&self, session_id: &str, checkpoint_id: &str) -> PathBuf {
+        self.checkpoints_dir(session_id).join(checkpoint_id)
+    }
+
+    fn checkpoint_files_dir(&self, session_id: &str, checkpoint_id: &str) -> PathBuf {
+        self.checkpoint_dir(session_id, checkpoint_id).join("files")
+    }
+
+    fn checkpoints_index_path(&self, session_id: &str) -> PathBuf {
+        self.checkpoints_dir(session_id).join("index.jsonl")
     }
 
     fn index_path(&self) -> PathBuf {
@@ -2405,6 +3040,14 @@ fn message_id(message: &ChatMessage, index: u64) -> String {
         .unwrap_or_else(|| stable_message_id(index))
 }
 
+fn parent_message_id_from_session(session: &Session, index: u64) -> Option<String> {
+    let parent_index = index.checked_sub(1)?;
+    session
+        .messages
+        .get(parent_index as usize)
+        .map(|message| message_id(message, parent_index))
+}
+
 fn stable_message_id(index: u64) -> String {
     format!("msg_{index}")
 }
@@ -2569,6 +3212,363 @@ fn tool_call_id_from_part(part: &MessagePart) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| part.attributes.get("call_id").and_then(Value::as_str))
         .map(ToString::to_string)
+}
+
+fn snapshot_workspace(
+    root: &Path,
+    current: &Path,
+    files_dir: &Path,
+    files: &mut Vec<CheckpointFileEntry>,
+) -> SessionResult<()> {
+    if !current.exists() {
+        return Ok(());
+    }
+    let max_file_bytes = checkpoint_max_file_bytes();
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if should_skip_snapshot_entry(&file_name.to_string_lossy()) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            snapshot_workspace(root, &path, files_dir, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        if max_file_bytes.is_some_and(|max| metadata.len() > max) {
+            continue;
+        }
+        let Some(relative) = relative_snapshot_path(root, &path) else {
+            continue;
+        };
+        let Some(target) = safe_snapshot_join(files_dir, &relative) else {
+            continue;
+        };
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&path, &target)?;
+        files.push(CheckpointFileEntry {
+            path: relative,
+            kind: "file".to_string(),
+            size_bytes: metadata.len(),
+            fingerprint: fingerprint_file(&path)?,
+        });
+    }
+    Ok(())
+}
+
+fn checkpoint_max_file_bytes() -> Option<u64> {
+    env::var(CHECKPOINT_MAX_FILE_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            env::var(BENCHMARK_MODE_ENV).ok().and_then(|value| {
+                if matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "terminal-bench" | "terminal_bench" | "terminalbench"
+                ) {
+                    Some(DEFAULT_BENCHMARK_CHECKPOINT_MAX_FILE_BYTES)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn restore_workspace_snapshot(
+    workspace: &Path,
+    files_dir: &Path,
+    checkpoint: &SessionCheckpointRecord,
+) -> SessionResult<()> {
+    fs::create_dir_all(workspace)?;
+    let wanted = checkpoint
+        .files
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    for path in collect_workspace_files(workspace)? {
+        let Some(relative) = relative_snapshot_path(workspace, &path) else {
+            continue;
+        };
+        if !wanted.contains(&relative) {
+            fs::remove_file(path)?;
+        }
+    }
+    for entry in &checkpoint.files {
+        let Some(source) = safe_snapshot_join(files_dir, &entry.path) else {
+            continue;
+        };
+        let Some(target) = safe_snapshot_join(workspace, &entry.path) else {
+            continue;
+        };
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, target)?;
+    }
+    Ok(())
+}
+
+fn collect_workspace_files(root: &Path) -> SessionResult<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_workspace_files_inner(root, root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_workspace_files_inner(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<PathBuf>,
+) -> SessionResult<()> {
+    if !current.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if should_skip_snapshot_entry(&file_name.to_string_lossy()) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_workspace_files_inner(root, &path, files)?;
+        } else if metadata.is_file() && relative_snapshot_path(root, &path).is_some() {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_snapshot_entry(name: &str) -> bool {
+    matches!(name, ".openagent" | ".git" | "target" | "node_modules")
+}
+
+fn relative_snapshot_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(value) = component else {
+            return None;
+        };
+        parts.push(value.to_string_lossy().to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn safe_snapshot_join(root: &Path, relative: &str) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let std::path::Component::Normal(value) = component else {
+            return None;
+        };
+        path.push(value);
+    }
+    Some(path)
+}
+
+fn fingerprint_file(path: &Path) -> SessionResult<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = DefaultHasher::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        buffer[..read].hash(&mut hasher);
+    }
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn diff_checkpoint_records(
+    before: &SessionCheckpointRecord,
+    after: &SessionCheckpointRecord,
+) -> CheckpointDiffRecord {
+    let before_by_path = before
+        .files
+        .iter()
+        .cloned()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let after_by_path = after
+        .files
+        .iter()
+        .cloned()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let paths = before_by_path
+        .keys()
+        .chain(after_by_path.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+    let mut added = 0;
+    let mut modified = 0;
+    let mut deleted = 0;
+    for path in paths {
+        match (before_by_path.get(&path), after_by_path.get(&path)) {
+            (None, Some(after)) => {
+                added += 1;
+                entries.push(CheckpointDiffEntry {
+                    path,
+                    change: "added".to_string(),
+                    before: None,
+                    after: Some(after.clone()),
+                });
+            }
+            (Some(before), None) => {
+                deleted += 1;
+                entries.push(CheckpointDiffEntry {
+                    path,
+                    change: "deleted".to_string(),
+                    before: Some(before.clone()),
+                    after: None,
+                });
+            }
+            (Some(before), Some(after)) if before.fingerprint != after.fingerprint => {
+                modified += 1;
+                entries.push(CheckpointDiffEntry {
+                    path,
+                    change: "modified".to_string(),
+                    before: Some(before.clone()),
+                    after: Some(after.clone()),
+                });
+            }
+            _ => {}
+        }
+    }
+    CheckpointDiffRecord {
+        schema_version: "openagent.checkpoint_diff.v1".to_string(),
+        before_checkpoint_id: before.checkpoint_id.clone(),
+        after_checkpoint_id: after.checkpoint_id.clone(),
+        added,
+        modified,
+        deleted,
+        entries,
+    }
+}
+
+fn normalize_message_lineage(messages: &mut [MessageWithParts]) {
+    let mut previous_id = None::<String>;
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.info.seq.is_none() {
+            message.info.seq = Some(index as u64);
+        }
+        if message.info.parent_message_id.is_none() {
+            message.info.parent_message_id = previous_id.clone();
+        }
+        if message.info.updated_at_ms.is_none() {
+            message.info.updated_at_ms = Some(message.info.created_at_ms);
+        }
+        if message.info.completed_at_ms.is_none()
+            && matches!(
+                message.info.status,
+                MessageStatus::Completed | MessageStatus::Error | MessageStatus::Interrupted
+            )
+        {
+            message.info.completed_at_ms = Some(message.info.created_at_ms);
+        }
+        previous_id = Some(message.info.id.clone());
+    }
+}
+
+fn apply_compaction_boundaries(messages: &mut Vec<MessageWithParts>) {
+    let Some((boundary_index, compacted_until)) =
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                let part = message
+                    .parts
+                    .iter()
+                    .find(|part| part.kind == MessagePartKind::Compaction)?;
+                let compacted_until = part
+                    .content
+                    .get("compacted_until_message_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        part.attributes
+                            .get("compacted_until_message_id")
+                            .and_then(Value::as_str)
+                    })
+                    .map(ToString::to_string);
+                Some((index, compacted_until))
+            })
+    else {
+        return;
+    };
+    let cutoff_index = compacted_until
+        .as_deref()
+        .and_then(|message_id| {
+            messages
+                .iter()
+                .position(|message| message.info.id == message_id)
+        })
+        .unwrap_or_else(|| boundary_index.saturating_sub(1));
+    if cutoff_index < messages.len() {
+        *messages = messages.split_off(cutoff_index + 1);
+    }
+}
+
+fn mark_incomplete_tool_parts_interrupted(messages: &mut [MessageWithParts]) {
+    for message in messages {
+        let finished_call_ids = message
+            .parts
+            .iter()
+            .filter(|part| {
+                part.kind == MessagePartKind::Tool
+                    && matches!(part.status, MessageStatus::Completed | MessageStatus::Error)
+            })
+            .filter_map(tool_call_id_from_part)
+            .collect::<BTreeSet<_>>();
+        let pending_interaction_call_ids = message
+            .parts
+            .iter()
+            .filter(|part| {
+                matches!(
+                    part.kind,
+                    MessagePartKind::Approval | MessagePartKind::Question
+                ) && matches!(part.status, MessageStatus::Pending | MessageStatus::Running)
+            })
+            .filter_map(tool_call_id_from_part)
+            .collect::<BTreeSet<_>>();
+        for part in &mut message.parts {
+            if part.kind != MessagePartKind::Tool {
+                continue;
+            }
+            if !matches!(part.status, MessageStatus::Pending | MessageStatus::Running) {
+                continue;
+            }
+            let call_is_finished = tool_call_id_from_part(part)
+                .as_ref()
+                .is_some_and(|call_id| finished_call_ids.contains(call_id));
+            let call_is_waiting_for_interaction = tool_call_id_from_part(part)
+                .as_ref()
+                .is_some_and(|call_id| pending_interaction_call_ids.contains(call_id));
+            if call_is_waiting_for_interaction {
+                continue;
+            }
+            if !call_is_finished {
+                part.status = MessageStatus::Interrupted;
+                part.attributes
+                    .entry("interrupted".to_string())
+                    .or_insert_with(|| json!(true));
+            }
+        }
+    }
 }
 
 fn message_tool_error(message: &ChatMessage) -> Option<String> {

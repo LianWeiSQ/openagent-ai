@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, error::Error, fs, path::PathBuf};
 
 use openagent_mcp::{
-    McpConfig, McpTransport, RemoteMcpManager, RemoteMcpToolCallResult, bridge_tool_output,
-    build_tool_descriptors_from_values, dynamic_tool_name, load_mcp_config,
+    McpConfig, McpServerType, McpTransport, RemoteMcpManager, RemoteMcpToolCallResult,
+    bridge_tool_output, build_tool_descriptors_from_values, dynamic_tool_name, load_mcp_config,
     load_mcp_config_from_sources, load_mcp_config_from_value, mcp_tool_definition,
     normalize_tool_call_result, sanitize_mcp_observation_value, sanitize_mcp_trace_value,
     timeout_seconds, tool_allowed, transport_candidates, unavailable_tool_result,
@@ -171,6 +171,74 @@ fn load_mcp_config_rejects_empty_or_invalid_sources() {
             .unwrap_or_else(|| "missing error".to_string()),
         "MCP config JSON must be an object."
     );
+}
+
+#[test]
+fn load_mcp_config_accepts_stdio_and_opencode_shapes() -> Result<(), Box<dyn Error>> {
+    let arbor_style = json!({
+        "mcpServers": {
+            "arbor-review": {
+                "command": "uvx",
+                "args": ["--from", "arbor-agent", "arbor-mcp-server"],
+                "cwd": "tools",
+                "env": {"ARBOR_TOKEN": "secret"},
+                "timeout": 10_000,
+            },
+        },
+    });
+    let parsed = load_mcp_config_from_value(&arbor_style)?;
+    let arbor = parsed.servers.first().ok_or("missing arbor server")?;
+    assert_eq!(arbor.name, "arbor-review");
+    assert_eq!(arbor.server_type, McpServerType::Local);
+    assert_eq!(arbor.transport, McpTransport::Stdio);
+    assert_eq!(
+        arbor.command,
+        ["uvx", "--from", "arbor-agent", "arbor-mcp-server"]
+    );
+    assert_eq!(arbor.cwd.as_deref(), Some("tools"));
+    assert_eq!(
+        arbor.environment.get("ARBOR_TOKEN").map(String::as_str),
+        Some("secret")
+    );
+    assert_eq!(arbor.timeout_ms, 10_000);
+
+    let opencode_style = json!({
+        "mcp": {
+            "timeout": 5_000,
+            "servers": {
+                "local": {
+                    "type": "local",
+                    "command": ["node", "./mcp/server.js"],
+                    "environment": {"API_KEY": "secret"},
+                    "disabled": false,
+                },
+                "remote": {
+                    "type": "remote",
+                    "url": "https://mcp.example.test/mcp",
+                    "disabled": true,
+                },
+            },
+        },
+    });
+    let parsed = load_mcp_config_from_value(&opencode_style)?;
+    let local = parsed
+        .servers
+        .iter()
+        .find(|server| server.name == "local")
+        .ok_or("missing local server")?;
+    assert_eq!(local.server_type, McpServerType::Local);
+    assert_eq!(local.command, ["node", "./mcp/server.js"]);
+    assert_eq!(local.timeout_ms, 5_000);
+    assert!(local.enabled);
+    let remote = parsed
+        .servers
+        .iter()
+        .find(|server| server.name == "remote")
+        .ok_or("missing remote server")?;
+    assert_eq!(remote.server_type, McpServerType::Remote);
+    assert!(!remote.enabled);
+    assert_eq!(remote.timeout_ms, 5_000);
+    Ok(())
 }
 
 fn read_fixture() -> Result<Value, Box<dyn Error>> {

@@ -143,8 +143,16 @@ impl MessagePartKind {
 pub struct MessageInfo {
     pub id: String,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     pub role: Role,
     pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
     pub run_id: Option<String>,
     pub step_index: Option<u64>,
     pub status: MessageStatus,
@@ -983,7 +991,14 @@ pub fn build_compaction_record(
 
 fn readonly_tools() -> impl Iterator<Item = &'static str> {
     [
-        "read", "glob", "grep", "ls", "skill", "todoread", "question",
+        "read",
+        "glob",
+        "grep",
+        "ls",
+        "skill",
+        "web_fetch",
+        "todoread",
+        "question",
     ]
     .into_iter()
 }
@@ -995,6 +1010,7 @@ fn plan_only_tools() -> impl Iterator<Item = &'static str> {
         "grep",
         "ls",
         "skill",
+        "web_fetch",
         "todoread",
         "todowrite",
         "question",
