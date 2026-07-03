@@ -2051,6 +2051,75 @@ fn app_bridge_terminal_keyflow_smoke_uses_real_remote_handler() -> Result<(), Bo
 }
 
 #[test]
+fn app_bridge_terminal_mcp_lifecycle_controls_remote_bridge() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeAppBridge::start()?;
+    let workspace = temp_test_dir("openagent-tui-bridge-mcp")?;
+    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+        server_url: bridge.server_url.clone(),
+        auth: RemoteAuth::bearer("secret"),
+        workspace: workspace.clone(),
+        ..AppBridgeTerminalOptions::default()
+    })
+    .map_err(std::io::Error::other)?;
+    let mut state = TuiState::new();
+
+    send_key_text("/mcp", &mut state, &mut handler)?;
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+    let text = timeline_text(&state);
+    assert!(text.contains("local-tools enabled=no"));
+    assert!(text.contains("lifecycle=stopped"));
+
+    send_key_text("/mcp start local-tools", &mut state, &mut handler)?;
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+    let text = timeline_text(&state);
+    assert!(text.contains("mcp start local-tools"));
+    assert!(text.contains("lifecycle=running"));
+    assert!(text.contains("pid=4242"));
+
+    send_key_text("/mcp enable local-tools", &mut state, &mut handler)?;
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+    let text = timeline_text(&state);
+    assert!(text.contains("local-tools enabled=yes"));
+    assert!(text.contains("lifecycle=running"));
+
+    send_key_text("/mcp test local-tools", &mut state, &mut handler)?;
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+    let text = timeline_text(&state);
+    assert!(text.contains("tools=1"));
+    assert!(text.contains("endpoint=python3 +1"));
+
+    send_key_text("/mcp show local-tools", &mut state, &mut handler)?;
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+    let text = timeline_text(&state);
+    assert!(text.contains("mcp server: local-tools"));
+    assert!(text.contains("tools: stdio_echo"));
+
+    send_key_text("/mcp stop local-tools", &mut state, &mut handler)?;
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+    let text = timeline_text(&state);
+    assert!(text.contains("mcp stop local-tools"));
+    assert!(text.contains("lifecycle=stopped"));
+
+    let recorded = bridge.requests();
+    for expected in [
+        "GET /api/mcp",
+        "POST /api/mcp/servers/local-tools/start",
+        "PATCH /api/mcp/servers/local-tools",
+        "POST /api/mcp/servers/local-tools/test",
+        "POST /api/mcp/servers/local-tools/stop",
+    ] {
+        assert!(
+            recorded.iter().any(|request| request == expected),
+            "missing request {expected}, got {recorded:?}"
+        );
+    }
+
+    bridge.stop();
+    let _ = fs::remove_dir_all(workspace);
+    Ok(())
+}
+
+#[test]
 fn app_bridge_terminal_transcript_reads_real_session_messages() -> Result<(), Box<dyn Error>> {
     let bridge = FakeAppBridge::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-transcript")?;
@@ -2964,6 +3033,15 @@ fn temp_test_dir(prefix: &str) -> Result<PathBuf, Box<dyn Error>> {
     Ok(path)
 }
 
+fn timeline_text(state: &TuiState) -> String {
+    state
+        .timeline
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Default)]
 struct FakeBridgeState {
     requests: Vec<String>,
@@ -2975,6 +3053,9 @@ struct FakeBridgeState {
     variant_update_payloads: Vec<Value>,
     thinking_update_payloads: Vec<Value>,
     session_update_payloads: Vec<Value>,
+    mcp_enabled: bool,
+    mcp_running: bool,
+    mcp_pid: u64,
 }
 
 struct FakeAppBridge {
@@ -3101,6 +3182,60 @@ fn handle_fake_bridge_connection(
         ("GET", "/api/health") => write_json(&mut stream, json!({"ok": true})),
         ("GET", "/api/models") => write_json(&mut stream, fake_models_payload()),
         ("GET", "/api/agents") => write_json(&mut stream, fake_agents_payload()),
+        ("GET", "/api/mcp") | ("GET", "/api/mcp?refresh=true") => {
+            let payload = {
+                let state = state.lock().expect("bridge state");
+                fake_mcp_payload(&state)
+            };
+            write_json(&mut stream, payload)
+        }
+        ("POST", "/api/mcp/servers/local-tools/start") => {
+            let payload = {
+                let mut state = state.lock().expect("bridge state");
+                state.mcp_running = true;
+                if state.mcp_pid == 0 {
+                    state.mcp_pid = 4242;
+                }
+                fake_mcp_payload(&state)
+            };
+            write_json(&mut stream, payload)
+        }
+        ("POST", "/api/mcp/servers/local-tools/stop") => {
+            let payload = {
+                let mut state = state.lock().expect("bridge state");
+                state.mcp_running = false;
+                fake_mcp_payload(&state)
+            };
+            write_json(&mut stream, payload)
+        }
+        ("POST", "/api/mcp/servers/local-tools/restart") => {
+            let payload = {
+                let mut state = state.lock().expect("bridge state");
+                state.mcp_running = true;
+                state.mcp_pid = state.mcp_pid.saturating_add(1).max(4243);
+                fake_mcp_payload(&state)
+            };
+            write_json(&mut stream, payload)
+        }
+        ("POST", "/api/mcp/servers/local-tools/test") => {
+            let payload = {
+                let state = state.lock().expect("bridge state");
+                fake_mcp_payload(&state)
+            };
+            write_json(&mut stream, payload)
+        }
+        ("PATCH", "/api/mcp/servers/local-tools") => {
+            let payload = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({}));
+            let payload = {
+                let mut state = state.lock().expect("bridge state");
+                state.mcp_enabled = payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(state.mcp_enabled);
+                fake_mcp_payload(&state)
+            };
+            write_json(&mut stream, payload)
+        }
         ("GET", "/api/sessions") => write_json(&mut stream, json!({"sessions": []})),
         ("GET", "/api/sessions?query=smoke") => {
             write_json(&mut stream, fake_session_search_payload())
@@ -3408,6 +3543,47 @@ fn fake_models_payload() -> Value {
         ],
         "variants": ["default", "deep"],
         "thinking": ["low", "high"]
+    })
+}
+
+fn fake_mcp_payload(state: &FakeBridgeState) -> Value {
+    let lifecycle_status = if state.mcp_running {
+        "running"
+    } else {
+        "stopped"
+    };
+    let lifecycle_pid = if state.mcp_running && state.mcp_pid > 0 {
+        json!(state.mcp_pid)
+    } else {
+        Value::Null
+    };
+    let tool_count = if state.mcp_running { 1 } else { 0 };
+    json!({
+        "status": "ok",
+        "servers": [{
+            "name": "local-tools",
+            "enabled": state.mcp_enabled,
+            "type": "local",
+            "transport": "stdio",
+            "selected_transport": "stdio",
+            "command": "python3",
+            "args_count": 1,
+            "status": if state.mcp_running { "connected" } else { "configured" },
+            "tool_count": tool_count,
+            "tools": if state.mcp_running {
+                json!([{
+                    "name": "stdio_echo",
+                    "title": "Stdio Echo",
+                    "description": "Echo text"
+                }])
+            } else {
+                json!([])
+            },
+            "lifecycle_status": lifecycle_status,
+            "lifecycle_pid": lifecycle_pid,
+            "lifecycle_tool_count": tool_count,
+            "remote_url_configured": false
+        }]
     })
 }
 
