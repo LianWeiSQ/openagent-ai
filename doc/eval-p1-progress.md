@@ -20,6 +20,7 @@ Build a generic eval regression layer on top of the P0 Agent Run Trace. P1 stays
 - 2026-06-09: Added trace-backed scoring rules: `require_trace_check`, `required_trace_events`, `forbidden_trace_events`, `required_tool_sources`, `max_model_calls`, `max_tool_calls`, `max_duration_ms`, `max_total_latency_ms`, and existing `max_cost`.
 - 2026-06-09: Added baseline regression output through `baseline_report=...`, writing `regression.json` and `regression.md`.
 - 2026-06-09: Updated replay summary to read both old observability events (`name`) and P0 trace events (`event`).
+- 2026-06-30: Hardened the Harbor Terminal-Bench 2.0 path after P0 wiring: added offline adapter tests, broader OpenAgent JSON event usage parsing, Langfuse/trace env passthrough, 1/5/10 task Harbor job configs, and a Harbor job summarizer that emits `summary.json` and `summary.md`.
 
 ## Remaining Later Work
 

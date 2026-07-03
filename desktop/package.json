@@ -1,0 +1,35 @@
+{
+  "name": "openagent-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "smoke:streaming": "node scripts/smoke-real-streaming.mjs",
+    "smoke:streaming:sub2api": "node scripts/smoke-real-streaming.mjs --provider=real --model=gpt-5.4-mini",
+    "smoke:local-mcp-ui": "node scripts/smoke-local-mcp-ui.mjs",
+    "smoke:packaged-app": "node scripts/smoke-packaged-app.mjs",
+    "smoke:packaged-app:launchservices": "node scripts/smoke-packaged-app.mjs --launch=launchservices --screenshot=/tmp/openagent-launchservices-smoke.png",
+    "smoke:packaged-app:workflow": "node scripts/smoke-packaged-app.mjs --launch=launchservices --workflow=approval-rollback --screenshot=/tmp/openagent-packaged-workflow-smoke.png",
+    "smoke:packaged-app:local-mcp-lifecycle": "node scripts/smoke-packaged-app.mjs --launch=launchservices --workflow=local-mcp-lifecycle --screenshot=/tmp/openagent-packaged-local-mcp-lifecycle-smoke.png",
+    "smoke:packaged-app:real-streaming": "node scripts/smoke-packaged-app.mjs --launch=launchservices --workflow=real-streaming --model=gpt-5.4-mini --screenshot=/tmp/openagent-packaged-real-streaming-smoke.png",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "playwright": "^1.61.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}
