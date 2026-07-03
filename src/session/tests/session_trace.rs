@@ -11,11 +11,11 @@ use openagent_session::{
     AgentTraceRecorder, FileSessionStore, ObservationConfig, ObservationEvent,
     ObservationEventOptions, ObservationRecorder, ObservationTraceRecord, RunRecord,
     RuntimeLogRecord, RuntimeLogger, RuntimeLoggingConfig, RuntimeWarningConfig,
-    RuntimeWarningRecord, Session, SessionEventOptions, SessionPartOptions, SessionStatus,
-    StartRunOptions, TodoItem, TraceConfig, TraceEvent, TraceEventOptions, check_trace_run,
-    format_runtime_warning_event, input_preview, load_trace_events, load_trace_summary,
-    output_stats, render_trace_summary, sanitize_observation_value, sanitize_trace_value,
-    step_usage_warnings,
+    RuntimeWarningRecord, Session, SessionEventOptions, SessionForkBoundary, SessionPartOptions,
+    SessionStatus, StartRunOptions, TodoItem, TraceConfig, TraceEvent, TraceEventOptions,
+    check_trace_run, format_runtime_warning_event, input_preview, load_trace_events,
+    load_trace_summary, output_stats, render_trace_summary, sanitize_observation_value,
+    sanitize_trace_value, step_usage_warnings,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -274,6 +274,464 @@ fn file_session_store_writes_message_v2_parts_and_attaches_tool_results() {
     assert_eq!(projected[1].role, Role::Tool);
     assert_eq!(projected[1].tool_call_id.as_deref(), Some("call_read"));
     assert_eq!(projected[1].content, "[workspace]");
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
+fn file_session_store_loads_transcript_v2_when_state_is_stale() {
+    let root = unique_temp_dir("openagent-stale-state-recovery");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_stale", root.join("workspace"));
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_stale".to_string(),
+                trace_id: "trace_stale".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+
+    let user = ChatMessage {
+        role: Role::User,
+        content: "persist me before provider".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_user_stale"))]),
+    };
+    session.add(user.clone());
+    store
+        .append_message(&session, &user, "run_stale", 0)
+        .expect("message appends after stale state save");
+
+    let restored = store
+        .load_session("session_stale")
+        .expect("session restores from transcript projection");
+    assert_eq!(restored.messages.len(), 1);
+    assert_eq!(restored.messages[0].content, "persist me before provider");
+    assert_eq!(
+        restored.messages[0].metadata["message_id"],
+        json!("msg_user_stale")
+    );
+
+    store
+        .save_state(&session, Some("run_stale"))
+        .expect("state saves projection cache");
+    let state = read_json(root.join("sessions/session_stale/state.latest.json"));
+    assert_eq!(state["message_source"], json!("transcript_v2"));
+    assert_eq!(
+        state["messages_v2"][0]["info"]["id"],
+        json!("msg_user_stale")
+    );
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
+fn file_session_store_marks_unfinished_tool_calls_interrupted_on_replay() {
+    let root = unique_temp_dir("openagent-interrupted-tool-recovery");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_interrupted", root.join("workspace"));
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_interrupted".to_string(),
+                trace_id: "trace_interrupted".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+
+    let assistant = ChatMessage {
+        role: Role::Assistant,
+        content: String::new(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([
+            ("message_id".to_string(), json!("msg_assistant_pending")),
+            ("step".to_string(), json!(1)),
+            (
+                "tool_calls".to_string(),
+                json!([{
+                    "id": "call_write",
+                    "call_id": "call_write",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": "{\"path\":\"note.txt\",\"content\":\"hi\"}"},
+                    "name": "write",
+                    "input": {"path": "note.txt", "content": "hi"}
+                }]),
+            ),
+        ]),
+    };
+    session.add(assistant.clone());
+    store
+        .append_message(&session, &assistant, "run_interrupted", 0)
+        .expect("assistant appends");
+
+    let messages = store
+        .list_messages_with_parts("session_interrupted", None, None)
+        .expect("messages replay");
+    let tool_part = messages[0]
+        .parts
+        .iter()
+        .find(|part| part.kind == MessagePartKind::Tool)
+        .expect("tool part exists");
+    assert_eq!(tool_part.status, MessageStatus::Interrupted);
+    assert_eq!(tool_part.attributes["interrupted"], json!(true));
+
+    let projected = message_parts_to_chat_messages(&messages);
+    assert_eq!(projected.len(), 2);
+    assert_eq!(projected[1].role, Role::Tool);
+    assert_eq!(projected[1].tool_call_id.as_deref(), Some("call_write"));
+    assert!(
+        projected[1]
+            .content
+            .contains("Tool call interrupted before completion")
+    );
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
+fn file_session_store_keeps_tool_call_pending_while_waiting_for_question() {
+    let root = unique_temp_dir("openagent-pending-question-tool-recovery");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_pending_question", root.join("workspace"));
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_pending_question".to_string(),
+                trace_id: "trace_pending_question".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+
+    let assistant = ChatMessage {
+        role: Role::Assistant,
+        content: String::new(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([
+            ("message_id".to_string(), json!("msg_assistant_question")),
+            ("step".to_string(), json!(1)),
+            (
+                "tool_calls".to_string(),
+                json!([{
+                    "id": "call_question",
+                    "call_id": "call_question",
+                    "type": "function",
+                    "function": {"name": "question", "arguments": "{\"questions\":[]}"},
+                    "name": "question",
+                    "input": {"questions": []}
+                }]),
+            ),
+        ]),
+    };
+    session.add(assistant.clone());
+    store
+        .append_message(&session, &assistant, "run_pending_question", 0)
+        .expect("assistant appends");
+    store
+        .append_part(
+            "session_pending_question",
+            "run_pending_question",
+            "question",
+            SessionPartOptions {
+                message_id: Some("msg_assistant_question".to_string()),
+                content: Some(json!({
+                    "call_id": "call_question",
+                    "name": "question",
+                    "status": "pending",
+                })),
+                attributes: BTreeMap::from([
+                    ("call_id".to_string(), json!("call_question")),
+                    ("name".to_string(), json!("question")),
+                ]),
+                step_index: Some(1),
+                status: "pending".to_string(),
+                ..SessionPartOptions::default()
+            },
+        )
+        .expect("question part appends");
+
+    let messages = store
+        .list_messages_with_parts("session_pending_question", None, None)
+        .expect("messages replay");
+    let tool_part = messages[0]
+        .parts
+        .iter()
+        .find(|part| part.kind == MessagePartKind::Tool)
+        .expect("tool part exists");
+    assert_eq!(tool_part.status, MessageStatus::Pending);
+    assert!(tool_part.attributes.get("interrupted").is_none());
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
+fn file_session_store_checkpoints_diff_and_restore_workspace() {
+    let root = unique_temp_dir("openagent-checkpoint-restore");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace exists");
+    fs::write(workspace.join("keep.txt"), "before").expect("file writes");
+    fs::write(workspace.join("delete.txt"), "delete me").expect("file writes");
+
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_checkpoint", &workspace);
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_checkpoint".to_string(),
+                trace_id: "trace_checkpoint".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+    let before = store
+        .create_checkpoint(
+            "session_checkpoint",
+            "run_checkpoint",
+            &workspace,
+            "step_start",
+            Some("msg_checkpoint"),
+            None,
+            Some(1),
+        )
+        .expect("checkpoint creates");
+
+    fs::write(workspace.join("keep.txt"), "after").expect("file modifies");
+    fs::remove_file(workspace.join("delete.txt")).expect("file deletes");
+    fs::write(workspace.join("added.txt"), "new").expect("file adds");
+    fs::create_dir_all(workspace.join(".openagent")).expect("state dir exists");
+    fs::write(workspace.join(".openagent/ignored.txt"), "ignored").expect("ignored writes");
+
+    let after = store
+        .create_checkpoint(
+            "session_checkpoint",
+            "run_checkpoint",
+            &workspace,
+            "step_end",
+            Some("msg_checkpoint"),
+            None,
+            Some(1),
+        )
+        .expect("checkpoint creates");
+    let diff = store
+        .diff_checkpoints(
+            "session_checkpoint",
+            &before.checkpoint_id,
+            &after.checkpoint_id,
+        )
+        .expect("checkpoint diff loads");
+    assert_eq!(diff.added, 1);
+    assert_eq!(diff.modified, 1);
+    assert_eq!(diff.deleted, 1);
+    assert!(
+        diff.entries
+            .iter()
+            .all(|entry| !entry.path.contains(".openagent"))
+    );
+
+    store
+        .restore_checkpoint(
+            "session_checkpoint",
+            "run_checkpoint",
+            &workspace,
+            &before.checkpoint_id,
+        )
+        .expect("checkpoint restores");
+    assert_eq!(
+        fs::read_to_string(workspace.join("keep.txt")).expect("file reads"),
+        "before"
+    );
+    assert!(workspace.join("delete.txt").exists());
+    assert!(!workspace.join("added.txt").exists());
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
+fn file_session_store_forks_and_truncates_message_v2_transcript() {
+    let root = unique_temp_dir("openagent-fork-truncate");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_source", root.join("workspace"));
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_source".to_string(),
+                trace_id: "trace_source".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+    for (index, (message_id, content)) in [
+        ("msg_source_1", "first"),
+        ("msg_source_2", "second"),
+        ("msg_source_3", "third"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let message = ChatMessage {
+            role: Role::User,
+            content: content.to_string(),
+            name: None,
+            tool_call_id: None,
+            metadata: BTreeMap::from([("message_id".to_string(), json!(message_id))]),
+        };
+        session.add(message.clone());
+        store
+            .append_message(&session, &message, "run_source", index as u64)
+            .expect("message appends");
+    }
+
+    let forked = store
+        .fork_session(
+            "session_source",
+            "session_forked",
+            root.join("forked_workspace"),
+            Some(SessionForkBoundary {
+                message_id: Some("msg_source_2".to_string()),
+                part_id: None,
+            }),
+        )
+        .expect("session forks");
+    assert_eq!(forked.messages.len(), 2);
+    assert_eq!(forked.messages[1].content, "second");
+    let forked_messages = store
+        .list_messages_with_parts("session_forked", None, None)
+        .expect("forked messages load");
+    assert_eq!(forked_messages.len(), 2);
+    assert!(
+        forked_messages[0]
+            .info
+            .id
+            .starts_with("msg_session_forked_")
+    );
+    assert_eq!(
+        forked_messages[0].info.metadata["forked_from_message_id"],
+        json!("msg_source_1")
+    );
+
+    store
+        .truncate_messages_after(
+            "session_source",
+            "run_source",
+            SessionForkBoundary {
+                message_id: Some("msg_source_1".to_string()),
+                part_id: None,
+            },
+        )
+        .expect("source truncates");
+    let truncated = store
+        .list_messages_with_parts("session_source", None, None)
+        .expect("truncated messages load");
+    assert_eq!(truncated.len(), 1);
+    assert_eq!(truncated[0].info.id, "msg_source_1");
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
+fn file_session_store_compaction_boundary_skips_compacted_context() {
+    let root = unique_temp_dir("openagent-compaction-boundary");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_compact", root.join("workspace"));
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_compact".to_string(),
+                trace_id: "trace_compact".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+    for (index, (message_id, content)) in [
+        ("msg_compact_1", "old context"),
+        ("msg_compact_2", "also old"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let message = ChatMessage {
+            role: Role::User,
+            content: content.to_string(),
+            name: None,
+            tool_call_id: None,
+            metadata: BTreeMap::from([("message_id".to_string(), json!(message_id))]),
+        };
+        session.add(message.clone());
+        store
+            .append_message(&session, &message, "run_compact", index as u64)
+            .expect("message appends");
+    }
+    let boundary_id = store
+        .append_compaction_boundary(
+            &mut session,
+            "run_compact",
+            "Summary of compacted context.",
+            "msg_compact_2",
+        )
+        .expect("compaction boundary appends");
+    let current = ChatMessage {
+        role: Role::User,
+        content: "fresh context".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_compact_3"))]),
+    };
+    session.add(current.clone());
+    store
+        .append_message(&session, &current, "run_compact", 3)
+        .expect("fresh message appends");
+
+    let messages = store
+        .list_messages_with_parts("session_compact", None, None)
+        .expect("messages load");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].info.id, boundary_id);
+    assert_eq!(messages[1].info.id, "msg_compact_3");
+    let projected = message_parts_to_chat_messages(&messages);
+    assert_eq!(projected[0].content, "Summary of compacted context.");
+    assert_eq!(projected[1].content, "fresh context");
 
     fs::remove_dir_all(root).expect("temporary session store is removed");
 }

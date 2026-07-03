@@ -1,6 +1,15 @@
 //! MCP config, auth, discovery, and tool bridge crate for the Rust rewrite.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, ChildStdin, Command as ProcessCommand, Stdio},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use openagent_protocol::{ToolConcurrency, ToolExecutionSchema, ToolExecutionScope};
 use openagent_tools::ToolDefinition;
@@ -49,6 +58,7 @@ pub enum McpTransport {
     Auto,
     Http,
     Sse,
+    Stdio,
 }
 
 impl McpTransport {
@@ -58,6 +68,25 @@ impl McpTransport {
             Self::Auto => "auto",
             Self::Http => "http",
             Self::Sse => "sse",
+            Self::Stdio => "stdio",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpServerType {
+    #[default]
+    Remote,
+    Local,
+}
+
+impl McpServerType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Local => "local",
         }
     }
 }
@@ -80,9 +109,18 @@ impl Default for McpToolFilter {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RemoteMcpServerConfig {
     pub name: String,
+    #[serde(default, skip_serializing_if = "is_default_server_type")]
+    pub server_type: McpServerType,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
     pub transport: McpTransport,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
     pub timeout_ms: u64,
     pub tools: McpToolFilter,
@@ -132,7 +170,12 @@ pub struct RemoteMcpToolCallResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RemoteMcpServerSnapshot {
     pub name: String,
+    #[serde(default, skip_serializing_if = "is_default_server_type")]
+    pub server_type: McpServerType,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
     pub enabled: bool,
     pub configured_transport: McpTransport,
     pub selected_transport: Option<McpTransport>,
@@ -215,7 +258,9 @@ impl RemoteMcpManager {
                     .collect::<Vec<_>>();
                 RemoteMcpServerSnapshot {
                     name: state.config.name.clone(),
+                    server_type: state.config.server_type,
                     url: state.config.url.clone(),
+                    command: state.config.command.clone(),
                     enabled: state.config.enabled,
                     configured_transport: state.config.transport,
                     selected_transport: state.selected_transport,
@@ -267,6 +312,23 @@ impl RemoteMcpManager {
             .collect();
         Ok(())
     }
+
+    pub fn set_server_error(
+        &mut self,
+        server_name: &str,
+        status: impl Into<String>,
+        error: impl Into<String>,
+        last_refreshed_at: Option<f64>,
+    ) -> McpResult<()> {
+        let Some(state) = self.servers.get_mut(server_name) else {
+            return Err(format!("Unknown MCP server: {server_name}"));
+        };
+        state.status = status.into();
+        state.last_error = Some(error.into());
+        state.last_refreshed_at = last_refreshed_at;
+        state.tools_by_dynamic_name.clear();
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -277,6 +339,11 @@ pub struct McpBridgeOutput {
     pub truncated: bool,
     pub attachments: Vec<Value>,
     pub error: Option<String>,
+}
+
+#[must_use]
+pub const fn is_default_server_type(value: &McpServerType) -> bool {
+    matches!(value, McpServerType::Remote)
 }
 
 pub fn load_mcp_config_from_sources(
@@ -315,10 +382,7 @@ pub fn load_mcp_config_from_value(raw: &Value) -> McpResult<McpConfig> {
     let Some(raw_object) = raw.as_object() else {
         return Err("MCP config must be a JSON object.".to_string());
     };
-    let mcp_block = raw_object
-        .get("mcpServers")
-        .or_else(|| raw_object.get("mcp"))
-        .unwrap_or(raw);
+    let (mcp_block, default_timeout_ms) = mcp_servers_block(raw_object, raw);
     let Some(servers_object) = mcp_block.as_object() else {
         return Err(
             "MCP config must contain an object-valued 'mcp' or 'mcpServers' field.".to_string(),
@@ -336,7 +400,11 @@ pub fn load_mcp_config_from_value(raw: &Value) -> McpResult<McpConfig> {
                 "MCP server '{trimmed}' must be configured with an object."
             ));
         };
-        servers.push(parse_server_config(trimmed, server_object)?);
+        servers.push(parse_server_config(
+            trimmed,
+            server_object,
+            default_timeout_ms,
+        )?);
     }
     Ok(McpConfig {
         servers,
@@ -344,25 +412,60 @@ pub fn load_mcp_config_from_value(raw: &Value) -> McpResult<McpConfig> {
     })
 }
 
-fn parse_server_config(name: &str, raw: &Map<String, Value>) -> McpResult<RemoteMcpServerConfig> {
+fn mcp_servers_block<'a>(raw_object: &'a Map<String, Value>, raw: &'a Value) -> (&'a Value, u64) {
+    if let Some(mcp_servers) = raw_object.get("mcpServers") {
+        return (mcp_servers, DEFAULT_TIMEOUT_MS);
+    }
+    if let Some(mcp) = raw_object.get("mcp") {
+        if let Some(mcp_object) = mcp.as_object()
+            && let Some(servers) = mcp_object.get("servers")
+        {
+            let default_timeout = parse_int(
+                mcp_object
+                    .get("timeout_ms")
+                    .or_else(|| mcp_object.get("timeout")),
+                DEFAULT_TIMEOUT_MS,
+                MIN_TIMEOUT_MS,
+            );
+            return (servers, default_timeout);
+        }
+        return (mcp, DEFAULT_TIMEOUT_MS);
+    }
+    (raw, DEFAULT_TIMEOUT_MS)
+}
+
+fn parse_server_config(
+    name: &str,
+    raw: &Map<String, Value>,
+    default_timeout_ms: u64,
+) -> McpResult<RemoteMcpServerConfig> {
+    let has_command = raw.get("command").is_some_and(legacy_truthy);
     let type_value = raw
         .get("type")
-        .map_or_else(|| "remote".to_string(), value_to_legacy_string)
+        .map_or_else(
+            || {
+                if has_command {
+                    "local".to_string()
+                } else {
+                    "remote".to_string()
+                }
+            },
+            value_to_legacy_string,
+        )
         .trim()
         .to_ascii_lowercase();
-    let default_transport = if matches!(
-        type_value.as_str(),
-        "streamablehttp" | "streamable_http" | "http"
-    ) {
-        McpTransport::Http
-    } else if type_value == "sse" {
-        McpTransport::Sse
-    } else if type_value == "remote" {
-        McpTransport::Auto
-    } else {
-        return Err(format!(
-            "MCP server '{name}' only supports type='remote', 'streamableHttp', or 'sse' in v1."
-        ));
+    let (server_type, default_transport) = match type_value.as_str() {
+        "local" | "stdio" => (McpServerType::Local, McpTransport::Stdio),
+        "streamablehttp" | "streamable_http" | "http" => {
+            (McpServerType::Remote, McpTransport::Http)
+        }
+        "sse" => (McpServerType::Remote, McpTransport::Sse),
+        "remote" => (McpServerType::Remote, McpTransport::Auto),
+        other => {
+            return Err(format!(
+                "MCP server '{name}' has unsupported type '{other}'. Supported values are remote, local, streamableHttp, sse, and stdio."
+            ));
+        }
     };
 
     let url = raw
@@ -371,8 +474,14 @@ fn parse_server_config(name: &str, raw: &Map<String, Value>) -> McpResult<Remote
         .map_or_else(String::new, value_to_legacy_string)
         .trim()
         .to_string();
-    if url.is_empty() {
+    if server_type == McpServerType::Remote && url.is_empty() {
         return Err(format!("MCP server '{name}' is missing a non-empty url."));
+    }
+    let command = parse_local_command(name, raw, server_type)?;
+    if server_type == McpServerType::Local && command.is_empty() {
+        return Err(format!(
+            "MCP server '{name}' is missing a non-empty command."
+        ));
     }
 
     let transport_raw = raw.get("transport").filter(|value| legacy_truthy(value));
@@ -387,22 +496,91 @@ fn parse_server_config(name: &str, raw: &Map<String, Value>) -> McpResult<Remote
         "auto" => McpTransport::Auto,
         "http" => McpTransport::Http,
         "sse" => McpTransport::Sse,
+        "stdio" => McpTransport::Stdio,
         other => {
             return Err(format!(
-                "MCP server '{name}' has unsupported transport '{other}'. Supported values are auto, http, sse."
+                "MCP server '{name}' has unsupported transport '{other}'. Supported values are auto, http, sse, stdio."
             ));
         }
     };
+    if server_type == McpServerType::Local
+        && !matches!(transport, McpTransport::Auto | McpTransport::Stdio)
+    {
+        return Err(format!(
+            "MCP server '{name}' is local and must use transport='stdio' or 'auto'."
+        ));
+    }
 
     Ok(RemoteMcpServerConfig {
         name: name.to_string(),
+        server_type,
         url,
-        transport,
-        enabled: raw.get("enabled").is_none_or(legacy_truthy),
+        transport: if server_type == McpServerType::Local {
+            McpTransport::Stdio
+        } else {
+            transport
+        },
+        enabled: parse_enabled(raw),
+        command,
+        cwd: raw
+            .get("cwd")
+            .filter(|value| legacy_truthy(value))
+            .map(value_to_legacy_string),
+        environment: normalize_environment(raw.get("environment").or_else(|| raw.get("env")))?,
         headers: normalize_headers(raw.get("headers"))?,
-        timeout_ms: parse_int(raw.get("timeout_ms"), DEFAULT_TIMEOUT_MS, MIN_TIMEOUT_MS),
+        timeout_ms: parse_int(
+            raw.get("timeout_ms").or_else(|| raw.get("timeout")),
+            default_timeout_ms,
+            MIN_TIMEOUT_MS,
+        ),
         tools: parse_tool_filter(raw.get("tools"))?,
     })
+}
+
+fn parse_enabled(raw: &Map<String, Value>) -> bool {
+    let enabled = raw.get("enabled").is_none_or(legacy_truthy);
+    let disabled = raw.get("disabled").is_some_and(legacy_truthy);
+    enabled && !disabled
+}
+
+fn parse_local_command(
+    name: &str,
+    raw: &Map<String, Value>,
+    server_type: McpServerType,
+) -> McpResult<Vec<String>> {
+    if server_type != McpServerType::Local {
+        return Ok(Vec::new());
+    }
+    let mut command = match raw.get("command") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(value_to_legacy_string)
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>(),
+        Some(value) if legacy_truthy(value) => {
+            let text = value_to_legacy_string(value).trim().to_string();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text]
+            }
+        }
+        _ => Vec::new(),
+    };
+    if let Some(args) = raw.get("args") {
+        let Some(items) = args.as_array() else {
+            return Err(format!("MCP server '{name}' args must be a string array."));
+        };
+        command.extend(
+            items
+                .iter()
+                .map(value_to_legacy_string)
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty()),
+        );
+    }
+    Ok(command)
 }
 
 fn parse_tool_filter(raw: Option<&Value>) -> McpResult<McpToolFilter> {
@@ -454,6 +632,24 @@ fn normalize_headers(raw: Option<&Value>) -> McpResult<BTreeMap<String, String>>
         headers.insert(header.to_string(), value_to_legacy_string(value));
     }
     Ok(headers)
+}
+
+fn normalize_environment(raw: Option<&Value>) -> McpResult<BTreeMap<String, String>> {
+    let Some(raw) = raw else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(object) = raw.as_object() else {
+        return Err("MCP environment must be an object.".to_string());
+    };
+    let mut environment = BTreeMap::new();
+    for (key, value) in object {
+        let name = key.trim();
+        if name.is_empty() {
+            continue;
+        }
+        environment.insert(name.to_string(), value_to_legacy_string(value));
+    }
+    Ok(environment)
 }
 
 #[must_use]
@@ -553,7 +749,457 @@ pub fn transport_candidates(transport: McpTransport) -> Vec<McpTransport> {
     match transport {
         McpTransport::Http => vec![McpTransport::Http],
         McpTransport::Sse => vec![McpTransport::Sse],
+        McpTransport::Stdio => vec![McpTransport::Stdio],
         McpTransport::Auto => vec![McpTransport::Http, McpTransport::Sse],
+    }
+}
+
+pub fn discover_mcp_server_tools(
+    server: &RemoteMcpServerConfig,
+    workspace: &Path,
+) -> McpResult<(McpTransport, Vec<Value>)> {
+    let mut errors = Vec::new();
+    for transport in transport_candidates(server.transport) {
+        match mcp_json_rpc(server, transport, "tools/list", json!({}), workspace) {
+            Ok(value) => {
+                let tools = value
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                return Ok((transport, tools));
+            }
+            Err(error) => errors.push(format!("{}: {error}", transport.as_str())),
+        }
+    }
+    Err(format!(
+        "MCP tools/list failed for server '{}': {}",
+        server.name,
+        errors.join("; ")
+    ))
+}
+
+pub fn mcp_json_rpc(
+    server: &RemoteMcpServerConfig,
+    transport: McpTransport,
+    method: &str,
+    params: Value,
+    workspace: &Path,
+) -> McpResult<Value> {
+    if transport == McpTransport::Stdio {
+        return stdio_mcp_json_rpc(server, method, params, workspace);
+    }
+    let timeout = Duration::from_millis(server.timeout_ms);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut request = client
+        .post(&server.url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": format!("openagent-{}", now_ms_mcp()),
+            "method": method,
+            "params": params,
+        }));
+    for (key, value) in &server.headers {
+        request = request.header(key, value);
+    }
+    let response = request
+        .send()
+        .map_err(|error| format!("{} request failed: {error}", transport.as_str()))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let raw = response
+        .text()
+        .map_err(|error| format!("MCP response read failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            summarize_mcp_http_error_body(&raw, &content_type)
+        ));
+    }
+    let value = if content_type.contains("text/event-stream") {
+        parse_sse_json_values(&raw)?
+            .into_iter()
+            .find(|item| item.get("result").is_some() || item.get("error").is_some())
+            .ok_or_else(|| "MCP SSE response did not contain a JSON-RPC result".to_string())?
+    } else {
+        serde_json::from_str::<Value>(&raw)
+            .map_err(|error| format!("MCP response was not JSON: {error}"))?
+    };
+    if let Some(error) = value.get("error") {
+        return Err(format!("MCP JSON-RPC error: {}", stable_json_dumps(error)));
+    }
+    Ok(value.get("result").cloned().unwrap_or(value))
+}
+
+pub struct StdioMcpSession {
+    child: Child,
+    stdin: ChildStdin,
+    rx: Receiver<McpResult<Value>>,
+    stderr_rx: Receiver<String>,
+    timeout: Duration,
+}
+
+impl StdioMcpSession {
+    pub fn start(server: &RemoteMcpServerConfig, workspace: &Path) -> McpResult<Self> {
+        let mut session = Self::spawn(server, workspace)?;
+        session.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"roots": {}},
+                "clientInfo": {"name": "openagent", "version": env!("CARGO_PKG_VERSION")},
+            }),
+        )?;
+        session.notify("notifications/initialized", json!({}))?;
+        Ok(session)
+    }
+
+    fn spawn(server: &RemoteMcpServerConfig, workspace: &Path) -> McpResult<Self> {
+        let Some((program, args)) = server.command.split_first() else {
+            return Err(format!(
+                "MCP server '{}' is missing a command.",
+                server.name
+            ));
+        };
+        let mut command = ProcessCommand::new(program);
+        command.args(args);
+        command.current_dir(resolve_stdio_cwd(server, workspace));
+        command.envs(&server.environment);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("failed to start MCP server '{}': {error}", server.name))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("MCP server '{}' stdout was not captured", server.name))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("MCP server '{}' stdin was not captured", server.name))?;
+        let (tx, rx) = mpsc::channel();
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        if let Some(stderr) = child.stderr.take() {
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut output = String::new();
+                let _ = reader.read_to_string(&mut output);
+                let _ = stderr_tx.send(output);
+            });
+        } else {
+            let _ = stderr_tx.send(String::new());
+        }
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match read_stdio_message(&mut reader) {
+                    Ok(value) => {
+                        if tx.send(Ok(value)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin,
+            rx,
+            stderr_rx,
+            timeout: Duration::from_millis(server.timeout_ms),
+        })
+    }
+
+    pub fn request(&mut self, method: &str, params: Value) -> McpResult<Value> {
+        let id = format!("openagent-{}", now_ms_mcp());
+        self.write(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))?;
+        self.read_response(&id)
+    }
+
+    pub fn tools_list(&mut self) -> McpResult<Vec<Value>> {
+        let value = self.request("tools/list", json!({}))?;
+        Ok(value
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> McpResult<()> {
+        self.write(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+    }
+
+    fn write(&mut self, message: Value) -> McpResult<()> {
+        let raw = serde_json::to_vec(&message).map_err(|error| error.to_string())?;
+        self.stdin
+            .write_all(format!("Content-Length: {}\r\n\r\n", raw.len()).as_bytes())
+            .map_err(|error| format!("failed to write MCP frame header: {error}"))?;
+        self.stdin
+            .write_all(&raw)
+            .map_err(|error| format!("failed to write MCP frame body: {error}"))?;
+        self.stdin
+            .flush()
+            .map_err(|error| format!("failed to flush MCP frame: {error}"))
+    }
+
+    fn read_response(&mut self, id: &str) -> McpResult<Value> {
+        loop {
+            let value = match self.rx.recv_timeout(self.timeout) {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => return Err(format!("{error}{}", self.stderr_suffix())),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "MCP stdio request timed out after {:?}{}",
+                        self.timeout,
+                        self.stderr_suffix()
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "MCP stdio server closed stdout{}",
+                        self.stderr_suffix()
+                    ));
+                }
+            };
+            if value.get("id").and_then(Value::as_str) != Some(id) {
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                return Err(format!("MCP JSON-RPC error: {}", stable_json_dumps(error)));
+            }
+            return Ok(value.get("result").cloned().unwrap_or(value));
+        }
+    }
+
+    fn stderr_suffix(&self) -> String {
+        match self.stderr_rx.try_recv() {
+            Ok(output) => {
+                let trimmed = output.trim();
+                if trimmed.is_empty() {
+                    String::new()
+                } else {
+                    format!("; stderr: {}", truncate_text(trimmed, 500))
+                }
+            }
+            Err(_) => String::new(),
+        }
+    }
+
+    pub fn close(mut self) {
+        let _ = self.write(json!({
+            "jsonrpc": "2.0",
+            "id": format!("openagent-shutdown-{}", now_ms_mcp()),
+            "method": "shutdown",
+            "params": {},
+        }));
+        let _ = self.notify("exit", json!({}));
+        for _ in 0..10 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn stdio_mcp_json_rpc(
+    server: &RemoteMcpServerConfig,
+    method: &str,
+    params: Value,
+    workspace: &Path,
+) -> McpResult<Value> {
+    let mut session = StdioMcpSession::start(server, workspace)?;
+    let result = session.request(method, params);
+    session.close();
+    result
+}
+
+fn resolve_stdio_cwd(server: &RemoteMcpServerConfig, workspace: &Path) -> PathBuf {
+    let Some(cwd) = server
+        .cwd
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return workspace.to_path_buf();
+    };
+    let path = PathBuf::from(cwd);
+    if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    }
+}
+
+fn read_stdio_message<R: BufRead>(reader: &mut R) -> McpResult<Value> {
+    let mut content_length = None::<usize>;
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("failed to read MCP frame header: {error}"))?;
+        if read == 0 {
+            return Err("MCP stdio server closed before sending a frame".to_string());
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid MCP content-length: {error}"))?,
+            );
+        }
+    }
+    let length = content_length.ok_or_else(|| "MCP frame missing content-length".to_string())?;
+    let mut body = vec![0_u8; length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| format!("failed to read MCP frame body: {error}"))?;
+    serde_json::from_slice::<Value>(&body)
+        .map_err(|error| format!("MCP frame body was not JSON: {error}"))
+}
+
+fn parse_sse_json_values(raw: &str) -> McpResult<Vec<Value>> {
+    let mut values = Vec::new();
+    let mut data_lines = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            flush_sse_json_value(&mut data_lines, &mut values)?;
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    flush_sse_json_value(&mut data_lines, &mut values)?;
+    Ok(values)
+}
+
+fn flush_sse_json_value(data_lines: &mut Vec<String>, values: &mut Vec<Value>) -> McpResult<()> {
+    if data_lines.is_empty() {
+        return Ok(());
+    }
+    let data = data_lines.join("\n");
+    data_lines.clear();
+    let trimmed = data.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(());
+    }
+    let value: Value = serde_json::from_str(trimmed)
+        .map_err(|error| format!("MCP SSE data was not JSON: {error}"))?;
+    values.push(value);
+    Ok(())
+}
+
+fn summarize_mcp_http_error_body(raw: &str, content_type: &str) -> String {
+    if content_type.contains("json")
+        && let Ok(value) = serde_json::from_str::<Value>(raw)
+    {
+        for key in ["error", "message", "detail"] {
+            if let Some(text) = value.get(key).and_then(Value::as_str)
+                && !text.trim().is_empty()
+            {
+                return truncate_text(text.trim(), 500);
+            }
+        }
+        return truncate_text(
+            &stable_json_dumps(&sanitize_mcp_observation_value(&value)),
+            500,
+        );
+    }
+    truncate_text(raw.trim(), 500)
+}
+
+fn now_ms_mcp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn stable_json_dumps(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(flag) => {
+            if *flag {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => serde_json::to_string(text).expect("string serializes"),
+        Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(stable_json_dumps)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.into_iter()
+                    .map(|key| {
+                        format!(
+                            "{}: {}",
+                            serde_json::to_string(key).expect("key serializes"),
+                            stable_json_dumps(&object[key])
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
     }
 }
 

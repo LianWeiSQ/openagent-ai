@@ -1,15 +1,20 @@
 use std::{
     error::Error,
     fs,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use openagent_protocol::PermissionRuleset;
 use openagent_tools::{
-    LocalWorkspaceRuntime, TodoItem, ToolContext, ToolRegistry, Toolkit, blocked_command,
-    ensure_within_root, exclusive_schema, format_read_output_from_text, qualify_tool_id,
-    readonly_schema, register_builtin_tools, truncate_output,
+    LocalWorkspaceRuntime, TaskSubagentDescriptor, TodoItem, ToolContext, ToolRegistry, Toolkit,
+    benchmark_mode_allows_shell_command, benchmark_mode_value_allows_shell_command,
+    blocked_command, ensure_within_root, exclusive_schema, format_read_output_from_text,
+    prepare_isolated_workspace, qualify_tool_id, readonly_schema, register_builtin_tools,
+    select_task_subagent_for_prompt, truncate_output,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -162,6 +167,24 @@ fn shell_runtime_blocks_destructive_commands_and_saves_truncated_output()
         blocked_command("printf ok; rm -rf tmp"),
         Some("rm".to_string())
     );
+    assert!(!benchmark_mode_allows_shell_command(&ctx));
+    assert!(benchmark_mode_value_allows_shell_command("terminal-bench"));
+    assert!(benchmark_mode_value_allows_shell_command("terminal_bench"));
+    assert!(!benchmark_mode_value_allows_shell_command("local"));
+
+    let mut benchmark_ctx = ToolContext::new(&root).with_session_id("session-shell-benchmark");
+    benchmark_ctx
+        .execution_metadata
+        .insert("benchmark_mode".to_string(), json!("terminal-bench"));
+    assert!(benchmark_mode_allows_shell_command(&benchmark_ctx));
+    let benchmark_allowed = toolkit.execute(
+        "bash",
+        json!({"command": "printf ok; rm -rf openagent-benchmark-missing"}),
+        "call_rm_benchmark",
+        &mut benchmark_ctx,
+    );
+    assert!(benchmark_allowed.error.is_none());
+    assert_eq!(benchmark_allowed.output, "ok");
 
     let result = toolkit.execute(
         "bash",
@@ -274,6 +297,112 @@ fn toolkit_enforces_permission_rules_before_execution() -> Result<(), Box<dyn Er
     );
     assert_eq!(still_denied.metadata["permission_action"], json!("deny"));
     assert!(!root.join("still-denied.txt").exists());
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn web_fetch_reads_http_sources_under_readonly_permissions() -> Result<(), Box<dyn Error>> {
+    let root = unique_temp_dir("openagent-tools-web-fetch")?;
+    let (port, server) = spawn_static_http_server(
+        "OpenAgent Scout docs\nEvidence: dependency version guidance.\n",
+        "text/plain; charset=utf-8",
+    )?;
+    let toolkit = Toolkit::with_builtins();
+    let mut ctx = ToolContext::new(&root)
+        .with_session_id("session/web-fetch")
+        .with_permission_ruleset(PermissionRuleset::Readonly);
+    let fetched = toolkit.execute(
+        "web_fetch",
+        json!({"url": format!("http://127.0.0.1:{port}/docs"), "max_bytes": 4096}),
+        "call_web_fetch",
+        &mut ctx,
+    );
+    assert!(fetched.error.is_none(), "{fetched:?}");
+    assert!(fetched.output.contains("OpenAgent Scout docs"));
+    assert_eq!(fetched.metadata["tool"], json!("web_fetch"));
+    assert_eq!(fetched.metadata["status"], json!(200));
+    assert_eq!(
+        fetched.metadata["content_type"],
+        json!("text/plain; charset=utf-8")
+    );
+    assert_eq!(fetched.metadata["truncated"], json!(false));
+
+    let rejected_scheme = toolkit.execute(
+        "web_fetch",
+        json!({"url": "file:///etc/passwd"}),
+        "call_web_fetch_file",
+        &mut ctx,
+    );
+    assert!(
+        rejected_scheme
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("only supports http and https")
+    );
+
+    server
+        .join()
+        .map_err(|_| "web fetch fixture server panicked")?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn task_subagent_router_selects_unique_description_match() {
+    let subagents = vec![
+        TaskSubagentDescriptor {
+            id: "explore".to_string(),
+            name: "Explore".to_string(),
+            description: "Read-only code exploration subagent for fast search and mapping."
+                .to_string(),
+        },
+        TaskSubagentDescriptor {
+            id: "scout".to_string(),
+            name: "Scout".to_string(),
+            description: "External documentation and dependency research subagent with web access."
+                .to_string(),
+        },
+        TaskSubagentDescriptor {
+            id: "general".to_string(),
+            name: "General".to_string(),
+            description: "General-purpose subagent for complex multi-step work.".to_string(),
+        },
+    ];
+
+    let routed = select_task_subagent_for_prompt(
+        &subagents,
+        "Research the external dependency docs before changing this integration.",
+    )
+    .expect("expected scout route");
+    assert_eq!(routed.subagent_id, "scout");
+    assert!(routed.score >= 4);
+    assert!(routed.matched_terms.contains(&"dependency".to_string()));
+    assert!(routed.matched_terms.contains(&"documentation".to_string()));
+
+    assert!(select_task_subagent_for_prompt(&subagents, "Please handle this task.").is_none());
+}
+
+#[test]
+fn prepare_isolated_workspace_copies_workspace_without_heavy_dirs() -> Result<(), Box<dyn Error>> {
+    let root = unique_temp_dir("openagent-tools-isolation")?;
+    let source = root.join("workspace");
+    let isolation_root = root.join("isolated");
+    fs::create_dir_all(source.join("src"))?;
+    fs::create_dir_all(source.join("target"))?;
+    fs::write(source.join("src").join("main.rs"), "fn main() {}\n")?;
+    fs::write(source.join("target").join("cache.txt"), "heavy\n")?;
+
+    let isolation = prepare_isolated_workspace(&source, &isolation_root, "task/one")?;
+    let isolated = PathBuf::from(&isolation.workspace);
+    assert_eq!(isolation.enabled, true);
+    assert_eq!(isolation.method, "directory_copy");
+    assert!(isolated.join("src").join("main.rs").exists());
+    assert!(!isolated.join("target").exists());
+    fs::write(isolated.join("child.txt"), "isolated\n")?;
+    assert!(!source.join("child.txt").exists());
 
     fs::remove_dir_all(root)?;
     Ok(())
@@ -525,6 +654,31 @@ fn sorted_property_names(schema: &Value) -> Vec<String> {
 
 fn to_value<T: Serialize>(value: T) -> Result<Value, serde_json::Error> {
     serde_json::to_value(value)
+}
+
+fn spawn_static_http_server(
+    body: &str,
+    content_type: &str,
+) -> Result<(u16, thread::JoinHandle<()>), Box<dyn Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let body = body.to_string();
+    let content_type = content_type.to_string();
+    Ok((
+        port,
+        thread::spawn(move || {
+            let Ok((mut stream, _addr)) = listener.accept() else {
+                return;
+            };
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }),
+    ))
 }
 
 fn unique_temp_dir(prefix: &str) -> Result<PathBuf, Box<dyn Error>> {

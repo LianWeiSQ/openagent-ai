@@ -21,6 +21,8 @@ pub fn core_crate_name() -> &'static str {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AppEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
     pub sequence: u64,
     pub method: String,
     pub params: Value,
@@ -38,6 +40,7 @@ impl AppEvent {
         created_at_ms: u64,
     ) -> Self {
         Self {
+            event_id: None,
             sequence,
             method: method.into(),
             params: json_safe(params),
@@ -49,6 +52,12 @@ impl AppEvent {
     #[must_use]
     pub fn with_global_sequence(mut self, global_sequence: u64) -> Self {
         self.global_sequence = Some(global_sequence);
+        self
+    }
+
+    #[must_use]
+    pub fn with_event_id(mut self, event_id: impl Into<String>) -> Self {
+        self.event_id = Some(event_id.into());
         self
     }
 

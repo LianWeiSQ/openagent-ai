@@ -1,11 +1,12 @@
 //! HTTP runtime service contracts for the Rust rewrite.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,21 +16,49 @@ use openagent_app_server::{
     parse_turn_question_reply_path, question_dismiss_payload, question_reply_payload,
     record_control_response_payload, tui_control_request_for_path,
 };
-use openagent_protocol::{ChatMessage, PermissionRuleset, Role, ToolCall, ToolResult, Usage};
+use openagent_core::{PermissionManager, permission_rule};
+use openagent_mcp::{
+    McpBridgeOutput, McpServerType, McpTransport, RemoteMcpManager, RemoteMcpServerConfig,
+    RemoteMcpToolDescriptor, StdioMcpSession, bridge_tool_output,
+    build_tool_descriptors_from_values, discover_mcp_server_tools, load_mcp_config,
+    load_mcp_config_from_value, mcp_json_rpc, mcp_tool_definition, normalize_tool_call_result,
+    unavailable_tool_result,
+};
+use openagent_protocol::{
+    ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema, Usage,
+};
 use openagent_provider::{
     OpenAiLanguageModelConfig, ProviderStreamEvent, build_openai_chat_payload,
     build_openai_responses_payload, default_env_mapping, normalize_openai_chat_sse_chunks,
     normalize_openai_responses_response, normalize_openai_responses_stream_events,
     normalize_provider, parse_tool_arguments, provider_default_base_url, provider_default_model,
-    provider_requires_api_key, summarize_http_error_body,
+    provider_label, provider_requires_api_key, summarize_http_error_body,
 };
 use openagent_session::{
     FileSessionStore, Session, SessionEventOptions, SessionPartOptions, SessionStatus,
     StartRunOptions,
 };
-use openagent_tools::{ToolContext, Toolkit, resolve_path_in_root};
+use openagent_tools::{
+    TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor, TaskSubagentRoute, ToolContext,
+    Toolkit, prepare_isolated_workspace, register_task_tool, resolve_path_in_root,
+    select_task_subagent_for_prompt, task_subagent_is_visible,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+mod app_bridge_routes;
+mod mcp_runtime;
+mod turn_runtime;
+
+use app_bridge_routes::*;
+pub use app_bridge_routes::{
+    CliRunResult, HttpResponseSpec, build_run_prompt, command_text_from_args, docker_smoke_command,
+    dockerfile_lines, emit_app_bridge_events, format_http_error, health_payload, parse_cli_args,
+    parse_sse_data, parse_sse_response_lines, route_health, route_options, route_unauthorized,
+    route_unknown, run_cli,
+};
+use mcp_runtime::*;
+use turn_runtime::*;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -38,6 +67,8 @@ const INDEX_HTML: &str = include_str!("../../static/app-server/static/index.html
 const APP_JS: &str = include_str!("../../static/app-server/static/app.js");
 const APP_CSS: &str = include_str!("../../static/app-server/static/app.css");
 const APP_EVENTS_FILE: &str = "app_events.jsonl";
+const APP_BRIDGE_PROTOCOL_VERSION: u64 = 1;
+const APP_BRIDGE_EVENT_SCHEMA_VERSION: &str = "openagent.app_event.v1";
 const TUI_CONTROL_QUEUE_FILE: &str = "tui_control_queue.json";
 const TUI_CONTROL_RESPONSES_FILE: &str = "tui_control_responses.jsonl";
 const FILE_CHANGE_UNDO_STACK_KEY: &str = "file_change_undo_stack";
@@ -45,6 +76,32 @@ const FILE_CHANGE_REDO_STACK_KEY: &str = "file_change_redo_stack";
 const FILE_CHANGE_LATEST_KEY: &str = "latest_file_change";
 const MAX_FILE_CHANGE_STACK: usize = 50;
 const MAX_RENDERED_DIFF_LINES: usize = 400;
+const MAX_FILE_TREE_ENTRIES: usize = 300;
+const MAX_TERMINAL_COMMAND_CHARS: usize = 4096;
+const MAX_TERMINAL_OUTPUT_CHARS: usize = 20_000;
+const DEFAULT_TERMINAL_TIMEOUT_MS: u64 = 10_000;
+const MAX_TERMINAL_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_TASK_RUN_LOCK_STALE_MS: u64 = 15 * 60 * 1000;
+const DEFAULT_BACKGROUND_TASK_WORKER_POLL_MS: u64 = 100;
+const DEFAULT_MAX_SUBAGENT_DEPTH: u64 = 3;
+const BUILD_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/build.txt");
+const EXPLORE_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/explore.txt");
+const PLAN_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/plan.txt");
+const SCOUT_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/scout.txt");
+const REVIEW_AGENT_PROMPT: &str = "You are OpenAgent Reviewer. Focus on correctness, regressions, risk, and missing tests. Prefer evidence from tools and keep findings concise.";
+const TURN_INTERRUPTED_ERROR: &str = "turn interrupted";
+const TURN_JOB_INDEX_FILE: &str = ".openagent-runtime/turn_jobs.json";
+const TURN_QUEUE_DIR: &str = ".openagent-runtime/turn_queue";
+const TURN_QUEUE_LEASE_DIR: &str = ".openagent-runtime/turn_queue_leases";
+const TURN_JOB_INDEX_SCHEMA_VERSION: u64 = 1;
+const TURN_QUEUE_PAYLOAD_SCHEMA_VERSION: u64 = 1;
+const TURN_QUEUE_LEASE_SCHEMA_VERSION: u64 = 1;
+const TURN_JOB_TERMINAL_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const MAX_TURN_JOB_INDEX_ENTRIES: usize = 200;
+const DEFAULT_MAX_QUEUED_TURNS_PER_SESSION: usize = 8;
+const DEFAULT_MAX_RUNNING_TURN_WORKERS: usize = 4;
+const DEFAULT_TURN_QUEUE_LEASE_STALE_MS: u64 = 30_000;
+const DEFAULT_TURN_QUEUE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -68,13 +125,19 @@ pub struct HttpRuntimeConfig {
     pub serve_static: bool,
     pub workspace: Option<String>,
     pub session_store_root: Option<String>,
+    pub mcp_config: Option<String>,
     pub auth_token: Option<String>,
     pub auth_username: Option<String>,
     pub auth_password: Option<String>,
     pub cors_origin: String,
     pub mdns_name: Option<String>,
+    pub max_queued_turns_per_session: usize,
+    pub max_running_turn_workers: usize,
+    pub turn_queue_lease_stale_ms: u64,
+    pub turn_queue_timeout_ms: u64,
 }
 
+// turn_runtime implementation lives in `turn_runtime.rs`.
 impl Default for HttpRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -83,11 +146,16 @@ impl Default for HttpRuntimeConfig {
             serve_static: true,
             workspace: None,
             session_store_root: None,
+            mcp_config: None,
             auth_token: None,
             auth_username: None,
             auth_password: None,
             cors_origin: "*".to_string(),
             mdns_name: Some("openagent".to_string()),
+            max_queued_turns_per_session: configured_max_queued_turns_per_session(),
+            max_running_turn_workers: configured_max_running_turn_workers(),
+            turn_queue_lease_stale_ms: configured_turn_queue_lease_stale_ms(),
+            turn_queue_timeout_ms: configured_turn_queue_timeout_ms(),
         }
     }
 }
@@ -116,954 +184,15 @@ impl HttpRuntimeConfig {
             "auth_basic_enabled": self.auth_password.as_ref().is_some_and(|value| !value.is_empty()),
             "cors_origin": self.cors_origin,
             "mdns_name": self.mdns_name,
+            "max_queued_turns_per_session": self.max_queued_turns_per_session,
+            "max_running_turn_workers": max_running_turn_workers(self),
+            "turn_queue_lease_stale_ms": self.turn_queue_lease_stale_ms,
+            "turn_queue_timeout_ms": turn_queue_timeout_ms(self),
         })
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct HttpResponseSpec {
-    pub status: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
-    #[serde(skip_serializing_if = "Map::is_empty")]
-    pub headers: Map<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body_text: Option<String>,
-}
-
-impl HttpResponseSpec {
-    #[must_use]
-    pub fn to_value(&self) -> Value {
-        serde_json::to_value(self).unwrap_or_else(|_| json!({}))
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CliRunResult {
-    pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-#[must_use]
-pub fn health_payload(config: &HttpRuntimeConfig) -> Value {
-    json!({
-        "ok": true,
-        "service": command_name(),
-        "app_bridge": app_server_crate_name(),
-        "ui_enabled": config.serve_static,
-        "auth_required": config.auth_required(),
-    })
-}
-
-#[must_use]
-pub fn route_health() -> HttpResponseSpec {
-    HttpResponseSpec {
-        status: 200,
-        content_type: Some("application/json; charset=utf-8".to_string()),
-        headers: Map::new(),
-        body: None,
-        body_text: None,
-    }
-}
-
-#[must_use]
-pub fn route_unauthorized() -> HttpResponseSpec {
-    let mut headers = Map::new();
-    headers.insert(
-        "WWW-Authenticate".to_string(),
-        Value::String(
-            "Bearer realm=\"openagent-app-bridge\", Basic realm=\"openagent-app-bridge\""
-                .to_string(),
-        ),
-    );
-    HttpResponseSpec {
-        status: 401,
-        content_type: None,
-        headers,
-        body: Some(json!({"error": "unauthorized"})),
-        body_text: None,
-    }
-}
-
-#[must_use]
-pub fn route_options() -> HttpResponseSpec {
-    let mut headers = Map::new();
-    headers.insert(
-        "Access-Control-Allow-Methods".to_string(),
-        Value::String("GET, POST, PATCH, DELETE, OPTIONS".to_string()),
-    );
-    headers.insert(
-        "Access-Control-Allow-Headers".to_string(),
-        Value::String("Authorization, Content-Type, X-OpenAgent-Token".to_string()),
-    );
-    headers.insert(
-        "Access-Control-Max-Age".to_string(),
-        Value::String("600".to_string()),
-    );
-    HttpResponseSpec {
-        status: 204,
-        content_type: None,
-        headers,
-        body: None,
-        body_text: None,
-    }
-}
-
-#[must_use]
-pub fn route_unknown() -> HttpResponseSpec {
-    HttpResponseSpec {
-        status: 404,
-        content_type: None,
-        headers: Map::new(),
-        body: Some(json!({"error": "unknown endpoint"})),
-        body_text: None,
-    }
-}
-
-pub fn parse_sse_response_lines(lines: &[&str]) -> Result<Vec<Value>, String> {
-    let mut events = Vec::new();
-    let mut data_lines: Vec<String> = Vec::new();
-    for raw_line in lines {
-        let line = raw_line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            if !data_lines.is_empty() {
-                events.push(parse_sse_data(&data_lines.join("\n"))?);
-                data_lines.clear();
-            }
-            continue;
-        }
-        if line.starts_with(':') {
-            continue;
-        }
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.trim_start().to_string());
-        }
-    }
-    if !data_lines.is_empty() {
-        events.push(parse_sse_data(&data_lines.join("\n"))?);
-    }
-    Ok(events)
-}
-
-pub fn parse_sse_data(data: &str) -> Result<Value, String> {
-    let value: Value = serde_json::from_str(data).map_err(|error| error.to_string())?;
-    if !value.is_object() {
-        return Err("SSE event data was not a JSON object".to_string());
-    }
-    Ok(value)
-}
-
-#[must_use]
-pub fn format_http_error(method: &str, path: &str, code: u16, body: Option<&Value>) -> String {
-    if let Some(error) = body
-        .and_then(|value| value.get("error"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-    {
-        return format!("{method} {path} returned HTTP {code}: {error}");
-    }
-    format!("{method} {path} returned HTTP {code}")
-}
-
-#[must_use]
-pub fn emit_app_bridge_events(
-    events: &[Value],
-    output_format: &str,
-    verbose: bool,
-) -> CliRunResult {
-    let mut result = CliRunResult::default();
-    let mut printed_answer = false;
-    let mut status = "failed".to_string();
-    let mut final_answer = String::new();
-
-    for event in events {
-        if output_format == "json" {
-            result.stdout.push_str(&stable_json_dumps(event));
-            result.stdout.push('\n');
-        } else if emit_text_event(event, verbose, &mut result.stdout, &mut result.stderr) {
-            printed_answer = true;
-        }
-
-        let method = event_method(event);
-        let params = event_params(event);
-        if matches!(
-            method.as_str(),
-            "turn/completed" | "turn/failed" | "turn/interrupted"
-        ) {
-            let default_status = match method.as_str() {
-                "turn/completed" => "completed",
-                "turn/interrupted" => "interrupted",
-                _ => "failed",
-            };
-            status = params
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or(default_status)
-                .to_string();
-            final_answer = params
-                .get("final_answer")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-        }
-    }
-
-    if output_format == "text" {
-        if printed_answer {
-            result.stdout.push('\n');
-        } else if !final_answer.is_empty() {
-            result.stdout.push_str(&final_answer);
-            result.stdout.push('\n');
-        }
-        if status != "completed" {
-            result
-                .stderr
-                .push_str(&format!("OpenAgent client turn failed: {status}\n"));
-        }
-    }
-    result.exit_code = if status == "completed" { 0 } else { 1 };
-    result
-}
-
-#[must_use]
-pub fn build_run_prompt(message: &str, files: &[(&str, &str)]) -> String {
-    let mut parts = Vec::new();
-    if !message.trim().is_empty() {
-        parts.push(message.trim().to_string());
-    }
-    for (path, content) in files {
-        parts.push(format!("Attached file: {path}\n\n```text\n{content}\n```"));
-    }
-    parts.join("\n\n").trim().to_string()
-}
-
-#[must_use]
-pub fn command_text_from_args(message: &[&str], stdin: Option<&str>, stdin_is_tty: bool) -> String {
-    let message = message.join(" ").trim().to_string();
-    if !message.is_empty() {
-        return message;
-    }
-    if stdin_is_tty {
-        return String::new();
-    }
-    stdin.unwrap_or_default().trim().to_string()
-}
-
-#[must_use]
-pub fn dockerfile_lines() -> Vec<&'static str> {
-    vec![
-        "FROM rust:1.85-bookworm AS builder",
-        "WORKDIR /app",
-        "COPY . .",
-        "RUN cargo build --release -p openagent-http-runtime",
-        "FROM debian:bookworm-slim",
-        "COPY --from=builder /app/target/release/openagent-http-runtime /usr/local/bin/openagent-http-runtime",
-        "EXPOSE 8787",
-        "HEALTHCHECK CMD [\"openagent-http-runtime\", \"--health-json\"]",
-        "ENTRYPOINT [\"openagent-http-runtime\"]",
-        "CMD [\"--host\", \"0.0.0.0\", \"--port\", \"8787\", \"--headless\"]",
-    ]
-}
-
-#[must_use]
-pub fn docker_smoke_command() -> Vec<&'static str> {
-    vec![
-        "docker",
-        "run",
-        "--rm",
-        "openagent-http-runtime:goal12",
-        "--health-json",
-    ]
-}
-
-#[must_use]
-pub fn parse_cli_args(args: &[String]) -> (HttpRuntimeConfig, bool, bool) {
-    let mut config = HttpRuntimeConfig::default();
-    let mut health_json = false;
-    let mut docker_smoke = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--host" => {
-                if let Some(value) = args.get(index + 1) {
-                    config.host = value.clone();
-                    index += 1;
-                }
-            }
-            "--port" => {
-                if let Some(value) = args
-                    .get(index + 1)
-                    .and_then(|value| value.parse::<u16>().ok())
-                {
-                    config.port = value;
-                    index += 1;
-                }
-            }
-            "--workspace" => {
-                if let Some(value) = args.get(index + 1) {
-                    config.workspace = Some(value.clone());
-                    index += 1;
-                }
-            }
-            "--session-root" => {
-                if let Some(value) = args.get(index + 1) {
-                    config.session_store_root = Some(value.clone());
-                    index += 1;
-                }
-            }
-            "--headless" => {
-                config.serve_static = false;
-            }
-            "--auth-token" => {
-                if let Some(value) = args.get(index + 1) {
-                    config.auth_token = Some(value.clone());
-                    index += 1;
-                }
-            }
-            "--username" | "-u" => {
-                if let Some(value) = args.get(index + 1) {
-                    config.auth_username = Some(value.clone());
-                    index += 1;
-                }
-            }
-            "--password" | "-p" => {
-                if let Some(value) = args.get(index + 1) {
-                    config.auth_password = Some(value.clone());
-                    index += 1;
-                }
-            }
-            "--cors-origin" => {
-                if let Some(value) = args.get(index + 1) {
-                    config.cors_origin = value.clone();
-                    index += 1;
-                }
-            }
-            "--mdns-name" => {
-                if let Some(value) = args.get(index + 1) {
-                    config.mdns_name = Some(value.clone());
-                    index += 1;
-                }
-            }
-            "--no-mdns" => {
-                config.mdns_name = None;
-            }
-            "--health-json" => {
-                health_json = true;
-            }
-            "--docker-smoke" => {
-                docker_smoke = true;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    (config, health_json, docker_smoke)
-}
-
-#[must_use]
-pub fn run_cli(args: &[String]) -> CliRunResult {
-    let (config, health_json, docker_smoke) = parse_cli_args(args);
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
-        return CliRunResult {
-            exit_code: 0,
-            stdout: "Usage: openagent-http-runtime [--host <host>] [--port <port>] [--workspace <path>] [--session-root <path>] [--headless] [--auth-token <token>] [-u|--username <name>] [-p|--password <password>] [--cors-origin <origin>] [--mdns-name <name>] [--no-mdns] [--health-json]\n".to_string(),
-            stderr: String::new(),
-        };
-    }
-    if health_json || docker_smoke {
-        let smoke_config = HttpRuntimeConfig {
-            serve_static: false,
-            auth_token: config.auth_token,
-            ..HttpRuntimeConfig::default()
-        };
-        return CliRunResult {
-            exit_code: 0,
-            stdout: format!("{}\n", stable_json_dumps(&health_payload(&smoke_config))),
-            stderr: String::new(),
-        };
-    }
-    serve_blocking(config)
-}
-
-fn serve_blocking(config: HttpRuntimeConfig) -> CliRunResult {
-    let listener = match TcpListener::bind((config.host.as_str(), config.port)) {
-        Ok(listener) => listener,
-        Err(error) => {
-            return CliRunResult {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: format!("failed to bind HTTP runtime: {error}\n"),
-            };
-        }
-    };
-    let local = listener
-        .local_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| format!("{}:{}", config.host, config.port));
-    println!("openagent HTTP runtime listening on http://{local}");
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let config = config.clone();
-                thread::spawn(move || {
-                    let _ = handle_http_stream(&mut stream, &config);
-                });
-            }
-            Err(error) => eprintln!("openagent HTTP runtime accept failed: {error}"),
-        }
-    }
-    CliRunResult {
-        exit_code: 0,
-        stdout: String::new(),
-        stderr: String::new(),
-    }
-}
-
-fn handle_http_stream(stream: &mut TcpStream, config: &HttpRuntimeConfig) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| error.to_string())?;
-    let request = read_http_request(stream)?;
-    if should_live_sse(&request, config) {
-        return write_live_sse_response(stream, config, &request);
-    }
-    let response = route_http_request(&request, config);
-    write_http_response(stream, with_runtime_headers(response, config))
-}
-
-#[derive(Clone, Debug)]
-struct HttpRequest {
-    method: String,
-    path: String,
-    headers: BTreeMap<String, String>,
-    body: String,
-}
-
-fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    loop {
-        let read = stream.read(&mut chunk).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-        if buffer.len() > 1024 * 1024 {
-            return Err("request headers too large".to_string());
-        }
-    }
-    let split = buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
-        .ok_or_else(|| "invalid HTTP request".to_string())?;
-    let head = String::from_utf8_lossy(&buffer[..split]).to_string();
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let path = parts.next().unwrap_or("/").to_string();
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
-        }
-    }
-    let content_length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_default();
-    let mut body_bytes = buffer[split..].to_vec();
-    while body_bytes.len() < content_length {
-        let read = stream.read(&mut chunk).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        body_bytes.extend_from_slice(&chunk[..read]);
-    }
-    body_bytes.truncate(content_length);
-    Ok(HttpRequest {
-        method,
-        path,
-        headers,
-        body: String::from_utf8_lossy(&body_bytes).to_string(),
-    })
-}
-
-fn route_http_request(request: &HttpRequest, config: &HttpRuntimeConfig) -> HttpResponseSpec {
-    if request.method == "OPTIONS" {
-        return route_options();
-    }
-    if !authorized(request, config) {
-        return route_unauthorized();
-    }
-    let path = request.path.split('?').next().unwrap_or("/");
-    match (request.method.as_str(), path) {
-        ("GET", "/api/health") => json_response(200, health_payload(config)),
-        ("GET", "/api/models") => json_response(200, models_payload()),
-        ("GET", "/api/agents") => json_response(200, agents_payload()),
-        ("GET", "/api/mdns") => json_response(200, mdns_payload(config)),
-        ("GET", "/api/events") => sse_response(global_sse_frames(config, &request.path)),
-        ("GET", "/api/sessions") => {
-            json_response(200, list_sessions_payload(config, &request.path))
-        }
-        ("POST", "/api/sessions") => {
-            json_response(200, create_session_payload(config, &request.body))
-        }
-        ("GET", "/") if config.serve_static => {
-            static_response("text/html; charset=utf-8", INDEX_HTML)
-        }
-        ("GET", "/index.html") if config.serve_static => {
-            static_response("text/html; charset=utf-8", INDEX_HTML)
-        }
-        ("GET", "/app.js") if config.serve_static => {
-            static_response("application/javascript; charset=utf-8", APP_JS)
-        }
-        ("GET", "/app.css") if config.serve_static => {
-            static_response("text/css; charset=utf-8", APP_CSS)
-        }
-        _ => route_dynamic_request(request, config, path),
-    }
-}
-
-fn route_dynamic_request(
-    request: &HttpRequest,
-    config: &HttpRuntimeConfig,
-    path: &str,
-) -> HttpResponseSpec {
-    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    if parts.len() == 3 && parts[0] == "api" && parts[1] == "sessions" {
-        return match request.method.as_str() {
-            "GET" => json_response(200, get_session_payload(config, parts[2])),
-            "PATCH" => match update_session_payload(config, parts[2], &request.body) {
-                Ok(payload) => json_response(200, payload),
-                Err(error) => json_response(400, json!({"error": error})),
-            },
-            "DELETE" => match delete_session_payload(config, parts[2]) {
-                Ok(payload) => json_response(200, payload),
-                Err(error) => json_response(400, json!({"error": error})),
-            },
-            _ => route_unknown(),
-        };
-    }
-    if parts.len() == 4
-        && parts[0] == "api"
-        && parts[1] == "sessions"
-        && parts[3] == "messages"
-        && request.method == "GET"
-    {
-        return match session_messages_payload(config, parts[2], &request.path) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    if parts.len() == 4
-        && parts[0] == "api"
-        && parts[1] == "sessions"
-        && parts[3] == "children"
-        && request.method == "GET"
-    {
-        return json_response(200, session_children_payload(config, parts[2]));
-    }
-    if parts.len() == 4 && parts[0] == "api" && parts[1] == "sessions" && parts[3] == "share" {
-        return match request.method.as_str() {
-            "POST" => match share_session_payload(config, parts[2]) {
-                Ok(payload) => json_response(200, payload),
-                Err(error) => json_response(400, json!({"error": error})),
-            },
-            "DELETE" => match unshare_session_payload(config, parts[2]) {
-                Ok(payload) => json_response(200, payload),
-                Err(error) => json_response(400, json!({"error": error})),
-            },
-            _ => route_unknown(),
-        };
-    }
-    if parts.len() == 4
-        && parts[0] == "api"
-        && parts[1] == "sessions"
-        && parts[3] == "compact"
-        && request.method == "POST"
-    {
-        return match compact_session_payload(config, parts[2]) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    if parts.len() == 4 && parts[0] == "api" && parts[1] == "sessions" && parts[3] == "diff" {
-        return match request.method.as_str() {
-            "GET" => match session_diff_payload(config, parts[2]) {
-                Ok(payload) => json_response(200, payload),
-                Err(error) => json_response(400, json!({"error": error})),
-            },
-            _ => route_unknown(),
-        };
-    }
-    if parts.len() == 4
-        && parts[0] == "api"
-        && parts[1] == "sessions"
-        && parts[3] == "undo"
-        && request.method == "POST"
-    {
-        return match undo_session_payload(config, parts[2]) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    if parts.len() == 4
-        && parts[0] == "api"
-        && parts[1] == "sessions"
-        && parts[3] == "redo"
-        && request.method == "POST"
-    {
-        return match redo_session_payload(config, parts[2]) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    if parts.len() == 4
-        && parts[0] == "api"
-        && parts[1] == "sessions"
-        && parts[3] == "turns"
-        && request.method == "POST"
-    {
-        return match start_turn_payload(config, parts[2], &request.body) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    if parts.len() == 4
-        && parts[0] == "api"
-        && parts[1] == "turns"
-        && parts[3] == "events"
-        && request.method == "GET"
-    {
-        return sse_response(turn_sse_frames(config, parts[2], &request.path));
-    }
-    if parts.len() == 4
-        && parts[0] == "api"
-        && parts[1] == "turns"
-        && parts[3] == "interrupt"
-        && request.method == "POST"
-    {
-        return match interrupt_turn_payload(config, parts[2]) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    if path.starts_with("/api/turns/") && path.contains("/approvals/") && request.method == "POST" {
-        return match respond_approval_payload(config, path, &request.body) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    if path.starts_with("/api/turns/")
-        && path.contains("/questions/")
-        && path.ends_with("/reply")
-        && request.method == "POST"
-    {
-        return match respond_question_payload(config, path, &request.body) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    if path == "/tui/control/next" && request.method == "GET" {
-        return json_response(200, pop_tui_control_payload(config));
-    }
-    if path == "/tui/control/response" && request.method == "POST" {
-        return json_response(200, record_tui_control_response(config, &request.body));
-    }
-    if path.starts_with("/tui/") && request.method == "POST" {
-        return match enqueue_tui_control_payload(config, path, &request.body) {
-            Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
-        };
-    }
-    route_unknown()
-}
-
-fn authorized(request: &HttpRequest, config: &HttpRuntimeConfig) -> bool {
-    if !config.auth_required() {
-        return true;
-    }
-    if let Some(token) = config.auth_token.as_ref().filter(|token| !token.is_empty()) {
-        let bearer_ok = request
-            .headers
-            .get("authorization")
-            .is_some_and(|value| value == &format!("Bearer {token}"));
-        let header_ok = request
-            .headers
-            .get("x-openagent-token")
-            .is_some_and(|value| value == token);
-        if bearer_ok || header_ok {
-            return true;
-        }
-    }
-    basic_auth_ok(
-        request.headers.get("authorization").map(String::as_str),
-        config,
-    )
-}
-
-fn json_response(status: u16, body: Value) -> HttpResponseSpec {
-    HttpResponseSpec {
-        status,
-        content_type: Some("application/json; charset=utf-8".to_string()),
-        headers: Map::new(),
-        body: Some(body),
-        body_text: None,
-    }
-}
-
-fn static_response(content_type: &str, body: &str) -> HttpResponseSpec {
-    HttpResponseSpec {
-        status: 200,
-        content_type: Some(content_type.to_string()),
-        headers: Map::new(),
-        body: None,
-        body_text: Some(body.to_string()),
-    }
-}
-
-fn sse_response(body: String) -> HttpResponseSpec {
-    let mut headers = Map::new();
-    headers.insert("Cache-Control".to_string(), json!("no-cache"));
-    headers.insert("X-Accel-Buffering".to_string(), json!("no"));
-    HttpResponseSpec {
-        status: 200,
-        content_type: Some("text/event-stream; charset=utf-8".to_string()),
-        headers,
-        body: None,
-        body_text: Some(body),
-    }
-}
-
-fn should_live_sse(request: &HttpRequest, config: &HttpRuntimeConfig) -> bool {
-    if request.method != "GET" || !authorized(request, config) {
-        return false;
-    }
-    let path = request.path.split('?').next().unwrap_or("/");
-    let is_sse_path = path == "/api/events" || turn_id_from_events_path(path).is_some();
-    is_sse_path
-        && request
-            .headers
-            .get("accept")
-            .is_some_and(|value| value.contains("text/event-stream"))
-}
-
-fn write_live_sse_response(
-    stream: &mut TcpStream,
-    config: &HttpRuntimeConfig,
-    request: &HttpRequest,
-) -> Result<(), String> {
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| error.to_string())?;
-    let path = request.path.split('?').next().unwrap_or("/");
-    let turn_id = turn_id_from_events_path(path);
-    let headers = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache, no-transform\r\nx-accel-buffering: no\r\naccess-control-allow-origin: {}\r\nconnection: close\r\n\r\n",
-        config.cors_origin
-    );
-    stream
-        .write_all(headers.as_bytes())
-        .map_err(|error| error.to_string())?;
-    let mut last_id = last_event_id_from_path(&request.path);
-    let timeout = live_sse_timeout(&request.path);
-    let started = Instant::now();
-    let mut last_heartbeat = Instant::now();
-    loop {
-        let mut terminal_seen = false;
-        for (id, event) in live_sse_events_after(config, turn_id.as_deref(), last_id) {
-            stream
-                .write_all(sse_frame(id, &event).as_bytes())
-                .map_err(|error| error.to_string())?;
-            last_id = id;
-            if is_terminal_turn_event(&event) {
-                terminal_seen = true;
-            }
-        }
-        stream.flush().map_err(|error| error.to_string())?;
-        if terminal_seen {
-            return Ok(());
-        }
-        if started.elapsed() >= timeout {
-            stream
-                .write_all(b": ping\n\n")
-                .map_err(|error| error.to_string())?;
-            stream.flush().map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-        if last_heartbeat.elapsed() >= Duration::from_secs(10) {
-            stream
-                .write_all(b": ping\n\n")
-                .map_err(|error| error.to_string())?;
-            stream.flush().map_err(|error| error.to_string())?;
-            last_heartbeat = Instant::now();
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn live_sse_events_after(
-    config: &HttpRuntimeConfig,
-    turn_id: Option<&str>,
-    last_id: u64,
-) -> Vec<(u64, Value)> {
-    let events = if let Some(turn_id) = turn_id {
-        turn_app_events(config, turn_id)
-    } else {
-        all_app_events(config)
-    };
-    events
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, event)| {
-            let id = event
-                .get(if turn_id.is_some() {
-                    "sequence"
-                } else {
-                    "global_sequence"
-                })
-                .or_else(|| event.get("sequence"))
-                .and_then(Value::as_u64)
-                .unwrap_or(index as u64 + 1);
-            (id > last_id).then_some((id, event))
-        })
-        .collect()
-}
-
-fn turn_id_from_events_path(path: &str) -> Option<String> {
-    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    (parts.len() == 4 && parts[0] == "api" && parts[1] == "turns" && parts[3] == "events")
-        .then(|| parts[2].to_string())
-}
-
-fn live_sse_timeout(request_path: &str) -> Duration {
-    let millis = query_value(request_path, "live_timeout_ms")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(30_000)
-        .clamp(250, 300_000);
-    Duration::from_millis(millis)
-}
-
-fn is_terminal_turn_event(event: &Value) -> bool {
-    matches!(
-        event.get("method").and_then(Value::as_str),
-        Some("turn/completed" | "turn/failed" | "turn/interrupted")
-    )
-}
-
-fn with_runtime_headers(
-    mut response: HttpResponseSpec,
-    config: &HttpRuntimeConfig,
-) -> HttpResponseSpec {
-    response.headers.insert(
-        "Access-Control-Allow-Origin".to_string(),
-        json!(config.cors_origin.clone()),
-    );
-    response.headers.insert(
-        "Access-Control-Allow-Headers".to_string(),
-        json!("Authorization, Content-Type, X-OpenAgent-Token"),
-    );
-    response.headers.insert(
-        "Access-Control-Allow-Methods".to_string(),
-        json!("GET, POST, PATCH, DELETE, OPTIONS"),
-    );
-    response
-}
-
-fn write_http_response(stream: &mut TcpStream, response: HttpResponseSpec) -> Result<(), String> {
-    let body = response.body_text.unwrap_or_else(|| {
-        response
-            .body
-            .as_ref()
-            .map(stable_json_dumps)
-            .unwrap_or_default()
-    });
-    let content_type = response
-        .content_type
-        .unwrap_or_else(|| "application/json; charset=utf-8".to_string());
-    let status_text = match response.status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        _ => "OK",
-    };
-    let mut headers = format!(
-        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n",
-        response.status,
-        status_text,
-        content_type,
-        body.len()
-    );
-    for (key, value) in response.headers {
-        if let Some(value) = value.as_str() {
-            headers.push_str(&format!("{key}: {value}\r\n"));
-        }
-    }
-    headers.push_str("\r\n");
-    stream
-        .write_all(headers.as_bytes())
-        .and_then(|()| stream.write_all(body.as_bytes()))
-        .map_err(|error| error.to_string())
-}
-
-fn basic_auth_ok(authorization: Option<&str>, config: &HttpRuntimeConfig) -> bool {
-    let Some(password) = config
-        .auth_password
-        .as_ref()
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-    let username = config.auth_username.as_deref().unwrap_or("openagent");
-    let Some(encoded) = authorization.and_then(|value| value.strip_prefix("Basic ")) else {
-        return false;
-    };
-    decode_base64(encoded).is_some_and(|decoded| decoded == format!("{username}:{password}"))
-}
-
-fn decode_base64(value: &str) -> Option<String> {
-    let mut output = Vec::new();
-    let mut buffer = 0_u32;
-    let mut bits = 0_u8;
-    for byte in value.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
-        if byte == b'=' {
-            break;
-        }
-        let sextet = base64_value(byte)? as u32;
-        buffer = (buffer << 6) | sextet;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push(((buffer >> bits) & 0xff) as u8);
-        }
-    }
-    String::from_utf8(output).ok()
-}
-
-fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
+// app_bridge_routes implementation lives in `app_bridge_routes.rs`.
 fn list_sessions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Value {
     let root = session_root(config);
     let query = query_param(request_path, "query").unwrap_or_default();
@@ -1093,56 +222,1309 @@ fn list_sessions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Valu
     json!({"session_root": root.to_string_lossy(), "query": query, "sessions": sessions})
 }
 
-fn models_payload() -> Value {
-    let current = default_model_id();
-    let mut models = vec![json!({
-        "id": current,
-        "provider_id": "openagent",
-        "name": "OpenAgent Server Local",
-        "capabilities": {"tools": true, "streaming": true, "reasoning": true},
-        "default": true,
-    })];
-    if models[0]["id"] != "server-local" {
-        models.push(json!({
-            "id": "server-local",
-            "provider_id": "openagent",
-            "name": "OpenAgent Server Local",
-            "capabilities": {"tools": true, "streaming": true, "reasoning": true},
-        }));
-    }
+fn models_payload(request_path: &str) -> Value {
+    let provider =
+        query_param(request_path, "provider").unwrap_or_else(|| active_provider_id(None));
+    let runtime_config = runtime_provider_config(Some(&provider), None, None)
+        .unwrap_or_else(|_| RuntimeProviderConfig::fallback(&provider));
+    let live_check = query_flag(request_path, "check") || query_flag(request_path, "refresh");
+    let probe = if live_check {
+        probe_runtime_models_endpoint(&runtime_config)
+    } else {
+        RuntimeModelProbe::not_checked(&runtime_config)
+    };
+    let models = model_records_for_runtime(&runtime_config, &probe);
     json!({
+        "provider": runtime_config.provider,
+        "provider_label": runtime_config.provider_label,
+        "base_url": runtime_config.base_url,
+        "base_url_source": runtime_config.base_url_source,
+        "model": runtime_config.model,
+        "model_source": runtime_config.model_source,
+        "wire_api": runtime_config.wire_api,
+        "wire_api_source": runtime_config.wire_api_source,
+        "api_key": if runtime_config.api_key.is_some() { "set" } else { "missing" },
+        "api_key_env": runtime_config.api_key_env,
+        "api_key_source": runtime_config.api_key_source,
+        "healthy": probe.ok,
+        "model_endpoint_checked": probe.checked,
+        "model_endpoint_ok": probe.ok,
+        "model_endpoint": probe.endpoint,
+        "model_endpoint_message": probe.message,
+        "model_count": probe.model_ids.len(),
+        "configured_model_available": probe.configured_model_available,
         "models": models,
         "variants": ["default", "fast", "balanced", "deep"],
         "thinking": ["off", "low", "medium", "high"],
     })
 }
 
-fn agents_payload() -> Value {
-    json!({
-        "agents": [
-            {
-                "id": "server",
-                "name": "Server",
-                "description": "Default server-backed coding agent",
-                "default": true,
-            },
-            {
-                "id": "coder",
-                "name": "Coder",
-                "description": "Implementation-focused profile",
-            },
-            {
-                "id": "reviewer",
-                "name": "Reviewer",
-                "description": "Review and risk-focused profile",
-            },
-            {
-                "id": "planner",
-                "name": "Planner",
-                "description": "Plan-first profile for large changes",
-            }
-        ],
+// mcp_runtime implementation lives in `mcp_runtime.rs`.
+fn model_records_for_runtime(
+    config: &RuntimeProviderConfig,
+    probe: &RuntimeModelProbe,
+) -> Vec<Value> {
+    let mut models = if probe.model_ids.is_empty() {
+        vec![config.model.clone()]
+    } else {
+        probe.model_ids.clone()
+    }
+    .into_iter()
+    .filter(|model| !model.is_empty())
+    .collect::<Vec<_>>();
+    if !models.iter().any(|model| model == &config.model) {
+        models.insert(0, config.model.clone());
+    }
+    if !models.iter().any(|model| model == "server-local") {
+        models.push("server-local".to_string());
+    }
+    models
+        .into_iter()
+        .map(|model| {
+            let provider_id = if model == "server-local" {
+                "openagent".to_string()
+            } else {
+                config.provider.clone()
+            };
+            let name = if model == "server-local" {
+                "OpenAgent Server Local".to_string()
+            } else {
+                model.clone()
+            };
+            let default = model == config.model;
+            json!({
+                "id": model,
+                "provider_id": provider_id,
+                "name": name,
+                "capabilities": {"tools": true, "streaming": true, "reasoning": true},
+                "default": default,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeProviderConfig {
+    provider: String,
+    provider_label: String,
+    api_key_env: String,
+    api_key: Option<String>,
+    api_key_source: Option<String>,
+    base_url: String,
+    base_url_source: String,
+    model: String,
+    model_source: String,
+    wire_api: String,
+    wire_api_source: String,
+    requires_api_key: bool,
+}
+
+impl RuntimeProviderConfig {
+    fn fallback(provider: &str) -> Self {
+        let provider = normalize_provider(Some(provider)).unwrap_or_else(|_| "openai".to_string());
+        Self {
+            provider_label: provider_label(&provider).unwrap_or_else(|_| provider.clone()),
+            api_key_env: default_env_mapping(&provider)
+                .ok()
+                .and_then(|env| env.get("api_key").cloned())
+                .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
+            api_key: None,
+            api_key_source: None,
+            base_url: provider_default_base_url(&provider)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            base_url_source: "default".to_string(),
+            model: provider_default_model(&provider)
+                .ok()
+                .flatten()
+                .unwrap_or_else(default_model_id),
+            model_source: "default".to_string(),
+            wire_api: "responses".to_string(),
+            wire_api_source: "default".to_string(),
+            requires_api_key: provider_requires_api_key(&provider).unwrap_or(true),
+            provider,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeProviderField {
+    value: String,
+    source: String,
+}
+
+fn runtime_provider_config(
+    provider: Option<&str>,
+    payload: Option<&Value>,
+    session: Option<&Session>,
+) -> Result<RuntimeProviderConfig, String> {
+    let provider = normalize_provider(Some(&active_provider_id(provider)))?;
+    let env = default_env_mapping(&provider)?;
+    let auth_record = runtime_auth_record(&provider);
+    let api_key_env = env
+        .get("api_key")
+        .cloned()
+        .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
+    let api_key = runtime_provider_field(
+        "api_key",
+        &api_key_env,
+        &["OPENAGENT_API_KEY"],
+        None,
+        payload,
+        session,
+        auth_record.as_ref(),
+    );
+    let base_url = runtime_provider_field(
+        "base_url",
+        env.get("base_url")
+            .map(String::as_str)
+            .unwrap_or("OPENAI_BASE_URL"),
+        &["OPENAGENT_BASE_URL"],
+        provider_default_base_url(&provider)
+            .ok()
+            .flatten()
+            .or_else(|| Some("https://api.openai.com/v1".to_string())),
+        payload,
+        session,
+        auth_record.as_ref(),
+    )
+    .expect("base_url has default");
+    let model = runtime_provider_field(
+        "model",
+        env.get("model")
+            .map(String::as_str)
+            .unwrap_or("OPENAI_MODEL"),
+        &["OPENAGENT_MODEL"],
+        provider_default_model(&provider)
+            .ok()
+            .flatten()
+            .or_else(|| Some(default_model_id())),
+        payload,
+        session,
+        auth_record.as_ref(),
+    )
+    .expect("model has default");
+    let wire_api = runtime_provider_field(
+        "wire_api",
+        env.get("wire_api")
+            .map(String::as_str)
+            .unwrap_or("OPENAI_WIRE_API"),
+        &["OPENAGENT_WIRE_API"],
+        Some("responses".to_string()),
+        payload,
+        session,
+        auth_record.as_ref(),
+    )
+    .expect("wire_api has default");
+    Ok(RuntimeProviderConfig {
+        provider_label: provider_label(&provider).unwrap_or_else(|_| provider.clone()),
+        api_key_env,
+        api_key: api_key.as_ref().map(|field| field.value.clone()),
+        api_key_source: api_key.map(|field| field.source),
+        base_url: base_url.value,
+        base_url_source: base_url.source,
+        model: model.value,
+        model_source: model.source,
+        wire_api: wire_api.value,
+        wire_api_source: wire_api.source,
+        requires_api_key: provider_requires_api_key(&provider).unwrap_or(true),
+        provider,
     })
+}
+
+fn active_provider_id(provider: Option<&str>) -> String {
+    provider
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("OPENAGENT_PROVIDER").ok())
+        .or_else(|| std::env::var("OPENAGENT_ACTIVE_PROVIDER").ok())
+        .unwrap_or_else(|| "openai".to_string())
+}
+
+fn runtime_provider_field(
+    field: &str,
+    provider_env_name: &str,
+    generic_env_names: &[&str],
+    default: Option<String>,
+    payload: Option<&Value>,
+    session: Option<&Session>,
+    auth_record: Option<&Value>,
+) -> Option<RuntimeProviderField> {
+    payload
+        .and_then(|payload| payload.get(field))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| RuntimeProviderField {
+            value: value.to_string(),
+            source: "payload".to_string(),
+        })
+        .or_else(|| {
+            session
+                .and_then(|session| session.metadata.get(field))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| RuntimeProviderField {
+                    value: value.to_string(),
+                    source: "session".to_string(),
+                })
+        })
+        .or_else(|| env_field(provider_env_name, "env"))
+        .or_else(|| {
+            generic_env_names
+                .iter()
+                .find_map(|name| env_field(name, "env"))
+        })
+        .or_else(|| {
+            auth_record
+                .and_then(|record| record.get(field))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| RuntimeProviderField {
+                    value: value.to_string(),
+                    source: "auth_file".to_string(),
+                })
+        })
+        .or_else(|| {
+            default.map(|value| RuntimeProviderField {
+                value,
+                source: "default".to_string(),
+            })
+        })
+}
+
+fn env_field(name: &str, source: &str) -> Option<RuntimeProviderField> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| RuntimeProviderField {
+            value,
+            source: source.to_string(),
+        })
+}
+
+fn runtime_auth_record(provider: &str) -> Option<Value> {
+    read_json_file(&runtime_auth_file())
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get(provider))
+        .cloned()
+}
+
+fn runtime_auth_file() -> PathBuf {
+    std::env::var("OPENAGENT_AUTH_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join(".config/openagent/auth.json"))
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeModelProbe {
+    checked: bool,
+    ok: bool,
+    message: String,
+    endpoint: Option<String>,
+    model_ids: Vec<String>,
+    configured_model_available: Option<bool>,
+}
+
+impl RuntimeModelProbe {
+    fn not_checked(config: &RuntimeProviderConfig) -> Self {
+        Self {
+            checked: false,
+            ok: !config.requires_api_key || config.api_key.is_some(),
+            message: "not checked; pass check=true to probe the provider /models endpoint"
+                .to_string(),
+            endpoint: Some(join_url(&config.base_url, "models")),
+            model_ids: Vec::new(),
+            configured_model_available: None,
+        }
+    }
+}
+
+fn probe_runtime_models_endpoint(config: &RuntimeProviderConfig) -> RuntimeModelProbe {
+    let endpoint = join_url(&config.base_url, "models");
+    if config.requires_api_key && config.api_key.is_none() {
+        return RuntimeModelProbe {
+            checked: false,
+            ok: false,
+            message: format!(
+                "missing API key in {}; /models was not checked",
+                config.api_key_env
+            ),
+            endpoint: Some(endpoint),
+            model_ids: Vec::new(),
+            configured_model_available: None,
+        };
+    }
+    let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return RuntimeModelProbe {
+                checked: true,
+                ok: false,
+                message: format!("failed to build HTTP client: {error}"),
+                endpoint: Some(endpoint),
+                model_ids: Vec::new(),
+                configured_model_available: None,
+            };
+        }
+    };
+    let mut request = client.get(&endpoint).header("accept", "application/json");
+    if let Some(api_key) = config.api_key.as_deref().filter(|value| !value.is_empty()) {
+        request = request.bearer_auth(api_key);
+    }
+    let response = match request.send() {
+        Ok(response) => response,
+        Err(error) => {
+            return RuntimeModelProbe {
+                checked: true,
+                ok: false,
+                message: format!("failed to GET {endpoint}: {error}"),
+                endpoint: Some(endpoint),
+                model_ids: Vec::new(),
+                configured_model_available: None,
+            };
+        }
+    };
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let raw = match response.text() {
+        Ok(raw) => raw,
+        Err(error) => {
+            return RuntimeModelProbe {
+                checked: true,
+                ok: false,
+                message: format!("failed to read {endpoint}: {error}"),
+                endpoint: Some(endpoint),
+                model_ids: Vec::new(),
+                configured_model_available: None,
+            };
+        }
+    };
+    if !status.is_success() {
+        return RuntimeModelProbe {
+            checked: true,
+            ok: false,
+            message: format!(
+                "HTTP {} from {endpoint}: {}",
+                status.as_u16(),
+                summarize_http_error_body(&raw, &content_type)
+            ),
+            endpoint: Some(endpoint),
+            model_ids: Vec::new(),
+            configured_model_available: None,
+        };
+    }
+    let model_ids = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .map(|value| extract_openai_model_ids(&value))
+        .unwrap_or_default();
+    let configured_model_available =
+        (!model_ids.is_empty()).then(|| model_ids.iter().any(|model| model == &config.model));
+    let message = match configured_model_available {
+        Some(true) => format!(
+            "HTTP {} from {endpoint}; configured model is listed among {} model(s)",
+            status.as_u16(),
+            model_ids.len()
+        ),
+        Some(false) => format!(
+            "HTTP {} from {endpoint}; {} model(s) listed, configured model '{}' was not listed",
+            status.as_u16(),
+            model_ids.len(),
+            config.model
+        ),
+        None => format!("HTTP {} from {endpoint}", status.as_u16()),
+    };
+    RuntimeModelProbe {
+        checked: true,
+        ok: true,
+        message,
+        endpoint: Some(endpoint),
+        model_ids,
+        configured_model_available,
+    }
+}
+
+fn extract_openai_model_ids(value: &Value) -> Vec<String> {
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn agents_payload(config: &HttpRuntimeConfig) -> Value {
+    let mut agents = vec![json!({
+        "id": "server",
+        "name": "Server",
+        "description": "Default server-backed coding agent",
+        "mode": "primary",
+        "default": true,
+    })];
+    agents.extend(
+        runtime_subagent_profiles(&workspace(config))
+            .into_iter()
+            .filter(|profile| !profile.hidden)
+            .map(|profile| runtime_subagent_public_value(&profile)),
+    );
+    json!({ "agents": agents })
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeSubagentProfile {
+    id: String,
+    name: String,
+    description: String,
+    mode: String,
+    permission: PermissionRuleset,
+    task_permissions: Vec<TaskPermissionRule>,
+    prompt: String,
+    tools: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    max_steps: Option<u64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    color: Option<String>,
+    disabled: bool,
+    model_options: BTreeMap<String, Value>,
+    workspace_isolation: bool,
+    hidden: bool,
+    source_path: Option<PathBuf>,
+}
+
+fn runtime_subagent_profiles(workspace: &Path) -> Vec<RuntimeSubagentProfile> {
+    runtime_agent_profiles(workspace)
+        .into_iter()
+        .filter(|profile| runtime_is_subagent_mode(&profile.mode))
+        .collect()
+}
+
+fn runtime_agent_profiles(workspace: &Path) -> Vec<RuntimeSubagentProfile> {
+    let mut profiles = builtin_runtime_subagent_profiles()
+        .into_iter()
+        .map(|profile| (profile.id.clone(), profile))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = runtime_agent_registry_dirs(workspace)
+        .into_iter()
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| runtime_agent_profile_file_kind(path).is_some())
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let fallback_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(sanitize_runtime_agent_id)
+            .unwrap_or_else(|| "agent".to_string());
+        if let Some(profile) = runtime_agent_profile_from_path(&path, &fallback_id)
+            && !profile.disabled
+        {
+            profiles.insert(profile.id.clone(), profile);
+        }
+    }
+    profiles.into_values().collect()
+}
+
+fn runtime_agent_registry_dirs(workspace: &Path) -> Vec<PathBuf> {
+    vec![
+        workspace.join(".openagent/agents"),
+        workspace.join(".opencode/agents"),
+        workspace.join(".opencode/agent"),
+    ]
+}
+
+fn runtime_agent_profile_file_kind(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("json") => Some("json"),
+        Some("md" | "markdown") => Some("markdown"),
+        _ => None,
+    }
+}
+
+fn runtime_agent_profile_from_path(
+    path: &Path,
+    fallback_id: &str,
+) -> Option<RuntimeSubagentProfile> {
+    let kind = runtime_agent_profile_file_kind(path)?;
+    let value = if kind == "json" {
+        read_json_file(path)
+    } else {
+        markdown_runtime_agent_profile_value(path).ok()?
+    };
+    runtime_agent_profile_from_value(&value, fallback_id, Some(path.to_path_buf()))
+}
+
+fn markdown_runtime_agent_profile_value(path: &Path) -> Result<Value, String> {
+    let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut value = json!({});
+    let mut body = raw.as_str();
+    if let Some(rest) = raw.trim_start_matches('\u{feff}').strip_prefix("---")
+        && let Some((frontmatter, tail)) = rest.split_once("---")
+    {
+        value = serde_yaml::from_str::<Value>(frontmatter).unwrap_or_else(|_| json!({}));
+        body = tail.trim_start_matches('\n');
+    }
+    if value.as_object().is_none() {
+        value = json!({});
+    }
+    if let Some(object) = value.as_object_mut() {
+        let prompt = body.trim_start_matches('\n').trim_end();
+        if !prompt.trim().is_empty() && !object.contains_key("prompt") {
+            object.insert("prompt".to_string(), json!(prompt));
+        }
+    }
+    Ok(value)
+}
+
+fn builtin_runtime_subagent_profiles() -> Vec<RuntimeSubagentProfile> {
+    vec![
+        builtin_runtime_subagent_profile(
+            "coder",
+            "Coder",
+            "Implementation-focused profile",
+            PermissionRuleset::PlanOnly,
+            BUILD_AGENT_PROMPT,
+            &[],
+        ),
+        builtin_runtime_subagent_profile(
+            "reviewer",
+            "Reviewer",
+            "Review and risk-focused profile",
+            PermissionRuleset::Readonly,
+            REVIEW_AGENT_PROMPT,
+            &[
+                "read",
+                "glob",
+                "grep",
+                "ls",
+                "code_search",
+                "skill",
+                "todoread",
+            ],
+        ),
+        builtin_runtime_subagent_profile(
+            "planner",
+            "Planner",
+            "Plan-first profile for large changes",
+            PermissionRuleset::PlanOnly,
+            PLAN_AGENT_PROMPT,
+            &[
+                "read",
+                "glob",
+                "grep",
+                "ls",
+                "code_search",
+                "skill",
+                "todoread",
+                "todowrite",
+                "question",
+            ],
+        ),
+        builtin_runtime_subagent_profile(
+            "general",
+            "General",
+            "General-purpose subagent for complex multi-step tasks",
+            PermissionRuleset::PlanOnly,
+            BUILD_AGENT_PROMPT,
+            &[],
+        ),
+        builtin_runtime_subagent_profile(
+            "explore",
+            "Explore",
+            "Read-only code exploration subagent",
+            PermissionRuleset::Readonly,
+            EXPLORE_AGENT_PROMPT,
+            &[
+                "read",
+                "glob",
+                "grep",
+                "ls",
+                "code_search",
+                "skill",
+                "todoread",
+            ],
+        ),
+        builtin_runtime_subagent_profile(
+            "scout",
+            "Scout",
+            "External documentation and dependency research subagent with read-only web fetch access",
+            PermissionRuleset::Readonly,
+            SCOUT_AGENT_PROMPT,
+            &[
+                "web_fetch",
+                "read",
+                "glob",
+                "grep",
+                "ls",
+                "code_search",
+                "skill",
+                "todoread",
+            ],
+        ),
+        builtin_runtime_subagent_profile(
+            "plan",
+            "Plan",
+            "Planning subagent for architecture and task breakdowns",
+            PermissionRuleset::PlanOnly,
+            PLAN_AGENT_PROMPT,
+            &[
+                "read",
+                "glob",
+                "grep",
+                "ls",
+                "code_search",
+                "skill",
+                "todoread",
+                "todowrite",
+                "question",
+            ],
+        ),
+    ]
+}
+
+fn builtin_runtime_subagent_profile(
+    id: &str,
+    name: &str,
+    description: &str,
+    permission: PermissionRuleset,
+    prompt: &str,
+    tools: &[&str],
+) -> RuntimeSubagentProfile {
+    RuntimeSubagentProfile {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        mode: "subagent".to_string(),
+        permission,
+        task_permissions: Vec::new(),
+        prompt: prompt.trim_start_matches('\u{feff}').to_string(),
+        tools: tools.iter().map(|item| (*item).to_string()).collect(),
+        provider: None,
+        model: None,
+        max_steps: None,
+        temperature: None,
+        top_p: None,
+        color: None,
+        disabled: false,
+        model_options: BTreeMap::new(),
+        workspace_isolation: false,
+        hidden: false,
+        source_path: None,
+    }
+}
+
+fn runtime_agent_profile_from_value(
+    value: &Value,
+    fallback_id: &str,
+    source_path: Option<PathBuf>,
+) -> Option<RuntimeSubagentProfile> {
+    if value.as_object().is_none_or(Map::is_empty) {
+        return None;
+    }
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("primary")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(mode.as_str(), "primary" | "subagent" | "all") {
+        return None;
+    }
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(sanitize_runtime_agent_id)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| sanitize_runtime_agent_id(fallback_id));
+    let permission = runtime_profile_permission_ruleset_value(value)
+        .and_then(|raw| parse_permission_ruleset(raw).ok())
+        .unwrap_or(PermissionRuleset::PlanOnly);
+    Some(RuntimeSubagentProfile {
+        id: if id.is_empty() {
+            "agent".to_string()
+        } else {
+            id
+        },
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_id)
+            .to_string(),
+        description: value
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        mode,
+        permission,
+        task_permissions: runtime_profile_task_permissions(value),
+        prompt: value
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or(BUILD_AGENT_PROMPT)
+            .trim_start_matches('\u{feff}')
+            .to_string(),
+        tools: runtime_profile_string_list(value.get("tools")),
+        provider: value
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        max_steps: value
+            .get("max_steps")
+            .or_else(|| value.get("steps"))
+            .or_else(|| value.get("maxSteps"))
+            .and_then(Value::as_u64),
+        temperature: value.get("temperature").and_then(Value::as_f64),
+        top_p: value
+            .get("top_p")
+            .or_else(|| value.get("topP"))
+            .and_then(Value::as_f64),
+        color: value
+            .get("color")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        disabled: value
+            .get("disabled")
+            .or_else(|| value.get("disable"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        model_options: runtime_profile_model_options(value),
+        workspace_isolation: value
+            .get("workspace_isolation")
+            .or_else(|| value.get("isolate_workspace"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        hidden: value
+            .get("hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        source_path,
+    })
+}
+
+fn runtime_profile_string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(item)) => item
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn runtime_profile_model_options(value: &Value) -> BTreeMap<String, Value> {
+    const KNOWN_KEYS: &[&str] = &[
+        "id",
+        "name",
+        "description",
+        "mode",
+        "model",
+        "provider",
+        "permission",
+        "task",
+        "task_permissions",
+        "tools",
+        "prompt",
+        "steps",
+        "max_steps",
+        "maxSteps",
+        "hidden",
+        "color",
+        "disabled",
+        "disable",
+        "temperature",
+        "top_p",
+        "topP",
+        "model_options",
+        "options",
+        "workspace_isolation",
+        "isolate_workspace",
+    ];
+    let mut options = BTreeMap::new();
+    if let Some(object) = value.as_object() {
+        for (key, item) in object {
+            if !KNOWN_KEYS.contains(&key.as_str()) {
+                options.insert(key.clone(), item.clone());
+            }
+        }
+    }
+    if let Some(temperature) = value.get("temperature").and_then(Value::as_f64) {
+        options.insert("temperature".to_string(), json!(temperature));
+    }
+    if let Some(top_p) = value
+        .get("top_p")
+        .or_else(|| value.get("topP"))
+        .and_then(Value::as_f64)
+    {
+        options.insert("top_p".to_string(), json!(top_p));
+    }
+    for key in ["model_options", "options"] {
+        if let Some(object) = value.get(key).and_then(Value::as_object) {
+            for (option_key, option_value) in object {
+                options.insert(option_key.clone(), option_value.clone());
+            }
+        }
+    }
+    options
+}
+
+fn runtime_subagent_profile(id: &str, workspace: &Path) -> Option<RuntimeSubagentProfile> {
+    let normalized = sanitize_runtime_agent_id(id);
+    runtime_subagent_profiles(workspace)
+        .into_iter()
+        .find(|profile| profile.id == normalized || profile.name.eq_ignore_ascii_case(id))
+}
+
+fn runtime_agent_profile(id: &str, workspace: &Path) -> Option<RuntimeSubagentProfile> {
+    let normalized = sanitize_runtime_agent_id(id);
+    runtime_agent_profiles(workspace)
+        .into_iter()
+        .find(|profile| profile.id == normalized || profile.name.eq_ignore_ascii_case(id))
+}
+
+fn runtime_task_subagent_descriptors(
+    workspace: &Path,
+    agent_profile: Option<&RuntimeSubagentProfile>,
+    parent_session: Option<&Session>,
+) -> Vec<TaskSubagentDescriptor> {
+    runtime_subagent_profiles(workspace)
+        .into_iter()
+        .filter(|profile| !profile.hidden)
+        .filter(|profile| {
+            agent_profile.is_none_or(|parent| {
+                task_subagent_is_visible(&parent.task_permissions, &profile.id)
+            })
+        })
+        .filter(|profile| {
+            parent_session
+                .is_none_or(|session| runtime_task_governance_error(session, profile).is_none())
+        })
+        .map(|profile| TaskSubagentDescriptor {
+            id: profile.id,
+            name: profile.name,
+            description: profile.description,
+        })
+        .collect()
+}
+
+fn runtime_agent_profile_for_session(session: &Session) -> Option<RuntimeSubagentProfile> {
+    if let Some(profile_value) = session.metadata.get("agent_profile") {
+        let fallback_id = profile_value
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| session.metadata.get("agent").and_then(Value::as_str))
+            .unwrap_or("agent");
+        if let Some(profile) = runtime_agent_profile_from_value(profile_value, fallback_id, None) {
+            return Some(profile);
+        }
+    }
+    session
+        .metadata
+        .get("agent")
+        .and_then(Value::as_str)
+        .and_then(|id| runtime_agent_profile(id, &session.directory))
+}
+
+fn filter_runtime_tools_for_profile(
+    tools: Vec<ToolSchema>,
+    profile: Option<&RuntimeSubagentProfile>,
+) -> Vec<ToolSchema> {
+    let Some(profile) = profile else {
+        return tools;
+    };
+    if profile.tools.is_empty() {
+        return tools;
+    }
+    tools
+        .into_iter()
+        .filter(|tool| runtime_tool_allowed_for_profile(&tool.name, profile))
+        .collect()
+}
+
+fn runtime_tool_allowed_for_profile(tool_name: &str, profile: &RuntimeSubagentProfile) -> bool {
+    profile
+        .tools
+        .iter()
+        .any(|pattern| runtime_tool_pattern_matches(pattern, tool_name))
+}
+
+fn runtime_tool_pattern_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern == "*" || pattern == value {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return value.starts_with(prefix);
+    }
+    false
+}
+
+fn toolkit_with_runtime_task_tool(
+    session: &Session,
+    agent_profile: Option<&RuntimeSubagentProfile>,
+) -> Toolkit {
+    let mut toolkit = Toolkit::with_builtins();
+    register_task_tool(
+        &mut toolkit.registry,
+        &runtime_task_subagent_descriptors(&session.directory, agent_profile, Some(session)),
+    );
+    toolkit
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeMcpRuntime {
+    manager: RemoteMcpManager,
+    descriptors: BTreeMap<String, RemoteMcpToolDescriptor>,
+    workspace: PathBuf,
+}
+
+fn register_runtime_mcp_tools(
+    config: &HttpRuntimeConfig,
+    workspace: &Path,
+    toolkit: &mut Toolkit,
+) -> Option<RuntimeMcpRuntime> {
+    let env = std::env::vars().collect::<BTreeMap<_, _>>();
+    let source = mcp_config_source_for_workspace(config, &env, workspace);
+    let mcp_config = match source
+        .read_source
+        .as_deref()
+        .map(load_mcp_config)
+        .transpose()
+    {
+        Ok(Some(config)) if config.enabled() => config,
+        _ => return None,
+    };
+    let mut manager = RemoteMcpManager::new(mcp_config.clone());
+    let mut descriptors_by_name = BTreeMap::new();
+    for server in mcp_config.servers.iter().filter(|server| server.enabled) {
+        if let Some(result) = refresh_mcp_lifecycle_server(server, workspace) {
+            match result {
+                Ok(descriptors) => {
+                    for descriptor in &descriptors {
+                        toolkit
+                            .registry
+                            .register(mcp_tool_definition(descriptor, "remote-mcp"));
+                        descriptors_by_name
+                            .insert(descriptor.dynamic_name.clone(), descriptor.clone());
+                    }
+                    let _ = manager.set_server_tools(
+                        &server.name,
+                        Some(McpTransport::Stdio),
+                        "connected",
+                        Some(now_ms() as f64 / 1000.0),
+                        descriptors,
+                    );
+                }
+                Err(error) => {
+                    let _ = manager.set_server_error(
+                        &server.name,
+                        "error",
+                        sanitize_mcp_status_error(&error),
+                        Some(now_ms() as f64 / 1000.0),
+                    );
+                }
+            }
+            continue;
+        }
+        match discover_mcp_server_tools(server, workspace) {
+            Ok((transport, tools)) => {
+                let descriptors = build_tool_descriptors_from_values(server, &tools);
+                for descriptor in &descriptors {
+                    toolkit
+                        .registry
+                        .register(mcp_tool_definition(descriptor, "remote-mcp"));
+                    descriptors_by_name.insert(descriptor.dynamic_name.clone(), descriptor.clone());
+                }
+                let _ = manager.set_server_tools(
+                    &server.name,
+                    Some(transport),
+                    "connected",
+                    Some(now_ms() as f64 / 1000.0),
+                    descriptors,
+                );
+            }
+            Err(error) => {
+                let _ = manager.set_server_error(
+                    &server.name,
+                    "error",
+                    sanitize_mcp_status_error(&error),
+                    Some(now_ms() as f64 / 1000.0),
+                );
+            }
+        }
+    }
+    Some(RuntimeMcpRuntime {
+        manager,
+        descriptors: descriptors_by_name,
+        workspace: workspace.to_path_buf(),
+    })
+}
+
+fn max_subagent_depth() -> u64 {
+    std::env::var("OPENAGENT_MAX_SUBAGENT_DEPTH")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_SUBAGENT_DEPTH)
+        .max(1)
+}
+
+fn runtime_child_task_depth(parent_session: &Session) -> u64 {
+    if parent_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        parent_session
+            .metadata
+            .get("task_depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .saturating_add(1)
+    } else {
+        1
+    }
+}
+
+fn runtime_task_root_session_id(parent_session: &Session) -> String {
+    if parent_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        parent_session
+            .metadata
+            .get("task_root_session_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(parent_session.id.as_str())
+            .to_string()
+    } else {
+        parent_session.id.clone()
+    }
+}
+
+fn runtime_parent_task_lineage(parent_session: &Session) -> Vec<String> {
+    parent_session
+        .metadata
+        .get("task_lineage_subagents")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            parent_session
+                .metadata
+                .get("agent")
+                .and_then(Value::as_str)
+                .filter(|_| {
+                    parent_session
+                        .metadata
+                        .get("subagent")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .map(|agent| vec![agent.to_string()])
+                .unwrap_or_default()
+        })
+}
+
+fn runtime_child_task_lineage(parent_session: &Session, child_agent: &str) -> Vec<String> {
+    let mut lineage = runtime_parent_task_lineage(parent_session);
+    lineage.push(child_agent.to_string());
+    lineage
+}
+
+fn runtime_task_governance_error(
+    parent_session: &Session,
+    profile: &RuntimeSubagentProfile,
+) -> Option<String> {
+    let lineage = runtime_parent_task_lineage(parent_session);
+    let parent_agent = parent_session
+        .metadata
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if parent_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && parent_agent == profile.id
+    {
+        return Some(format!("subagent {} cannot call itself", profile.id));
+    }
+    if lineage.iter().any(|agent| agent == &profile.id) {
+        return Some(format!(
+            "subagent {} is already in task lineage",
+            profile.id
+        ));
+    }
+    let child_depth = runtime_child_task_depth(parent_session);
+    let max_depth = max_subagent_depth();
+    if child_depth > max_depth {
+        return Some(format!(
+            "subagent nesting depth {child_depth} exceeds max subagent depth {max_depth}"
+        ));
+    }
+    None
+}
+
+fn runtime_is_subagent_mode(mode: &str) -> bool {
+    matches!(mode, "subagent" | "all")
+}
+
+fn runtime_profile_permission_ruleset_value(value: &Value) -> Option<&str> {
+    let permission = value.get("permission")?;
+    if let Some(raw) = permission.as_str() {
+        return Some(raw);
+    }
+    permission
+        .get("ruleset")
+        .or_else(|| permission.get("default"))
+        .or_else(|| permission.get("mode"))
+        .and_then(Value::as_str)
+}
+
+fn runtime_profile_task_permissions(value: &Value) -> Vec<TaskPermissionRule> {
+    let Some(task) = value
+        .get("permission")
+        .and_then(|permission| permission.get("task"))
+        .or_else(|| value.get("task_permissions"))
+        .or_else(|| value.get("task_permission"))
+    else {
+        return Vec::new();
+    };
+    runtime_parse_task_permission_rules(task)
+}
+
+fn runtime_parse_task_permission_rules(value: &Value) -> Vec<TaskPermissionRule> {
+    if let Some(object) = value.as_object() {
+        return object
+            .iter()
+            .filter_map(|(pattern, action)| {
+                runtime_task_permission_action(action).map(|action| TaskPermissionRule {
+                    pattern: pattern.clone(),
+                    action,
+                })
+            })
+            .collect();
+    }
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let pattern = item
+                .get("pattern")
+                .or_else(|| item.get("subagent"))
+                .or_else(|| item.get("agent"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let action = item
+                .get("action")
+                .and_then(runtime_task_permission_action)?;
+            Some(TaskPermissionRule {
+                pattern: pattern.to_string(),
+                action,
+            })
+        })
+        .collect()
+}
+
+fn runtime_task_permission_action(value: &Value) -> Option<PermissionAction> {
+    let raw = value.as_str()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "allow" | "allowed" => Some(PermissionAction::Allow),
+        "deny" | "denied" => Some(PermissionAction::Deny),
+        "ask" | "prompt" => Some(PermissionAction::Ask),
+        _ => None,
+    }
+}
+
+fn runtime_permission_manager_for_agent(
+    ruleset: PermissionRuleset,
+    agent_profile: Option<&RuntimeSubagentProfile>,
+) -> PermissionManager {
+    let mut manager = PermissionManager::new();
+    manager.set_ruleset(ruleset);
+    if let Some(profile) = agent_profile {
+        for rule in &profile.task_permissions {
+            manager.add_rule(permission_rule(
+                TASK_TOOL_ID,
+                rule.action.clone(),
+                Some(&rule.pattern),
+            ));
+        }
+    }
+    manager
+}
+
+fn sanitize_runtime_agent_id(value: &str) -> String {
+    let mut output = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    while output.contains("--") {
+        output = output.replace("--", "-");
+    }
+    if output.is_empty() {
+        "agent".to_string()
+    } else {
+        output
+    }
 }
 
 fn default_model_id() -> String {
@@ -1172,22 +1554,15 @@ fn create_session_payload(config: &HttpRuntimeConfig, body: &str) -> Value {
     let session_id = new_id("session");
     let store = FileSessionStore::new(session_root(config));
     let mut session = if let Some(fork_from) = payload.get("fork_from").and_then(Value::as_str) {
-        store.load_session(fork_from).map_or_else(
-            |_| Session::new(session_id.clone(), workspace.clone()),
-            |base| {
-                let mut forked = Session::new(session_id.clone(), workspace.clone());
-                forked.messages = base.messages;
-                forked.todos = base.todos;
-                forked.metadata = base.metadata;
-                forked
-                    .metadata
-                    .insert("forked_from".to_string(), json!(fork_from));
+        match store.fork_session(fork_from, &session_id, workspace.clone(), None) {
+            Ok(mut forked) => {
                 forked
                     .metadata
                     .insert("parent_session_id".to_string(), json!(fork_from));
                 forked
-            },
-        )
+            }
+            Err(_) => Session::new(session_id.clone(), workspace.clone()),
+        }
     } else {
         Session::new(session_id.clone(), workspace.clone())
     };
@@ -1373,6 +1748,480 @@ fn session_children_payload(config: &HttpRuntimeConfig, session_id: &str) -> Val
     json!({"session_id": session_id, "children": children})
 }
 
+fn session_tasks_payload(config: &HttpRuntimeConfig, session_id: &str) -> Value {
+    let root = session_root(config);
+    let mut all_tasks = Vec::new();
+    let mut tasks = Vec::new();
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let state = read_json_file(&path.join("state.latest.json"));
+            let metadata = state
+                .get("metadata")
+                .filter(|value| value.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let parent = metadata
+                .get("parent_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let subagent = metadata
+                .get("subagent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if subagent {
+                let task = session_task_summary_from_state(
+                    &root,
+                    &state,
+                    &entry.file_name().to_string_lossy(),
+                );
+                if parent == session_id {
+                    tasks.push(task.clone());
+                }
+                all_tasks.push(task);
+            }
+        }
+    }
+    tasks.sort_by(|left, right| {
+        right["updated_at_ms"]
+            .as_u64()
+            .cmp(&left["updated_at_ms"].as_u64())
+    });
+    let tree = task_tree_for_parent(&all_tasks, session_id);
+    let flat_tasks = flatten_task_tree(&tree);
+    json!({
+        "session_id": session_id,
+        "tasks": tasks,
+        "flat_tasks": flat_tasks,
+        "tree": tree,
+    })
+}
+
+fn task_tree_for_parent(all_tasks: &[Value], parent_session_id: &str) -> Vec<Value> {
+    let mut visited = BTreeSet::new();
+    task_tree_for_parent_inner(all_tasks, parent_session_id, &mut visited)
+}
+
+fn task_tree_for_parent_inner(
+    all_tasks: &[Value],
+    parent_session_id: &str,
+    visited: &mut BTreeSet<String>,
+) -> Vec<Value> {
+    let mut children = all_tasks
+        .iter()
+        .filter(|task| {
+            task.get("parent_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                == parent_session_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| {
+        right["updated_at_ms"]
+            .as_u64()
+            .cmp(&left["updated_at_ms"].as_u64())
+    });
+    children
+        .into_iter()
+        .filter_map(|mut task| {
+            let task_id = task
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if task_id.is_empty() || !visited.insert(task_id.clone()) {
+                return None;
+            }
+            let nested = task_tree_for_parent_inner(all_tasks, &task_id, visited);
+            if let Some(object) = task.as_object_mut() {
+                object.insert("children".to_string(), Value::Array(nested));
+            }
+            Some(task)
+        })
+        .collect()
+}
+
+fn flatten_task_tree(tree: &[Value]) -> Vec<Value> {
+    let mut flat = Vec::new();
+    for task in tree {
+        let mut without_children = task.clone();
+        let children = without_children
+            .as_object_mut()
+            .and_then(|object| object.remove("children"))
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        flat.push(without_children);
+        flat.extend(flatten_task_tree(&children));
+    }
+    flat
+}
+
+fn run_session_task_payload(
+    config: &HttpRuntimeConfig,
+    parent_session_id: &str,
+    task_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    if !valid_session_id(parent_session_id) || !valid_session_id(task_id) {
+        return Err("invalid session id".to_string());
+    }
+    let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    let store = FileSessionStore::new(session_root(config));
+    let mut child_session = store
+        .load_session(task_id)
+        .map_err(|error| error.to_string())?;
+    let parent = child_session
+        .metadata
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if parent != parent_session_id {
+        return Err("task does not belong to parent session".to_string());
+    }
+    if !child_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("session is not a subagent task".to_string());
+    }
+    let task_status = child_session
+        .metadata
+        .get("task_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if task_status != "queued" {
+        return Err(format!("task is not queued: {task_status}"));
+    }
+    let _task_run_lock = claim_session_task_run_lock(config, task_id)?;
+    child_session = store
+        .load_session(task_id)
+        .map_err(|error| error.to_string())?;
+    let parent = child_session
+        .metadata
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if parent != parent_session_id {
+        return Err("task does not belong to parent session".to_string());
+    }
+    if !child_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("session is not a subagent task".to_string());
+    }
+    let task_status = child_session
+        .metadata
+        .get("task_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if task_status != "queued" {
+        return Err(format!("task is not queued: {task_status}"));
+    }
+
+    let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| new_id("turn"));
+    let agent_name = child_session
+        .metadata
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or("subagent")
+        .to_string();
+    let provider = child_session
+        .metadata
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("openai")
+        .to_string();
+    let model = child_session
+        .metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let permission_raw = child_session
+        .metadata
+        .get("permission")
+        .and_then(Value::as_str)
+        .unwrap_or("PLAN_ONLY")
+        .to_string();
+    let permission_ruleset = parse_permission_ruleset(&permission_raw)?;
+    let max_steps = child_session
+        .metadata
+        .get("max_steps")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| provider_max_steps(&payload));
+    let skip_permissions = skip_permissions_for_turn(&payload);
+
+    child_session.status = SessionStatus::Running;
+    child_session
+        .metadata
+        .insert("task_status".to_string(), json!("running"));
+    child_session.metadata.insert(
+        "run_started_by".to_string(),
+        json!(if payload
+            .get("background_worker")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "background_worker"
+        } else {
+            "run_task"
+        }),
+    );
+    child_session
+        .metadata
+        .insert("run_claimed_at_ms".to_string(), json!(now_ms()));
+    store
+        .start_run(
+            &mut child_session,
+            StartRunOptions {
+                run_id: run_id.clone(),
+                trace_id: new_id("trace"),
+                agent_name,
+                model_id: model.clone(),
+                provider_id: Some(provider.clone()),
+                permission: if skip_permissions {
+                    format!("auto_allow:{permission_raw}")
+                } else {
+                    permission_raw.clone()
+                },
+                max_steps,
+                started_at_ms: None,
+            },
+        )
+        .map_err(|error| format!("failed to start task run: {error}"))?;
+
+    for (index, message) in child_session.messages.iter().enumerate() {
+        store
+            .append_message(&child_session, message, &run_id, index as u64)
+            .map_err(|error| format!("failed to record task prompt: {error}"))?;
+    }
+
+    let mut child_payload = provider_resume_payload(&payload);
+    if let Some(object) = child_payload.as_object_mut() {
+        object.insert("max_steps".to_string(), json!(max_steps));
+    }
+    let loop_result = run_provider_loop(RuntimeProviderLoopInput {
+        config,
+        store: &store,
+        session: &mut child_session,
+        run_id: &run_id,
+        payload: &child_payload,
+        permission_ruleset,
+        skip_permissions,
+        events: Vec::new(),
+        carry: RuntimeProviderLoopCarry::default(),
+    });
+
+    let (status, output) = match loop_result {
+        Ok(value) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed")
+                .to_string();
+            child_session
+                .metadata
+                .insert("task_status".to_string(), json!(status.clone()));
+            let _ = store.save_state(&child_session, Some(&run_id));
+            (status, value)
+        }
+        Err(error) => {
+            child_session.status = SessionStatus::Idle;
+            child_session
+                .metadata
+                .insert("task_status".to_string(), json!("failed"));
+            let _ = store.finish_run(
+                &child_session,
+                &run_id,
+                "failed",
+                1,
+                Some("error"),
+                Some(&error),
+            );
+            let _ = store.save_state(&child_session, Some(&run_id));
+            (
+                "failed".to_string(),
+                json!({"status": "failed", "error": error}),
+            )
+        }
+    };
+    let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+    let task = session_task_summary_from_state(&session_root(config), &state, task_id);
+    Ok(json!({
+        "session_id": parent_session_id,
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": status,
+        "task": task,
+        "result": output,
+    }))
+}
+
+struct RuntimeTaskRunLock {
+    path: PathBuf,
+}
+
+impl Drop for RuntimeTaskRunLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn task_run_lock_path(config: &HttpRuntimeConfig, task_id: &str) -> PathBuf {
+    session_root(config).join(task_id).join("task.run.lock")
+}
+
+fn claim_session_task_run_lock(
+    config: &HttpRuntimeConfig,
+    task_id: &str,
+) -> Result<RuntimeTaskRunLock, String> {
+    let path = task_run_lock_path(config, task_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    match create_session_task_run_lock(&path, task_id) {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !remove_stale_task_run_lock(&path)? {
+                return Err("task is already running".to_string());
+            }
+            match create_session_task_run_lock(&path, task_id) {
+                Ok(lock) => Ok(lock),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err("task is already running".to_string())
+                }
+                Err(error) => Err(format!("failed to claim task run lock: {error}")),
+            }
+        }
+        Err(error) => Err(format!("failed to claim task run lock: {error}")),
+    }
+}
+
+fn create_session_task_run_lock(path: &Path, task_id: &str) -> std::io::Result<RuntimeTaskRunLock> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let payload = json!({
+        "task_id": task_id,
+        "claimed_at_ms": now_ms(),
+    });
+    if let Err(error) = writeln!(file, "{payload}") {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(RuntimeTaskRunLock {
+        path: path.to_path_buf(),
+    })
+}
+
+fn task_run_lock_stale_ms() -> u64 {
+    std::env::var("OPENAGENT_TASK_RUN_LOCK_STALE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TASK_RUN_LOCK_STALE_MS)
+}
+
+fn remove_stale_task_run_lock(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let lock = read_json_file(path);
+    let Some(claimed_at_ms) = lock.get("claimed_at_ms").and_then(Value::as_u64) else {
+        return Ok(false);
+    };
+    if now_ms().saturating_sub(claimed_at_ms) < task_run_lock_stale_ms() {
+        return Ok(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!("failed to remove stale task run lock: {error}")),
+    }
+}
+
+fn cancel_session_task_payload(
+    config: &HttpRuntimeConfig,
+    parent_session_id: &str,
+    task_id: &str,
+) -> Result<Value, String> {
+    if !valid_session_id(parent_session_id) || !valid_session_id(task_id) {
+        return Err("invalid session id".to_string());
+    }
+    let store = FileSessionStore::new(session_root(config));
+    let mut child_session = store
+        .load_session(task_id)
+        .map_err(|error| error.to_string())?;
+    let parent = child_session
+        .metadata
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if parent != parent_session_id {
+        return Err("task does not belong to parent session".to_string());
+    }
+    if !child_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("session is not a subagent task".to_string());
+    }
+    let task_status = child_session
+        .metadata
+        .get("task_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if task_status != "queued" {
+        return Err(format!("task is not queued: {task_status}"));
+    }
+    let lock_path = task_run_lock_path(config, task_id);
+    if lock_path.exists() && !remove_stale_task_run_lock(&lock_path)? {
+        return Err("task is already running".to_string());
+    }
+    let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| new_id("turn"));
+    child_session.status = SessionStatus::Idle;
+    child_session
+        .metadata
+        .insert("task_status".to_string(), json!("canceled"));
+    child_session
+        .metadata
+        .insert("canceled_at_ms".to_string(), json!(now_ms()));
+    store
+        .save_state(&child_session, Some(&run_id))
+        .map_err(|error| format!("failed to cancel task: {error}"))?;
+    let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+    let task = session_task_summary_from_state(&session_root(config), &state, task_id);
+    Ok(json!({
+        "session_id": parent_session_id,
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": "canceled",
+        "task": task,
+    }))
+}
+
 fn share_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<Value, String> {
     let store = FileSessionStore::new(session_root(config));
     let mut session = store
@@ -1454,6 +2303,509 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
     }))
 }
 
+fn pending_approvals_payload(config: &HttpRuntimeConfig, request_path: &str) -> Value {
+    pending_interactions_payload(
+        config,
+        request_path,
+        "pending_approval",
+        "approval",
+        "approvals",
+    )
+}
+
+fn pending_questions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Value {
+    pending_interactions_payload(
+        config,
+        request_path,
+        "pending_question",
+        "question",
+        "questions",
+    )
+}
+
+fn pending_interactions_payload(
+    config: &HttpRuntimeConfig,
+    request_path: &str,
+    metadata_key: &str,
+    item_key: &str,
+    collection_key: &str,
+) -> Value {
+    let root = session_root(config);
+    let session_filter = query_param(request_path, "session_id");
+    let mut items = Vec::new();
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let session_id = entry.file_name().to_string_lossy().to_string();
+            if session_filter
+                .as_deref()
+                .is_some_and(|filter| filter != session_id)
+            {
+                continue;
+            }
+            let state = read_json_file(&path.join("state.latest.json"));
+            let Some(pending) = state
+                .get("metadata")
+                .and_then(|metadata| metadata.get(metadata_key))
+                .filter(|value| value.is_object())
+                .cloned()
+            else {
+                continue;
+            };
+            let request_id = pending
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let turn_id = pending
+                .get("turn_id")
+                .or_else(|| pending.get("run_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut item = Map::new();
+            item.insert("kind".to_string(), json!(item_key));
+            item.insert("status".to_string(), json!("pending"));
+            item.insert("session_id".to_string(), json!(session_id));
+            item.insert("turn_id".to_string(), json!(turn_id));
+            item.insert("request_id".to_string(), json!(request_id));
+            item.insert(item_key.to_string(), pending);
+            item.insert(
+                "session".to_string(),
+                session_summary_from_state(&state, &entry.file_name().to_string_lossy()),
+            );
+            items.push(Value::Object(item));
+        }
+    }
+    items.sort_by(|left, right| {
+        right[item_key]["created_at_ms"]
+            .as_u64()
+            .cmp(&left[item_key]["created_at_ms"].as_u64())
+    });
+    let count = items.len();
+    json!({
+        collection_key: items,
+        "count": count,
+        "session_id": session_filter.unwrap_or_default(),
+    })
+}
+
+fn respond_global_approval_payload(
+    config: &HttpRuntimeConfig,
+    request_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    let turn_id = find_pending_interaction_turn(config, "pending_approval", request_id)?;
+    respond_approval_payload(
+        config,
+        &format!("/api/turns/{turn_id}/approvals/{request_id}"),
+        body,
+    )
+}
+
+fn respond_global_question_payload(
+    config: &HttpRuntimeConfig,
+    request_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    let turn_id = find_pending_interaction_turn(config, "pending_question", request_id)?;
+    respond_question_payload(
+        config,
+        &format!("/api/turns/{turn_id}/questions/{request_id}/reply"),
+        body,
+    )
+}
+
+fn find_pending_interaction_turn(
+    config: &HttpRuntimeConfig,
+    metadata_key: &str,
+    request_id: &str,
+) -> Result<String, String> {
+    if request_id.is_empty() || request_id.contains('/') || request_id.contains("..") {
+        return Err("invalid request id".to_string());
+    }
+    let root = session_root(config);
+    for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let state = read_json_file(&entry.path().join("state.latest.json"));
+        let Some(pending) = state
+            .get("metadata")
+            .and_then(|metadata| metadata.get(metadata_key))
+        else {
+            continue;
+        };
+        if pending.get("request_id").and_then(Value::as_str) != Some(request_id) {
+            continue;
+        }
+        let turn_id = pending
+            .get("turn_id")
+            .or_else(|| pending.get("run_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "pending interaction is missing turn_id".to_string())?;
+        return Ok(turn_id.to_string());
+    }
+    Err("pending interaction not found".to_string())
+}
+
+fn files_payload(config: &HttpRuntimeConfig, request_path: &str) -> Result<Value, String> {
+    let root = workspace(config);
+    let requested = query_param(request_path, "path").unwrap_or_default();
+    let include_content = query_flag(request_path, "content");
+    let depth = query_param(request_path, "depth")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
+        .min(4);
+    let target = resolve_path_in_root(&root, &requested)?;
+    let relative = workspace_relative_path(&root, &target);
+    if !target.exists() {
+        return Ok(json!({
+            "workspace": root.to_string_lossy(),
+            "path": relative,
+            "absolute_path": target.to_string_lossy(),
+            "exists": false,
+            "is_file": false,
+            "is_dir": false,
+            "entries": [],
+            "entry_count": 0,
+            "truncated": false,
+            "content": Value::Null,
+            "error": "not found",
+        }));
+    }
+    let mut entries = Vec::new();
+    collect_file_entries(&root, &target, depth, &mut entries)?;
+    let content = if include_content && target.is_file() && file_is_text_like(&target) {
+        fs::read_to_string(&target).ok()
+    } else {
+        None
+    };
+    let entry_count = entries.len();
+    let truncated = entry_count >= MAX_FILE_TREE_ENTRIES;
+    Ok(json!({
+        "workspace": root.to_string_lossy(),
+        "path": relative,
+        "absolute_path": target.to_string_lossy(),
+        "exists": true,
+        "is_file": target.is_file(),
+        "is_dir": target.is_dir(),
+        "entries": entries,
+        "entry_count": entry_count,
+        "truncated": truncated,
+        "content": content,
+    }))
+}
+
+fn git_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
+    let root = workspace(config);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("--branch")
+        .output()
+        .map_err(|error| format!("failed to run git status: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Ok(json!({
+            "workspace": root.to_string_lossy(),
+            "is_repo": false,
+            "branch": "",
+            "ahead": 0,
+            "behind": 0,
+            "changes": [],
+            "change_count": 0,
+            "error": stderr,
+        }));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut branch = String::new();
+    let mut ahead = 0_i64;
+    let mut behind = 0_i64;
+    let mut changes = Vec::new();
+    for line in stdout.lines() {
+        if let Some(raw) = line.strip_prefix("## ") {
+            let parsed = parse_git_branch_line(raw);
+            branch = parsed.0;
+            ahead = parsed.1;
+            behind = parsed.2;
+            continue;
+        }
+        if line.len() < 3 {
+            continue;
+        }
+        let xy = &line[..2];
+        let path = line[3..].to_string();
+        changes.push(json!({
+            "status": xy.trim(),
+            "index": xy.chars().next().unwrap_or(' '),
+            "worktree": xy.chars().nth(1).unwrap_or(' '),
+            "path": path,
+        }));
+    }
+    let change_count = changes.len();
+    Ok(json!({
+        "workspace": root.to_string_lossy(),
+        "is_repo": true,
+        "branch": branch,
+        "ahead": ahead,
+        "behind": behind,
+        "changes": changes,
+        "change_count": change_count,
+    }))
+}
+
+fn terminal_run_payload(config: &HttpRuntimeConfig, body: &str) -> Result<Value, String> {
+    let payload = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
+    let command_text = payload
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if command_text.is_empty() {
+        return Err("terminal command is required".to_string());
+    }
+    if command_text.chars().count() > MAX_TERMINAL_COMMAND_CHARS {
+        return Err(format!(
+            "terminal command exceeds {MAX_TERMINAL_COMMAND_CHARS} characters"
+        ));
+    }
+
+    let root = workspace(config);
+    let requested_cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let cwd = if requested_cwd.is_empty() {
+        resolve_path_in_root(&root, ".")?
+    } else {
+        resolve_path_in_root(&root, requested_cwd)?
+    };
+    if !cwd.exists() {
+        return Err(format!("terminal cwd does not exist: {}", cwd.display()));
+    }
+    if !cwd.is_dir() {
+        return Err(format!(
+            "terminal cwd is not a directory: {}",
+            cwd.display()
+        ));
+    }
+
+    let timeout_ms = payload
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TERMINAL_TIMEOUT_MS)
+        .clamp(250, MAX_TERMINAL_TIMEOUT_MS);
+    run_terminal_command(&command_text, &root, &cwd, timeout_ms)
+}
+
+fn run_terminal_command(
+    command_text: &str,
+    root: &Path,
+    cwd: &Path,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let started_at_ms = now_ms();
+    let started = Instant::now();
+    let mut command = terminal_shell_command(command_text);
+    let mut child = command
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run terminal command: {error}"))?;
+
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("failed to poll terminal command: {error}"))?
+        {
+            Some(_) => break,
+            None if started.elapsed() >= timeout => {
+                timed_out = true;
+                let _ = child.kill();
+                break;
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to collect terminal output: {error}"))?;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let exit_code = output
+        .status
+        .code()
+        .unwrap_or(if timed_out { -1 } else { 1 });
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let (stdout, stdout_truncated) = truncate_terminal_output(stdout);
+    let (stderr, stderr_truncated) = truncate_terminal_output(stderr);
+
+    Ok(json!({
+        "command": command_text,
+        "workspace": root.to_string_lossy(),
+        "cwd": cwd.to_string_lossy(),
+        "cwd_relative": workspace_relative_path(root, cwd),
+        "success": output.status.success() && !timed_out,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "timeout_ms": timeout_ms,
+        "duration_ms": duration_ms,
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": now_ms(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }))
+}
+
+fn terminal_shell_command(command_text: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(command_text);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("sh");
+        command.arg("-lc").arg(command_text);
+        command
+    }
+}
+
+fn truncate_terminal_output(text: String) -> (String, bool) {
+    if text.chars().count() <= MAX_TERMINAL_OUTPUT_CHARS {
+        return (text, false);
+    }
+    (text.chars().take(MAX_TERMINAL_OUTPUT_CHARS).collect(), true)
+}
+
+fn collect_file_entries(
+    root: &Path,
+    target: &Path,
+    depth: usize,
+    entries: &mut Vec<Value>,
+) -> Result<(), String> {
+    if entries.len() >= MAX_FILE_TREE_ENTRIES {
+        return Ok(());
+    }
+    if target.is_file() {
+        entries.push(file_entry_value(root, target)?);
+        return Ok(());
+    }
+    if !target.is_dir() {
+        return Err("file path does not exist".to_string());
+    }
+    let mut children = fs::read_dir(target)
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| !is_hidden_runtime_dir(path))
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| {
+        let left_dir = left.is_dir();
+        let right_dir = right.is_dir();
+        right_dir
+            .cmp(&left_dir)
+            .then_with(|| left.file_name().cmp(&right.file_name()))
+    });
+    for child in children {
+        if entries.len() >= MAX_FILE_TREE_ENTRIES {
+            break;
+        }
+        entries.push(file_entry_value(root, &child)?);
+        if depth > 0 && child.is_dir() {
+            collect_file_entries(root, &child, depth - 1, entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn file_entry_value(root: &Path, path: &Path) -> Result<Value, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    Ok(json!({
+        "path": workspace_relative_path(root, path),
+        "name": path.file_name().and_then(|value| value.to_str()).unwrap_or(""),
+        "kind": if metadata.is_dir() { "dir" } else { "file" },
+        "size_bytes": if metadata.is_file() { metadata.len() } else { 0 },
+        "text": metadata.is_file() && file_is_text_like(path),
+    }))
+}
+
+fn workspace_relative_path(root: &Path, path: &Path) -> String {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical_path
+        .strip_prefix(&canonical_root)
+        .unwrap_or(&canonical_path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn is_hidden_runtime_dir(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    matches!(
+        name,
+        ".git" | ".openagent" | "node_modules" | "target" | "dist" | ".DS_Store"
+    )
+}
+
+fn file_is_text_like(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() > 256 * 1024 {
+        return false;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    !bytes.iter().take(4096).any(|byte| *byte == 0)
+}
+
+fn parse_git_branch_line(raw: &str) -> (String, i64, i64) {
+    let branch = raw
+        .split(['.', '['])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut ahead = 0_i64;
+    let mut behind = 0_i64;
+    if let Some(status) = raw
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+    {
+        for item in status.0.split(',') {
+            let item = item.trim();
+            if let Some(value) = item.strip_prefix("ahead ") {
+                ahead = value.parse::<i64>().unwrap_or_default();
+            } else if let Some(value) = item.strip_prefix("behind ") {
+                behind = value.parse::<i64>().unwrap_or_default();
+            }
+        }
+    }
+    (branch, ahead, behind)
+}
+
 fn session_diff_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<Value, String> {
     let store = FileSessionStore::new(session_root(config));
     let session = store
@@ -1478,6 +2830,85 @@ fn session_diff_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<
         "latest": undo_stack.last().map(public_file_change).unwrap_or(Value::Null),
         "patches": patches,
         "redo": redo,
+    }))
+}
+
+fn session_checkpoints_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+) -> Result<Value, String> {
+    if !valid_session_id(session_id) {
+        return Err("invalid session id".to_string());
+    }
+    let store = FileSessionStore::new(session_root(config));
+    let _ = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let path = store
+        .root
+        .join(session_id)
+        .join("checkpoints")
+        .join("index.jsonl");
+    let mut checkpoints = read_jsonl_values(&path);
+    checkpoints.sort_by(|left, right| {
+        right["timestamp_ms"]
+            .as_u64()
+            .cmp(&left["timestamp_ms"].as_u64())
+    });
+    Ok(json!({
+        "session_id": session_id,
+        "count": checkpoints.len(),
+        "latest": checkpoints.first().cloned().unwrap_or(Value::Null),
+        "checkpoints": checkpoints,
+    }))
+}
+
+fn restore_session_checkpoint_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    checkpoint_id: &str,
+) -> Result<Value, String> {
+    if !valid_session_id(session_id) || !valid_checkpoint_id(checkpoint_id) {
+        return Err("invalid checkpoint request".to_string());
+    }
+    let store = FileSessionStore::new(session_root(config));
+    let mut session = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let run_id = new_id("restore");
+    let checkpoint = store
+        .restore_checkpoint(session_id, &run_id, &session.directory, checkpoint_id)
+        .map_err(|error| error.to_string())?;
+    session.metadata.insert(
+        "latest_checkpoint_restore".to_string(),
+        json!({
+            "checkpoint_id": checkpoint_id,
+            "run_id": run_id,
+            "restored_at_ms": now_ms(),
+        }),
+    );
+    store
+        .save_state(&session, Some(&run_id))
+        .map_err(|error| error.to_string())?;
+    let event = json!({
+        "method": "checkpoint/restored",
+        "params": {
+            "session_id": session.id.as_str(),
+            "thread_id": session.id.as_str(),
+            "turn_id": run_id,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint": checkpoint,
+            "status": "restored",
+        }
+    });
+    let mut events = vec![event];
+    append_app_events(&store.root, session_id, &run_id, &mut events);
+    Ok(json!({
+        "session_id": session_id,
+        "run_id": run_id,
+        "status": "restored",
+        "checkpoint": checkpoint,
+        "events": events,
     }))
 }
 
@@ -1721,12 +3152,9 @@ fn append_patch_stack_event(
             "patch": patch,
         }
     });
-    append_app_events(
-        &store.root,
-        &session.id,
-        turn_id,
-        std::slice::from_ref(&event),
-    );
+    let mut events = vec![event];
+    append_app_events(&store.root, &session.id, turn_id, &mut events);
+    let event = events.into_iter().next().unwrap_or_else(|| json!({}));
     let _ = store.record_event(
         &session.id,
         turn_id,
@@ -1826,10 +3254,20 @@ fn mark_file_change(mut change: Value, status: &str) -> Value {
 
 fn public_file_change(change: &Value) -> Value {
     let mut public = change.clone();
+    let side_by_side = change.get("path").and_then(Value::as_str).map(|path| {
+        render_side_by_side_diff(
+            path,
+            change.get("before").and_then(Value::as_str),
+            change.get("after").and_then(Value::as_str),
+        )
+    });
     if let Some(object) = public.as_object_mut() {
         object.remove("before");
         object.remove("after");
         object.remove("absolute_path");
+        if let Some(side_by_side) = side_by_side {
+            object.insert("side_by_side".to_string(), side_by_side);
+        }
     }
     public
 }
@@ -1911,6 +3349,34 @@ fn render_unified_diff(path: &str, before: Option<&str>, after: Option<&str>) ->
     truncate_diff_lines(lines).join("\n")
 }
 
+fn render_side_by_side_diff(path: &str, before: Option<&str>, after: Option<&str>) -> Value {
+    let before_lines = before
+        .map(|value| value.lines().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let after_lines = after
+        .map(|value| value.lines().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut rows = if before_lines.len().saturating_mul(after_lines.len()) <= 200_000 {
+        lcs_side_by_side_rows(&before_lines, &after_lines)
+    } else {
+        full_file_side_by_side_rows(&before_lines, &after_lines)
+    };
+    let row_count = rows.len();
+    let omitted_rows = row_count.saturating_sub(MAX_RENDERED_DIFF_LINES);
+    if omitted_rows > 0 {
+        rows.truncate(MAX_RENDERED_DIFF_LINES);
+    }
+    json!({
+        "path": path,
+        "old_label": format!("a/{path}"),
+        "new_label": format!("b/{path}"),
+        "row_count": row_count,
+        "truncated": omitted_rows > 0,
+        "omitted_rows": omitted_rows,
+        "rows": rows,
+    })
+}
+
 fn lcs_diff_lines(before: &[&str], after: &[&str]) -> Vec<String> {
     let rows = before.len() + 1;
     let cols = after.len() + 1;
@@ -1946,12 +3412,92 @@ fn lcs_diff_lines(before: &[&str], after: &[&str]) -> Vec<String> {
     output
 }
 
+fn lcs_side_by_side_rows(before: &[&str], after: &[&str]) -> Vec<Value> {
+    let rows = before.len() + 1;
+    let cols = after.len() + 1;
+    let mut table = vec![0_usize; rows * cols];
+    for row in 1..rows {
+        for col in 1..cols {
+            table[row * cols + col] = if before[row - 1] == after[col - 1] {
+                table[(row - 1) * cols + col - 1] + 1
+            } else {
+                table[(row - 1) * cols + col].max(table[row * cols + col - 1])
+            };
+        }
+    }
+    let mut row = before.len();
+    let mut col = after.len();
+    let mut output = Vec::new();
+    while row > 0 || col > 0 {
+        if row > 0 && col > 0 && before[row - 1] == after[col - 1] {
+            output.push(side_by_side_row(
+                "context",
+                Some(row),
+                Some(col),
+                Some(before[row - 1]),
+                Some(after[col - 1]),
+            ));
+            row -= 1;
+            col -= 1;
+        } else if col > 0
+            && (row == 0 || table[row * cols + col - 1] >= table[(row - 1) * cols + col])
+        {
+            output.push(side_by_side_row(
+                "added",
+                None,
+                Some(col),
+                None,
+                Some(after[col - 1]),
+            ));
+            col -= 1;
+        } else if row > 0 {
+            output.push(side_by_side_row(
+                "removed",
+                Some(row),
+                None,
+                Some(before[row - 1]),
+                None,
+            ));
+            row -= 1;
+        }
+    }
+    output.reverse();
+    output
+}
+
 fn full_file_diff_lines(before: &[&str], after: &[&str]) -> Vec<String> {
     before
         .iter()
         .map(|line| format!("-{line}"))
         .chain(after.iter().map(|line| format!("+{line}")))
         .collect()
+}
+
+fn full_file_side_by_side_rows(before: &[&str], after: &[&str]) -> Vec<Value> {
+    before
+        .iter()
+        .enumerate()
+        .map(|(index, line)| side_by_side_row("removed", Some(index + 1), None, Some(line), None))
+        .chain(after.iter().enumerate().map(|(index, line)| {
+            side_by_side_row("added", None, Some(index + 1), None, Some(line))
+        }))
+        .collect()
+}
+
+fn side_by_side_row(
+    kind: &str,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Value {
+    json!({
+        "kind": kind,
+        "old_line": old_line,
+        "new_line": new_line,
+        "old": old,
+        "new": new,
+    })
 }
 
 fn truncate_diff_lines(mut lines: Vec<String>) -> Vec<String> {
@@ -1971,6 +3517,17 @@ fn query_param(path: &str, target: &str) -> Option<String> {
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find_map(|(key, value)| (key == target).then(|| percent_decode(value)))
+}
+
+fn query_flag(path: &str, target: &str) -> bool {
+    query_param(path, target)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn percent_decode(value: &str) -> String {
@@ -2085,6 +3642,106 @@ fn session_summary_from_state(state: &Value, fallback_id: &str) -> Value {
     })
 }
 
+fn session_task_summary_from_state(root: &Path, state: &Value, fallback_id: &str) -> Value {
+    let metadata = state
+        .get("metadata")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let session_id = state
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_id)
+        .to_string();
+    let run_id = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let run_dir = root.join(&session_id).join("runs").join(&run_id);
+    let run_summary = if run_id.is_empty() {
+        Value::Null
+    } else {
+        read_json_file(&run_dir.join("summary.json"))
+    };
+    let run_record = if run_id.is_empty() {
+        Value::Null
+    } else {
+        read_json_file(&run_dir.join("run.json"))
+    };
+    let status = metadata
+        .get("task_status")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            metadata
+                .get("status")
+                .and_then(Value::as_str)
+                .filter(|value| *value == "queued")
+        })
+        .or_else(|| run_summary.get("status").and_then(Value::as_str))
+        .or_else(|| run_record.get("status").and_then(Value::as_str))
+        .or_else(|| state.get("status").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_string();
+    let run_status = run_summary
+        .get("status")
+        .or_else(|| run_record.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let subagent_type = metadata
+        .get("task_subagent_type")
+        .or_else(|| metadata.get("agent"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let title = metadata
+        .get("task_description")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            metadata
+                .get("agent_profile")
+                .and_then(|profile| profile.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or(subagent_type.as_str())
+        })
+        .to_string();
+    json!({
+        "id": session_id,
+        "task_id": session_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "status": status,
+        "session_status": state.get("status").cloned().unwrap_or_else(|| json!("idle")),
+        "title": title,
+        "description": metadata.get("task_description").cloned().unwrap_or(Value::Null),
+        "subagent_type": subagent_type,
+        "agent": metadata.get("agent").cloned().unwrap_or(Value::Null),
+        "agent_profile": metadata.get("agent_profile").cloned().unwrap_or(Value::Null),
+        "background": metadata.get("background").cloned().unwrap_or(Value::Bool(false)),
+        "provider": metadata.get("provider").cloned().unwrap_or(Value::Null),
+        "model": metadata.get("model").cloned().unwrap_or(Value::Null),
+        "permission": metadata.get("permission").cloned().unwrap_or(Value::Null),
+        "max_steps": metadata.get("max_steps").cloned().unwrap_or(Value::Null),
+        "workspace": state.get("workspace").cloned().unwrap_or(Value::Null),
+        "workspace_isolation": metadata.get("workspace_isolation").cloned().unwrap_or(Value::Null),
+        "task_depth": metadata.get("task_depth").cloned().unwrap_or(Value::Null),
+        "task_root_session_id": metadata.get("task_root_session_id").cloned().unwrap_or(Value::Null),
+        "task_parent_session_id": metadata.get("task_parent_session_id").cloned().unwrap_or(Value::Null),
+        "task_lineage_subagents": metadata.get("task_lineage_subagents").cloned().unwrap_or_else(|| json!([])),
+        "parent_session_id": metadata.get("parent_session_id").cloned().unwrap_or(Value::Null),
+        "parent_run_id": metadata.get("parent_run_id").cloned().unwrap_or(Value::Null),
+        "parent_tool_call_id": metadata.get("parent_tool_call_id").cloned().unwrap_or(Value::Null),
+        "updated_at_ms": state.get("updated_at_ms").cloned().unwrap_or_else(|| json!(0)),
+        "message_count": state.get("messages").and_then(Value::as_array).map_or(0, Vec::len),
+        "finish_reason": run_record.get("finish_reason").cloned().unwrap_or(Value::Null),
+        "error": run_record.get("error").cloned().unwrap_or(Value::Null),
+        "run_status": if run_status.is_empty() { Value::Null } else { json!(run_status) },
+        "run": run_summary,
+        "metadata": metadata,
+    })
+}
+
 fn session_matches_query(summary: &Value, query: &str) -> bool {
     let query = query.to_ascii_lowercase();
     [
@@ -2144,6 +3801,14 @@ fn valid_session_id(session_id: &str) -> bool {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
         && !session_id.contains("..")
+}
+
+fn valid_checkpoint_id(checkpoint_id: &str) -> bool {
+    !checkpoint_id.is_empty()
+        && checkpoint_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && !checkpoint_id.contains("..")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2317,6 +3982,7 @@ struct OpenAiRuntimeProviderRequest<'a> {
     stream: bool,
     messages: &'a [ChatMessage],
     tools: &'a [openagent_protocol::ToolSchema],
+    model_options: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -2347,6 +4013,7 @@ struct RuntimeProviderResume {
 }
 
 struct RuntimeProviderLoopInput<'a> {
+    config: &'a HttpRuntimeConfig,
     store: &'a FileSessionStore,
     session: &'a mut Session,
     run_id: &'a str,
@@ -2361,50 +4028,20 @@ fn provider_turn_result(
     store: &FileSessionStore,
     session: &Session,
     payload: &Value,
+    tools: &[ToolSchema],
     stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<RuntimeProviderResult, String> {
-    let provider_raw = payload
+    let provider = payload
         .get("provider")
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            session
-                .metadata
-                .get("provider")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| std::env::var("OPENAGENT_PROVIDER").ok())
-        .unwrap_or_else(|| "openai".to_string());
-    let provider = normalize_provider(Some(&provider_raw))?;
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            session
-                .metadata
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| std::env::var("OPENAGENT_MODEL").ok())
-        .or_else(|| provider_default_model(&provider).ok().flatten())
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
-    let env = default_env_mapping(&provider)?;
-    let api_key = payload
-        .get("api_key")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| env.get("api_key").and_then(|key| std::env::var(key).ok()))
-        .or_else(|| std::env::var("OPENAGENT_API_KEY").ok());
-    if provider_requires_api_key(&provider)? && api_key.as_deref().unwrap_or_default().is_empty() {
+        .or_else(|| session.metadata.get("provider").and_then(Value::as_str));
+    let provider_config = runtime_provider_config(provider, Some(payload), Some(session))?;
+    if provider_config.requires_api_key && provider_config.api_key.is_none() {
         return Ok(RuntimeProviderResult {
             answer: format!(
-                "Provider `{provider}` is not configured. Set {} or OPENAGENT_API_KEY, then retry this turn.",
-                env.get("api_key")
-                    .map(String::as_str)
-                    .unwrap_or("OPENAI_API_KEY")
+                "Provider `{}` is not configured. Set {} or OPENAGENT_API_KEY, then retry this turn.",
+                provider_config.provider, provider_config.api_key_env
             ),
             tool_calls: Vec::new(),
             usage: Usage::default(),
@@ -2412,48 +4049,117 @@ fn provider_turn_result(
             finish_reason: "configuration_required".to_string(),
         });
     }
-    let api_key = api_key.unwrap_or_default();
-    let base_url = payload
-        .get("base_url")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| env.get("base_url").and_then(|key| std::env::var(key).ok()))
-        .or_else(|| provider_default_base_url(&provider).ok().flatten())
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let wire_api = payload
-        .get("wire_api")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| env.get("wire_api").and_then(|key| std::env::var(key).ok()))
-        .unwrap_or_else(|| "responses".to_string());
+    let api_key = provider_config.api_key.clone().unwrap_or_default();
     let timeout = payload
         .get("timeout_s")
         .and_then(Value::as_u64)
         .unwrap_or(60);
     let stream = provider_streaming_enabled_for_turn(payload);
-    let tools = Toolkit::with_builtins().get_all_tools("local");
     let provider_messages = store
         .materialized_chat_messages(session)
         .unwrap_or_else(|_| session.messages.clone());
+    let model_options = runtime_provider_model_options(session, payload);
     call_openai_compatible_provider_for_runtime(
         OpenAiRuntimeProviderRequest {
-            provider: &provider,
-            model: &model,
+            provider: &provider_config.provider,
+            model: &provider_config.model,
             api_key: &api_key,
-            base_url: &base_url,
-            wire_api: &wire_api,
+            base_url: &provider_config.base_url,
+            wire_api: &provider_config.wire_api,
             timeout_s: timeout,
             stream,
             messages: &provider_messages,
-            tools: &tools,
+            tools,
+            model_options,
         },
         stream_sink,
+        should_cancel,
+    )
+}
+
+fn runtime_provider_model_options(session: &Session, payload: &Value) -> BTreeMap<String, Value> {
+    let mut options = BTreeMap::new();
+    merge_model_options_from_value(session.metadata.get("model_options"), &mut options);
+    merge_temperature_top_p_from_value(
+        &serde_json::to_value(&session.metadata).unwrap_or_default(),
+        &mut options,
+    );
+    merge_explicit_model_options_from_value(payload, &mut options);
+    merge_temperature_top_p_from_value(payload, &mut options);
+    options
+}
+
+fn merge_model_options_from_value(value: Option<&Value>, options: &mut BTreeMap<String, Value>) {
+    let Some(value) = value else {
+        return;
+    };
+    if let Some(object) = value.as_object() {
+        for (key, item) in object {
+            if key == "model_options" || key == "options" {
+                if let Some(nested) = item.as_object() {
+                    for (nested_key, nested_value) in nested {
+                        if runtime_provider_option_allowed(nested_key) {
+                            options.insert(nested_key.clone(), nested_value.clone());
+                        }
+                    }
+                }
+            } else if runtime_provider_option_allowed(key) {
+                options.insert(key.clone(), item.clone());
+            }
+        }
+    }
+}
+
+fn merge_explicit_model_options_from_value(value: &Value, options: &mut BTreeMap<String, Value>) {
+    for key in ["model_options", "options"] {
+        if let Some(object) = value.get(key).and_then(Value::as_object) {
+            for (option_key, option_value) in object {
+                if runtime_provider_option_allowed(option_key) {
+                    options.insert(option_key.clone(), option_value.clone());
+                }
+            }
+        }
+    }
+}
+
+fn merge_temperature_top_p_from_value(value: &Value, options: &mut BTreeMap<String, Value>) {
+    if let Some(temperature) = value.get("temperature").and_then(Value::as_f64) {
+        options.insert("temperature".to_string(), json!(temperature));
+    }
+    if let Some(top_p) = value
+        .get("top_p")
+        .or_else(|| value.get("topP"))
+        .and_then(Value::as_f64)
+    {
+        options.insert("top_p".to_string(), json!(top_p));
+    }
+}
+
+fn apply_runtime_model_options_to_payload(
+    payload: &mut Value,
+    model_options: &BTreeMap<String, Value>,
+) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    for (key, value) in model_options {
+        if runtime_provider_option_allowed(key) {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn runtime_provider_option_allowed(key: &str) -> bool {
+    !matches!(
+        key,
+        "model" | "messages" | "input" | "tools" | "tool_choice" | "stream"
     )
 }
 
 fn call_openai_compatible_provider_for_runtime(
     request: OpenAiRuntimeProviderRequest<'_>,
     mut stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<RuntimeProviderResult, String> {
     let OpenAiRuntimeProviderRequest {
         provider,
@@ -2465,6 +4171,7 @@ fn call_openai_compatible_provider_for_runtime(
         stream,
         messages,
         tools,
+        model_options,
     } = request;
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -2475,7 +4182,7 @@ fn call_openai_compatible_provider_for_runtime(
     config.provider_id = provider.to_string();
     config.base_url = base_url.to_string();
     config.wire_api = wire_api.to_string();
-    let (endpoint, payload) = if wire_api == "chat" {
+    let (endpoint, mut payload) = if wire_api == "chat" {
         let mut payload =
             build_openai_chat_payload(&config, None, messages, tools, None, None, None);
         if let Some(object) = payload.as_object_mut() {
@@ -2490,6 +4197,7 @@ fn call_openai_compatible_provider_for_runtime(
         }
         (join_url(base_url, "responses"), payload)
     };
+    apply_runtime_model_options_to_payload(&mut payload, &model_options);
     let mut request = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -2521,6 +4229,9 @@ fn call_openai_compatible_provider_for_runtime(
         }
         let mut chunks = Vec::new();
         read_sse_json_values_stream(response, |chunk| {
+            if should_cancel.is_some_and(|cancelled| cancelled()) {
+                return Err(TURN_INTERRUPTED_ERROR.to_string());
+            }
             if let Some(event) = openai_stream_text_delta(wire_api, &chunk)
                 && let Some(sink) = stream_sink.as_deref_mut()
             {
@@ -2597,16 +4308,34 @@ where
                 saw_done = true;
             }
             if let Some(value) = parse_sse_frame_json(&frame)? {
+                let terminal = provider_sse_json_value_is_terminal(&value);
                 on_value(value)?;
+                if terminal {
+                    saw_done = true;
+                    break;
+                }
             }
         }
+        if saw_done {
+            break;
+        }
     }
-    if !raw.trim().is_empty()
+    if !saw_done
+        && !raw.trim().is_empty()
         && let Some(value) = parse_sse_frame_json(&raw)?
     {
         on_value(value)?;
     }
     Ok(())
+}
+
+fn provider_sse_json_value_is_terminal(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some(
+            "response.completed" | "response.failed" | "response.cancelled" | "response.incomplete"
+        )
+    )
 }
 
 fn sse_frame_is_done(frame: &str) -> bool {
@@ -2970,6 +4699,12 @@ fn latest_assistant_message_id_for_tool(session: &Session, tool_call: &ToolCall)
     })
 }
 
+fn session_has_message_id(session: &Session, message_id: &str) -> bool {
+    session.messages.iter().any(|message| {
+        message.metadata.get("message_id").and_then(Value::as_str) == Some(message_id)
+    })
+}
+
 fn assistant_message_for_provider_step(content: String, tool_calls: &[ToolCall]) -> ChatMessage {
     let mut message = runtime_chat_message(Role::Assistant, content);
     if !tool_calls.is_empty() {
@@ -2997,6 +4732,7 @@ fn openai_tool_call_value(call: &ToolCall) -> Value {
 
 fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, String> {
     let RuntimeProviderLoopInput {
+        config,
         store,
         session,
         run_id,
@@ -3007,10 +4743,21 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         mut carry,
     } = input;
     let max_steps = provider_max_steps(payload);
-    let toolkit = Toolkit::with_builtins();
+    let agent_profile = runtime_agent_profile_for_session(session);
+    let mut toolkit = toolkit_with_runtime_task_tool(session, agent_profile.as_ref());
+    let mcp_runtime = register_runtime_mcp_tools(config, &session.directory, &mut toolkit);
+    let visible_tools =
+        filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref());
+    let visible_tool_names = visible_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
     let mut ctx = ToolContext::new(&session.directory)
         .with_session_id(session.id.clone())
-        .with_permission_ruleset(permission_ruleset.clone())
+        .with_permission_manager(runtime_permission_manager_for_agent(
+            permission_ruleset.clone(),
+            agent_profile.as_ref(),
+        ))
         .with_dangerously_skip_permissions(skip_permissions);
     if let Some(answers) = payload
         .get("question_answers")
@@ -3025,11 +4772,24 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         &store.root,
         &session.id,
         run_id,
-        &events,
+        &mut events,
         &mut persisted_events,
     );
     while carry.next_step <= max_steps {
+        if turn_cancel_requested(run_id) {
+            return finish_provider_loop_interrupted(
+                store,
+                session,
+                run_id,
+                events,
+                &mut persisted_events,
+                "interrupt requested",
+            );
+        }
         let step = carry.next_step;
+        let assistant_index = session.messages.len() as u64;
+        let assistant_message_id = runtime_message_id(assistant_index);
+        runtime_record_step_started(store, &session.id, run_id, step, None);
         let mut streamed_text = false;
         let session_id = session.id.clone();
         let root = store.root.clone();
@@ -3054,13 +4814,33 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                     &root,
                     &session_id,
                     run_id,
-                    &events,
+                    &mut events,
                     &mut persisted_events,
                 );
             }
         };
-        let provider_result =
-            provider_turn_result(store, session, payload, Some(&mut on_provider_stream))?;
+        let should_cancel = || turn_cancel_requested(run_id);
+        let provider_result = match provider_turn_result(
+            store,
+            session,
+            payload,
+            &visible_tools,
+            Some(&mut on_provider_stream),
+            Some(&should_cancel),
+        ) {
+            Ok(result) => result,
+            Err(error) if is_turn_interrupted_error(&error) => {
+                return finish_provider_loop_interrupted(
+                    store,
+                    session,
+                    run_id,
+                    events,
+                    &mut persisted_events,
+                    "interrupt requested",
+                );
+            }
+            Err(error) => return Err(error),
+        };
         add_usage(&mut carry.usage, &provider_result.usage);
         if provider_result.source == "provider_missing_api_key" {
             events.push(json!({
@@ -3107,15 +4887,14 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             );
         }
 
-        let assistant_index = session.messages.len() as u64;
-        let assistant_message_id = runtime_message_id(assistant_index);
         let mut assistant = assistant_message_for_provider_step(
             provider_result.answer.clone(),
             &provider_result.tool_calls,
         );
-        assistant
-            .metadata
-            .insert("message_id".to_string(), json!(assistant_message_id));
+        assistant.metadata.insert(
+            "message_id".to_string(),
+            json!(assistant_message_id.clone()),
+        );
         assistant.metadata.insert("step".to_string(), json!(step));
         session.add(assistant.clone());
         let _ = store.append_message(session, &assistant, run_id, assistant_index);
@@ -3132,6 +4911,15 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             );
         }
 
+        let step_start_checkpoint = runtime_create_step_checkpoint(
+            store,
+            &session.id,
+            run_id,
+            &session.directory,
+            step,
+            "step_start",
+            &assistant_message_id,
+        );
         let resume_carry = RuntimeProviderLoopCarry {
             next_step: step.saturating_add(1),
             ..carry.clone()
@@ -3150,11 +4938,15 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                 payload,
                 step,
                 tool_call,
+                config,
                 &toolkit,
+                mcp_runtime.as_ref(),
+                &visible_tool_names,
                 &mut ctx,
                 &permission_ruleset,
                 skip_permissions,
                 &pending_carry,
+                step_start_checkpoint.as_deref(),
                 &mut events,
                 &mut persisted_events,
             )? {
@@ -3162,6 +4954,15 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             }
         }
 
+        runtime_finalize_step_checkpoint(
+            store,
+            &session.id,
+            run_id,
+            &session.directory,
+            step,
+            &assistant_message_id,
+            step_start_checkpoint.as_deref(),
+        );
         carry.next_step = step.saturating_add(1);
     }
 
@@ -3196,7 +4997,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         &store.root,
         &session.id,
         run_id,
-        &events,
+        &mut events,
         &mut persisted_events,
     );
     Ok(json!({
@@ -3207,6 +5008,869 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
     }))
 }
 
+struct RuntimeTaskExecutionContext<'a> {
+    config: &'a HttpRuntimeConfig,
+    store: &'a FileSessionStore,
+    parent_session: &'a Session,
+    parent_run_id: &'a str,
+    payload: &'a Value,
+    skip_permissions: bool,
+}
+
+fn execute_runtime_tool_call(
+    toolkit: &Toolkit,
+    mcp_runtime: Option<&RuntimeMcpRuntime>,
+    tool_call: &ToolCall,
+    ctx: &mut ToolContext,
+    task_context: RuntimeTaskExecutionContext<'_>,
+) -> ToolResult {
+    if let Some(result) = execute_runtime_mcp_tool(toolkit, mcp_runtime, tool_call, ctx) {
+        return result;
+    }
+    if tool_call.name == TASK_TOOL_ID {
+        execute_runtime_task_tool_call(toolkit, tool_call, ctx, task_context)
+    } else {
+        toolkit.execute(
+            &tool_call.name,
+            tool_call.input.clone(),
+            &tool_call.call_id,
+            ctx,
+        )
+    }
+}
+
+fn execute_runtime_mcp_tool(
+    toolkit: &Toolkit,
+    mcp_runtime: Option<&RuntimeMcpRuntime>,
+    tool_call: &ToolCall,
+    ctx: &mut ToolContext,
+) -> Option<ToolResult> {
+    let runtime = mcp_runtime?;
+    let descriptor = runtime.descriptors.get(&tool_call.name)?;
+    if let Some(result) = toolkit.permission_result_for_tool(
+        &tool_call.name,
+        &tool_call.input,
+        &tool_call.call_id,
+        ctx,
+    ) {
+        return Some(result);
+    }
+    let Some(state) = runtime.manager.servers.get(&descriptor.server_name) else {
+        let result = unavailable_tool_result(&tool_call.name);
+        let bridge = bridge_tool_output(descriptor, result);
+        return Some(mcp_bridge_to_tool_result(tool_call, bridge));
+    };
+    let transport = state.selected_transport.unwrap_or(McpTransport::Http);
+    if transport == McpTransport::Stdio
+        && let Some(result) = execute_runtime_mcp_lifecycle_tool_call(
+            tool_call,
+            descriptor,
+            &state.config,
+            &runtime.workspace,
+        )
+    {
+        return Some(result);
+    }
+    let result = match mcp_json_rpc(
+        &state.config,
+        transport,
+        "tools/call",
+        json!({
+            "name": descriptor.original_name,
+            "arguments": tool_call.input.clone(),
+        }),
+        &runtime.workspace,
+    ) {
+        Ok(value) => normalize_tool_call_result(descriptor, Some(transport), &value),
+        Err(error) => {
+            let mut result = unavailable_tool_result(&tool_call.name);
+            result.error = Some(error);
+            result
+        }
+    };
+    Some(mcp_bridge_to_tool_result(
+        tool_call,
+        bridge_tool_output(descriptor, result),
+    ))
+}
+
+fn execute_runtime_mcp_lifecycle_tool_call(
+    tool_call: &ToolCall,
+    descriptor: &RemoteMcpToolDescriptor,
+    server: &RemoteMcpServerConfig,
+    workspace: &Path,
+) -> Option<ToolResult> {
+    if server.server_type != McpServerType::Local {
+        return None;
+    }
+    let key = mcp_lifecycle_key(workspace, &server.name);
+    let fingerprint = mcp_server_fingerprint(server);
+    let mut registry = mcp_lifecycle_registry().lock().ok()?;
+    let mut remove_entry = false;
+    let result = match registry.get_mut(&key) {
+        Some(entry) => {
+            if entry.config_fingerprint != fingerprint {
+                remove_entry = true;
+                let mut result = unavailable_tool_result(&tool_call.name);
+                result.error = Some(
+                    "MCP local lifecycle process config changed; restart the server and retry."
+                        .to_string(),
+                );
+                result
+            } else if !entry.session.running() {
+                remove_entry = true;
+                let mut result = unavailable_tool_result(&tool_call.name);
+                result.error = Some(
+                    "MCP local lifecycle process exited; restart the server and retry.".to_string(),
+                );
+                result
+            } else {
+                let pid = entry.session.pid();
+                match entry.session.request(
+                    "tools/call",
+                    json!({
+                        "name": descriptor.original_name,
+                        "arguments": tool_call.input.clone(),
+                    }),
+                ) {
+                    Ok(value) => {
+                        entry.last_refreshed_at_ms = now_ms();
+                        let mut result = normalize_tool_call_result(
+                            descriptor,
+                            Some(McpTransport::Stdio),
+                            &value,
+                        );
+                        result
+                            .metadata
+                            .insert("mcp_lifecycle_reused".to_string(), json!(true));
+                        result
+                            .metadata
+                            .insert("mcp_lifecycle_pid".to_string(), json!(pid));
+                        result
+                    }
+                    Err(error) => {
+                        remove_entry = true;
+                        let mut result = unavailable_tool_result(&tool_call.name);
+                        result.error =
+                            Some(format!("MCP local lifecycle tools/call failed: {error}"));
+                        result
+                    }
+                }
+            }
+        }
+        None => return None,
+    };
+    if remove_entry {
+        if let Some(entry) = registry.remove(&key) {
+            drop(registry);
+            entry.session.close();
+        }
+    }
+    Some(mcp_bridge_to_tool_result(
+        tool_call,
+        bridge_tool_output(descriptor, result),
+    ))
+}
+
+fn mcp_bridge_to_tool_result(tool_call: &ToolCall, bridge: McpBridgeOutput) -> ToolResult {
+    ToolResult {
+        call_id: tool_call.call_id.clone(),
+        output: bridge.output,
+        error: bridge.error,
+        metadata: bridge.metadata,
+    }
+}
+
+fn execute_runtime_task_tool_call(
+    toolkit: &Toolkit,
+    tool_call: &ToolCall,
+    ctx: &mut ToolContext,
+    task_context: RuntimeTaskExecutionContext<'_>,
+) -> ToolResult {
+    if let Some(result) =
+        toolkit.permission_result_for_tool(TASK_TOOL_ID, &tool_call.input, &tool_call.call_id, ctx)
+    {
+        return result;
+    }
+    let input = &tool_call.input;
+    let background = input
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let subagent_type = match runtime_task_input_string(input, "subagent_type")
+        .or_else(|_| runtime_task_input_string(input, "agent_type"))
+        .or_else(|_| runtime_task_input_string(input, "agent"))
+    {
+        Ok(value) => value,
+        Err(error) => return runtime_task_tool_error(tool_call, &error, BTreeMap::new()),
+    };
+    let prompt = match runtime_task_input_string(input, "prompt") {
+        Ok(value) => value,
+        Err(error) => return runtime_task_tool_error(tool_call, &error, BTreeMap::new()),
+    };
+    let description =
+        runtime_task_input_string(input, "description").unwrap_or_else(|_| subagent_type.clone());
+    let profile =
+        match runtime_subagent_profile(&subagent_type, &task_context.parent_session.directory) {
+            Some(profile) => profile,
+            None => {
+                return runtime_task_tool_error(
+                    tool_call,
+                    &format!("subagent profile not found: {subagent_type}"),
+                    BTreeMap::from([("subagent_type".to_string(), json!(subagent_type))]),
+                );
+            }
+        };
+    let child_permission = profile.permission.clone();
+    let child_provider = profile
+        .provider
+        .clone()
+        .or_else(|| {
+            task_context
+                .payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            task_context
+                .parent_session
+                .metadata
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "openai".to_string());
+    let child_model = profile
+        .model
+        .clone()
+        .or_else(|| {
+            task_context
+                .payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            task_context
+                .parent_session
+                .metadata
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(default_model_id);
+    let child_max_steps = profile
+        .max_steps
+        .unwrap_or_else(|| provider_max_steps(task_context.payload));
+    let task_id = input
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut child_session = match task_id.as_deref() {
+        Some(existing) => match task_context.store.load_session(existing) {
+            Ok(session) => session,
+            Err(error) => {
+                return runtime_task_tool_error(
+                    tool_call,
+                    &format!("failed to resume task session {existing}: {error}"),
+                    BTreeMap::from([("task_id".to_string(), json!(existing))]),
+                );
+            }
+        },
+        None => Session::new(
+            new_id("subtask"),
+            task_context.parent_session.directory.clone(),
+        ),
+    };
+    let mut workspace_isolation = None;
+    if let Some(existing) = task_id.as_deref() {
+        if let Err(error) = validate_runtime_task_resume_session(
+            &child_session,
+            task_context.parent_session,
+            &profile,
+            existing,
+        ) {
+            return runtime_task_tool_error(
+                tool_call,
+                &error,
+                BTreeMap::from([
+                    ("subagent_type".to_string(), json!(profile.id.clone())),
+                    ("task_id".to_string(), json!(existing)),
+                ]),
+            );
+        }
+    }
+    if task_id.is_none()
+        && runtime_task_workspace_isolation_requested(input, profile.workspace_isolation)
+    {
+        match prepare_isolated_workspace(
+            &task_context.parent_session.directory,
+            task_context.store.root.join("isolated_workspaces"),
+            &child_session.id,
+        ) {
+            Ok(isolation) => {
+                child_session.directory = PathBuf::from(&isolation.workspace);
+                workspace_isolation = Some(isolation);
+            }
+            Err(error) => {
+                return runtime_task_tool_error(
+                    tool_call,
+                    &format!("failed to prepare isolated workspace: {error}"),
+                    BTreeMap::from([("subagent_type".to_string(), json!(profile.id.clone()))]),
+                );
+            }
+        }
+    }
+    if let Some(error) = runtime_task_governance_error(task_context.parent_session, &profile) {
+        return runtime_task_tool_error(
+            tool_call,
+            &error,
+            BTreeMap::from([
+                ("tool".to_string(), json!(TASK_TOOL_ID)),
+                ("subagent_type".to_string(), json!(profile.id.clone())),
+                ("status".to_string(), json!("failed")),
+                (
+                    "task_depth".to_string(),
+                    json!(runtime_child_task_depth(task_context.parent_session)),
+                ),
+                ("max_task_depth".to_string(), json!(max_subagent_depth())),
+                (
+                    "task_lineage_subagents".to_string(),
+                    json!(runtime_parent_task_lineage(task_context.parent_session)),
+                ),
+            ]),
+        );
+    }
+    let child_task_depth = runtime_child_task_depth(task_context.parent_session);
+    let task_root_session_id = runtime_task_root_session_id(task_context.parent_session);
+    let task_lineage_subagents =
+        runtime_child_task_lineage(task_context.parent_session, &profile.id);
+    let child_run_id = new_id("turn");
+    child_session.status = SessionStatus::Running;
+    child_session
+        .metadata
+        .insert("agent".to_string(), json!(profile.id.clone()));
+    child_session
+        .metadata
+        .insert("provider".to_string(), json!(child_provider.clone()));
+    child_session
+        .metadata
+        .insert("model".to_string(), json!(child_model.clone()));
+    child_session.metadata.insert(
+        "model_options".to_string(),
+        json!(profile.model_options.clone()),
+    );
+    if let Some(temperature) = profile.temperature {
+        child_session
+            .metadata
+            .insert("temperature".to_string(), json!(temperature));
+    }
+    if let Some(top_p) = profile.top_p {
+        child_session
+            .metadata
+            .insert("top_p".to_string(), json!(top_p));
+    }
+    if let Some(color) = profile.color.as_deref() {
+        child_session
+            .metadata
+            .insert("color".to_string(), json!(color));
+    }
+    child_session
+        .metadata
+        .insert("subagent".to_string(), json!(true));
+    child_session.metadata.insert(
+        "parent_session_id".to_string(),
+        json!(task_context.parent_session.id.clone()),
+    );
+    child_session.metadata.insert(
+        "task_parent_session_id".to_string(),
+        json!(task_context.parent_session.id.clone()),
+    );
+    child_session.metadata.insert(
+        "task_root_session_id".to_string(),
+        json!(task_root_session_id.clone()),
+    );
+    child_session
+        .metadata
+        .insert("task_depth".to_string(), json!(child_task_depth));
+    child_session.metadata.insert(
+        "task_lineage_subagents".to_string(),
+        json!(task_lineage_subagents.clone()),
+    );
+    child_session.metadata.insert(
+        "parent_run_id".to_string(),
+        json!(task_context.parent_run_id),
+    );
+    child_session.metadata.insert(
+        "parent_tool_call_id".to_string(),
+        json!(tool_call.call_id.clone()),
+    );
+    child_session
+        .metadata
+        .insert("task_description".to_string(), json!(description.clone()));
+    child_session
+        .metadata
+        .insert("task_subagent_type".to_string(), json!(profile.id.clone()));
+    child_session
+        .metadata
+        .insert("permission".to_string(), json!(child_permission.as_str()));
+    child_session
+        .metadata
+        .insert("max_steps".to_string(), json!(child_max_steps));
+    if let Some(isolation) = workspace_isolation.as_ref() {
+        child_session
+            .metadata
+            .insert("workspace_isolation".to_string(), json!(isolation));
+    }
+    if task_id.is_some() {
+        let resume_count = child_session
+            .metadata
+            .get("task_resume_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .saturating_add(1);
+        child_session
+            .metadata
+            .insert("task_resume_count".to_string(), json!(resume_count));
+        child_session
+            .metadata
+            .insert("task_resumed_at_ms".to_string(), json!(now_ms()));
+    }
+    if background {
+        child_session
+            .metadata
+            .insert("task_status".to_string(), json!("queued"));
+        child_session
+            .metadata
+            .insert("background".to_string(), json!(true));
+    } else {
+        child_session
+            .metadata
+            .insert("background".to_string(), json!(false));
+    }
+    child_session.metadata.insert(
+        "agent_profile".to_string(),
+        runtime_subagent_public_value(&profile),
+    );
+    let system_message = bind_runtime_subagent_system_prompt(&mut child_session, &profile);
+    let user = runtime_chat_message(Role::User, prompt.clone());
+    let user_index = child_session.messages.len() as u64;
+    child_session.add(user.clone());
+
+    if background {
+        child_session.status = SessionStatus::Idle;
+        if let Err(error) = task_context
+            .store
+            .save_state(&child_session, Some(&child_run_id))
+        {
+            return runtime_task_tool_error(
+                tool_call,
+                &format!("failed to queue background subagent session: {error}"),
+                BTreeMap::from([("subagent_type".to_string(), json!(profile.id.clone()))]),
+            );
+        }
+        let mut metadata = BTreeMap::from([
+            ("tool".to_string(), json!(TASK_TOOL_ID)),
+            ("title".to_string(), json!(description)),
+            ("subagent_type".to_string(), json!(profile.id.clone())),
+            ("task_id".to_string(), json!(child_session.id.clone())),
+            ("session_id".to_string(), json!(child_session.id.clone())),
+            ("run_id".to_string(), json!(child_run_id)),
+            ("status".to_string(), json!("queued")),
+            ("background".to_string(), json!(true)),
+            ("provider".to_string(), json!(child_provider)),
+            ("model".to_string(), json!(child_model)),
+            (
+                "model_options".to_string(),
+                json!(profile.model_options.clone()),
+            ),
+            ("max_steps".to_string(), json!(child_max_steps)),
+            ("task_depth".to_string(), json!(child_task_depth)),
+            (
+                "task_root_session_id".to_string(),
+                json!(task_root_session_id),
+            ),
+            (
+                "task_parent_session_id".to_string(),
+                json!(task_context.parent_session.id.clone()),
+            ),
+            (
+                "task_lineage_subagents".to_string(),
+                json!(task_lineage_subagents),
+            ),
+            (
+                "agent_profile".to_string(),
+                runtime_subagent_public_value(&profile),
+            ),
+        ]);
+        if let Some(isolation) = workspace_isolation.as_ref() {
+            metadata.insert("workspace_isolation".to_string(), json!(isolation));
+        }
+        return ToolResult {
+            call_id: tool_call.call_id.clone(),
+            output: render_runtime_task_output(
+                &child_session.id,
+                "queued",
+                "Background subagent task queued.",
+            ),
+            error: None,
+            metadata,
+        };
+    }
+
+    if let Err(error) = task_context.store.start_run(
+        &mut child_session,
+        StartRunOptions {
+            run_id: child_run_id.clone(),
+            trace_id: new_id("trace"),
+            agent_name: profile.id.clone(),
+            model_id: Some(child_model.clone()),
+            provider_id: Some(child_provider.clone()),
+            permission: if task_context.skip_permissions {
+                format!("auto_allow:{}", child_permission.as_str())
+            } else {
+                child_permission.as_str().to_string()
+            },
+            max_steps: child_max_steps,
+            started_at_ms: None,
+        },
+    ) {
+        return runtime_task_tool_error(
+            tool_call,
+            &format!("failed to start subagent session: {error}"),
+            BTreeMap::from([("subagent_type".to_string(), json!(profile.id.clone()))]),
+        );
+    }
+    if let Some((system, system_index)) = system_message {
+        let _ =
+            task_context
+                .store
+                .append_message(&child_session, &system, &child_run_id, system_index);
+    }
+    let _ = task_context
+        .store
+        .append_message(&child_session, &user, &child_run_id, user_index);
+
+    let mut child_payload = provider_resume_payload(task_context.payload);
+    if let Some(object) = child_payload.as_object_mut() {
+        object.insert("max_steps".to_string(), json!(child_max_steps));
+    }
+    let child_result = run_provider_loop(RuntimeProviderLoopInput {
+        config: task_context.config,
+        store: task_context.store,
+        session: &mut child_session,
+        run_id: &child_run_id,
+        payload: &child_payload,
+        permission_ruleset: child_permission,
+        skip_permissions: task_context.skip_permissions,
+        events: Vec::new(),
+        carry: RuntimeProviderLoopCarry::default(),
+    });
+    match child_result {
+        Ok(value) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            let final_answer = value
+                .get("turn")
+                .and_then(|turn| turn.get("final_answer"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if status != "completed" {
+                return runtime_task_tool_error(
+                    tool_call,
+                    &format!("subagent {} finished with status {status}", profile.id),
+                    BTreeMap::from([
+                        ("tool".to_string(), json!(TASK_TOOL_ID)),
+                        ("title".to_string(), json!(description)),
+                        ("subagent_type".to_string(), json!(profile.id.clone())),
+                        ("task_id".to_string(), json!(child_session.id.clone())),
+                        ("session_id".to_string(), json!(child_session.id.clone())),
+                        ("run_id".to_string(), json!(child_run_id)),
+                        ("status".to_string(), json!(status)),
+                        ("provider".to_string(), json!(child_provider)),
+                        ("model".to_string(), json!(child_model)),
+                        (
+                            "model_options".to_string(),
+                            json!(profile.model_options.clone()),
+                        ),
+                        ("max_steps".to_string(), json!(child_max_steps)),
+                        ("task_depth".to_string(), json!(child_task_depth)),
+                        (
+                            "task_root_session_id".to_string(),
+                            json!(task_root_session_id.clone()),
+                        ),
+                        (
+                            "task_parent_session_id".to_string(),
+                            json!(task_context.parent_session.id.clone()),
+                        ),
+                        (
+                            "task_lineage_subagents".to_string(),
+                            json!(task_lineage_subagents.clone()),
+                        ),
+                        (
+                            "agent_profile".to_string(),
+                            runtime_subagent_public_value(&profile),
+                        ),
+                    ]),
+                );
+            }
+            let mut metadata = BTreeMap::from([
+                ("tool".to_string(), json!(TASK_TOOL_ID)),
+                ("title".to_string(), json!(description)),
+                ("subagent_type".to_string(), json!(profile.id.clone())),
+                ("task_id".to_string(), json!(child_session.id.clone())),
+                ("session_id".to_string(), json!(child_session.id.clone())),
+                ("run_id".to_string(), json!(child_run_id)),
+                ("status".to_string(), json!("completed")),
+                ("provider".to_string(), json!(child_provider)),
+                ("model".to_string(), json!(child_model)),
+                (
+                    "model_options".to_string(),
+                    json!(profile.model_options.clone()),
+                ),
+                ("max_steps".to_string(), json!(child_max_steps)),
+                ("task_depth".to_string(), json!(child_task_depth)),
+                (
+                    "task_root_session_id".to_string(),
+                    json!(task_root_session_id.clone()),
+                ),
+                (
+                    "task_parent_session_id".to_string(),
+                    json!(task_context.parent_session.id.clone()),
+                ),
+                (
+                    "task_lineage_subagents".to_string(),
+                    json!(task_lineage_subagents.clone()),
+                ),
+                (
+                    "agent_profile".to_string(),
+                    runtime_subagent_public_value(&profile),
+                ),
+            ]);
+            if let Some(isolation) = workspace_isolation.as_ref() {
+                metadata.insert("workspace_isolation".to_string(), json!(isolation));
+            }
+            ToolResult {
+                call_id: tool_call.call_id.clone(),
+                output: render_runtime_task_output(&child_session.id, "completed", &final_answer),
+                error: None,
+                metadata,
+            }
+        }
+        Err(error) => runtime_task_tool_error(
+            tool_call,
+            &format!("subagent {} failed: {error}", profile.id),
+            BTreeMap::from([
+                ("tool".to_string(), json!(TASK_TOOL_ID)),
+                ("title".to_string(), json!(description)),
+                ("subagent_type".to_string(), json!(profile.id.clone())),
+                ("task_id".to_string(), json!(child_session.id.clone())),
+                ("session_id".to_string(), json!(child_session.id.clone())),
+                ("run_id".to_string(), json!(child_run_id)),
+                ("status".to_string(), json!("failed")),
+                (
+                    "model_options".to_string(),
+                    json!(profile.model_options.clone()),
+                ),
+                ("task_depth".to_string(), json!(child_task_depth)),
+                (
+                    "task_root_session_id".to_string(),
+                    json!(task_root_session_id),
+                ),
+                (
+                    "task_parent_session_id".to_string(),
+                    json!(task_context.parent_session.id.clone()),
+                ),
+                (
+                    "task_lineage_subagents".to_string(),
+                    json!(task_lineage_subagents),
+                ),
+            ]),
+        ),
+    }
+}
+
+fn validate_runtime_task_resume_session(
+    child_session: &Session,
+    parent_session: &Session,
+    profile: &RuntimeSubagentProfile,
+    task_id: &str,
+) -> Result<(), String> {
+    if !child_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!("task session {task_id} is not a subagent task"));
+    }
+    let parent_id = child_session
+        .metadata
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if parent_id != parent_session.id {
+        return Err("task does not belong to parent session".to_string());
+    }
+    let stored_agent = child_session
+        .metadata
+        .get("agent")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            child_session
+                .metadata
+                .get("task_subagent_type")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default();
+    if !stored_agent.is_empty() && stored_agent != profile.id {
+        return Err(format!(
+            "task session {task_id} belongs to subagent {stored_agent}, not {}",
+            profile.id
+        ));
+    }
+    match child_session
+        .metadata
+        .get("task_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "queued" | "running" | "canceled" => {
+            return Err(format!(
+                "task session {task_id} cannot be resumed while task status is {}",
+                child_session
+                    .metadata
+                    .get("task_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ));
+        }
+        _ => {}
+    }
+    if matches!(
+        child_session.status,
+        SessionStatus::Running | SessionStatus::Paused | SessionStatus::Compacting
+    ) {
+        return Err(format!(
+            "task session {task_id} cannot be resumed while session status is {}",
+            session_status_text(&child_session.status)
+        ));
+    }
+    Ok(())
+}
+
+fn bind_runtime_subagent_system_prompt(
+    session: &mut Session,
+    profile: &RuntimeSubagentProfile,
+) -> Option<(ChatMessage, u64)> {
+    let prompt = profile.prompt.trim_start_matches('\u{feff}').trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    let already_bound = session.messages.iter().any(|message| {
+        message.role == Role::System
+            && message
+                .metadata
+                .get("agent_profile")
+                .and_then(Value::as_str)
+                == Some(profile.id.as_str())
+    });
+    if already_bound {
+        return None;
+    }
+    let mut system = runtime_chat_message(Role::System, prompt.to_string());
+    system
+        .metadata
+        .insert("agent_profile".to_string(), json!(profile.id.clone()));
+    system
+        .metadata
+        .insert("agent_mode".to_string(), json!("subagent"));
+    let system_index = session.messages.len() as u64;
+    session.add(system.clone());
+    Some((system, system_index))
+}
+
+fn runtime_subagent_public_value(profile: &RuntimeSubagentProfile) -> Value {
+    json!({
+        "id": profile.id.clone(),
+        "name": profile.name.clone(),
+        "description": profile.description.clone(),
+        "mode": profile.mode.clone(),
+        "permission": profile.permission.as_str(),
+        "task_permissions": profile.task_permissions.clone(),
+        "tools": profile.tools.clone(),
+        "provider": profile.provider.clone(),
+        "model": profile.model.clone(),
+        "max_steps": profile.max_steps,
+        "steps": profile.max_steps,
+        "temperature": profile.temperature,
+        "top_p": profile.top_p,
+        "color": profile.color.clone(),
+        "disabled": profile.disabled,
+        "model_options": profile.model_options.clone(),
+        "workspace_isolation": profile.workspace_isolation,
+        "hidden": profile.hidden,
+        "source_path": profile.source_path.as_ref().map(|path| path.to_string_lossy().to_string()),
+    })
+}
+
+fn runtime_task_input_string(input: &Value, key: &str) -> Result<String, String> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("task tool requires non-empty {key}"))
+}
+
+fn runtime_task_workspace_isolation_requested(input: &Value, profile_default: bool) -> bool {
+    input
+        .get("isolate_workspace")
+        .or_else(|| input.get("workspace_isolation"))
+        .and_then(Value::as_bool)
+        .unwrap_or(profile_default)
+}
+
+fn runtime_task_tool_error(
+    tool_call: &ToolCall,
+    error: &str,
+    mut metadata: BTreeMap<String, Value>,
+) -> ToolResult {
+    metadata
+        .entry("tool".to_string())
+        .or_insert_with(|| json!(TASK_TOOL_ID));
+    ToolResult {
+        call_id: tool_call.call_id.clone(),
+        output: String::new(),
+        error: Some(error.to_string()),
+        metadata,
+    }
+}
+
+fn render_runtime_task_output(task_id: &str, state: &str, text: &str) -> String {
+    format!(
+        "<task id=\"{}\" state=\"{}\">\n<task_result>\n{}\n</task_result>\n</task>",
+        escape_runtime_task_text(task_id),
+        escape_runtime_task_text(state),
+        escape_runtime_task_text(text),
+    )
+}
+
+fn escape_runtime_task_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_provider_tool_call(
     store: &FileSessionStore,
@@ -3215,11 +5879,15 @@ fn execute_provider_tool_call(
     payload: &Value,
     step: u64,
     tool_call: &ToolCall,
+    config: &HttpRuntimeConfig,
     toolkit: &Toolkit,
+    mcp_runtime: Option<&RuntimeMcpRuntime>,
+    visible_tool_names: &BTreeSet<String>,
     ctx: &mut ToolContext,
     permission_ruleset: &PermissionRuleset,
     skip_permissions: bool,
     pending_carry: &RuntimeProviderLoopCarry,
+    step_start_checkpoint: Option<&str>,
     events: &mut Vec<Value>,
     persisted_events: &mut usize,
 ) -> Result<Option<Value>, String> {
@@ -3252,8 +5920,37 @@ fn execute_provider_tool_call(
         },
     );
 
+    if !visible_tool_names.contains(&tool_call.name) {
+        let mut tool_result = ToolResult {
+            call_id: tool_call.call_id.clone(),
+            output: String::new(),
+            error: Some(format!(
+                "tool `{}` is not available to this agent profile",
+                tool_call.name
+            )),
+            metadata: BTreeMap::from([
+                ("tool".to_string(), json!(tool_call.name.clone())),
+                ("denied_by_agent_profile".to_string(), json!(true)),
+            ]),
+        };
+        append_completed_tool_result(
+            store,
+            session,
+            run_id,
+            step,
+            tool_call,
+            None,
+            &mut tool_result,
+            events,
+        )?;
+        append_unpersisted_app_events(&store.root, &session.id, run_id, events, persisted_events);
+        return Ok(None);
+    }
+
     if tool_call.name == "question" && ctx.question_answers.is_none() {
-        let question = question_payload_for_tool_call(session, run_id, step, tool_call);
+        let assistant_message_id = latest_assistant_message_id_for_tool(session, tool_call);
+        let mut question = question_payload_for_tool_call(session, run_id, step, tool_call);
+        attach_runtime_step_to_question(&mut question, assistant_message_id.as_deref());
         session.status = SessionStatus::Paused;
         session
             .metadata
@@ -3286,7 +5983,7 @@ fn execute_provider_tool_call(
                 ..SessionEventOptions::default()
             },
         );
-        if let Some(message_id) = latest_assistant_message_id_for_tool(session, tool_call) {
+        if let Some(message_id) = assistant_message_id {
             let _ = store.append_part(
                 &session.id,
                 run_id,
@@ -3329,11 +6026,19 @@ fn execute_provider_tool_call(
     }
 
     let change_before = capture_file_change_before(session, tool_call);
-    let mut tool_result = toolkit.execute(
-        &tool_call.name,
-        tool_call.input.clone(),
-        &tool_call.call_id,
+    let mut tool_result = execute_runtime_tool_call(
+        toolkit,
+        mcp_runtime,
+        tool_call,
         ctx,
+        RuntimeTaskExecutionContext {
+            config,
+            store,
+            parent_session: session,
+            parent_run_id: run_id,
+            payload,
+            skip_permissions,
+        },
     );
     if tool_result
         .metadata
@@ -3341,8 +6046,14 @@ fn execute_provider_tool_call(
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
+        let assistant_message_id = latest_assistant_message_id_for_tool(session, tool_call);
         let mut approval =
             approval_payload_for_tool_call(session, run_id, step, tool_call, &tool_result.metadata);
+        attach_runtime_step_to_approval(
+            &mut approval,
+            assistant_message_id.as_deref(),
+            step_start_checkpoint,
+        );
         if let Some(preview) = change_before
             .as_ref()
             .and_then(|before| file_change_preview(before, tool_call))
@@ -3376,7 +6087,7 @@ fn execute_provider_tool_call(
                 ..SessionEventOptions::default()
             },
         );
-        if let Some(message_id) = latest_assistant_message_id_for_tool(session, tool_call) {
+        if let Some(message_id) = assistant_message_id {
             let _ = store.append_part(
                 &session.id,
                 run_id,
@@ -3560,6 +6271,202 @@ fn append_tool_result_to_session(
         .map_err(|error| format!("failed to record tool message: {error}"))
 }
 
+fn runtime_create_step_checkpoint(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    workspace: &Path,
+    step: u64,
+    kind: &str,
+    message_id: &str,
+) -> Option<String> {
+    store
+        .create_checkpoint(
+            session_id,
+            run_id,
+            workspace,
+            kind,
+            Some(message_id),
+            None,
+            Some(step),
+        )
+        .ok()
+        .map(|checkpoint| checkpoint.checkpoint_id)
+}
+
+fn runtime_finalize_step_checkpoint(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    workspace: &Path,
+    step: u64,
+    message_id: &str,
+    start_checkpoint_id: Option<&str>,
+) {
+    let Some(end_checkpoint_id) = runtime_create_step_checkpoint(
+        store, session_id, run_id, workspace, step, "step_end", message_id,
+    ) else {
+        return;
+    };
+    let _ = store.append_part(
+        session_id,
+        run_id,
+        "context",
+        SessionPartOptions {
+            message_id: Some(message_id.to_string()),
+            content: Some(json!({
+                "kind": "checkpoint",
+                "snapshot_start": start_checkpoint_id,
+                "snapshot_end": end_checkpoint_id,
+            })),
+            attributes: BTreeMap::from([
+                ("kind".to_string(), json!("checkpoint")),
+                ("snapshot_start".to_string(), json!(start_checkpoint_id)),
+                ("snapshot_end".to_string(), json!(end_checkpoint_id.clone())),
+            ]),
+            step_index: Some(step),
+            status: "completed".to_string(),
+            ..SessionPartOptions::default()
+        },
+    );
+    if let Some(start_checkpoint_id) = start_checkpoint_id {
+        let _ = store.append_checkpoint_patch_part(
+            session_id,
+            run_id,
+            message_id,
+            start_checkpoint_id,
+            &end_checkpoint_id,
+            Some(step),
+        );
+    }
+}
+
+fn append_runtime_completion_assistant(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    answer: &str,
+    step: u64,
+    assistant_message_id: &str,
+    start_checkpoint_id: Option<&str>,
+) {
+    let assistant = ChatMessage {
+        role: Role::Assistant,
+        content: answer.to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([
+            (
+                "message_id".to_string(),
+                json!(assistant_message_id.to_string()),
+            ),
+            ("snapshot_start".to_string(), json!(start_checkpoint_id)),
+            ("step".to_string(), json!(step)),
+        ]),
+    };
+    let assistant_index = session.messages.len() as u64;
+    session.add(assistant.clone());
+    let _ = store.append_message(session, &assistant, run_id, assistant_index);
+    runtime_finalize_step_checkpoint(
+        store,
+        &session.id,
+        run_id,
+        &session.directory,
+        step,
+        assistant_message_id,
+        start_checkpoint_id,
+    );
+}
+
+fn append_interaction_resolution_part(
+    store: &FileSessionStore,
+    session: &Session,
+    run_id: &str,
+    part_type: &str,
+    pending: &Value,
+    resolved: &Value,
+    resolution_status: &str,
+) {
+    let Some(message_id) = pending
+        .get("assistant_message_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if !session_has_message_id(session, message_id) {
+        return;
+    }
+    let part_status = match resolution_status {
+        "denied" | "dismissed" | "failed" | "error" => "error",
+        _ => "completed",
+    };
+    let request_id = pending
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let call_id = pending
+        .get("call_id")
+        .or_else(|| pending.get("tool_call_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = pending
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or(part_type)
+        .to_string();
+    let step = pending.get("step").and_then(Value::as_u64);
+    let _ = store.append_part(
+        &session.id,
+        run_id,
+        part_type,
+        SessionPartOptions {
+            message_id: Some(message_id.to_string()),
+            content: Some(json!({
+                "request_id": request_id,
+                "call_id": call_id,
+                "name": name,
+                "status": resolution_status,
+                "request": pending,
+                "resolution": resolved,
+            })),
+            attributes: BTreeMap::from([
+                ("request_id".to_string(), json!(request_id)),
+                ("call_id".to_string(), json!(call_id)),
+                ("name".to_string(), json!(name)),
+                ("resolution_status".to_string(), json!(resolution_status)),
+            ]),
+            step_index: step,
+            status: part_status.to_string(),
+            ..SessionPartOptions::default()
+        },
+    );
+}
+
+fn runtime_record_step_started(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    step: u64,
+    checkpoint_id: Option<&str>,
+) {
+    let _ = store.record_event(
+        session_id,
+        run_id,
+        "step.started",
+        SessionEventOptions {
+            kind: "step".to_string(),
+            attributes: BTreeMap::from([
+                ("step".to_string(), json!(step)),
+                ("checkpoint_id".to_string(), json!(checkpoint_id)),
+            ]),
+            ..SessionEventOptions::default()
+        },
+    );
+}
+
 fn finish_provider_loop(
     store: &FileSessionStore,
     session: &mut Session,
@@ -3601,7 +6508,13 @@ fn finish_provider_loop(
             "finish_reason": finish_reason,
         }
     }));
-    append_unpersisted_app_events(&store.root, &session.id, run_id, &events, persisted_events);
+    append_unpersisted_app_events(
+        &store.root,
+        &session.id,
+        run_id,
+        &mut events,
+        persisted_events,
+    );
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
@@ -3622,20 +6535,227 @@ fn finish_provider_loop(
     }))
 }
 
+fn finish_provider_loop_interrupted(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    mut events: Vec<Value>,
+    _persisted_events: &mut usize,
+    reason: &str,
+) -> Result<Value, String> {
+    let interrupted = record_turn_interrupted(store, session, run_id, reason);
+    if !events
+        .iter()
+        .any(|event| event.get("method").and_then(Value::as_str) == Some("turn/interrupted"))
+    {
+        events.extend(interrupted);
+    }
+    Ok(json!({
+        "session_id": session.id,
+        "turn_id": run_id,
+        "status": "interrupted",
+        "turn": {
+            "id": run_id,
+            "session_id": session.id,
+            "status": "interrupted",
+            "error": reason,
+        },
+        "events": events,
+    }))
+}
+
+#[cfg(test)]
 fn start_turn_payload(
     config: &HttpRuntimeConfig,
     session_id: &str,
     body: &str,
 ) -> Result<Value, String> {
     let payload: Value = serde_json::from_str(body).map_err(|error| error.to_string())?;
+    start_turn_payload_inner(config, session_id, payload, None)
+}
+
+fn start_turn_response(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    request_path: &str,
+    body: &str,
+) -> HttpResponseSpec {
+    let payload: Value = match serde_json::from_str(body) {
+        Ok(payload) => payload,
+        Err(error) => return json_response(400, json!({"error": error.to_string()})),
+    };
+    if turn_async_requested(request_path, &payload) {
+        match start_turn_async_payload(config, session_id, payload) {
+            Ok((status, payload)) => json_response(status, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        }
+    } else {
+        match start_turn_payload_inner(config, session_id, payload, None) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        }
+    }
+}
+
+fn start_turn_async_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    payload: Value,
+) -> Result<(u16, Value), String> {
+    validate_start_turn_payload(&payload)?;
+    let run_id = new_id("turn");
+    let registration = match register_turn_job(config, session_id, &run_id, payload.clone()) {
+        Ok(registration) => registration,
+        Err(TurnJobRegisterError::Unavailable) => {
+            return Err("turn job registry unavailable".to_string());
+        }
+        Err(TurnJobRegisterError::QueuePersistFailed(error)) => {
+            return Ok((
+                500,
+                json!({
+                    "error": error,
+                    "error_code": "turn_queue_persist_failed",
+                    "session_id": session_id,
+                    "status": "rejected",
+                    "accepted": false,
+                    "async": true,
+                    "queued": false,
+                }),
+            ));
+        }
+        Err(TurnJobRegisterError::QueueFull {
+            queued_count,
+            max_queued_turns_per_session,
+        }) => {
+            return Ok((
+                429,
+                json!({
+                    "error": "turn queue is full",
+                    "error_code": "turn_queue_full",
+                    "session_id": session_id,
+                    "status": "rejected",
+                    "accepted": false,
+                    "async": true,
+                    "queued": false,
+                    "queued_count": queued_count,
+                    "max_queued_turns_per_session": max_queued_turns_per_session,
+                    "scheduler": {
+                        "max_queued_turns_per_session": max_queued_turns_per_session,
+                        "max_running_turn_workers": max_running_turn_workers(config),
+                        "turn_queue_lease_stale_ms": config.turn_queue_lease_stale_ms,
+                        "turn_queue_timeout_ms": turn_queue_timeout_ms(config),
+                    },
+                }),
+            ));
+        }
+    };
+    let (status, queue_position, queue_reason) = match registration {
+        TurnJobRegistration::Running(_cancel) => {
+            spawn_async_turn_worker(config, session_id.to_string(), run_id.clone(), payload)?;
+            ("running", None, None)
+        }
+        TurnJobRegistration::Queued {
+            job: _job,
+            queue_position,
+            queue_reason,
+        } => ("queued", Some(queue_position), Some(queue_reason)),
+    };
+    Ok((
+        202,
+        json!({
+            "session_id": session_id,
+            "turn_id": run_id,
+            "status": status,
+            "accepted": true,
+            "async": true,
+            "queued": status == "queued",
+            "queue_position": queue_position,
+            "queue_reason": queue_reason,
+            "scheduler": {
+                "max_queued_turns_per_session": config.max_queued_turns_per_session,
+                "max_running_turn_workers": max_running_turn_workers(config),
+                "turn_queue_lease_stale_ms": config.turn_queue_lease_stale_ms,
+                "turn_queue_timeout_ms": turn_queue_timeout_ms(config),
+            },
+            "turn": {
+                "id": run_id,
+                "session_id": session_id,
+                "status": status,
+                "queue_position": queue_position,
+                "queue_reason": queue_reason,
+            },
+            "events": [],
+        }),
+    ))
+}
+
+fn spawn_async_turn_worker(
+    config: &HttpRuntimeConfig,
+    session_id: String,
+    run_id: String,
+    payload: Value,
+) -> Result<(), String> {
+    let thread_config = config.clone();
+    let thread_session_id = session_id;
+    let thread_run_id = run_id;
+    thread::Builder::new()
+        .name(format!("openagent-turn-{thread_run_id}"))
+        .spawn(move || {
+            match start_turn_payload_inner(
+                &thread_config,
+                &thread_session_id,
+                payload,
+                Some(thread_run_id.clone()),
+            ) {
+                Ok(payload) => {
+                    let status = payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    mark_turn_job_status(&thread_config, &thread_run_id, status);
+                }
+                Err(error) if is_turn_interrupted_error(&error) => {
+                    let store = FileSessionStore::new(session_root(&thread_config));
+                    if let Ok((_session_id, mut session)) =
+                        find_session_for_turn(&store, &thread_run_id)
+                    {
+                        let _ = record_turn_interrupted(
+                            &store,
+                            &mut session,
+                            &thread_run_id,
+                            "interrupt requested",
+                        );
+                    }
+                    mark_turn_job_status(&thread_config, &thread_run_id, "interrupted");
+                }
+                Err(error) => {
+                    record_async_turn_failure(
+                        &thread_config,
+                        &thread_session_id,
+                        &thread_run_id,
+                        &error,
+                    );
+                    mark_turn_job_status(&thread_config, &thread_run_id, "failed");
+                }
+            }
+            start_next_queued_turns(&thread_config);
+        })
+        .map(|_| ())
+        .map_err(|error| format!("failed to start async turn: {error}"))
+}
+
+fn start_turn_payload_inner(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    payload: Value,
+    run_id_override: Option<String>,
+) -> Result<Value, String> {
+    validate_start_turn_payload(&payload)?;
     let input = payload
         .get("input")
         .or_else(|| payload.get("message"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if input.trim().is_empty() {
-        return Err("turn input is required".to_string());
-    }
     let permission_ruleset = permission_ruleset_for_turn(&payload)?;
     let skip_permissions = skip_permissions_for_turn(&payload);
     let store = FileSessionStore::new(session_root(config));
@@ -3643,7 +6763,7 @@ fn start_turn_payload(
         .load_session(session_id)
         .unwrap_or_else(|_| Session::new(session_id.to_string(), workspace(config)));
     let runtime_profile = apply_turn_runtime_profile(&mut session, &payload);
-    let run_id = new_id("turn");
+    let run_id = run_id_override.unwrap_or_else(|| new_id("turn"));
     session.status = SessionStatus::Running;
     let _ = store.start_run(
         &mut session,
@@ -3672,9 +6792,30 @@ fn start_turn_payload(
     let user_index = session.messages.len() as u64;
     session.add(user.clone());
     let _ = store.append_message(&session, &user, &run_id, user_index);
-    let tool_calls = tool_calls_from_turn_payload(&payload)?;
+    let mut tool_calls = tool_calls_from_turn_payload(&payload)?;
+    if tool_calls.is_empty()
+        && let Some(call) = manual_runtime_subagent_tool_call(&input)
+    {
+        tool_calls.push(call);
+    }
+    if tool_calls.is_empty() {
+        let agent_profile = runtime_agent_profile_for_session(&session);
+        let descriptors = runtime_task_subagent_descriptors(
+            &session.directory,
+            agent_profile.as_ref(),
+            Some(&session),
+        );
+        if let Some(route) = select_task_subagent_for_prompt(&descriptors, input) {
+            session.metadata.insert(
+                "auto_subagent_route".to_string(),
+                runtime_auto_route_value(&route),
+            );
+            tool_calls.push(auto_runtime_subagent_tool_call(input, &route));
+        }
+    }
     if !tool_calls.is_empty() {
         return run_http_tool_turn(
+            config,
             &store,
             &mut session,
             &run_id,
@@ -3686,6 +6827,7 @@ fn start_turn_payload(
     let _ = runtime_profile;
     let initial_events = vec![turn_started_event(&session, &run_id)];
     run_provider_loop(RuntimeProviderLoopInput {
+        config,
         store: &store,
         session: &mut session,
         run_id: &run_id,
@@ -3697,7 +6839,173 @@ fn start_turn_payload(
     })
 }
 
+fn validate_start_turn_payload(payload: &Value) -> Result<(), String> {
+    let input = payload
+        .get("input")
+        .or_else(|| payload.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if input.trim().is_empty() {
+        return Err("turn input is required".to_string());
+    }
+    let _ = permission_ruleset_for_turn(payload)?;
+    Ok(())
+}
+
+fn turn_async_requested(request_path: &str, payload: &Value) -> bool {
+    ["async", "background", "run_async"]
+        .iter()
+        .filter_map(|key| query_value(request_path, key))
+        .any(|value| truthy(&value))
+        || ["async", "background", "run_async"]
+            .iter()
+            .filter_map(|key| payload.get(*key))
+            .any(value_truthy)
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn value_truthy(value: &Value) -> bool {
+    value
+        .as_bool()
+        .unwrap_or_else(|| value.as_str().is_some_and(truthy))
+}
+
+fn is_turn_interrupted_error(error: &str) -> bool {
+    error == TURN_INTERRUPTED_ERROR || error.contains(TURN_INTERRUPTED_ERROR)
+}
+
+fn turn_event_recorded(root: &Path, session_id: &str, turn_id: &str, method: &str) -> bool {
+    read_jsonl_values(&app_events_path(root, session_id, turn_id))
+        .iter()
+        .any(|event| event.get("method").and_then(Value::as_str) == Some(method))
+}
+
+fn turn_status_payload(config: &HttpRuntimeConfig, turn_id: &str) -> Result<Value, String> {
+    expire_queued_turns(config);
+    if let Some(job) = turn_job_payload(turn_id) {
+        return Ok(json!({
+            "turn_id": turn_id,
+            "status": job.get("status").cloned().unwrap_or_else(|| json!("running")),
+            "job": job,
+            "source": "runtime_job_registry",
+        }));
+    }
+    let root = session_root(config);
+    if let Some(job) = persisted_turn_job_payload(&root, turn_id) {
+        return Ok(json!({
+            "turn_id": turn_id,
+            "status": job.get("status").cloned().unwrap_or_else(|| json!("interrupted")),
+            "job": job,
+            "source": "runtime_job_index",
+        }));
+    }
+    let store = FileSessionStore::new(session_root(config));
+    let (session_id, session) = find_session_for_turn(&store, turn_id)?;
+    let run_dir = store.root.join(&session_id).join("runs").join(turn_id);
+    let run_record = read_json_file(&run_dir.join("run.json"));
+    let summary = read_json_file(&run_dir.join("summary.json"));
+    let status = summary
+        .get("status")
+        .or_else(|| run_record.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| session_status_label(&session.status));
+    Ok(json!({
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "status": status,
+        "session_status": session_status_label(&session.status),
+        "run": run_record,
+        "summary": summary,
+        "source": "session_store",
+    }))
+}
+
+fn session_status_label(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "idle",
+        SessionStatus::Running => "running",
+        SessionStatus::Paused => "paused",
+        SessionStatus::Stop => "stop",
+        SessionStatus::Compacting => "compacting",
+    }
+}
+
+fn record_async_turn_failure(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    run_id: &str,
+    error: &str,
+) {
+    let store = FileSessionStore::new(session_root(config));
+    let mut session = store
+        .load_session(session_id)
+        .unwrap_or_else(|_| Session::new(session_id.to_string(), workspace(config)));
+    session.status = SessionStatus::Idle;
+    session.metadata.remove("pending_provider_turn");
+    let _ = store.finish_run(
+        &session,
+        run_id,
+        "failed",
+        1,
+        Some("async_turn_error"),
+        Some(error),
+    );
+    let _ = store.save_state(&session, Some(run_id));
+    let mut events = vec![json!({
+        "method": "turn/failed",
+        "params": {
+            "session_id": session.id,
+            "turn_id": run_id,
+            "status": "failed",
+            "error": error,
+        }
+    })];
+    append_app_events(&store.root, session_id, run_id, &mut events);
+}
+
+fn record_turn_interrupted(
+    store: &FileSessionStore,
+    session: &mut Session,
+    turn_id: &str,
+    error: &str,
+) -> Vec<Value> {
+    session.status = SessionStatus::Stop;
+    session.metadata.remove("pending_provider_turn");
+    let _ = store.finish_run(
+        session,
+        turn_id,
+        "interrupted",
+        1,
+        Some("interrupted"),
+        Some(error),
+    );
+    let _ = store.save_state(session, Some(turn_id));
+    mark_turn_job_status_at_root(&store.root, turn_id, "interrupted");
+    let event = json!({
+        "method": "turn/interrupted",
+        "params": {
+            "session_id": session.id.clone(),
+            "thread_id": session.id.clone(),
+            "turn_id": turn_id,
+            "status": "interrupted",
+            "error": error,
+        }
+    });
+    let mut events = vec![event];
+    if !turn_event_recorded(&store.root, &session.id, turn_id, "turn/interrupted") {
+        append_app_events(&store.root, &session.id, turn_id, &mut events);
+    }
+    events
+}
+
 fn run_http_tool_turn(
+    config: &HttpRuntimeConfig,
     store: &FileSessionStore,
     session: &mut Session,
     run_id: &str,
@@ -3705,13 +7013,30 @@ fn run_http_tool_turn(
     permission_ruleset: PermissionRuleset,
     skip_permissions: bool,
 ) -> Result<Value, String> {
-    let toolkit = Toolkit::with_builtins();
+    let agent_profile = runtime_agent_profile_for_session(session);
+    let mut toolkit = toolkit_with_runtime_task_tool(session, agent_profile.as_ref());
+    let mcp_runtime = register_runtime_mcp_tools(config, &session.directory, &mut toolkit);
     let tool_call_count = tool_calls.len() as u64;
+    let empty_payload = json!({});
     let mut ctx = ToolContext::new(&session.directory)
         .with_session_id(session.id.clone())
-        .with_permission_ruleset(permission_ruleset)
+        .with_permission_manager(runtime_permission_manager_for_agent(
+            permission_ruleset.clone(),
+            agent_profile.as_ref(),
+        ))
         .with_dangerously_skip_permissions(skip_permissions);
     let mut events = vec![turn_started_event(session, run_id)];
+    let assistant_message_id = runtime_message_id(session.messages.len() as u64 + tool_call_count);
+    let start_checkpoint = runtime_create_step_checkpoint(
+        store,
+        &session.id,
+        run_id,
+        &session.directory,
+        1,
+        "step_start",
+        &assistant_message_id,
+    );
+    runtime_record_step_started(store, &session.id, run_id, 1, start_checkpoint.as_deref());
 
     for (index, tool_call) in tool_calls.into_iter().enumerate() {
         let step = index as u64 + 1;
@@ -3726,11 +7051,19 @@ fn run_http_tool_turn(
             }
         }));
         let change_before = capture_file_change_before(session, &tool_call);
-        let mut tool_result = toolkit.execute(
-            &tool_call.name,
-            tool_call.input.clone(),
-            &tool_call.call_id,
+        let mut tool_result = execute_runtime_tool_call(
+            &toolkit,
+            mcp_runtime.as_ref(),
+            &tool_call,
             &mut ctx,
+            RuntimeTaskExecutionContext {
+                config,
+                store,
+                parent_session: session,
+                parent_run_id: run_id,
+                payload: &empty_payload,
+                skip_permissions,
+            },
         );
         if tool_result
             .metadata
@@ -3744,6 +7077,11 @@ fn run_http_tool_turn(
                 step,
                 &tool_call,
                 &tool_result.metadata,
+            );
+            attach_runtime_step_to_approval(
+                &mut approval,
+                Some(&assistant_message_id),
+                start_checkpoint.as_deref(),
             );
             if let Some(preview) = change_before
                 .as_ref()
@@ -3780,7 +7118,7 @@ fn run_http_tool_turn(
                     "approval": approval,
                 }
             }));
-            append_app_events(&store.root, &session.id, run_id, &events);
+            append_app_events(&store.root, &session.id, run_id, &mut events);
             return Ok(json!({
                 "session_id": session.id,
                 "turn_id": run_id,
@@ -3789,43 +7127,16 @@ fn run_http_tool_turn(
             }));
         }
 
-        let failed = tool_result.error.is_some();
-        let patch = complete_file_change(
+        append_completed_tool_result(
             store,
             session,
             run_id,
+            step,
             &tool_call,
             change_before,
-            &tool_result,
-        );
-        if let Some(change) = patch.as_ref() {
-            tool_result
-                .metadata
-                .insert("patch".to_string(), public_file_change(change));
-            tool_result.metadata.insert(
-                "patch_id".to_string(),
-                change.get("id").cloned().unwrap_or(Value::Null),
-            );
-            tool_result.metadata.insert(
-                "diff".to_string(),
-                change.get("diff").cloned().unwrap_or(Value::Null),
-            );
-        }
-        events.push(json!({
-            "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
-            "params": {
-                "session_id": session.id.clone(),
-                "turn_id": run_id,
-                "call_id": tool_call.call_id.clone(),
-                "name": tool_call.name.clone(),
-                "output": tool_result.output,
-                "error": tool_result.error,
-                "metadata": tool_result.metadata,
-            }
-        }));
-        if let Some(change) = patch.as_ref() {
-            events.push(patch_detected_event(session, run_id, change));
-        }
+            &mut tool_result,
+            &mut events,
+        )?;
     }
 
     let answer = if tool_calls_completed_successfully(&events) {
@@ -3833,17 +7144,16 @@ fn run_http_tool_turn(
     } else {
         "tool execution failed".to_string()
     };
-    let assistant = ChatMessage {
-        role: Role::Assistant,
-        content: answer.clone(),
-        name: None,
-        tool_call_id: None,
-        metadata: BTreeMap::new(),
-    };
-    let assistant_index = session.messages.len() as u64;
-    session.add(assistant.clone());
+    append_runtime_completion_assistant(
+        store,
+        session,
+        run_id,
+        &answer,
+        tool_call_count.max(1),
+        &assistant_message_id,
+        start_checkpoint.as_deref(),
+    );
     session.status = SessionStatus::Idle;
-    let _ = store.append_message(session, &assistant, run_id, assistant_index);
     let _ = store.finish_run(session, run_id, "completed", 1, Some("stop"), None);
     let input = latest_user_message(session);
     let usage = usage_payload(&input, &answer, tool_call_count);
@@ -3860,7 +7170,7 @@ fn run_http_tool_turn(
             "trace": trace,
         }
     }));
-    append_app_events(&store.root, &session.id, run_id, &events);
+    append_app_events(&store.root, &session.id, run_id, &mut events);
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
@@ -3915,7 +7225,7 @@ fn respond_approval_payload(
             "turn_id": run_id.clone(),
             "request_id": request_id.clone(),
             "status": if action == "allow" { "running" } else { "denied" },
-            "approval": resolved,
+            "approval": resolved.clone(),
         }
     })];
     let _ = store.record_event(
@@ -3933,32 +7243,90 @@ fn respond_approval_payload(
         },
     );
 
+    let response_status: &str;
     if action == "allow" {
         let tool_call = pending_approval_tool_call(&approval)?;
-        let toolkit = Toolkit::with_builtins();
+        let agent_profile = runtime_agent_profile_for_session(&session);
+        let mut toolkit = toolkit_with_runtime_task_tool(&session, agent_profile.as_ref());
+        let mcp_runtime = register_runtime_mcp_tools(config, &session.directory, &mut toolkit);
+        let pending_payload = session
+            .metadata
+            .get("pending_provider_turn")
+            .and_then(|pending| pending.get("payload"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let pending_skip_permissions = session
+            .metadata
+            .get("pending_provider_turn")
+            .and_then(|pending| pending.get("skip_permissions"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let mut ctx = ToolContext::new(&session.directory)
             .with_session_id(session.id.clone())
+            .with_permission_manager(runtime_permission_manager_for_agent(
+                parse_permission_ruleset(
+                    session
+                        .metadata
+                        .get("permission")
+                        .and_then(Value::as_str)
+                        .unwrap_or("FULL"),
+                )
+                .unwrap_or(PermissionRuleset::Full),
+                agent_profile.as_ref(),
+            ))
             .with_dangerously_skip_permissions(true);
         let change_before = capture_file_change_before(&session, &tool_call);
-        let mut tool_result = toolkit.execute(
-            &tool_call.name,
-            tool_call.input.clone(),
-            &tool_call.call_id,
+        let mut tool_result = execute_runtime_tool_call(
+            &toolkit,
+            mcp_runtime.as_ref(),
+            &tool_call,
             &mut ctx,
+            RuntimeTaskExecutionContext {
+                config,
+                store: &store,
+                parent_session: &session,
+                parent_run_id: &run_id,
+                payload: &pending_payload,
+                skip_permissions: pending_skip_permissions,
+            },
         );
+        let approval_step = approval.get("step").and_then(Value::as_u64).unwrap_or(1);
         append_completed_tool_result(
             &store,
             &mut session,
             &run_id,
-            approval.get("step").and_then(Value::as_u64).unwrap_or(1),
+            approval_step,
             &tool_call,
             change_before,
             &mut tool_result,
             &mut events,
         )?;
+        let approval_start_checkpoint = approval
+            .get("snapshot_start")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let approval_assistant_message_id = approval
+            .get("assistant_message_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| latest_assistant_message_id_for_tool(&session, &tool_call))
+            .unwrap_or_else(|| runtime_message_id(session.messages.len() as u64));
         if let Some(resume) = take_pending_provider_turn(&mut session) {
+            append_interaction_resolution_part(
+                &store, &session, &run_id, "approval", &approval, &resolved, "allowed",
+            );
+            runtime_finalize_step_checkpoint(
+                &store,
+                &session.id,
+                &run_id,
+                &session.directory,
+                approval_step,
+                &approval_assistant_message_id,
+                approval_start_checkpoint.as_deref(),
+            );
             session.status = SessionStatus::Running;
             return run_provider_loop(RuntimeProviderLoopInput {
+                config,
                 store: &store,
                 session: &mut session,
                 run_id: &run_id,
@@ -3970,11 +7338,24 @@ fn respond_approval_payload(
             });
         }
         let failed = tool_result.error.is_some();
+        response_status = if failed { "failed" } else { "completed" };
         let answer = if failed {
             "approval resolved, but tool execution failed".to_string()
         } else {
             "approval resolved".to_string()
         };
+        append_runtime_completion_assistant(
+            &store,
+            &mut session,
+            &run_id,
+            &answer,
+            approval_step,
+            &approval_assistant_message_id,
+            approval_start_checkpoint.as_deref(),
+        );
+        append_interaction_resolution_part(
+            &store, &session, &run_id, "approval", &approval, &resolved, "allowed",
+        );
         let input = latest_user_message(&session);
         let usage = usage_payload(&input, &answer, 1);
         let trace = trace_payload(&session, &run_id, 1);
@@ -4000,8 +7381,12 @@ fn respond_approval_payload(
             }
         }));
     } else {
+        response_status = "failed";
         session.metadata.remove("pending_provider_turn");
         session.status = SessionStatus::Idle;
+        append_interaction_resolution_part(
+            &store, &session, &run_id, "approval", &approval, &resolved, "denied",
+        );
         let _ = store.finish_run(
             &session,
             &run_id,
@@ -4021,10 +7406,12 @@ fn respond_approval_payload(
         }));
     }
     let _ = store.save_state(&session, Some(&run_id));
-    append_app_events(&store.root, &session.id, &run_id, &events);
+    append_app_events(&store.root, &session.id, &run_id, &mut events);
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
+        "request_id": request_id,
+        "status": response_status,
         "approval": response,
         "events": events,
     }))
@@ -4084,6 +7471,15 @@ fn respond_question_payload(
     {
         session.metadata.remove("pending_provider_turn");
         session.status = SessionStatus::Idle;
+        append_interaction_resolution_part(
+            &store,
+            &session,
+            &run_id,
+            "question",
+            &question,
+            &response,
+            "dismissed",
+        );
         let _ = store.finish_run(
             &session,
             &run_id,
@@ -4102,11 +7498,12 @@ fn respond_question_payload(
             }
         }));
         let _ = store.save_state(&session, Some(&run_id));
-        append_app_events(&store.root, &session.id, &run_id, &events);
+        append_app_events(&store.root, &session.id, &run_id, &mut events);
         return Ok(json!({
             "session_id": session.id,
             "turn_id": run_id,
             "request_id": request_id,
+            "status": "failed",
             "question": response,
             "events": events,
         }));
@@ -4119,7 +7516,8 @@ fn respond_question_payload(
         .and_then(question_answers_from_json)
         .unwrap_or_default();
     ctx.set_question_answers(answers);
-    let toolkit = Toolkit::with_builtins();
+    let agent_profile = runtime_agent_profile_for_session(&session);
+    let toolkit = toolkit_with_runtime_task_tool(&session, agent_profile.as_ref());
     let mut tool_result = toolkit.execute(
         "question",
         tool_call.input.clone(),
@@ -4136,10 +7534,14 @@ fn respond_question_payload(
         &mut tool_result,
         &mut events,
     )?;
+    append_interaction_resolution_part(
+        &store, &session, &run_id, "question", &question, &response, "answered",
+    );
 
     if let Some(resume) = take_pending_provider_turn(&mut session) {
         session.status = SessionStatus::Running;
         return run_provider_loop(RuntimeProviderLoopInput {
+            config,
             store: &store,
             session: &mut session,
             run_id: &run_id,
@@ -4169,11 +7571,12 @@ fn respond_question_payload(
             "trace": trace,
         }
     }));
-    append_app_events(&store.root, &session.id, &run_id, &events);
+    append_app_events(&store.root, &session.id, &run_id, &mut events);
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
         "request_id": request_id,
+        "status": "completed",
         "question": response,
         "events": events,
     }))
@@ -4181,37 +7584,28 @@ fn respond_question_payload(
 
 fn interrupt_turn_payload(config: &HttpRuntimeConfig, turn_id: &str) -> Result<Value, String> {
     let store = FileSessionStore::new(session_root(config));
-    let (session_id, mut session) = find_session_for_turn(&store, turn_id)?;
-    session.status = SessionStatus::Stop;
-    let _ = store.finish_run(
-        &session,
-        turn_id,
-        "failed",
-        1,
-        Some("interrupted"),
-        Some("interrupt requested"),
-    );
-    let event = json!({
-        "method": "turn/interrupted",
-        "params": {
-            "session_id": session_id,
-            "thread_id": session_id,
-            "turn_id": turn_id,
-            "status": "interrupted",
-            "error": "interrupt requested",
+    let job = request_turn_job_cancel(config, turn_id);
+    let (session_id, mut session) = match find_session_for_turn(&store, turn_id) {
+        Ok(found) => found,
+        Err(error) => {
+            let session_id = job
+                .as_ref()
+                .and_then(|value| value.get("session_id"))
+                .and_then(Value::as_str)
+                .ok_or(error)?;
+            let session = store
+                .load_session(session_id)
+                .unwrap_or_else(|_| Session::new(session_id.to_string(), workspace(config)));
+            (session_id.to_string(), session)
         }
-    });
-    append_app_events(
-        &store.root,
-        &session_id,
-        turn_id,
-        std::slice::from_ref(&event),
-    );
+    };
+    let events = record_turn_interrupted(&store, &mut session, turn_id, "interrupt requested");
     Ok(json!({
         "session_id": session_id,
         "turn_id": turn_id,
         "status": "interrupted",
-        "events": [event],
+        "job": job,
+        "events": events,
     }))
 }
 
@@ -4391,6 +7785,33 @@ fn approval_payload_for_tool_call(
     })
 }
 
+fn attach_runtime_step_to_approval(
+    approval: &mut Value,
+    assistant_message_id: Option<&str>,
+    start_checkpoint_id: Option<&str>,
+) {
+    if let Some(object) = approval.as_object_mut() {
+        if let Some(assistant_message_id) = assistant_message_id {
+            object.insert(
+                "assistant_message_id".to_string(),
+                json!(assistant_message_id),
+            );
+        }
+        object.insert("snapshot_start".to_string(), json!(start_checkpoint_id));
+    }
+}
+
+fn attach_runtime_step_to_question(question: &mut Value, assistant_message_id: Option<&str>) {
+    if let Some(object) = question.as_object_mut()
+        && let Some(assistant_message_id) = assistant_message_id
+    {
+        object.insert(
+            "assistant_message_id".to_string(),
+            json!(assistant_message_id),
+        );
+    }
+}
+
 fn question_payload_for_tool_call(
     session: &Session,
     run_id: &str,
@@ -4461,6 +7882,55 @@ fn tool_calls_from_turn_payload(payload: &Value) -> Result<Vec<ToolCall>, String
     Ok(Vec::new())
 }
 
+fn manual_runtime_subagent_tool_call(input: &str) -> Option<ToolCall> {
+    let trimmed = input.trim_start();
+    let rest = trimmed.strip_prefix('@')?;
+    let (subagent_type, prompt) = rest.split_once(char::is_whitespace)?;
+    let subagent_type = subagent_type.trim();
+    let prompt = prompt.trim();
+    if subagent_type.is_empty()
+        || prompt.is_empty()
+        || !subagent_type
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(ToolCall {
+        name: TASK_TOOL_ID.to_string(),
+        input: json!({
+            "description": format!("@{subagent_type}"),
+            "prompt": prompt,
+            "subagent_type": subagent_type,
+        }),
+        call_id: format!("manual_task_{subagent_type}"),
+    })
+}
+
+fn auto_runtime_subagent_tool_call(input: &str, route: &TaskSubagentRoute) -> ToolCall {
+    ToolCall {
+        name: TASK_TOOL_ID.to_string(),
+        input: json!({
+            "description": format!("Auto-routed to {}", route.subagent_id),
+            "prompt": input,
+            "subagent_type": route.subagent_id.clone(),
+            "command": "auto_route",
+        }),
+        call_id: format!(
+            "auto_task_{}",
+            sanitize_runtime_agent_id(&route.subagent_id)
+        ),
+    }
+}
+
+fn runtime_auto_route_value(route: &TaskSubagentRoute) -> Value {
+    json!({
+        "subagent_type": route.subagent_id.clone(),
+        "score": route.score,
+        "matched_terms": route.matched_terms.clone(),
+    })
+}
+
 fn tool_call_from_value(value: &Value, index: usize) -> Result<ToolCall, String> {
     let name = value
         .get("name")
@@ -4528,23 +7998,12 @@ fn provider_streaming_enabled_for_turn(payload: &Value) -> bool {
         })
 }
 
-fn append_app_events(root: &Path, session_id: &str, turn_id: &str, events: &[Value]) {
+fn append_app_events(root: &Path, session_id: &str, turn_id: &str, events: &mut [Value]) {
     let path = app_events_path(root, session_id, turn_id);
     let existing = read_jsonl_values(&path).len() as u64;
-    for (index, event) in events.iter().enumerate() {
-        let mut normalized = event.clone();
-        if let Some(object) = normalized.as_object_mut() {
-            object
-                .entry("sequence".to_string())
-                .or_insert_with(|| json!(existing + index as u64 + 1));
-            object
-                .entry("created_at_ms".to_string())
-                .or_insert_with(|| json!(now_ms()));
-            object
-                .entry("global_sequence".to_string())
-                .or_insert_with(|| json!(existing + index as u64 + 1));
-        }
-        append_json_line(&path, &normalized);
+    for (index, event) in events.iter_mut().enumerate() {
+        normalize_app_event(event, session_id, turn_id, existing + index as u64 + 1);
+        append_json_line(&path, event);
     }
 }
 
@@ -4552,14 +8011,46 @@ fn append_unpersisted_app_events(
     root: &Path,
     session_id: &str,
     turn_id: &str,
-    events: &[Value],
+    events: &mut [Value],
     persisted_events: &mut usize,
 ) {
     if *persisted_events >= events.len() {
         return;
     }
-    append_app_events(root, session_id, turn_id, &events[*persisted_events..]);
+    append_app_events(root, session_id, turn_id, &mut events[*persisted_events..]);
     *persisted_events = events.len();
+}
+
+fn normalize_app_event(event: &mut Value, session_id: &str, turn_id: &str, fallback_sequence: u64) {
+    let Some(object) = event.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("schema_version".to_string())
+        .or_insert_with(|| json!(APP_BRIDGE_EVENT_SCHEMA_VERSION));
+    object
+        .entry("protocol_version".to_string())
+        .or_insert_with(|| json!(APP_BRIDGE_PROTOCOL_VERSION));
+    let sequence = object
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .unwrap_or(fallback_sequence);
+    object
+        .entry("sequence".to_string())
+        .or_insert_with(|| json!(sequence));
+    object
+        .entry("created_at_ms".to_string())
+        .or_insert_with(|| json!(now_ms()));
+    object
+        .entry("global_sequence".to_string())
+        .or_insert_with(|| json!(sequence));
+    object
+        .entry("event_id".to_string())
+        .or_insert_with(|| json!(app_event_id(session_id, turn_id, sequence)));
+}
+
+fn app_event_id(session_id: &str, turn_id: &str, sequence: u64) -> String {
+    format!("app_evt:{session_id}:{turn_id}:{sequence}")
 }
 
 fn global_sse_frames(config: &HttpRuntimeConfig, request_path: &str) -> String {
@@ -4777,7 +8268,9 @@ fn now_ms() -> u64 {
 }
 
 fn new_id(prefix: &str) -> String {
-    format!("{prefix}_{}_{}", now_ms(), std::process::id())
+    static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let sequence = ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("{prefix}_{}_{}_{}", now_ms(), std::process::id(), sequence)
 }
 
 #[must_use]
@@ -5013,6 +8506,29 @@ pub fn stable_json_dumps(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn provider_sse_stream_stops_on_responses_completed_without_done() {
+        let raw = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"after\"}\n\n",
+        );
+        let mut chunks = Vec::new();
+        read_sse_json_values_stream(raw.as_bytes(), |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })
+        .expect("read stream");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0]["type"], json!("response.output_text.delta"));
+        assert_eq!(chunks[1]["type"], json!("response.completed"));
+    }
 
     #[test]
     fn exposes_command_boundary() {
@@ -5022,11 +8538,1241 @@ mod tests {
     }
 
     #[test]
+    fn app_bridge_terminal_run_is_workspace_scoped() {
+        let root = std::env::temp_dir().join(format!("openagent-http-terminal-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        fs::create_dir_all(&nested).expect("workspace");
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(root.join("sessions").to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+
+        let ok_response = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/terminal/run".to_string(),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({
+                    "command": "printf terminal-ok",
+                    "cwd": "nested",
+                })),
+            },
+            &config,
+        );
+        assert_eq!(ok_response.status, 200);
+        let ok = ok_response.body.expect("terminal body");
+        assert_eq!(ok["success"], true);
+        assert_eq!(ok["exit_code"], 0);
+        assert_eq!(ok["stdout"], "terminal-ok");
+        assert_eq!(ok["stderr"], "");
+        assert_eq!(ok["timed_out"], false);
+        assert_eq!(ok["cwd_relative"], "nested");
+
+        let escape_response = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/terminal/run".to_string(),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({
+                    "command": "printf outside",
+                    "cwd": "..",
+                })),
+            },
+            &config,
+        );
+        assert_eq!(escape_response.status, 400);
+        assert!(
+            escape_response.body.expect("escape body")["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("escapes session root")
+        );
+    }
+
+    #[test]
+    fn app_bridge_mcp_status_sanitizes_config() {
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            mcp_config: Some(stable_json_dumps(&json!({
+                "mcp": {
+                    "servers": {
+                        "local-tools": {
+                            "type": "stdio",
+                            "command": ["npx", "secret-package", "--token", "secret-command-token"],
+                            "env": {"API_KEY": "secret-env-token"},
+                            "headers": {"Authorization": "Bearer secret-header-token"},
+                            "enabled": true,
+                        },
+                        "remote-tools": {
+                            "url": "https://example.test/mcp?token=secret-url-token",
+                            "transport": "http",
+                            "enabled": false,
+                        }
+                    }
+                }
+            }))),
+            ..HttpRuntimeConfig::default()
+        };
+        let protocol = app_bridge_protocol_payload();
+        assert_eq!(
+            protocol["endpoints"]["mcp"],
+            "GET /api/mcp; POST /api/mcp/servers; PATCH|DELETE /api/mcp/servers/{name}; POST /api/mcp/servers/{name}/test|start|stop|restart"
+        );
+
+        let response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/mcp".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(response.status, 200);
+        let body = response.body.expect("mcp body");
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["server_count"], 2);
+        assert_eq!(body["tool_count"], 0);
+        assert_eq!(body["source"], "config");
+
+        let servers = body["servers"].as_array().expect("servers");
+        let local = servers
+            .iter()
+            .find(|server| server["name"] == "local-tools")
+            .expect("local server");
+        assert_eq!(local["type"], "local");
+        assert_eq!(local["transport"], "stdio");
+        assert_eq!(local["command"], "npx");
+        assert_eq!(local["args_count"], 3);
+        assert_eq!(local["env_count"], 1);
+        assert_eq!(local["header_count"], 1);
+
+        let remote = servers
+            .iter()
+            .find(|server| server["name"] == "remote-tools")
+            .expect("remote server");
+        assert_eq!(remote["remote_url_configured"], true);
+        assert_eq!(remote["status"], "disabled");
+
+        let serialized = stable_json_dumps(&body);
+        for secret in [
+            "secret-command-token",
+            "secret-env-token",
+            "secret-header-token",
+            "secret-url-token",
+            "Authorization",
+            "API_KEY",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "MCP status leaked secret marker: {secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_bridge_mcp_server_config_crud_writes_default_file() {
+        let root = std::env::temp_dir().join(format!("openagent-mcp-crud-{}", now_ms()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(root.join("sessions").to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+
+        let initial = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/mcp".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(initial.status, 200);
+        let initial_body = initial.body.expect("initial mcp body");
+        assert_eq!(initial_body["configured"], false);
+        assert_eq!(initial_body["source"], "none");
+        assert_eq!(initial_body["writable"], true);
+
+        let create = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers".to_string(),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({
+                    "name": "remote-tools",
+                    "type": "remote",
+                    "url": "http://127.0.0.1:9/mcp?token=crud-secret",
+                    "transport": "http",
+                    "enabled": true,
+                    "timeout_ms": 2000
+                })),
+            },
+            &config,
+        );
+        assert_eq!(create.status, 200);
+        let created = create.body.expect("created mcp body");
+        assert_eq!(created["configured"], true);
+        assert_eq!(created["source"], "default");
+        assert_eq!(created["server_count"], 1);
+        assert_eq!(created["servers"][0]["name"], "remote-tools");
+        assert_eq!(created["servers"][0]["remote_url_configured"], true);
+        assert!(!stable_json_dumps(&created).contains("crud-secret"));
+
+        let config_path = workspace.join(".openagent").join("mcp.json");
+        assert!(config_path.is_file());
+        let stored = read_json_file(&config_path);
+        assert_eq!(
+            stored["mcp"]["servers"]["remote-tools"]["url"],
+            "http://127.0.0.1:9/mcp?token=crud-secret"
+        );
+
+        let disable = route_http_request(
+            &HttpRequest {
+                method: "PATCH".to_string(),
+                path: "/api/mcp/servers/remote-tools".to_string(),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({"enabled": false})),
+            },
+            &config,
+        );
+        assert_eq!(disable.status, 200);
+        let disabled = disable.body.expect("disabled mcp body");
+        assert_eq!(disabled["servers"][0]["enabled"], false);
+        assert_eq!(disabled["servers"][0]["status"], "disabled");
+
+        let delete = route_http_request(
+            &HttpRequest {
+                method: "DELETE".to_string(),
+                path: "/api/mcp/servers/remote-tools".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(delete.status, 200);
+        let deleted = delete.body.expect("deleted mcp body");
+        assert_eq!(deleted["configured"], false);
+        assert_eq!(deleted["server_count"], 0);
+        let stored_after_delete = read_json_file(&config_path);
+        assert!(
+            stored_after_delete["mcp"]["servers"]
+                .as_object()
+                .expect("servers object")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn app_bridge_mcp_server_config_crud_writes_local_stdio_fields() {
+        let root = std::env::temp_dir().join(format!("openagent-mcp-local-crud-{}", now_ms()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(root.join("sessions").to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+
+        let create = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers".to_string(),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({
+                    "name": "local-tools",
+                    "type": "local",
+                    "command": "node",
+                    "args": ["server.js", "--stdio"],
+                    "cwd": "/tmp/local-tools",
+                    "env": {"LOCAL_SECRET": "local-secret-value"},
+                    "headers": {"X-Local-Token": "local-header-secret"},
+                    "timeout_ms": 3000,
+                    "enabled": true
+                })),
+            },
+            &config,
+        );
+        assert_eq!(create.status, 200);
+        let created = create.body.expect("created local mcp body");
+        assert_eq!(created["configured"], true);
+        assert_eq!(created["server_count"], 1);
+        assert_eq!(created["servers"][0]["name"], "local-tools");
+        assert_eq!(created["servers"][0]["type"], "local");
+        assert_eq!(created["servers"][0]["transport"], "stdio");
+        assert_eq!(created["servers"][0]["command"], "node");
+        assert_eq!(created["servers"][0]["args_count"], 2);
+        assert_eq!(created["servers"][0]["cwd_configured"], true);
+        assert_eq!(created["servers"][0]["env_count"], 1);
+        assert_eq!(created["servers"][0]["header_count"], 1);
+        assert_eq!(created["servers"][0]["timeout_ms"], 3000);
+        let serialized = stable_json_dumps(&created);
+        assert!(!serialized.contains("local-secret-value"));
+        assert!(!serialized.contains("local-header-secret"));
+        assert!(!serialized.contains("LOCAL_SECRET"));
+        assert!(!serialized.contains("X-Local-Token"));
+
+        let stored = read_json_file(&workspace.join(".openagent").join("mcp.json"));
+        assert_eq!(
+            stored["mcp"]["servers"]["local-tools"]["command"],
+            json!(["node", "server.js", "--stdio"])
+        );
+        assert_eq!(
+            stored["mcp"]["servers"]["local-tools"]["env"]["LOCAL_SECRET"],
+            "local-secret-value"
+        );
+        assert_eq!(
+            stored["mcp"]["servers"]["local-tools"]["headers"]["X-Local-Token"],
+            "local-header-secret"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_bridge_mcp_refresh_and_test_discover_local_stdio_tools() {
+        let root = std::env::temp_dir().join(format!("openagent-mcp-stdio-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let tools_dir = workspace.join("tools");
+        fs::create_dir_all(&tools_dir).expect("workspace tools dir");
+        let fake_server = compile_fake_stdio_mcp_server(&root);
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            mcp_config: Some(stable_json_dumps(&json!({
+                "mcp": {
+                    "servers": {
+                        "local-tools": {
+                            "type": "local",
+                            "command": [fake_server.to_string_lossy(), "--flag"],
+                            "cwd": "tools",
+                            "env": {"LOCAL_SECRET": "stdio-secret-value"},
+                            "timeout_ms": 5000,
+                            "enabled": true,
+                        }
+                    }
+                }
+            }))),
+            ..HttpRuntimeConfig::default()
+        };
+
+        let refreshed = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/mcp?refresh=true".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(refreshed.status, 200);
+        let refreshed_body = refreshed.body.expect("stdio refresh body");
+        assert_local_stdio_mcp_connected(&refreshed_body);
+
+        let tested = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/test".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(tested.status, 200);
+        let tested_body = tested.body.expect("stdio test body");
+        assert_local_stdio_mcp_connected(&tested_body);
+
+        for payload in [refreshed_body, tested_body] {
+            let serialized = stable_json_dumps(&payload);
+            assert!(!serialized.contains("stdio-secret-value"));
+            assert!(!serialized.contains("LOCAL_SECRET"));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_bridge_mcp_local_stdio_lifecycle_start_stop_restart() {
+        let root = std::env::temp_dir().join(format!("openagent-mcp-lifecycle-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let tools_dir = workspace.join("tools");
+        fs::create_dir_all(&tools_dir).expect("workspace tools dir");
+        let fake_server = compile_fake_stdio_mcp_server(&root);
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            mcp_config: Some(stable_json_dumps(&json!({
+                "mcp": {
+                    "servers": {
+                        "local-tools": {
+                            "type": "local",
+                            "command": [fake_server.to_string_lossy(), "--flag"],
+                            "cwd": "tools",
+                            "env": {"LOCAL_SECRET": "stdio-lifecycle-secret"},
+                            "timeout_ms": 5000,
+                            "enabled": false,
+                        }
+                    }
+                }
+            }))),
+            ..HttpRuntimeConfig::default()
+        };
+
+        let started = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/start".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(started.status, 200);
+        let started_body = started.body.expect("start body");
+        assert_local_stdio_lifecycle_running(&started_body);
+        let first_pid = started_body["servers"][0]["lifecycle_pid"]
+            .as_u64()
+            .expect("lifecycle pid");
+
+        let status = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/mcp".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(status.status, 200);
+        let status_body = status.body.expect("status body");
+        assert_local_stdio_lifecycle_running(&status_body);
+        assert_eq!(status_body["servers"][0]["lifecycle_pid"], json!(first_pid));
+
+        let refreshed = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/mcp?refresh=true".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(refreshed.status, 200);
+        let refreshed_body = refreshed.body.expect("refresh body");
+        assert_local_stdio_lifecycle_running(&refreshed_body);
+        assert_eq!(
+            refreshed_body["servers"][0]["lifecycle_pid"],
+            json!(first_pid)
+        );
+
+        let stopped = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/stop".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(stopped.status, 200);
+        let stopped_body = stopped.body.expect("stop body");
+        assert_eq!(stopped_body["servers"][0]["status"], "stopped");
+        assert_eq!(stopped_body["servers"][0]["lifecycle_status"], "stopped");
+        assert_eq!(stopped_body["servers"][0]["tool_count"], 0);
+
+        let restarted = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/restart".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(restarted.status, 200);
+        let restarted_body = restarted.body.expect("restart body");
+        assert_local_stdio_lifecycle_running(&restarted_body);
+
+        let cleanup = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/stop".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(cleanup.status, 200);
+
+        let serialized = stable_json_dumps(&json!([
+            started_body,
+            status_body,
+            refreshed_body,
+            restarted_body
+        ]));
+        assert!(!serialized.contains("stdio-lifecycle-secret"));
+        assert!(!serialized.contains("LOCAL_SECRET"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_bridge_mcp_tool_call_reuses_local_stdio_lifecycle_session() {
+        let root = std::env::temp_dir().join(format!("openagent-mcp-lifecycle-call-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        let tools_dir = workspace.join("tools");
+        fs::create_dir_all(&tools_dir).expect("workspace tools dir");
+        let request_log = root.join("stdio-requests.log");
+        let fake_server = compile_fake_stdio_mcp_server(&root);
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            mcp_config: Some(stable_json_dumps(&json!({
+                "mcp": {
+                    "servers": {
+                        "local-tools": {
+                            "type": "local",
+                            "command": [fake_server.to_string_lossy(), "--flag"],
+                            "cwd": "tools",
+                            "env": {
+                                "LOCAL_SECRET": "stdio-lifecycle-call-secret",
+                                "LOCAL_REQUEST_LOG": request_log.to_string_lossy(),
+                            },
+                            "timeout_ms": 5000,
+                            "enabled": true,
+                        }
+                    }
+                }
+            }))),
+            ..HttpRuntimeConfig::default()
+        };
+
+        let started_lifecycle = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/start".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(started_lifecycle.status, 200);
+        let started_lifecycle_body = started_lifecycle.body.expect("start body");
+        assert_local_stdio_lifecycle_running(&started_lifecycle_body);
+        let lifecycle_pid = started_lifecycle_body["servers"][0]["lifecycle_pid"]
+            .as_u64()
+            .expect("lifecycle pid");
+
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session id");
+        let turn = start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "call local lifecycle MCP",
+                "permission": "FULL",
+                "dangerously_skip_permissions": true,
+                "tool_call": {
+                    "call_id": "call_stdio_echo",
+                    "name": "mcp_tool_local_tools_stdio_echo",
+                    "input": {"text": "from-lifecycle"}
+                }
+            })),
+        )
+        .expect("mcp tool turn");
+        assert_eq!(turn["status"], "completed");
+        let completed = turn["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .find(|event| {
+                event["method"] == "item/toolCall/completed"
+                    && event["params"]["call_id"] == "call_stdio_echo"
+            })
+            .expect("completed MCP call");
+        assert!(
+            completed["params"]["output"]
+                .as_str()
+                .is_some_and(|value| value.contains("stdio echo: from-lifecycle"))
+        );
+        assert_eq!(
+            completed["params"]["metadata"]["mcp_lifecycle_reused"],
+            json!(true)
+        );
+        assert_eq!(
+            completed["params"]["metadata"]["mcp_lifecycle_pid"],
+            json!(lifecycle_pid)
+        );
+
+        let status = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/mcp".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(status.status, 200);
+        let status_body = status.body.expect("status body");
+        assert_eq!(
+            status_body["servers"][0]["lifecycle_pid"],
+            json!(lifecycle_pid)
+        );
+
+        let cleanup = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/stop".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(cleanup.status, 200);
+
+        let log = fs::read_to_string(&request_log).expect("stdio request log");
+        let entries = log.lines().collect::<Vec<_>>();
+        let pids = entries
+            .iter()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(pids.len(), 1, "expected one stdio process, got log:\n{log}");
+        assert!(pids.contains(lifecycle_pid.to_string().as_str()));
+        let methods = entries
+            .iter()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "initialize")
+                .count(),
+            1,
+            "runtime should not short-start another stdio session:\n{log}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "tools/call")
+                .count(),
+            1,
+            "expected one lifecycle tools/call:\n{log}"
+        );
+
+        let serialized = stable_json_dumps(&json!([started_lifecycle_body, turn, status_body]));
+        assert!(!serialized.contains("stdio-lifecycle-call-secret"));
+        assert!(!serialized.contains("LOCAL_SECRET"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_bridge_mcp_lifecycle_survives_enable_toggle() {
+        let root =
+            std::env::temp_dir().join(format!("openagent-mcp-lifecycle-toggle-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        let tools_dir = workspace.join("tools");
+        let openagent_dir = workspace.join(".openagent");
+        fs::create_dir_all(&tools_dir).expect("workspace tools dir");
+        fs::create_dir_all(&openagent_dir).expect("workspace .openagent dir");
+        let request_log = root.join("stdio-requests.log");
+        let fake_server = compile_fake_stdio_mcp_server(&root);
+        fs::write(
+            openagent_dir.join("mcp.json"),
+            stable_json_dumps(&json!({
+                "mcp": {
+                    "servers": {
+                        "local-tools": {
+                            "type": "local",
+                            "command": [fake_server.to_string_lossy(), "--flag"],
+                            "cwd": "tools",
+                            "env": {
+                                "LOCAL_SECRET": "stdio-lifecycle-toggle-secret",
+                                "LOCAL_REQUEST_LOG": request_log.to_string_lossy(),
+                            },
+                            "timeout_ms": 5000,
+                            "enabled": false,
+                        }
+                    }
+                }
+            })),
+        )
+        .expect("write mcp config");
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+
+        let initial = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/mcp?refresh=true".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(initial.status, 200);
+        let initial_body = initial.body.expect("initial mcp body");
+        assert_eq!(initial_body["servers"][0]["enabled"], false);
+        assert_eq!(initial_body["servers"][0]["lifecycle_status"], "stopped");
+        assert!(
+            !request_log.exists(),
+            "refresh should not start disabled local MCP"
+        );
+
+        let started_lifecycle = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/start".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(started_lifecycle.status, 200);
+        let started_lifecycle_body = started_lifecycle.body.expect("start body");
+        assert_local_stdio_lifecycle_running(&started_lifecycle_body);
+        assert_eq!(started_lifecycle_body["servers"][0]["enabled"], false);
+        let lifecycle_pid = started_lifecycle_body["servers"][0]["lifecycle_pid"]
+            .as_u64()
+            .expect("lifecycle pid");
+
+        let enabled = route_http_request(
+            &HttpRequest {
+                method: "PATCH".to_string(),
+                path: "/api/mcp/servers/local-tools".to_string(),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({"enabled": true})),
+            },
+            &config,
+        );
+        assert_eq!(enabled.status, 200);
+        let enabled_body = enabled.body.expect("enabled body");
+        assert_eq!(enabled_body["servers"][0]["enabled"], true);
+        assert_eq!(enabled_body["servers"][0]["lifecycle_status"], "running");
+        assert_eq!(
+            enabled_body["servers"][0]["lifecycle_pid"],
+            json!(lifecycle_pid)
+        );
+
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session id");
+        let turn = start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "call local lifecycle MCP after enable",
+                "permission": "FULL",
+                "dangerously_skip_permissions": true,
+                "tool_call": {
+                    "call_id": "call_stdio_echo_after_enable",
+                    "name": "mcp_tool_local_tools_stdio_echo",
+                    "input": {"text": "after-enable"}
+                }
+            })),
+        )
+        .expect("mcp tool turn");
+        assert_eq!(turn["status"], "completed");
+        let completed = turn["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .find(|event| {
+                event["method"] == "item/toolCall/completed"
+                    && event["params"]["call_id"] == "call_stdio_echo_after_enable"
+            })
+            .expect("completed MCP call");
+        assert!(
+            completed["params"]["output"]
+                .as_str()
+                .is_some_and(|value| value.contains("stdio echo: after-enable"))
+        );
+        assert_eq!(
+            completed["params"]["metadata"]["mcp_lifecycle_reused"],
+            json!(true)
+        );
+        assert_eq!(
+            completed["params"]["metadata"]["mcp_lifecycle_pid"],
+            json!(lifecycle_pid)
+        );
+
+        let cleanup = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/local-tools/stop".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(cleanup.status, 200);
+
+        let log = fs::read_to_string(&request_log).expect("stdio request log");
+        let entries = log.lines().collect::<Vec<_>>();
+        let pids = entries
+            .iter()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(pids.len(), 1, "expected one stdio process, got log:\n{log}");
+        assert!(pids.contains(lifecycle_pid.to_string().as_str()));
+        let methods = entries
+            .iter()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "initialize")
+                .count(),
+            1,
+            "enabled toggle should not short-start another stdio session:\n{log}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "tools/call")
+                .count(),
+            1,
+            "expected one lifecycle tools/call:\n{log}"
+        );
+
+        let serialized = stable_json_dumps(&json!([started_lifecycle_body, enabled_body, turn]));
+        assert!(!serialized.contains("stdio-lifecycle-toggle-secret"));
+        assert!(!serialized.contains("LOCAL_SECRET"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_bridge_mcp_refresh_discovers_tools_without_leaking_endpoint_secret() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock mcp bind");
+        let port = listener.local_addr().expect("mock mcp addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock mcp accept");
+            let request = read_http_request(&mut stream).expect("mock mcp request");
+            assert_eq!(request.method, "POST");
+            assert!(
+                request.path.starts_with("/mcp?token=refresh-secret"),
+                "unexpected MCP request path: {}",
+                request.path
+            );
+            let request_json =
+                serde_json::from_str::<Value>(&request.body).expect("mock mcp json request");
+            assert_eq!(request_json["method"], "tools/list");
+            let response_body = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": request_json.get("id").cloned().unwrap_or(Value::Null),
+                "result": {
+                    "tools": [
+                        {
+                            "name": "echo",
+                            "title": "Echo",
+                            "description": "Echo input",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "text": {"type": "string"}
+                                }
+                            }
+                        }
+                    ]
+                }
+            }))
+            .expect("mock mcp response json");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("mock mcp response write");
+        });
+
+        let workspace = std::env::temp_dir().join(format!("openagent-mcp-refresh-{}", now_ms()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            mcp_config: Some(stable_json_dumps(&json!({
+                "mcp": {
+                    "servers": {
+                        "remote-tools": {
+                            "url": format!("http://127.0.0.1:{port}/mcp?token=refresh-secret"),
+                            "transport": "http",
+                            "timeout_ms": 2000,
+                            "enabled": true,
+                        }
+                    }
+                }
+            }))),
+            ..HttpRuntimeConfig::default()
+        };
+        let response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/mcp?refresh=true".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(response.status, 200);
+        let body = response.body.expect("mcp refresh body");
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["status"], "connected");
+        assert_eq!(body["server_count"], 1);
+        assert_eq!(body["tool_count"], 1);
+
+        let servers = body["servers"].as_array().expect("servers");
+        let remote = servers.first().expect("remote server");
+        assert_eq!(remote["name"], "remote-tools");
+        assert_eq!(remote["selected_transport"], "http");
+        assert_eq!(remote["status"], "connected");
+        assert_eq!(remote["tool_count"], 1);
+        let tools = remote["tools"].as_array().expect("tools");
+        assert_eq!(tools[0]["name"], "mcp_tool_remote_tools_echo");
+        assert_eq!(tools[0]["original_name"], "echo");
+
+        let serialized = stable_json_dumps(&body);
+        assert!(!serialized.contains("refresh-secret"));
+        assert!(!serialized.contains("token="));
+        server.join().expect("mock mcp join");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    fn assert_local_stdio_mcp_connected(body: &Value) {
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["server_count"], 1);
+        assert_eq!(body["tool_count"], 1);
+        assert_eq!(body["status"], "connected");
+        let local = body["servers"].as_array().expect("servers")[0].clone();
+        assert_eq!(local["name"], "local-tools");
+        assert_eq!(local["type"], "local");
+        assert_eq!(local["transport"], "stdio");
+        assert_eq!(local["selected_transport"], "stdio");
+        assert_eq!(local["status"], "connected");
+        assert_eq!(local["tool_count"], 1);
+        assert_eq!(local["args_count"], 1);
+        assert_eq!(local["cwd_configured"], true);
+        assert_eq!(local["env_count"], 1);
+        let tool = local["tools"].as_array().expect("stdio tools")[0].clone();
+        assert_eq!(tool["name"], "mcp_tool_local_tools_stdio_echo");
+        assert_eq!(tool["original_name"], "stdio_echo");
+        assert!(
+            tool["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("cwd=tools"))
+        );
+    }
+
+    fn assert_local_stdio_lifecycle_running(body: &Value) {
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["server_count"], 1);
+        assert_eq!(body["tool_count"], 1);
+        let local = body["servers"].as_array().expect("servers")[0].clone();
+        assert_eq!(local["name"], "local-tools");
+        assert_eq!(local["type"], "local");
+        assert_eq!(local["selected_transport"], "stdio");
+        assert_eq!(local["status"], "connected");
+        assert_eq!(local["tool_count"], 1);
+        assert_eq!(local["lifecycle_status"], "running");
+        assert!(local["lifecycle_pid"].as_u64().is_some());
+        assert!(local["lifecycle_started_at"].as_f64().is_some());
+        assert!(local["lifecycle_last_refreshed_at"].as_f64().is_some());
+        assert_eq!(local["lifecycle_tool_count"], 1);
+        assert_eq!(local["tools"][0]["name"], "mcp_tool_local_tools_stdio_echo");
+    }
+
+    fn compile_fake_stdio_mcp_server(root: &Path) -> PathBuf {
+        fs::create_dir_all(root).expect("fake stdio root");
+        let source = root.join("fake_stdio_mcp.rs");
+        let binary = root.join(if cfg!(windows) {
+            "fake_stdio_mcp.exe"
+        } else {
+            "fake_stdio_mcp"
+        });
+        fs::write(&source, FAKE_STDIO_MCP_SERVER).expect("write fake stdio source");
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let output = Command::new(rustc)
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("compile fake stdio server");
+        assert!(
+            output.status.success(),
+            "fake stdio server compile failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        binary
+    }
+
+    const FAKE_STDIO_MCP_SERVER: &str = r#"
+use std::env;
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::process;
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut stdout = io::stdout();
+    while let Some(body) = read_frame(&mut reader)? {
+        log_request(&body);
+        if body.contains("\"method\":\"initialize\"") {
+            write_response(
+                &mut stdout,
+                &body,
+                "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake-stdio\",\"version\":\"1.0\"}}",
+            )?;
+        } else if body.contains("\"method\":\"tools/list\"") {
+            let arg_ok = env::args().any(|arg| arg == "--flag");
+            let env_ok = env::var("LOCAL_SECRET").is_ok();
+            let cwd = env::current_dir()
+                .ok()
+                .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "unknown".to_string());
+            let tool_name = if arg_ok && env_ok && cwd == "tools" {
+                "stdio_echo"
+            } else {
+                "stdio_misconfigured"
+            };
+            let result = format!(
+                "{{\"tools\":[{{\"name\":\"{}\",\"title\":\"Stdio Echo\",\"description\":\"local stdio discovery reached cwd={} arg_ok={} env_ok={}\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"text\":{{\"type\":\"string\"}}}}}}}}]}}",
+                tool_name, cwd, arg_ok, env_ok
+            );
+            write_response(&mut stdout, &body, &result)?;
+        } else if body.contains("\"method\":\"tools/call\"") {
+            let text = extract_text_argument(&body);
+            let result = format!(
+                "{{\"content\":[{{\"type\":\"text\",\"text\":\"stdio echo: {}\"}}]}}",
+                escape_json_string(&text)
+            );
+            write_response(&mut stdout, &body, &result)?;
+        } else if body.contains("\"method\":\"shutdown\"") {
+            write_response(&mut stdout, &body, "{}")?;
+        } else if body.contains("\"method\":\"exit\"") {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut content_length = None::<usize>;
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<usize>().ok();
+            }
+        }
+    }
+    let Some(length) = content_length else {
+        return Ok(None);
+    };
+    let mut body = vec![0_u8; length];
+    reader.read_exact(&mut body)?;
+    Ok(Some(String::from_utf8_lossy(&body).to_string()))
+}
+
+fn write_response<W: Write>(writer: &mut W, request: &str, result: &str) -> io::Result<()> {
+    let id = extract_id(request);
+    let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}", id, result);
+    write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    writer.flush()
+}
+
+fn log_request(request: &str) {
+    let Ok(path) = env::var("LOCAL_REQUEST_LOG") else {
+        return;
+    };
+    let method = extract_method(request);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{} {}", process::id(), method);
+    }
+}
+
+fn extract_method(request: &str) -> String {
+    if let Some(start) = request.find("\"method\":\"") {
+        let rest = &request[start + 10..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn extract_id(request: &str) -> String {
+    if let Some(start) = request.find("\"id\":\"") {
+        let rest = &request[start + 6..];
+        if let Some(end) = rest.find('"') {
+            return format!("\"{}\"", &rest[..end]);
+        }
+    }
+    if let Some(start) = request.find("\"id\":") {
+        let rest = &request[start + 5..];
+        let end = rest
+            .find(|character| character == ',' || character == '}')
+            .unwrap_or(rest.len());
+        return rest[..end].trim().to_string();
+    }
+    "null".to_string()
+}
+
+fn extract_text_argument(request: &str) -> String {
+    if let Some(start) = request.find("\"text\":\"") {
+        let rest = &request[start + 8..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].replace("\\\"", "\"");
+        }
+    }
+    String::new()
+}
+
+fn escape_json_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+"#;
+
+    #[test]
+    fn app_bridge_mcp_server_test_discovers_disabled_server_tools() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock mcp bind");
+        let port = listener.local_addr().expect("mock mcp addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock mcp accept");
+            let request = read_http_request(&mut stream).expect("mock mcp request");
+            assert_eq!(request.method, "POST");
+            assert!(
+                request.path.starts_with("/mcp?token=test-secret"),
+                "unexpected MCP request path: {}",
+                request.path
+            );
+            let request_json =
+                serde_json::from_str::<Value>(&request.body).expect("mock mcp json request");
+            assert_eq!(request_json["method"], "tools/list");
+            let response_body = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": request_json.get("id").cloned().unwrap_or(Value::Null),
+                "result": {
+                    "tools": [
+                        {
+                            "name": "lookup",
+                            "title": "Lookup",
+                            "description": "Lookup docs",
+                            "inputSchema": {"type": "object"}
+                        }
+                    ]
+                }
+            }))
+            .expect("mock mcp response json");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("mock mcp response write");
+        });
+
+        let workspace = std::env::temp_dir().join(format!("openagent-mcp-test-{}", now_ms()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            mcp_config: Some(stable_json_dumps(&json!({
+                "mcp": {
+                    "servers": {
+                        "remote-tools": {
+                            "url": format!("http://127.0.0.1:{port}/mcp?token=test-secret"),
+                            "transport": "http",
+                            "timeout_ms": 2000,
+                            "enabled": false,
+                        }
+                    }
+                }
+            }))),
+            ..HttpRuntimeConfig::default()
+        };
+        let response = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/mcp/servers/remote-tools/test".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(response.status, 200);
+        let body = response.body.expect("mcp test body");
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["status"], "disabled");
+        assert_eq!(body["server_count"], 1);
+        assert_eq!(body["tool_count"], 1);
+        let remote = body["servers"].as_array().expect("servers")[0].clone();
+        assert_eq!(remote["name"], "remote-tools");
+        assert_eq!(remote["enabled"], false);
+        assert_eq!(remote["selected_transport"], "http");
+        assert_eq!(remote["status"], "connected");
+        assert_eq!(remote["tool_count"], 1);
+        assert_eq!(remote["tools"][0]["name"], "mcp_tool_remote_tools_lookup");
+        assert_eq!(remote["tools"][0]["original_name"], "lookup");
+
+        let serialized = stable_json_dumps(&body);
+        assert!(!serialized.contains("test-secret"));
+        assert!(!serialized.contains("token="));
+        server.join().expect("mock mcp join");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn app_bridge_permission_approval_round_trip_executes_allowed_tool() {
         let root = std::env::temp_dir().join(format!("openagent-http-permission-{}", now_ms()));
         let workspace = root.join("workspace");
         let session_root = root.join("sessions");
         fs::create_dir_all(&workspace).expect("workspace");
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .arg("init")
+            .output();
         let config = HttpRuntimeConfig {
             serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
@@ -5085,6 +9831,380 @@ mod tests {
         assert!(events.iter().any(|event| {
             event["method"] == "turn/completed" && event["params"]["status"] == "completed"
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_bridge_trust_boundary_routes_list_approve_diff_and_restore_checkpoint() {
+        let root = std::env::temp_dir().join(format!("openagent-http-trust-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            serve_static: false,
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session id");
+        let file_path = workspace.join("notes.txt");
+
+        let started = start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "write notes with approval",
+                "permission": "PLAN_ONLY",
+                "tool_call": {
+                    "call_id": "call_write_notes",
+                    "name": "write",
+                    "input": {"file_path": "notes.txt", "content": "alpha\n"}
+                }
+            })),
+        )
+        .expect("start turn");
+        assert_eq!(started["status"], "waiting_approval");
+
+        let approvals_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/approvals".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let approvals = approvals_response.body.expect("approvals body");
+        let request_id = approvals["approvals"][0]["request_id"]
+            .as_str()
+            .expect("request id")
+            .to_string();
+        assert_eq!(approvals["count"], json!(1));
+        assert_eq!(approvals["approvals"][0]["session_id"], json!(session_id));
+
+        let approved_response = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/api/approvals/{request_id}"),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({"action": "allow", "scope": "once"})),
+            },
+            &config,
+        );
+        let approved = approved_response.body.expect("approved body");
+        assert!(approved["events"].as_array().is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event["method"] == "item/toolCall/completed")
+        }));
+        assert_eq!(fs::read_to_string(&file_path).expect("file"), "alpha\n");
+        let approvals_after_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/approvals".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let approvals_after = approvals_after_response.body.expect("approvals after body");
+        assert_eq!(approvals_after["count"], json!(0));
+
+        let messages_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: format!("/api/sessions/{session_id}/messages?limit=20"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let messages = messages_response.body.expect("messages body");
+        assert_eq!(messages["session_id"], json!(session_id));
+        assert!(messages["message_v2_count"].as_u64().unwrap_or_default() >= 3);
+        let approval_messages_v2 = messages["messages_v2"].as_array().expect("messages v2");
+        let roles = approval_messages_v2
+            .iter()
+            .filter_map(|message| message["info"]["role"].as_str())
+            .collect::<Vec<_>>();
+        assert!(roles.contains(&"user"));
+        assert!(roles.contains(&"tool"));
+        assert!(roles.contains(&"assistant"));
+        assert!(approval_messages_v2.iter().any(|message| {
+            message["parts"].as_array().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part["content"] == "write notes with approval")
+            })
+        }));
+        let approval_assistant = approval_messages_v2
+            .iter()
+            .find(|message| message["info"]["role"] == "assistant")
+            .expect("approval assistant message");
+        let approval_assistant_parts = approval_assistant["parts"]
+            .as_array()
+            .expect("approval assistant parts");
+        let approval_assistant_part_ids = approval_assistant_parts
+            .iter()
+            .filter_map(|part| part["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            approval_assistant_part_ids.len(),
+            approval_assistant_parts.len()
+        );
+        assert!(
+            approval_assistant_parts
+                .iter()
+                .any(|part| part["kind"] == "patch")
+        );
+        assert!(
+            approval_assistant_parts.iter().any(|part| {
+                part["kind"] == "context" && part["content"]["kind"] == "checkpoint"
+            })
+        );
+        assert!(approval_assistant_parts.iter().any(|part| {
+            part["kind"] == "approval"
+                && part["status"] == "completed"
+                && part["content"]["status"] == "allowed"
+                && part["content"]["resolution"]["action"] == "allow"
+        }));
+        let approval_checkpoints =
+            session_checkpoints_payload(&config, session_id).expect("approval checkpoints");
+        assert!(
+            approval_checkpoints["checkpoints"]
+                .as_array()
+                .expect("approval checkpoints list")
+                .iter()
+                .any(|checkpoint| checkpoint["kind"] == "step_end")
+        );
+
+        let diff = session_diff_payload(&config, session_id).expect("diff");
+        assert_eq!(diff["undo_count"], json!(1));
+        assert!(
+            diff["latest"]["diff"]
+                .as_str()
+                .is_some_and(|value| value.contains("+alpha"))
+        );
+
+        let direct = start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "update notes directly",
+                "permission": "FULL",
+                "tool_call": {
+                    "call_id": "call_bash_beta",
+                    "name": "bash",
+                    "input": {"command": "printf 'beta\\n' > notes.txt"}
+                }
+            })),
+        )
+        .expect("direct write");
+        assert_eq!(direct["status"], "completed");
+        assert_eq!(fs::read_to_string(&file_path).expect("file"), "beta\n");
+
+        let direct_messages_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: format!("/api/sessions/{session_id}/messages?limit=20"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let direct_messages = direct_messages_response.body.expect("direct messages body");
+        let direct_roles = direct_messages["messages_v2"]
+            .as_array()
+            .expect("direct messages v2")
+            .iter()
+            .filter_map(|message| message["info"]["role"].as_str())
+            .collect::<Vec<_>>();
+        assert!(direct_roles.contains(&"user"));
+        assert!(direct_roles.contains(&"tool"));
+        assert!(direct_roles.contains(&"assistant"));
+        let direct_messages_v2 = direct_messages["messages_v2"]
+            .as_array()
+            .expect("direct messages v2");
+        assert!(direct_messages_v2.iter().any(|message| {
+            message["info"]["role"] == "tool"
+                && message["parts"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["kind"] == "tool"))
+        }));
+        let direct_assistant = direct_messages_v2
+            .iter()
+            .find(|message| message["info"]["role"] == "assistant")
+            .expect("assistant message");
+        let direct_assistant_parts = direct_assistant["parts"]
+            .as_array()
+            .expect("assistant parts");
+        let assistant_part_ids = direct_assistant_parts
+            .iter()
+            .filter_map(|part| part["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(assistant_part_ids.len(), direct_assistant_parts.len());
+        assert!(
+            direct_assistant_parts
+                .iter()
+                .any(|part| part["kind"] == "patch")
+        );
+        assert!(
+            direct_assistant_parts.iter().any(|part| {
+                part["kind"] == "context" && part["content"]["kind"] == "checkpoint"
+            })
+        );
+
+        let all_events_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/events?last_event_id=0".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let all_events_body = all_events_response.body_text.expect("events body");
+        let all_events = parse_sse_response_lines(&all_events_body.lines().collect::<Vec<_>>())
+            .expect("parse events");
+        assert!(
+            all_events
+                .iter()
+                .any(|event| event["method"] == "turn/approval_requested")
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|event| event["method"] == "turn/approval_resolved")
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|event| event["method"] == "item/toolCall/completed")
+        );
+        let last_sequence = all_events
+            .last()
+            .and_then(|event| event["global_sequence"].as_u64())
+            .expect("last global sequence");
+        let resumed_events_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: format!("/api/events?last_event_id={}", last_sequence - 1),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let resumed_events_body = resumed_events_response
+            .body_text
+            .expect("resumed events body");
+        let resumed_events =
+            parse_sse_response_lines(&resumed_events_body.lines().collect::<Vec<_>>())
+                .expect("parse resumed events");
+        assert_eq!(resumed_events.len(), 1);
+        assert_eq!(resumed_events[0]["global_sequence"], json!(last_sequence));
+
+        let git_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/git".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let git = git_response.body.expect("git body");
+        if git["is_repo"] == json!(true) {
+            assert!(git["change_count"].as_u64().unwrap_or_default() >= 1);
+            assert!(
+                git["changes"]
+                    .as_array()
+                    .expect("git changes")
+                    .iter()
+                    .any(|change| change["path"] == "notes.txt")
+            );
+        } else {
+            assert!(git["error"].as_str().is_some_and(|value| !value.is_empty()));
+        }
+
+        let checkpoints_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: format!("/api/sessions/{session_id}/checkpoints"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let checkpoints = checkpoints_response.body.expect("checkpoints body");
+        assert!(checkpoints["count"].as_u64().unwrap_or_default() >= 2);
+        let start_checkpoint = checkpoints["checkpoints"]
+            .as_array()
+            .expect("checkpoints")
+            .iter()
+            .find(|checkpoint| checkpoint["kind"] == "step_start")
+            .and_then(|checkpoint| checkpoint["checkpoint_id"].as_str())
+            .expect("step_start checkpoint")
+            .to_string();
+
+        let restore_response = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/api/sessions/{session_id}/checkpoints/{start_checkpoint}/restore"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let restored = restore_response.body.expect("restore body");
+        assert_eq!(restored["status"], json!("restored"));
+        assert_eq!(fs::read_to_string(&file_path).expect("file"), "alpha\n");
+        assert!(restored["events"].as_array().is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event["method"] == "checkpoint/restored")
+        }));
+        let events_after_restore_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/events?last_event_id=0".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let events_after_restore_body = events_after_restore_response
+            .body_text
+            .expect("events after restore body");
+        let events_after_restore =
+            parse_sse_response_lines(&events_after_restore_body.lines().collect::<Vec<_>>())
+                .expect("parse events after restore");
+        assert!(
+            events_after_restore
+                .iter()
+                .any(|event| event["method"] == "checkpoint/restored")
+        );
+
+        let files_response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/files?path=notes.txt&content=true".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        let files = files_response.body.expect("files body");
+        assert_eq!(files["path"], json!("notes.txt"));
+        assert_eq!(files["content"], json!("alpha\n"));
+        assert_eq!(files["entries"][0]["kind"], json!("file"));
 
         let _ = fs::remove_dir_all(root);
     }

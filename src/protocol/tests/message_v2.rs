@@ -77,8 +77,12 @@ fn message(id: &str, role: Role, parts: Vec<MessagePart>) -> MessageWithParts {
         info: MessageInfo {
             id: id.to_string(),
             session_id: "session_test".to_string(),
+            parent_message_id: None,
+            seq: Some(0),
             role,
             created_at_ms: 1,
+            updated_at_ms: Some(1),
+            completed_at_ms: Some(1),
             run_id: Some("run_test".to_string()),
             step_index: Some(1),
             status: MessageStatus::Completed,

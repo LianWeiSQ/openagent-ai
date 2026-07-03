@@ -65,6 +65,12 @@
           "action": "allow",
           "condition": null,
           "pattern": "*",
+          "tool": "web_fetch"
+        },
+        {
+          "action": "allow",
+          "condition": null,
+          "pattern": "*",
           "tool": "todoread"
         },
         {
@@ -119,6 +125,12 @@
           "condition": null,
           "pattern": "*",
           "tool": "skill"
+        },
+        {
+          "action": "allow",
+          "condition": null,
+          "pattern": "*",
+          "tool": "web_fetch"
         },
         {
           "action": "allow",

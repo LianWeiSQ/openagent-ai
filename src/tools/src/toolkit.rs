@@ -2,11 +2,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     ffi::OsStr,
-    fs, io,
+    fs,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     process::Command,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use openagent_core::{
@@ -22,6 +24,7 @@ use serde_json::{Value, json};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const TASK_TOOL_ID: &str = "task";
+pub const WEB_FETCH_TOOL_ID: &str = "web_fetch";
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
@@ -34,6 +37,9 @@ const LS_LIMIT: usize = 100;
 const CODE_SEARCH_MAX_HITS: usize = 200;
 const CODE_SEARCH_MAX_PREVIEW_HITS: usize = 20;
 const CODE_SEARCH_MAX_LINE_CHARS: usize = 240;
+const WEB_FETCH_DEFAULT_TIMEOUT_MS: u64 = 10_000;
+const WEB_FETCH_MAX_BYTES: usize = 128 * 1024;
+const BENCHMARK_MODE_ENV: &str = "OPENAGENT_BENCHMARK_MODE";
 
 const DEFAULT_LS_IGNORE: &[&str] = &[
     "node_modules/",
@@ -168,6 +174,58 @@ pub struct TaskSubagentDescriptor {
     pub description: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TaskSubagentRoute {
+    pub subagent_id: String,
+    pub score: u64,
+    pub matched_terms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TaskPermissionRule {
+    pub pattern: String,
+    pub action: PermissionAction,
+}
+
+#[must_use]
+pub fn task_subagent_permission_action(
+    rules: &[TaskPermissionRule],
+    subagent_id: &str,
+) -> Option<PermissionAction> {
+    let mut matched = None;
+    for rule in rules {
+        if task_permission_pattern_matches(&rule.pattern, subagent_id) {
+            matched = Some(rule.action.clone());
+        }
+    }
+    matched
+}
+
+#[must_use]
+pub fn task_subagent_is_visible(rules: &[TaskPermissionRule], subagent_id: &str) -> bool {
+    !matches!(
+        task_subagent_permission_action(rules, subagent_id),
+        Some(PermissionAction::Deny)
+    )
+}
+
+fn task_permission_pattern_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern == "*" || pattern == value {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return value.starts_with(prefix);
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return value.ends_with(suffix);
+    }
+    if let Some((prefix, suffix)) = pattern.split_once('*') {
+        return value.starts_with(prefix) && value.ends_with(suffix);
+    }
+    false
+}
+
 #[must_use]
 pub fn task_tool_description(subagents: &[TaskSubagentDescriptor]) -> String {
     let mut description = [
@@ -226,6 +284,10 @@ pub fn task_tool_definition(subagents: &[TaskSubagentDescriptor]) -> ToolDefinit
                 "background": {
                     "type": "boolean",
                     "description": "Reserved for background execution; current runtime executes foreground tasks."
+                },
+                "isolate_workspace": {
+                    "type": "boolean",
+                    "description": "Run the subagent in an isolated copy of the parent workspace."
                 }
             },
             "required": ["description", "prompt", "subagent_type"]
@@ -247,6 +309,193 @@ pub fn task_tool_definition(subagents: &[TaskSubagentDescriptor]) -> ToolDefinit
 
 pub fn register_task_tool(registry: &mut ToolRegistry, subagents: &[TaskSubagentDescriptor]) {
     registry.register(task_tool_definition(subagents));
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct WorkspaceIsolation {
+    pub enabled: bool,
+    pub method: String,
+    pub source_workspace: String,
+    pub workspace: String,
+}
+
+pub fn prepare_isolated_workspace(
+    source_workspace: impl AsRef<Path>,
+    isolation_root: impl AsRef<Path>,
+    task_id: &str,
+) -> ToolResultValue<WorkspaceIsolation> {
+    let source = root_path(source_workspace.as_ref());
+    if !source.is_dir() {
+        return Err(format!(
+            "workspace isolation requires a directory source: {}",
+            source.display()
+        ));
+    }
+    let root_raw = isolation_root
+        .as_ref()
+        .join(sanitize_isolation_segment(task_id));
+    if root_raw.exists() {
+        fs::remove_dir_all(&root_raw).map_err(io_error)?;
+    }
+    fs::create_dir_all(&root_raw).map_err(io_error)?;
+    let root = root_path(&root_raw);
+    copy_workspace_dir(&source, &root, &root)?;
+    Ok(WorkspaceIsolation {
+        enabled: true,
+        method: "directory_copy".to_string(),
+        source_workspace: path_to_string(&source),
+        workspace: path_to_string(&root),
+    })
+}
+
+#[must_use]
+pub fn select_task_subagent_for_prompt(
+    subagents: &[TaskSubagentDescriptor],
+    prompt: &str,
+) -> Option<TaskSubagentRoute> {
+    let prompt_terms = route_terms(prompt);
+    if prompt_terms.is_empty() {
+        return None;
+    }
+    let normalized_prompt = route_normalized_text(prompt);
+    let mut scored = subagents
+        .iter()
+        .filter_map(|agent| {
+            let route_text = format!("{} {} {}", agent.id, agent.name, agent.description);
+            let route_terms = route_terms(&route_text);
+            let mut matched_terms = prompt_terms
+                .intersection(&route_terms)
+                .cloned()
+                .collect::<Vec<_>>();
+            matched_terms.sort();
+            let mut score = matched_terms.len() as u64 * 2;
+            if route_contains_phrase(&normalized_prompt, &agent.id)
+                || route_contains_phrase(&normalized_prompt, &agent.name)
+            {
+                score = score.saturating_add(6);
+            }
+            if score == 0 {
+                return None;
+            }
+            Some(TaskSubagentRoute {
+                subagent_id: agent.id.clone(),
+                score,
+                matched_terms,
+            })
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.subagent_id.cmp(&right.subagent_id))
+    });
+    let best = scored.first()?;
+    let second_score = scored.get(1).map(|route| route.score).unwrap_or_default();
+    if best.score >= 4 && best.score >= second_score.saturating_add(2) {
+        Some(best.clone())
+    } else {
+        None
+    }
+}
+
+fn route_terms(text: &str) -> BTreeSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the", "and", "for", "with", "this", "that", "from", "into", "about", "your", "agent",
+        "subagent", "task", "please", "need", "needs", "using", "use", "can", "you", "are",
+    ];
+    route_normalized_text(text)
+        .split_whitespace()
+        .map(route_term_alias)
+        .filter(|term| term.len() >= 3 && !STOP_WORDS.contains(&term.as_str()))
+        .collect()
+}
+
+fn route_normalized_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+fn route_term_alias(term: &str) -> String {
+    match term {
+        "doc" | "docs" | "documentation" => "documentation".to_string(),
+        "dependencies" => "dependency".to_string(),
+        "researching" | "researched" => "research".to_string(),
+        "debugging" | "debugged" => "debug".to_string(),
+        "reviews" | "reviewing" => "review".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn route_contains_phrase(normalized_text: &str, phrase: &str) -> bool {
+    let phrase = route_normalized_text(phrase);
+    let phrase = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+    if phrase.is_empty() {
+        return false;
+    }
+    format!(" {normalized_text} ").contains(&format!(" {phrase} "))
+}
+
+fn sanitize_isolation_segment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "task".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn copy_workspace_dir(
+    source: &Path,
+    destination: &Path,
+    isolation_target: &Path,
+) -> ToolResultValue<()> {
+    for entry in fs::read_dir(source).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let source_path = entry.path();
+        let name = entry.file_name();
+        if should_skip_isolation_entry(&name) || isolation_target.starts_with(&source_path) {
+            continue;
+        }
+        let destination_path = destination.join(&name);
+        let metadata = entry.file_type().map_err(io_error)?;
+        if metadata.is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination_path).map_err(io_error)?;
+            copy_workspace_dir(&source_path, &destination_path, isolation_target)?;
+        } else if metadata.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent).map_err(io_error)?;
+            }
+            fs::copy(&source_path, &destination_path).map_err(io_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_isolation_entry(name: &OsStr) -> bool {
+    matches!(
+        name.to_str().unwrap_or_default(),
+        ".git" | "target" | "node_modules" | ".venv" | "venv" | "__pycache__"
+    )
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -1061,6 +1310,17 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
         execution_schema: readonly_schema("skill", false, false, None),
     });
     registry.register(ToolDefinition {
+        id: WEB_FETCH_TOOL_ID.to_string(),
+        description:
+            "Fetch an HTTP(S) URL for read-only external documentation and dependency research."
+                .to_string(),
+        parameter_schema: schema(&["url"], &["url", "timeout", "max_bytes"]),
+        dangerous: false,
+        group: "network".to_string(),
+        execution_scope: ToolExecutionScope::HostOnly,
+        execution_schema: readonly_schema("network-read", true, false, Some(4)),
+    });
+    registry.register(ToolDefinition {
         id: "code_search".to_string(),
         description: "Search files for a literal substring.".to_string(),
         parameter_schema: schema(&["query"], &["query", "glob", "path"]),
@@ -1189,6 +1449,38 @@ pub fn blocked_command(command: &str) -> Option<String> {
         .map(|matched| matched.as_str().to_string())
 }
 
+#[must_use]
+pub fn benchmark_mode_value_allows_shell_command(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "terminal-bench" | "terminal_bench" | "terminalbench"
+    )
+}
+
+#[must_use]
+pub fn benchmark_mode_allows_shell_command(ctx: &ToolContext) -> bool {
+    if env::var(BENCHMARK_MODE_ENV)
+        .ok()
+        .as_deref()
+        .is_some_and(benchmark_mode_value_allows_shell_command)
+    {
+        return true;
+    }
+
+    let context_keys = ["benchmark_mode", "harness", "execution_mode"];
+    context_keys.iter().any(|key| {
+        ctx.execution_metadata
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(benchmark_mode_value_allows_shell_command)
+            || ctx
+                .agent_options
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(benchmark_mode_value_allows_shell_command)
+    })
+}
+
 pub fn ensure_within_root(
     root: impl AsRef<Path>,
     target: impl AsRef<Path>,
@@ -1240,6 +1532,7 @@ fn execute_builtin(name: &str, input: Value, ctx: &mut ToolContext) -> ToolResul
         "ls" => ls_tool(input, ctx),
         "bash" => bash_tool(input, ctx),
         "skill" => skill_tool(input, ctx),
+        WEB_FETCH_TOOL_ID => web_fetch_tool(input),
         "code_search" => code_search_tool(input, ctx),
         "memory_read" => memory_read_tool(input, ctx),
         "memory_write" => memory_write_tool(input, ctx),
@@ -1420,7 +1713,9 @@ fn bash_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput>
     let timeout = u64_arg(&input, "timeout", 120_000)?;
     let workdir = optional_string_arg(&input, "workdir")?;
     let description = optional_string_arg(&input, "description")?.unwrap_or_default();
-    if let Some(blocked) = blocked_command(&command) {
+    if !benchmark_mode_allows_shell_command(ctx)
+        && let Some(blocked) = blocked_command(&command)
+    {
         return Err(format!(
             "{blocked} command is disabled for security reasons"
         ));
@@ -1559,6 +1854,74 @@ fn skill_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
     output
         .metadata
         .insert("duplicate_count".to_string(), json!(report.duplicate_count));
+    Ok(output)
+}
+
+fn web_fetch_tool(input: Value) -> ToolResultValue<ToolOutput> {
+    let raw_url = string_arg(&input, "url")?;
+    let url = reqwest::Url::parse(raw_url.trim())
+        .map_err(|error| format!("invalid web_fetch url: {error}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "web_fetch only supports http and https URLs, got: {scheme}"
+            ));
+        }
+    }
+    let timeout = Duration::from_millis(u64_arg(&input, "timeout", WEB_FETCH_DEFAULT_TIMEOUT_MS)?);
+    let max_bytes = optional_usize_arg(&input, "max_bytes")?
+        .unwrap_or(WEB_FETCH_MAX_BYTES)
+        .clamp(1, WEB_FETCH_MAX_BYTES);
+    let mut client_builder = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::limited(5));
+    if url
+        .host_str()
+        .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
+    {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder
+        .build()
+        .map_err(|error| format!("failed to build web_fetch client: {error}"))?;
+    let mut response = client
+        .get(url.clone())
+        .header(reqwest::header::USER_AGENT, "openagent-web-fetch/0.1")
+        .send()
+        .map_err(|error| format!("web_fetch request failed: {error:?}"))?;
+    let status = response.status().as_u16();
+    let final_url = response.url().to_string();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read web_fetch response: {error}"))?;
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    let mut output = ToolOutput::new(final_url.clone(), body);
+    output.truncated = truncated;
+    output
+        .metadata
+        .insert("url".to_string(), json!(raw_url.trim()));
+    output
+        .metadata
+        .insert("final_url".to_string(), json!(final_url));
+    output.metadata.insert("status".to_string(), json!(status));
+    output
+        .metadata
+        .insert("content_type".to_string(), json!(content_type));
+    output
+        .metadata
+        .insert("max_bytes".to_string(), json!(max_bytes));
     Ok(output)
 }
 
@@ -1710,10 +2073,12 @@ fn schema(required: &[&str], properties: &[&str]) -> Value {
 
 fn property_schema(name: &str) -> Value {
     match name {
-        "offset" | "limit" | "timeout" => json!({"type": "integer"}),
-        "replace_all" | "multiple" | "include_content" | "include_diagnostics" => {
-            json!({"type": "boolean"})
-        }
+        "offset" | "limit" | "timeout" | "max_bytes" => json!({"type": "integer"}),
+        "replace_all"
+        | "multiple"
+        | "include_content"
+        | "include_diagnostics"
+        | "isolate_workspace" => json!({"type": "boolean"}),
         "ignore" | "questions" | "todos" | "options" => json!({"type": "array"}),
         "value" => json!({}),
         _ => json!({"type": "string"}),
