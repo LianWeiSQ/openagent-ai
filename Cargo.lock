@@ -738,6 +738,7 @@ dependencies = [
 name = "openagent-cli"
 version = "0.1.0"
 dependencies = [
+ "openagent-app-server-client",
  "openagent-core",
  "openagent-http-runtime",
  "openagent-mcp",
@@ -750,6 +751,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -783,6 +785,7 @@ dependencies = [
  "openagent-app-server",
  "openagent-app-server-client",
  "openagent-core",
+ "openagent-mcp",
  "openagent-protocol",
  "openagent-provider",
  "openagent-session",
@@ -790,6 +793,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -798,6 +802,7 @@ version = "0.1.0"
 dependencies = [
  "openagent-protocol",
  "openagent-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "sha1",
@@ -849,6 +854,7 @@ dependencies = [
  "openagent-core",
  "openagent-protocol",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
 ]

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 openagent-protocol.workspace = true
 openagent-tools.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

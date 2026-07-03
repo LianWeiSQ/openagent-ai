@@ -1,0 +1,17 @@
+FROM docker.m.daocloud.io/library/rust:1.96-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p openagent-cli --bin openagent
+RUN mkdir -p /out \
+    && cp /src/target/release/openagent /out/openagent \
+    && strip /out/openagent || true
+
+FROM docker.m.daocloud.io/library/debian:bookworm-slim AS runner
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates bash git openssh-client ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/openagent /usr/local/bin/openagent
+ENTRYPOINT ["openagent"]
+
+FROM scratch AS artifact
+COPY --from=builder /out/openagent /out/openagent

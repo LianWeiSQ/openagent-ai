@@ -27,6 +27,7 @@ rust-version = "1.85"
 openagent-app-server = { path = "runtime/app-server" }
 openagent-app-server-client = { path = "runtime/app-server-client" }
 openagent-core = { path = "src" }
+openagent-mcp = { path = "src/mcp" }
 openagent-protocol = { path = "src/protocol" }
 openagent-provider = { path = "src/provider" }
 openagent-session = { path = "src/session" }

@@ -13,6 +13,7 @@ uv.lock
 .ruff_cache/
 .coverage
 .openagent/
+node_modules/
 htmlcov/
 dist/
 build/
