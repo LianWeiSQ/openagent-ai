@@ -68,6 +68,8 @@ SessionRunner
 - question-answer JSON parsing；
 - `item/toolCall/started` event construction；
 - `item/toolCall/completed` / `failed` event construction。
+- tool-result message/session projection payload construction；
+- skill session-event payload construction。
 
 近期验证覆盖：
 
@@ -85,13 +87,14 @@ cargo check -p openagent-cli -p openagent-http-runtime
 1. Shared ToolContext。
 2. Shared question-answer parsing。
 3. Shared tool-call event construction。
-4. Shared tool-result append to session。
-5. Shared skill event recording。
-6. Shared system prompt/profile binding。
-7. Shared provider message assembly。
-8. Shared provider-step result model。
-9. Shared pending approval/question resume。
-10. CLI/HTTP loop 包到 SessionRunner。
+4. Shared tool-result message/projection payload construction。
+5. Shared skill event payload construction。
+6. Shared tool-result append to session。
+7. Shared system prompt/profile binding。
+8. Shared provider message assembly。
+9. Shared provider-step result model。
+10. Shared pending approval/question resume。
+11. CLI/HTTP loop 包到 SessionRunner。
 
 每一步都要有 CLI + HTTP 验收，防止 surface drift。
 

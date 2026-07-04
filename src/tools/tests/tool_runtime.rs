@@ -236,6 +236,92 @@ fn session_runner_facade_builds_shared_tool_call_events() {
 }
 
 #[test]
+fn session_runner_facade_builds_shared_tool_result_session_projection() {
+    let facade = SessionRunnerFacade::new("/tmp/openagent-session-runner", "session_projection");
+    let call = ToolCall {
+        name: "skill".to_string(),
+        input: json!({"name": "review"}),
+        call_id: "call_skill".to_string(),
+    };
+    let result = ToolResult {
+        call_id: "call_skill".to_string(),
+        output: "<skill_content name=\"review\">...</skill_content>".to_string(),
+        error: None,
+        metadata: BTreeMap::from([
+            ("skill_name".to_string(), json!("review")),
+            (
+                "skill_location".to_string(),
+                json!("/workspace/skills/review/SKILL.md"),
+            ),
+            (
+                "skill_files".to_string(),
+                json!(["references/checklist.md"]),
+            ),
+        ]),
+    };
+
+    let message = facade.tool_result_message(
+        3,
+        &call,
+        &result,
+        Some("msg_assistant"),
+        Some("msg_tool".to_string()),
+    );
+    assert_eq!(message.role, openagent_protocol::Role::Tool);
+    assert_eq!(message.content, result.output);
+    assert_eq!(message.name.as_deref(), Some("skill"));
+    assert_eq!(message.tool_call_id.as_deref(), Some("call_skill"));
+    assert_eq!(message.metadata["message_id"], "msg_tool");
+    assert_eq!(message.metadata["assistant_message_id"], "msg_assistant");
+    assert_eq!(message.metadata["step"], 3);
+    assert_eq!(message.metadata["tool_result"]["call_id"], "call_skill");
+
+    let projection = facade.tool_result_session_projection(3, &call, &result);
+    assert!(!projection.failed);
+    assert_eq!(projection.event_name, "tool.call.finished");
+    assert_eq!(projection.event_status, "ok");
+    assert_eq!(projection.event_attributes["call_id"], "call_skill");
+    assert_eq!(projection.event_attributes["name"], "skill");
+    assert_eq!(
+        projection.event_attributes["metadata"]["skill_name"],
+        "review"
+    );
+    assert_eq!(projection.part_attributes["failed"], false);
+
+    let skill_event = facade
+        .skill_tool_session_event(3, &call, &result)
+        .expect("skill load event");
+    assert_eq!(skill_event.event_name, "skill.loaded");
+    assert_eq!(skill_event.attributes["skill_name"], "review");
+    assert_eq!(
+        skill_event.attributes["skill_location"],
+        "/workspace/skills/review/SKILL.md"
+    );
+    assert_eq!(
+        skill_event.attributes["skill_files"][0],
+        "references/checklist.md"
+    );
+
+    let failed_result = ToolResult {
+        call_id: "call_skill".to_string(),
+        output: String::new(),
+        error: Some("denied".to_string()),
+        metadata: BTreeMap::new(),
+    };
+    let failed_message = facade.tool_result_message(4, &call, &failed_result, None, None);
+    assert_eq!(failed_message.content, "Tool failed: denied");
+    let failed_projection = facade.tool_result_session_projection(4, &call, &failed_result);
+    assert!(failed_projection.failed);
+    assert_eq!(failed_projection.event_name, "tool.call.failed");
+    assert_eq!(failed_projection.event_status, "error");
+    assert!(
+        facade
+            .skill_tool_session_event(4, &call, &failed_result)
+            .is_none()
+    );
+}
+
+#[test]
 fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(), Box<dyn Error>> {
     let root = unique_temp_dir("openagent-tools-file")?;
     fs::write(root.join("notes.txt"), "alpha\nbeta\ngamma\n")?;

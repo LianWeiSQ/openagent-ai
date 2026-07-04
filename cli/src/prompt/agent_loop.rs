@@ -247,23 +247,13 @@ pub(super) fn run_agent_loop(
             ),
             event_sink,
         );
-        let mut tool_message = chat_message(
-            Role::Tool,
-            tool_result.error.as_ref().map_or_else(
-                || tool_result.output.clone(),
-                |error| format!("Tool failed: {error}"),
-            ),
+        let tool_message = runner_facade.tool_result_message(
+            1,
+            &tool_call,
+            &tool_result,
+            Some(&assistant_message_id),
+            Some(new_cli_id("msg")),
         );
-        tool_message.name = Some(tool_call.name.clone());
-        tool_message.tool_call_id = Some(tool_call.call_id.clone());
-        tool_message
-            .metadata
-            .insert("tool_result".to_string(), json!(tool_result));
-        tool_message.metadata.insert(
-            "assistant_message_id".to_string(),
-            json!(assistant_message_id.clone()),
-        );
-        tool_message.metadata.insert("step".to_string(), json!(1));
         let tool_index = session.messages.len() as u64;
         session.add(tool_message.clone());
         store
@@ -710,7 +700,6 @@ pub(super) fn run_agent_loop(
                     paused: true,
                 });
             }
-            let failed = tool_result.error.is_some();
             emit_run_event(
                 &mut events,
                 runner_facade.tool_call_finished_event(
@@ -730,29 +719,18 @@ pub(super) fn run_agent_loop(
                 step,
                 &tool_call,
                 &tool_result,
+                &runner_facade,
             );
+            let projection =
+                runner_facade.tool_result_session_projection(step, &tool_call, &tool_result);
             let _ = store.record_event(
                 &session.id,
                 run_id,
-                if failed {
-                    "tool.call.failed"
-                } else {
-                    "tool.call.finished"
-                },
+                &projection.event_name,
                 SessionEventOptions {
                     kind: "tool".to_string(),
-                    status: if failed {
-                        "error".to_string()
-                    } else {
-                        "ok".to_string()
-                    },
-                    attributes: BTreeMap::from([
-                        ("call_id".to_string(), json!(tool_call.call_id.clone())),
-                        ("name".to_string(), json!(tool_call.name.clone())),
-                        ("error".to_string(), json!(tool_result.error.clone())),
-                        ("metadata".to_string(), json!(tool_result.metadata.clone())),
-                        ("step".to_string(), json!(step)),
-                    ]),
+                    status: projection.event_status,
+                    attributes: projection.event_attributes,
                     ..SessionEventOptions::default()
                 },
             );
@@ -761,35 +739,19 @@ pub(super) fn run_agent_loop(
                 run_id,
                 "tool_result",
                 SessionPartOptions {
-                    attributes: BTreeMap::from([
-                        ("call_id".to_string(), json!(tool_call.call_id.clone())),
-                        ("name".to_string(), json!(tool_call.name.clone())),
-                        ("failed".to_string(), json!(failed)),
-                    ]),
+                    attributes: projection.part_attributes,
                     step_index: Some(step),
                     ..SessionPartOptions::default()
                 },
             );
 
-            let mut tool_message = chat_message(
-                Role::Tool,
-                tool_result.error.as_ref().map_or_else(
-                    || tool_result.output.clone(),
-                    |error| format!("Tool failed: {error}"),
-                ),
+            let tool_message = runner_facade.tool_result_message(
+                step,
+                &tool_call,
+                &tool_result,
+                Some(&assistant_message_id),
+                Some(new_cli_id("msg")),
             );
-            tool_message.name = Some(tool_call.name.clone());
-            tool_message.tool_call_id = Some(tool_call.call_id.clone());
-            tool_message
-                .metadata
-                .insert("tool_result".to_string(), json!(tool_result));
-            tool_message.metadata.insert(
-                "assistant_message_id".to_string(),
-                json!(assistant_message_id.clone()),
-            );
-            tool_message
-                .metadata
-                .insert("step".to_string(), json!(step));
             let tool_index = session.messages.len() as u64;
             session.add(tool_message.clone());
             store
@@ -1757,18 +1719,17 @@ fn append_tool_result_to_session(
     tool_call: &ToolCall,
     tool_result: ToolResult,
 ) -> Result<(), String> {
-    let failed = tool_result.error.is_some();
+    let runner_facade = SessionRunnerFacade::new(context.workspace, context.session.id.clone());
     emit_run_event(
         context.events,
-        SessionRunnerFacade::new(context.workspace, context.session.id.clone())
-            .tool_call_finished_event(
-                context.run_id,
-                step,
-                tool_call,
-                &tool_result,
-                None,
-                BTreeMap::new(),
-            ),
+        runner_facade.tool_call_finished_event(
+            context.run_id,
+            step,
+            tool_call,
+            &tool_result,
+            None,
+            BTreeMap::new(),
+        ),
         context.event_sink,
     );
     record_skill_tool_session_event(
@@ -1778,29 +1739,17 @@ fn append_tool_result_to_session(
         step,
         tool_call,
         &tool_result,
+        &runner_facade,
     );
+    let projection = runner_facade.tool_result_session_projection(step, tool_call, &tool_result);
     let _ = context.store.record_event(
         &context.session.id,
         context.run_id,
-        if failed {
-            "tool.call.failed"
-        } else {
-            "tool.call.finished"
-        },
+        &projection.event_name,
         SessionEventOptions {
             kind: "tool".to_string(),
-            status: if failed {
-                "error".to_string()
-            } else {
-                "ok".to_string()
-            },
-            attributes: BTreeMap::from([
-                ("call_id".to_string(), json!(tool_call.call_id.clone())),
-                ("name".to_string(), json!(tool_call.name.clone())),
-                ("error".to_string(), json!(tool_result.error.clone())),
-                ("metadata".to_string(), json!(tool_result.metadata.clone())),
-                ("step".to_string(), json!(step)),
-            ]),
+            status: projection.event_status,
+            attributes: projection.event_attributes,
             ..SessionEventOptions::default()
         },
     );
@@ -1809,28 +1758,12 @@ fn append_tool_result_to_session(
         context.run_id,
         "tool_result",
         SessionPartOptions {
-            attributes: BTreeMap::from([
-                ("call_id".to_string(), json!(tool_call.call_id.clone())),
-                ("name".to_string(), json!(tool_call.name.clone())),
-                ("failed".to_string(), json!(failed)),
-            ]),
+            attributes: projection.part_attributes,
             step_index: Some(step),
             ..SessionPartOptions::default()
         },
     );
-    let mut tool_message = chat_message(
-        Role::Tool,
-        tool_result.error.as_ref().map_or_else(
-            || tool_result.output.clone(),
-            |error| format!("Tool failed: {error}"),
-        ),
-    );
-    tool_message.name = Some(tool_call.name.clone());
-    tool_message.tool_call_id = Some(tool_call.call_id.clone());
-    tool_message
-        .metadata
-        .insert("tool_result".to_string(), json!(tool_result));
-    if let Some(message_id) = context
+    let assistant_message_id = context
         .session
         .metadata
         .get(if tool_call.name == "question" {
@@ -1840,14 +1773,14 @@ fn append_tool_result_to_session(
         })
         .and_then(|value| value.get("assistant_message_id"))
         .and_then(Value::as_str)
-    {
-        tool_message
-            .metadata
-            .insert("assistant_message_id".to_string(), json!(message_id));
-    }
-    tool_message
-        .metadata
-        .insert("step".to_string(), json!(step));
+        .map(str::to_string);
+    let tool_message = runner_facade.tool_result_message(
+        step,
+        tool_call,
+        &tool_result,
+        assistant_message_id.as_deref(),
+        Some(new_cli_id("msg")),
+    );
     let tool_index = context.session.messages.len() as u64;
     context.session.add(tool_message.clone());
     context
@@ -1863,60 +1796,19 @@ fn record_skill_tool_session_event(
     step: u64,
     tool_call: &ToolCall,
     tool_result: &ToolResult,
+    runner_facade: &SessionRunnerFacade,
 ) {
-    if tool_call.name != "skill" || tool_result.error.is_some() {
+    let Some(skill_event) = runner_facade.skill_tool_session_event(step, tool_call, tool_result)
+    else {
         return;
-    }
-    let mut attributes = BTreeMap::from([
-        ("call_id".to_string(), json!(tool_call.call_id.clone())),
-        ("name".to_string(), json!(tool_call.name.clone())),
-        ("input".to_string(), tool_call.input.clone()),
-        ("step".to_string(), json!(step)),
-        ("metadata".to_string(), json!(tool_result.metadata.clone())),
-    ]);
-    for key in [
-        "query",
-        "skill_count",
-        "loaded_count",
-        "scanned_files",
-        "invalid_count",
-        "duplicate_count",
-    ] {
-        if let Some(value) = tool_result.metadata.get(key) {
-            attributes.insert(key.to_string(), value.clone());
-        }
-    }
-    let event = if let Some(skill_name) = tool_result
-        .metadata
-        .get("skill_name")
-        .and_then(Value::as_str)
-    {
-        attributes.insert("skill_name".to_string(), json!(skill_name));
-        for key in [
-            "skill_location",
-            "skill_dir",
-            "skill_files",
-            "skill_files_truncated",
-            "skill_arguments",
-            "skill_context",
-            "skill_agent",
-            "background",
-        ] {
-            if let Some(value) = tool_result.metadata.get(key) {
-                attributes.insert(key.to_string(), value.clone());
-            }
-        }
-        "skill.loaded"
-    } else {
-        "skill.discovered"
     };
     let _ = store.record_event(
         session_id,
         run_id,
-        event,
+        &skill_event.event_name,
         SessionEventOptions {
             kind: "skill".to_string(),
-            attributes,
+            attributes: skill_event.attributes,
             ..SessionEventOptions::default()
         },
     );

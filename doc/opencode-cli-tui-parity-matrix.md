@@ -100,9 +100,10 @@ Remaining parity risk:
   HTTP `/api/skills` golden, `skill.discovered`/`skill.loaded` session events,
   and compaction protection are covered. AgentProfile/SkillConfig/TaskConfig
   parsing is now shared, and the first `SessionRunnerFacade` layer now
-  centralizes ToolContext construction, question-answer JSON parsing, and
-  `item/toolCall/*` event construction for CLI and HTTP. The next runtime risk
-  is the still-duplicated provider-step/tool-call/task loop, which should move
+  centralizes ToolContext construction, question-answer JSON parsing,
+  `item/toolCall/*` event construction, tool-result message/projection payloads,
+  and skill session-event payloads for CLI and HTTP. The next runtime risk is
+  the still-duplicated provider-step/tool-call/task loop, which should move
   behind the same facade.
 - HTTP provider catalog and fallback handling now keep catalog filtering
   separate from execution model selection: explicit session/profile models are
@@ -119,7 +120,7 @@ Current local verification anchors:
 | CLI agents/subagents | Built-in agents, OpenCode Markdown agents, task routing, workspace isolation | `cli/tests/cli_commands.rs::binary_agent_registry_exposes_builtin_subagents`, `binary_agent_registry_loads_opencode_markdown_agents`, and task-subagent tests |
 | TUI controls | Session, file, model, agent, variant/thinking pickers; approval/question/diff docks | `runtime/tui/src/tests.rs` picker, interaction, render, and App Bridge tests |
 | HTTP/App Bridge | Sessions, turns, approvals/questions, diff/checkpoint, MCP, agents, skills, task trees, provider catalog/fallback contract | `cargo test -p openagent-http-runtime --test http_runtime -q` covers the full HTTP runtime contract |
-| Shared runner contract | Shared profile schema, ToolContext construction, question-answer parsing, and tool-call events | `cargo test -p openagent-tools -q`; `cargo test -p openagent-cli binary_approval_and_question_responses_resume_paused_runs --test cli_commands -q`; `cargo test -p openagent-http-runtime app_bridge_protocol_contract_and_client_live_subscription --test http_runtime -q`; `cargo check -p openagent-cli -p openagent-http-runtime` |
+| Shared runner contract | Shared profile schema, ToolContext construction, question-answer parsing, tool-call events, tool-result projection, and skill event payloads | `cargo test -p openagent-tools -q`; `cargo test -p openagent-cli binary_approval_and_question_responses_resume_paused_runs --test cli_commands -q`; `cargo test -p openagent-http-runtime --test http_runtime -q`; `cargo check -p openagent-cli -p openagent-http-runtime` |
 
 ## CLI Matrix
 
@@ -162,10 +163,11 @@ Current local verification anchors:
 P0 rows are the first implementation tranche after this matrix:
 
 1. Shared SessionRunner facade: the first facade layer now owns shared
-   ToolContext construction, question-answer parsing, and tool-call event
-   construction for CLI and HTTP. Continue moving provider calls, task handoff,
-   skill loading, pending approval/question resume, and remaining session
-   events into the common runner until the duplicated loops disappear.
+   ToolContext construction, question-answer parsing, tool-call event
+   construction, tool-result session projection, and skill event payloads for
+   CLI and HTTP. Continue moving provider calls, task handoff, skill loading,
+   pending approval/question resume, and remaining session events into the
+   common runner until the duplicated loops disappear.
 2. [CLI-14 / Task background](#cli-matrix): complete background task state
    machine across queued/running/completed/failed/cancelled plus
    wait/promote/cancel/resume. HTTP has the queue foundation; CLI is still

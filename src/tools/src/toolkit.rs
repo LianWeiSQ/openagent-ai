@@ -17,8 +17,8 @@ use openagent_core::{
     skill_document_model_invocable, skill_info_model_invocable,
 };
 use openagent_protocol::{
-    PermissionAction, PermissionRuleset, ToolCall, ToolConcurrency, ToolExecutionSchema,
-    ToolExecutionScope, ToolResult, ToolSchema,
+    ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolConcurrency,
+    ToolExecutionSchema, ToolExecutionScope, ToolResult, ToolSchema,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1104,6 +1104,21 @@ pub struct SessionRunnerFacade {
     question_answers: Option<Vec<Vec<String>>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ToolResultSessionProjection {
+    pub failed: bool,
+    pub event_name: String,
+    pub event_status: String,
+    pub event_attributes: BTreeMap<String, Value>,
+    pub part_attributes: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SkillToolSessionEvent {
+    pub event_name: String,
+    pub attributes: BTreeMap<String, Value>,
+}
+
 impl SessionRunnerFacade {
     #[must_use]
     pub fn new(session_root: impl Into<PathBuf>, session_id: impl Into<String>) -> Self {
@@ -1208,6 +1223,131 @@ impl SessionRunnerFacade {
         json!({
             "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
             "params": Value::Object(params),
+        })
+    }
+
+    #[must_use]
+    pub fn tool_result_message(
+        &self,
+        step: u64,
+        call: &ToolCall,
+        result: &ToolResult,
+        assistant_message_id: Option<&str>,
+        message_id: Option<String>,
+    ) -> ChatMessage {
+        let mut metadata = BTreeMap::from([
+            ("tool_result".to_string(), json!(result)),
+            ("step".to_string(), json!(step)),
+        ]);
+        if let Some(message_id) = message_id.filter(|value| !value.is_empty()) {
+            metadata.insert("message_id".to_string(), json!(message_id));
+        }
+        if let Some(assistant_message_id) = assistant_message_id.filter(|value| !value.is_empty()) {
+            metadata.insert(
+                "assistant_message_id".to_string(),
+                json!(assistant_message_id),
+            );
+        }
+        ChatMessage {
+            role: Role::Tool,
+            content: result.error.as_ref().map_or_else(
+                || result.output.clone(),
+                |error| format!("Tool failed: {error}"),
+            ),
+            name: Some(call.name.clone()),
+            tool_call_id: Some(call.call_id.clone()),
+            metadata,
+        }
+    }
+
+    #[must_use]
+    pub fn tool_result_session_projection(
+        &self,
+        step: u64,
+        call: &ToolCall,
+        result: &ToolResult,
+    ) -> ToolResultSessionProjection {
+        let failed = result.error.is_some();
+        ToolResultSessionProjection {
+            failed,
+            event_name: if failed {
+                "tool.call.failed".to_string()
+            } else {
+                "tool.call.finished".to_string()
+            },
+            event_status: if failed {
+                "error".to_string()
+            } else {
+                "ok".to_string()
+            },
+            event_attributes: BTreeMap::from([
+                ("call_id".to_string(), json!(call.call_id.clone())),
+                ("name".to_string(), json!(call.name.clone())),
+                ("error".to_string(), json!(result.error.clone())),
+                ("metadata".to_string(), json!(result.metadata.clone())),
+                ("step".to_string(), json!(step)),
+            ]),
+            part_attributes: BTreeMap::from([
+                ("call_id".to_string(), json!(call.call_id.clone())),
+                ("name".to_string(), json!(call.name.clone())),
+                ("failed".to_string(), json!(failed)),
+            ]),
+        }
+    }
+
+    #[must_use]
+    pub fn skill_tool_session_event(
+        &self,
+        step: u64,
+        call: &ToolCall,
+        result: &ToolResult,
+    ) -> Option<SkillToolSessionEvent> {
+        if call.name != "skill" || result.error.is_some() {
+            return None;
+        }
+        let mut attributes = BTreeMap::from([
+            ("call_id".to_string(), json!(call.call_id.clone())),
+            ("name".to_string(), json!(call.name.clone())),
+            ("input".to_string(), call.input.clone()),
+            ("step".to_string(), json!(step)),
+            ("metadata".to_string(), json!(result.metadata.clone())),
+        ]);
+        for key in [
+            "query",
+            "skill_count",
+            "loaded_count",
+            "scanned_files",
+            "invalid_count",
+            "duplicate_count",
+        ] {
+            if let Some(value) = result.metadata.get(key) {
+                attributes.insert(key.to_string(), value.clone());
+            }
+        }
+        let event_name =
+            if let Some(skill_name) = result.metadata.get("skill_name").and_then(Value::as_str) {
+                attributes.insert("skill_name".to_string(), json!(skill_name));
+                for key in [
+                    "skill_location",
+                    "skill_dir",
+                    "skill_files",
+                    "skill_files_truncated",
+                    "skill_arguments",
+                    "skill_context",
+                    "skill_agent",
+                    "background",
+                ] {
+                    if let Some(value) = result.metadata.get(key) {
+                        attributes.insert(key.to_string(), value.clone());
+                    }
+                }
+                "skill.loaded"
+            } else {
+                "skill.discovered"
+            };
+        Some(SkillToolSessionEvent {
+            event_name: event_name.to_string(),
+            attributes,
         })
     }
 
