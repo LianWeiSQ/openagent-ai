@@ -1074,9 +1074,22 @@ fn remote_runtime_client_executes_task_subagent_tool() -> Result<(), Box<dyn Err
             "permission": "READONLY",
             "prompt": "You are the Custom runtime researcher.",
             "tools": ["read"],
+            "skills": ["runtime-brief"],
+            "skill_roots": ["shared-skills"],
             "model": "custom-child-model",
             "max_steps": 3
         }))?,
+    )?;
+    let shared_skill = workspace.join("shared-skills/runtime-brief");
+    fs::create_dir_all(&shared_skill)?;
+    fs::write(
+        shared_skill.join("SKILL.md"),
+        r#"---
+name: runtime-brief
+description: Runtime preloaded subagent skill
+---
+Use runtime preloaded guidance.
+"#,
     )?;
     let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
     let mut server = spawn_runtime_with_env(
@@ -1102,6 +1115,8 @@ fn remote_runtime_client_executes_task_subagent_tool() -> Result<(), Box<dyn Err
                 && agent["description"] == "Workspace-defined research subagent"
                 && agent["model"] == "custom-child-model"
                 && agent["tools"] == serde_json::json!(["read"])
+                && agent["skills"] == serde_json::json!(["runtime-brief"])
+                && agent["skill_roots"] == serde_json::json!(["shared-skills"])
         })
     }));
     let started = client.start_turn(
@@ -1122,6 +1137,7 @@ fn remote_runtime_client_executes_task_subagent_tool() -> Result<(), Box<dyn Err
     )?;
 
     assert_eq!(started["status"], "completed");
+    assert!(!serde_json::to_string(&started)?.contains("Use runtime preloaded guidance."));
     let events = started["events"].as_array().expect("events");
     let completed = events
         .iter()
@@ -1157,6 +1173,14 @@ fn remote_runtime_client_executes_task_subagent_tool() -> Result<(), Box<dyn Err
         child_state["metadata"]["agent_profile"]["tools"],
         serde_json::json!(["read"])
     );
+    assert_eq!(
+        child_state["metadata"]["skills"],
+        serde_json::json!(["runtime-brief"])
+    );
+    assert_eq!(
+        child_state["metadata"]["preloaded_skills"],
+        serde_json::json!(["runtime-brief"])
+    );
     let tasks = client.tasks(&session_id)?;
     let task = tasks
         .iter()
@@ -1171,9 +1195,11 @@ fn remote_runtime_client_executes_task_subagent_tool() -> Result<(), Box<dyn Err
     assert!(child_state["messages"].as_array().is_some_and(|messages| {
         messages.iter().any(|message| {
             message["role"] == "system"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("Custom runtime researcher"))
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("Custom runtime researcher")
+                        && content.contains("<preloaded_skills>")
+                        && content.contains("Use runtime preloaded guidance.")
+                })
         })
     }));
 
@@ -1189,6 +1215,8 @@ fn remote_runtime_client_executes_task_subagent_tool() -> Result<(), Box<dyn Err
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
     assert_eq!(tool_names, vec!["read"]);
+    assert!(requests[0].contains("<preloaded_skills>"));
+    assert!(requests[0].contains("Use runtime preloaded guidance."));
     assert!(requests[0].contains("Summarize this runtime fixture."));
     assert!(requests[0].contains("custom-child-model"));
     assert!(requests[1].contains("function_call_output"));
@@ -1970,13 +1998,24 @@ id: markdown-research
 name: Markdown Research
 description: OpenCode markdown research agent
 mode: subagent
-permission: READONLY
+permission:
+  ruleset: READONLY
+  skill:
+    alpha: deny
+skills: ["alpha"]
+skill_roots: ["shared-skills"]
+skill_permissions:
+  beta: allow
 tools: ["read"]
 model: markdown-child-model
 steps: 2
 temperature: 0.21
 top_p: 0.82
 reasoning_effort: medium
+options:
+  skill_roots: ["must-not-leak"]
+  skill_permissions:
+    leaked: deny
 color: cyan
 ---
 You are the Markdown research subagent.
@@ -2038,9 +2077,25 @@ Disabled prompt.
     assert_eq!(markdown_agent["temperature"], 0.21);
     assert_eq!(markdown_agent["top_p"], 0.82);
     assert_eq!(markdown_agent["color"], "cyan");
+    assert_eq!(markdown_agent["permission"], "READONLY");
+    assert_eq!(markdown_agent["skills"], serde_json::json!(["alpha"]));
+    assert_eq!(
+        markdown_agent["skill_roots"],
+        serde_json::json!(["shared-skills"])
+    );
+    assert_eq!(markdown_agent["skill_permissions"][0]["pattern"], "alpha");
+    assert_eq!(markdown_agent["skill_permissions"][0]["action"], "deny");
+    assert_eq!(markdown_agent["skill_permissions"][1]["pattern"], "beta");
+    assert_eq!(markdown_agent["skill_permissions"][1]["action"], "allow");
     assert_eq!(
         markdown_agent["model_options"]["reasoning_effort"],
         "medium"
+    );
+    assert!(markdown_agent["model_options"].get("skill_roots").is_none());
+    assert!(
+        markdown_agent["model_options"]
+            .get("skill_permissions")
+            .is_none()
     );
     assert!(
         !agent_items
@@ -2112,6 +2167,370 @@ Disabled prompt.
     assert_eq!(provider_request["temperature"], 0.21);
     assert_eq!(provider_request["top_p"], 0.82);
     assert_eq!(provider_request["reasoning_effort"], "medium");
+    let provider_request_text = requests[0].as_str();
+    assert!(!provider_request_text.contains("skill_roots"));
+    assert!(!provider_request_text.contains("skill_permissions"));
+    assert!(!provider_request_text.contains("must-not-leak"));
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn provider_loop_skill_tool_uses_profile_skill_roots() -> Result<(), Box<dyn Error>> {
+    let skill_call = serde_json::json!({
+        "id": "resp_skill_call",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_skill_list",
+            "name": "skill",
+            "arguments": "{\"query\":\"root\"}"
+        }, {
+            "type": "function_call",
+            "call_id": "call_skill_rooted",
+            "name": "skill",
+            "arguments": "{\"name\":\"rooted\"}"
+        }],
+        "usage": {"input_tokens": 5, "output_tokens": 1}
+    });
+    let final_answer = serde_json::json!({
+        "id": "resp_skill_final",
+        "output_text": "Loaded rooted skill.",
+        "usage": {"input_tokens": 8, "output_tokens": 2}
+    });
+    let denied_skill_call = serde_json::json!({
+        "id": "resp_skill_denied_call",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_skill_alpha",
+            "name": "skill",
+            "arguments": "{\"name\":\"alpha\"}"
+        }],
+        "usage": {"input_tokens": 5, "output_tokens": 1}
+    });
+    let denied_final_answer = serde_json::json!({
+        "id": "resp_skill_denied_final",
+        "output_text": "Alpha skill was denied.",
+        "usage": {"input_tokens": 8, "output_tokens": 2}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![
+            skill_call,
+            final_answer,
+            denied_skill_call,
+            denied_final_answer,
+        ])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-skill-roots")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let agent_dir = workspace.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("skillful.md"),
+        r#"---
+id: skillful
+name: Skillful
+description: Skill root aware primary agent
+mode: primary
+permission:
+  ruleset: FULL
+  skill:
+    alpha: deny
+tools: ["skill"]
+skill_roots: ["shared-skills"]
+---
+You are the skillful primary agent.
+"#,
+    )?;
+    let shared_skill = workspace.join("shared-skills/rooted");
+    fs::create_dir_all(&shared_skill)?;
+    fs::write(
+        shared_skill.join("SKILL.md"),
+        r#"---
+name: rooted
+description: Rooted HTTP skill
+---
+Use the HTTP rooted skill guidance.
+"#,
+    )?;
+    let denied_skill = workspace.join("shared-skills/alpha");
+    fs::create_dir_all(&denied_skill)?;
+    fs::write(
+        denied_skill.join("SKILL.md"),
+        r#"---
+name: alpha
+description: Alpha HTTP skill should be hidden
+---
+Do not expose HTTP alpha guidance.
+"#,
+    )?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "fake-model"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let started = client.start_turn(
+        &session_id,
+        "load rooted skill",
+        serde_json::json!({
+            "agent": "skillful",
+            "permission": "FULL"
+        }),
+    )?;
+    assert_eq!(started["status"], "completed");
+    assert!(started["events"].as_array().is_some_and(|events| {
+        events.iter().any(|event| {
+            event["method"] == "item/toolCall/completed"
+                && event["params"]["name"] == "skill"
+                && event["params"]["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("Use the HTTP rooted skill guidance."))
+        })
+    }));
+    let run_id = started["turn_id"].as_str().ok_or("missing run id")?;
+    let session_events = read_session_event_records(&session_root, &session_id, run_id)?;
+    assert!(session_events.iter().any(|event| {
+        event["event"] == "skill.discovered"
+            && event["kind"] == "skill"
+            && event["attributes"]["query"] == "root"
+            && event["attributes"]["skill_count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+    }));
+    assert!(session_events.iter().any(|event| {
+        event["event"] == "skill.loaded"
+            && event["kind"] == "skill"
+            && event["attributes"]["skill_name"] == "rooted"
+            && event["attributes"]["skill_dir"]
+                .as_str()
+                .is_some_and(|dir| dir.ends_with("shared-skills/rooted"))
+            && event["attributes"]["skill_files"].as_array().is_some()
+    }));
+    let denied_session_id = client.create_session(&workspace, None)?;
+    let denied = client.start_turn(
+        &denied_session_id,
+        "load alpha skill",
+        serde_json::json!({
+            "agent": "skillful",
+            "permission": "FULL"
+        }),
+    )?;
+    assert_eq!(denied["status"], "completed");
+    let denied_events = denied["events"].as_array().ok_or("missing denied events")?;
+    let failed_skill = denied_events
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/failed" && event["params"]["name"] == "skill"
+        })
+        .ok_or("missing denied skill event")?;
+    assert_eq!(
+        failed_skill["params"]["metadata"]["permission_action"],
+        "deny"
+    );
+    assert_eq!(
+        failed_skill["params"]["metadata"]["error_kind"],
+        "permission_denied"
+    );
+
+    let _ = server.kill();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].contains("<available_skills>"));
+    assert!(requests[0].contains("<name>rooted</name>"));
+    assert!(requests[0].contains("Rooted HTTP skill"));
+    assert!(!requests[0].contains("<name>alpha</name>"));
+    assert!(!requests[0].contains("Alpha HTTP skill should be hidden"));
+    assert!(requests[2].contains("<available_skills>"));
+    assert!(!requests[2].contains("<name>alpha</name>"));
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn skill_fork_context_routes_to_subagent_foreground_and_background() -> Result<(), Box<dyn Error>> {
+    let child_final = serde_json::json!({
+        "id": "resp_fork_skill_child",
+        "output_text": "fork worker answer",
+        "usage": {"input_tokens": 4, "output_tokens": 2}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![child_final])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-skill-fork")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let agent_dir = workspace.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("fork-worker.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": "fork-worker",
+            "name": "Fork Worker",
+            "description": "Runs fork skills",
+            "mode": "subagent",
+            "permission": "READONLY",
+            "prompt": "You are the fork worker.",
+            "tools": ["read"],
+            "model": "fork-child-model",
+            "max_steps": 2
+        }))?,
+    )?;
+    let skill_dir = workspace.join(".openagent/skills/forker");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: forker
+description: Fork foreground skill
+context: fork
+agent: fork-worker
+---
+Use forked skill guidance for {{topic}}.
+"#,
+    )?;
+    let background_skill_dir = workspace.join(".openagent/skills/forker-bg");
+    fs::create_dir_all(&background_skill_dir)?;
+    fs::write(
+        background_skill_dir.join("SKILL.md"),
+        r#"---
+name: forker-bg
+description: Fork background skill
+context: fork
+agent: fork-worker
+background: true
+---
+Queue forked background guidance.
+"#,
+    )?;
+
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "fake-model"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let foreground = client.start_turn(
+        &session_id,
+        "run fork skill",
+        serde_json::json!({
+            "permission": "FULL",
+            "tool_call": {
+                "call_id": "call_fork_skill",
+                "name": "skill",
+                "input": {
+                    "name": "forker",
+                    "arguments": {"topic": "routing"}
+                }
+            }
+        }),
+    )?;
+    assert_eq!(foreground["status"], "completed");
+    let foreground_text = serde_json::to_string(&foreground)?;
+    assert!(foreground_text.contains("fork worker answer"));
+    assert!(!foreground_text.contains("Use forked skill guidance"));
+    let completed = foreground["events"]
+        .as_array()
+        .ok_or("missing foreground events")?
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/completed" && event["params"]["name"] == "skill"
+        })
+        .ok_or("missing fork skill completion")?;
+    assert_eq!(completed["params"]["metadata"]["skill_context"], "fork");
+    assert_eq!(completed["params"]["metadata"]["skill_name"], "forker");
+    assert_eq!(
+        completed["params"]["metadata"]["skill_agent"],
+        "fork-worker"
+    );
+    let child_session_id = completed["params"]["metadata"]["session_id"]
+        .as_str()
+        .ok_or("missing fork child session id")?;
+    let child_state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root
+            .join(child_session_id)
+            .join("state.latest.json"),
+    )?)?;
+    assert!(child_state["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("Use forked skill guidance for routing.")
+                })
+        })
+    }));
+
+    let background = client.start_turn(
+        &session_id,
+        "queue fork skill",
+        serde_json::json!({
+            "permission": "FULL",
+            "tool_call": {
+                "call_id": "call_fork_skill_bg",
+                "name": "skill",
+                "input": {"name": "forker-bg"}
+            }
+        }),
+    )?;
+    assert_eq!(background["status"], "completed");
+    let queued = background["events"]
+        .as_array()
+        .ok_or("missing background events")?
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/completed" && event["params"]["name"] == "skill"
+        })
+        .ok_or("missing background fork skill completion")?;
+    assert_eq!(queued["params"]["metadata"]["skill_context"], "fork");
+    assert_eq!(queued["params"]["metadata"]["status"], "queued");
+    assert_eq!(queued["params"]["metadata"]["background"], true);
+    let background_child_id = queued["params"]["metadata"]["session_id"]
+        .as_str()
+        .ok_or("missing background child session id")?;
+    let background_state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root
+            .join(background_child_id)
+            .join("state.latest.json"),
+    )?)?;
+    assert!(
+        background_state["metadata"]["task_status"]
+            .as_str()
+            .is_some_and(|status| matches!(status, "queued" | "running"))
+    );
+    assert_eq!(background_state["metadata"]["background"], true);
+
+    let _ = server.kill();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("Use forked skill guidance for routing."));
+    assert!(requests[0].contains("fork-child-model"));
     let _ = fs::remove_dir_all(temp);
     Ok(())
 }
@@ -5043,6 +5462,23 @@ fn temp_dir(prefix: &str) -> Result<PathBuf, Box<dyn Error>> {
     let path = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+fn read_session_event_records(
+    session_root: &std::path::Path,
+    session_id: &str,
+    run_id: &str,
+) -> Result<Vec<Value>, Box<dyn Error>> {
+    let path = session_root
+        .join(session_id)
+        .join("runs")
+        .join(run_id)
+        .join("events.jsonl");
+    let raw = fs::read_to_string(path)?;
+    raw.lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn spawn_runtime(

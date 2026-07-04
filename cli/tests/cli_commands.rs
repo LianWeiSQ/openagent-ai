@@ -6,6 +6,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
@@ -31,6 +32,80 @@ fn binary_default_smoke_prints_command_name() -> Result<(), Box<dyn Error>> {
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout)?, "openagent\n");
     assert_eq!(String::from_utf8(output.stderr)?, "");
+    Ok(())
+}
+
+#[test]
+fn binary_skills_cli_lists_shows_and_doctors_workspace_skills() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-skills-command")?;
+    let skill_dir = temp.join(".openagent/skills/rooted");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: rooted
+description: Rooted CLI command skill
+metadata:
+  audience: test
+---
+Use rooted CLI command guidance.
+"#,
+    )?;
+
+    let list = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "skills",
+            "list",
+            "--workspace",
+            path_str(&temp),
+            "--query",
+            "root",
+            "--limit",
+            "1",
+        ])
+        .output()?;
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_payload: Value = serde_json::from_slice(&list.stdout)?;
+    assert_eq!(list_payload["query"], "root");
+    assert_eq!(list_payload["skills"][0]["name"], "rooted");
+    assert_eq!(
+        list_payload["skills"][0]["description"],
+        "Rooted CLI command skill"
+    );
+
+    let show = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args(["skills", "show", "rooted", "--workspace", path_str(&temp)])
+        .output()?;
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let show_payload: Value = serde_json::from_slice(&show.stdout)?;
+    assert_eq!(show_payload["name"], "rooted");
+    assert!(
+        show_payload["rendered"]
+            .as_str()
+            .is_some_and(|rendered| rendered.contains("Use rooted CLI command guidance."))
+    );
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args(["skills", "doctor", "--workspace", path_str(&temp)])
+        .output()?;
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor_payload: Value = serde_json::from_slice(&doctor.stdout)?;
+    assert!(doctor_payload["loaded_count"].as_u64().unwrap_or_default() >= 1);
+    assert_eq!(doctor_payload["invalid_count"], 0);
+
+    let _ = fs::remove_dir_all(temp);
     Ok(())
 }
 
@@ -1253,6 +1328,10 @@ mode: subagent
 permission: READONLY
 tools:
   - read
+skills:
+  - brief
+skill_roots:
+  - shared-skills
 model: markdown-child-model
 steps: 2
 temperature: 0.31
@@ -1261,6 +1340,17 @@ reasoning_effort: medium
 color: cyan
 ---
 You are the CLI Markdown research subagent.
+"#,
+    )?;
+    let shared_skill = temp.join("shared-skills/brief");
+    fs::create_dir_all(&shared_skill)?;
+    fs::write(
+        shared_skill.join("SKILL.md"),
+        r#"---
+name: brief
+description: Brief preloaded subagent skill
+---
+Use preloaded brief guidance.
 "#,
     )?;
     fs::write(
@@ -1302,6 +1392,8 @@ Disabled prompt.
     assert_eq!(markdown["temperature"], 0.31);
     assert_eq!(markdown["top_p"], 0.73);
     assert_eq!(markdown["color"], "cyan");
+    assert_eq!(markdown["skills"], json!(["brief"]));
+    assert_eq!(markdown["skill_roots"], json!(["shared-skills"]));
     assert_eq!(markdown["model_options"]["reasoning_effort"], "medium");
     assert!(!agents.iter().any(|agent| agent["id"] == "disabled-worker"));
 
@@ -1333,7 +1425,9 @@ Disabled prompt.
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let events = String::from_utf8(output.stdout)?
+    let stdout_text = String::from_utf8(output.stdout)?;
+    assert!(!stdout_text.contains("Use preloaded brief guidance."));
+    let events = stdout_text
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<Result<Vec<_>, _>>()?;
@@ -1358,9 +1452,18 @@ Disabled prompt.
     assert!(child_state["messages"].as_array().is_some_and(|messages| {
         messages.iter().any(|message| {
             message["role"] == "system"
-                && message["content"] == "You are the CLI Markdown research subagent."
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("You are the CLI Markdown research subagent.")
+                        && content.contains("<preloaded_skills>")
+                        && content.contains("Use preloaded brief guidance.")
+                })
         })
     }));
+    assert_eq!(child_state["metadata"]["skills"], json!(["brief"]));
+    assert_eq!(
+        child_state["metadata"]["preloaded_skills"],
+        json!(["brief"])
+    );
     assert_eq!(child_state["metadata"]["temperature"], 0.31);
     assert_eq!(child_state["metadata"]["top_p"], 0.73);
     assert_eq!(
@@ -2009,6 +2112,321 @@ fn binary_run_discovers_and_executes_stdio_mcp_tool() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn binary_agent_profile_skill_config_public_and_not_provider_options() -> Result<(), Box<dyn Error>>
+{
+    let temp = temp_dir("openagent-cli-agent-skill-config")?;
+    let agent_dir = temp.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("skillful.md"),
+        r#"---
+id: skillful
+name: Skillful
+description: Skill aware primary agent
+mode: primary
+permission:
+  skill:
+    alpha: deny
+skills: ["alpha"]
+skill_roots: ["shared-skills"]
+skill_permissions:
+  beta: allow
+tools: ["read", "skill"]
+model: gpt-skillful
+options:
+  reasoning_effort: medium
+  skill_roots: ["must-not-leak"]
+  skill_permissions:
+    leaked: deny
+---
+You are the skillful profile.
+"#,
+    )?;
+
+    let show = run_openagent(
+        [
+            "agent",
+            "show",
+            "skillful",
+            "--workspace",
+            path_str(&temp),
+            "--format",
+            "json",
+        ],
+        None,
+    )?;
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let profile: Value = serde_json::from_slice(&show.stdout)?;
+    assert_eq!(profile["skills"], json!(["alpha"]));
+    assert_eq!(profile["skill_roots"], json!(["shared-skills"]));
+    assert_eq!(profile["skill_permissions"][0]["pattern"], "alpha");
+    assert_eq!(profile["skill_permissions"][0]["action"], "deny");
+    assert_eq!(profile["skill_permissions"][1]["pattern"], "beta");
+    assert_eq!(profile["skill_permissions"][1]["action"], "allow");
+    assert_eq!(profile["model_options"]["reasoning_effort"], "medium");
+    assert!(profile["model_options"].get("skill_roots").is_none());
+    assert!(profile["model_options"].get("skill_permissions").is_none());
+
+    let shared_skill = temp.join("shared-skills/rooted");
+    fs::create_dir_all(&shared_skill)?;
+    fs::write(
+        shared_skill.join("SKILL.md"),
+        r#"---
+name: rooted
+description: Rooted skill from profile roots
+---
+Use the rooted skill guidance.
+"#,
+    )?;
+    let denied_skill = temp.join("shared-skills/alpha");
+    fs::create_dir_all(&denied_skill)?;
+    fs::write(
+        denied_skill.join("SKILL.md"),
+        r#"---
+name: alpha
+description: Alpha skill should be hidden by permission
+---
+Do not expose alpha guidance.
+"#,
+    )?;
+
+    let (port, server, requests) = serve_http_capture_once_on_free_port(
+        "application/json",
+        json!({
+            "id": "resp_skill_config",
+            "output_text": "profile answer",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string(),
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&temp.join("sessions")),
+            "--agent",
+            "skillful",
+            "--format",
+            "json",
+            "hello",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
+        .env("OPENAI_WIRE_API", "responses")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server
+        .join()
+        .expect("provider server thread")
+        .expect("provider response");
+    let request = requests
+        .lock()
+        .expect("captured provider requests")
+        .first()
+        .cloned()
+        .ok_or("missing provider request")?;
+    assert!(request.contains("\"reasoning_effort\":\"medium\""));
+    assert!(request.contains("<available_skills>"));
+    assert!(request.contains("<name>rooted</name>"));
+    assert!(request.contains("Rooted skill from profile roots"));
+    assert!(!request.contains("<name>alpha</name>"));
+    assert!(!request.contains("Alpha skill should be hidden by permission"));
+    assert!(!request.contains("skill_roots"));
+    assert!(!request.contains("skill_permissions"));
+    assert!(!request.contains("must-not-leak"));
+
+    let skill_run = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&temp.join("skill-sessions")),
+            "--agent",
+            "skillful",
+            "--format",
+            "json",
+            "load rooted skill",
+        ])
+        .env_clear()
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_skill_list","name":"skill","input":{"query":"root"}},{"call_id":"call_skill","name":"skill","input":{"name":"rooted"}}]"#,
+        )
+        .env("OPENAGENT_MOCK_ANSWER", "loaded rooted skill")
+        .output()?;
+    assert!(
+        skill_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&skill_run.stderr)
+    );
+    let skill_events = String::from_utf8(skill_run.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(skill_events.iter().any(|event| {
+        event["method"] == "item/toolCall/completed"
+            && event["params"]["name"] == "skill"
+            && event["params"]["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("Use the rooted skill guidance."))
+    }));
+    let completed = skill_events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .ok_or("missing completed event")?;
+    let session_id = completed["params"]["session_id"]
+        .as_str()
+        .ok_or("missing session id")?;
+    let run_id = completed["params"]["run_id"]
+        .as_str()
+        .ok_or("missing run id")?;
+    let session_events =
+        read_session_event_records(&temp.join("skill-sessions"), session_id, run_id)?;
+    assert!(session_events.iter().any(|event| {
+        event["event"] == "skill.discovered"
+            && event["kind"] == "skill"
+            && event["attributes"]["query"] == "root"
+            && event["attributes"]["skill_count"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+    }));
+    assert!(session_events.iter().any(|event| {
+        event["event"] == "skill.loaded"
+            && event["kind"] == "skill"
+            && event["attributes"]["skill_name"] == "rooted"
+            && event["attributes"]["skill_dir"]
+                .as_str()
+                .is_some_and(|dir| dir.ends_with("shared-skills/rooted"))
+            && event["attributes"]["skill_files"].as_array().is_some()
+    }));
+
+    let denied_skill_run = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&temp.join("denied-skill-sessions")),
+            "--agent",
+            "skillful",
+            "--format",
+            "json",
+            "load alpha skill",
+        ])
+        .env_clear()
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_skill_alpha","name":"skill","input":{"name":"alpha"}}]"#,
+        )
+        .env("OPENAGENT_MOCK_ANSWER", "alpha should not load")
+        .output()?;
+    assert!(
+        denied_skill_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&denied_skill_run.stderr)
+    );
+    let denied_skill_events = String::from_utf8(denied_skill_run.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let failed_skill = denied_skill_events
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/failed" && event["params"]["name"] == "skill"
+        })
+        .ok_or("missing denied skill event")?;
+    assert_eq!(
+        failed_skill["params"]["metadata"]["permission_action"],
+        "deny"
+    );
+    assert_eq!(
+        failed_skill["params"]["metadata"]["error_kind"],
+        "permission_denied"
+    );
+
+    fs::write(
+        agent_dir.join("noskill.md"),
+        r#"---
+id: noskill
+name: No Skill
+description: Agent without skill tool
+mode: primary
+tools: ["read"]
+skill_roots: ["shared-skills"]
+---
+You cannot load skills.
+"#,
+    )?;
+    let (no_skill_port, no_skill_server, no_skill_requests) = serve_http_capture_once_on_free_port(
+        "application/json",
+        json!({
+            "id": "resp_no_skill",
+            "output_text": "no skill answer",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string(),
+    )?;
+    let no_skill_output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&temp.join("no-skill-sessions")),
+            "--agent",
+            "noskill",
+            "--format",
+            "json",
+            "hello without skills",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env(
+            "OPENAI_BASE_URL",
+            format!("http://127.0.0.1:{no_skill_port}"),
+        )
+        .env("OPENAI_WIRE_API", "responses")
+        .output()?;
+    assert!(
+        no_skill_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&no_skill_output.stderr)
+    );
+    no_skill_server
+        .join()
+        .expect("no-skill provider server thread")
+        .expect("no-skill provider response");
+    let no_skill_request = no_skill_requests
+        .lock()
+        .expect("captured no-skill provider requests")
+        .first()
+        .cloned()
+        .ok_or("missing no-skill provider request")?;
+    assert!(!no_skill_request.contains("<available_skills>"));
+    assert!(!no_skill_request.contains("Rooted skill from profile roots"));
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn binary_run_command_and_agent_profile_affect_real_run_state() -> Result<(), Box<dyn Error>> {
     let temp = temp_dir("openagent-cli-command-agent")?;
     let command_dir = temp.join(".openagent/commands");
@@ -2620,6 +3038,34 @@ fn serve_http_responses_on_free_port(
     Ok((port, server))
 }
 
+fn serve_http_capture_once_on_free_port(
+    content_type: &str,
+    body: String,
+) -> Result<(u16, MockServer, Arc<Mutex<Vec<String>>>), Box<dyn Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let content_type = content_type.to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+        let request = read_http_request_body(&mut stream)?;
+        captured
+            .lock()
+            .map_err(|error| error.to_string())?
+            .push(request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .map_err(|error| error.to_string())
+    });
+    Ok((port, server, requests))
+}
+
 fn serve_dripping_sse_provider() -> Result<(u16, MockServer), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -2844,4 +3290,21 @@ fn temp_dir(prefix: &str) -> Result<PathBuf, Box<dyn Error>> {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().unwrap_or("")
+}
+
+fn read_session_event_records(
+    session_root: &Path,
+    session_id: &str,
+    run_id: &str,
+) -> Result<Vec<Value>, Box<dyn Error>> {
+    let path = session_root
+        .join(session_id)
+        .join("runs")
+        .join(run_id)
+        .join("events.jsonl");
+    let raw = fs::read_to_string(path)?;
+    raw.lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }

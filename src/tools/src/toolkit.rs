@@ -12,7 +12,9 @@ use std::{
 };
 
 use openagent_core::{
-    PermissionManager, SkillDiscoveryReport, SkillRegistry, pattern_for, render_skill_document,
+    PermissionManager, SkillDiscoveryReport, SkillDocument, SkillInfo, SkillRegistry,
+    SkillRegistryOptions, pattern_for, render_skill_document, skill_display_description,
+    skill_document_model_invocable, skill_info_model_invocable,
 };
 use openagent_protocol::{
     PermissionAction, PermissionRuleset, ToolConcurrency, ToolExecutionSchema, ToolExecutionScope,
@@ -187,6 +189,20 @@ pub struct TaskPermissionRule {
     pub action: PermissionAction,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SkillPermissionRule {
+    pub pattern: String,
+    pub action: PermissionAction,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ForkSkillTask {
+    pub skill_name: String,
+    pub agent: String,
+    pub background: bool,
+    pub task_input: Value,
+}
+
 #[must_use]
 pub fn task_subagent_permission_action(
     rules: &[TaskPermissionRule],
@@ -209,7 +225,33 @@ pub fn task_subagent_is_visible(rules: &[TaskPermissionRule], subagent_id: &str)
     )
 }
 
+#[must_use]
+pub fn skill_permission_action(
+    rules: &[SkillPermissionRule],
+    skill_name: &str,
+) -> Option<PermissionAction> {
+    let mut matched = None;
+    for rule in rules {
+        if pattern_permission_matches(&rule.pattern, skill_name) {
+            matched = Some(rule.action.clone());
+        }
+    }
+    matched
+}
+
+#[must_use]
+pub fn skill_is_visible(rules: &[SkillPermissionRule], skill_name: &str) -> bool {
+    !matches!(
+        skill_permission_action(rules, skill_name),
+        Some(PermissionAction::Deny)
+    )
+}
+
 fn task_permission_pattern_matches(pattern: &str, value: &str) -> bool {
+    pattern_permission_matches(pattern, value)
+}
+
+fn pattern_permission_matches(pattern: &str, value: &str) -> bool {
     let pattern = pattern.trim();
     if pattern == "*" || pattern == value {
         return true;
@@ -614,6 +656,12 @@ impl ToolContext {
         let mut manager = PermissionManager::new();
         manager.set_ruleset(ruleset);
         self.permission_manager = Some(manager);
+        self
+    }
+
+    #[must_use]
+    pub fn with_agent_options(mut self, options: BTreeMap<String, Value>) -> Self {
+        self.agent_options = options;
         self
     }
 
@@ -1123,6 +1171,9 @@ fn permission_gate(
     call_id: &str,
     ctx: &ToolContext,
 ) -> Option<ToolResult> {
+    if let Some(result) = skill_tool_restriction_gate(tool, input, call_id, ctx) {
+        return Some(result);
+    }
     let manager = ctx.permission_manager.as_ref()?;
     let tool_call = json!({"name": tool.id, "input": input});
     match manager.decide(&tool_call) {
@@ -1206,6 +1257,107 @@ fn permission_action_name(action: &PermissionAction) -> &'static str {
         PermissionAction::Allow => "allow",
         PermissionAction::Deny => "deny",
         PermissionAction::Ask => "ask",
+    }
+}
+
+fn skill_tool_restriction_gate(
+    tool: &ToolDefinition,
+    input: &Value,
+    call_id: &str,
+    ctx: &ToolContext,
+) -> Option<ToolResult> {
+    if tool.id == "skill" {
+        return None;
+    }
+    let disallowed = skill_tool_patterns_from_options(ctx, "skill_disallowed_tools");
+    if disallowed
+        .iter()
+        .any(|pattern| skill_tool_pattern_matches(pattern, &tool.id))
+    {
+        return Some(skill_restriction_tool_result(
+            tool,
+            input,
+            call_id,
+            "Tool disallowed by loaded skill",
+            disallowed,
+        ));
+    }
+    let allowed = skill_tool_patterns_from_options(ctx, "skill_allowed_tools");
+    if !allowed.is_empty()
+        && !allowed
+            .iter()
+            .any(|pattern| skill_tool_pattern_matches(pattern, &tool.id))
+    {
+        return Some(skill_restriction_tool_result(
+            tool,
+            input,
+            call_id,
+            "Tool not allowed by loaded skill",
+            allowed,
+        ));
+    }
+    None
+}
+
+fn skill_tool_patterns_from_options(ctx: &ToolContext, key: &str) -> Vec<String> {
+    let Some(value) = ctx.agent_options.get(key) else {
+        return Vec::new();
+    };
+    if let Some(raw) = value.as_str() {
+        return split_skill_list(raw);
+    }
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str())
+        .flat_map(split_skill_list)
+        .collect()
+}
+
+fn skill_tool_pattern_matches(pattern: &str, tool_id: &str) -> bool {
+    let pattern = pattern
+        .trim()
+        .split_once('(')
+        .map(|(tool, _args)| tool)
+        .unwrap_or(pattern)
+        .trim();
+    if pattern == "*" {
+        return true;
+    }
+    let lowered = pattern.to_ascii_lowercase();
+    let normalized = match lowered.as_str() {
+        "bash" => "bash",
+        "read" => "read",
+        "write" => "write",
+        "edit" => "edit",
+        "glob" => "glob",
+        "grep" => "grep",
+        "skill" => "skill",
+        other => other,
+    };
+    normalized == tool_id
+        || (normalized.ends_with('*') && tool_id.starts_with(normalized.trim_end_matches('*')))
+}
+
+fn skill_restriction_tool_result(
+    tool: &ToolDefinition,
+    input: &Value,
+    call_id: &str,
+    message: &'static str,
+    patterns: Vec<String>,
+) -> ToolResult {
+    ToolResult {
+        call_id: call_id.to_string(),
+        output: String::new(),
+        error: Some(format!("{message}: {}", tool.id)),
+        metadata: BTreeMap::from([
+            ("tool".to_string(), json!(tool.id)),
+            ("error_kind".to_string(), json!("skill_tool_restricted")),
+            ("skill_tool_patterns".to_string(), json!(patterns)),
+            ("call_id".to_string(), json!(call_id)),
+            ("input".to_string(), input.clone()),
+        ]),
     }
 }
 
@@ -1299,6 +1451,9 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
             &[
                 "name",
                 "query",
+                "path",
+                "paths",
+                "arguments",
                 "limit",
                 "include_content",
                 "include_diagnostics",
@@ -1759,17 +1914,25 @@ fn skill_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
     let limit = optional_usize_arg(&input, "limit")?.filter(|value| *value > 0);
     let include_content = bool_arg(&input, "include_content", false)?;
     let include_diagnostics = bool_arg(&input, "include_diagnostics", false)?;
-    let registry = SkillRegistry::new(
+    let requested_paths = skill_requested_paths(&input)?;
+    let registry = SkillRegistry::new_with_options(
         Some(ctx.session_root.clone()),
         skill_roots(ctx),
         Option::<PathBuf>::None,
+        SkillRegistryOptions {
+            include_builtin_skills: builtin_skills_enabled(ctx),
+        },
     );
 
     if requested_name.is_empty() {
-        let report = registry.report(
+        let mut report = registry.report(
             (!requested_query.is_empty()).then_some(requested_query.as_str()),
             limit,
         );
+        report.skills.retain(|skill| {
+            skill_info_model_invocable(skill)
+                && skill_matches_requested_paths(skill, &requested_paths)
+        });
         let mut lines = if report.skills.is_empty() {
             if requested_query.is_empty() {
                 vec!["No skills available.".to_string()]
@@ -1789,7 +1952,9 @@ fn skill_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
                     .unwrap_or_default();
                 lines.push(format!(
                     "- `{}`:{} {}",
-                    skill.name, score, skill.description
+                    skill.name,
+                    score,
+                    skill_display_description(skill)
                 ));
                 if include_content && let Some(document) = registry.get(&skill.name) {
                     lines.push(render_skill_document(&document, false));
@@ -1814,6 +1979,13 @@ fn skill_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
         } else {
             registry.search(&requested_query, limit)
         };
+        let skills = skills
+            .into_iter()
+            .filter(|skill| {
+                skill_info_model_invocable(skill)
+                    && skill_matches_requested_paths(skill, &requested_paths)
+            })
+            .collect::<Vec<_>>();
         let available = if skills.is_empty() {
             "none".to_string()
         } else {
@@ -1827,11 +1999,24 @@ fn skill_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
             "Skill \"{requested_name}\" not found. Available skills: {available}"
         ));
     };
+    if !skill_document_model_invocable(&document) {
+        return Err(format!(
+            "Skill \"{requested_name}\" is disabled for model invocation"
+        ));
+    }
+    if !skill_document_matches_requested_paths(&document, &requested_paths) {
+        return Err(format!(
+            "Skill \"{requested_name}\" does not match requested path scope"
+        ));
+    }
 
     let report = registry.report(None, None);
+    let sampled_files = sampled_skill_files(&document.directory, 20);
+    apply_loaded_skill_tool_restrictions(&document, ctx);
+    let rendered_content = apply_skill_arguments(&document.content, input.get("arguments"));
     let mut output = ToolOutput::new(
         format!("Loaded skill: {}", document.name),
-        render_skill_document(&document, true),
+        render_loaded_skill_document_v2(&document, &sampled_files, &rendered_content),
     );
     output
         .metadata
@@ -1842,6 +2027,18 @@ fn skill_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
     output
         .metadata
         .insert("skill_dir".to_string(), json!(document.directory));
+    output
+        .metadata
+        .insert("skill_files".to_string(), json!(sampled_files.files));
+    output.metadata.insert(
+        "skill_files_truncated".to_string(),
+        json!(sampled_files.truncated),
+    );
+    if let Some(arguments) = input.get("arguments") {
+        output
+            .metadata
+            .insert("skill_arguments".to_string(), arguments.clone());
+    }
     output
         .metadata
         .insert("skill_count".to_string(), json!(report.loaded_count));
@@ -1855,6 +2052,378 @@ fn skill_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
         .metadata
         .insert("duplicate_count".to_string(), json!(report.duplicate_count));
     Ok(output)
+}
+
+#[derive(Clone, Debug, Default)]
+struct SampledSkillFiles {
+    files: Vec<String>,
+    truncated: bool,
+}
+
+fn render_loaded_skill_document_v2(
+    document: &SkillDocument,
+    sampled_files: &SampledSkillFiles,
+    content: &str,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "<skill_content name=\"{}\">",
+            xml_escape_text(&document.name)
+        ),
+        format!(
+            "  <base_directory>{}</base_directory>",
+            xml_escape_text(&document.directory)
+        ),
+        format!(
+            "  <skill_files sampled=\"{}\" truncated=\"{}\">",
+            sampled_files.files.len(),
+            sampled_files.truncated
+        ),
+    ];
+    for file in &sampled_files.files {
+        lines.push(format!("    <file>{}</file>", xml_escape_text(file)));
+    }
+    lines.extend([
+        "  </skill_files>".to_string(),
+        "  <content>".to_string(),
+        content.trim().to_string(),
+        "  </content>".to_string(),
+        "</skill_content>".to_string(),
+    ]);
+    lines.join("\n").trim().to_string()
+}
+
+fn skill_requested_paths(input: &Value) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    if let Some(path) = optional_string_arg(input, "path")?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        paths.push(path);
+    }
+    if let Some(value) = input.get("paths") {
+        if let Some(path) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            paths.push(path.to_string());
+        } else if let Some(items) = value.as_array() {
+            for item in items {
+                if let Some(path) = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    paths.push(path.to_string());
+                }
+            }
+        } else {
+            return Err("skill paths must be a string or array of strings".to_string());
+        }
+    }
+    Ok(paths)
+}
+
+fn skill_matches_requested_paths(skill: &SkillInfo, requested_paths: &[String]) -> bool {
+    skill_metadata_matches_requested_paths(&skill.metadata, requested_paths)
+}
+
+fn skill_document_matches_requested_paths(
+    skill: &SkillDocument,
+    requested_paths: &[String],
+) -> bool {
+    skill_metadata_matches_requested_paths(&skill.metadata, requested_paths)
+}
+
+fn skill_metadata_matches_requested_paths(
+    metadata: &BTreeMap<String, Value>,
+    requested_paths: &[String],
+) -> bool {
+    if requested_paths.is_empty() {
+        return true;
+    }
+    let patterns = skill_metadata_string_list(metadata, &["paths", "path"]);
+    if patterns.is_empty() {
+        return true;
+    }
+    requested_paths.iter().any(|path| {
+        let normalized = path.replace('\\', "/");
+        let name = Path::new(&normalized)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or(normalized.as_str());
+        patterns
+            .iter()
+            .any(|pattern| matches_glob(&pattern.replace('\\', "/"), &normalized, name))
+    })
+}
+
+fn skill_metadata_string_list(metadata: &BTreeMap<String, Value>, keys: &[&str]) -> Vec<String> {
+    let mut values = Vec::new();
+    for key in keys {
+        let Some(value) = metadata.get(*key) else {
+            continue;
+        };
+        if let Some(raw) = value.as_str() {
+            values.extend(split_skill_list(raw));
+        } else if let Some(items) = value.as_array() {
+            for item in items {
+                if let Some(raw) = item.as_str() {
+                    values.extend(split_skill_list(raw));
+                }
+            }
+        }
+    }
+    values
+}
+
+fn split_skill_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn apply_skill_arguments(content: &str, arguments: Option<&Value>) -> String {
+    let Some(arguments) = arguments else {
+        return content.to_string();
+    };
+    let argument_text = match arguments {
+        Value::String(value) => value.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    let mut rendered = content
+        .replace("$ARGUMENTS", &argument_text)
+        .replace("{{arguments}}", &argument_text)
+        .replace("{{ arguments }}", &argument_text);
+    if let Some(object) = arguments.as_object() {
+        for (key, value) in object {
+            let replacement = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default());
+            let pattern = format!(r"\{{\{{\s*{}\s*\}}\}}", regex::escape(key));
+            if let Ok(regex) = Regex::new(&pattern) {
+                rendered = regex
+                    .replace_all(&rendered, replacement.as_str())
+                    .to_string();
+            }
+        }
+    }
+    rendered
+}
+
+fn apply_loaded_skill_tool_restrictions(document: &SkillDocument, ctx: &mut ToolContext) {
+    let allowed = skill_metadata_string_list(
+        &document.metadata,
+        &["allowed-tools", "allowed_tools", "allowed_tools"],
+    );
+    let disallowed = skill_metadata_string_list(
+        &document.metadata,
+        &["disallowed-tools", "disallowed_tools"],
+    );
+    if !allowed.is_empty() {
+        ctx.agent_options
+            .insert("skill_allowed_tools".to_string(), json!(allowed));
+    }
+    if !disallowed.is_empty() {
+        ctx.agent_options
+            .insert("skill_disallowed_tools".to_string(), json!(disallowed));
+    }
+}
+
+pub fn fork_skill_task_from_input(
+    input: &Value,
+    ctx: &ToolContext,
+) -> Result<Option<ForkSkillTask>, String> {
+    let requested_name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(requested_name) = requested_name else {
+        return Ok(None);
+    };
+    let registry = SkillRegistry::new_with_options(
+        Some(ctx.session_root.clone()),
+        skill_roots(ctx),
+        Option::<PathBuf>::None,
+        SkillRegistryOptions {
+            include_builtin_skills: builtin_skills_enabled(ctx),
+        },
+    );
+    let Some(document) = registry.get(requested_name) else {
+        return Ok(None);
+    };
+    let context = skill_metadata_string(&document.metadata, &["context"]).unwrap_or_default();
+    if !context
+        .split(['+', ',', ' '])
+        .any(|part| part.trim().eq_ignore_ascii_case("fork"))
+    {
+        return Ok(None);
+    }
+    if !skill_document_model_invocable(&document) {
+        return Err(format!(
+            "Skill \"{requested_name}\" is disabled for model invocation"
+        ));
+    }
+    let requested_paths = skill_requested_paths(input)?;
+    if !skill_document_matches_requested_paths(&document, &requested_paths) {
+        return Err(format!(
+            "Skill \"{requested_name}\" does not match requested path scope"
+        ));
+    }
+    let agent = skill_metadata_string(
+        &document.metadata,
+        &["agent", "subagent", "subagent_type", "agent_type"],
+    )
+    .ok_or_else(|| format!("Fork skill \"{requested_name}\" requires an agent"))?;
+    let background = input
+        .get("background")
+        .and_then(Value::as_bool)
+        .or_else(|| skill_metadata_bool(&document.metadata, &["background"]))
+        .unwrap_or(false);
+    let rendered_content = apply_skill_arguments(&document.content, input.get("arguments"));
+    let sampled_files = sampled_skill_files(&document.directory, 20);
+    let skill_block = render_loaded_skill_document_v2(&document, &sampled_files, &rendered_content);
+    let prompt = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "Run forked skill `{}` in an isolated subagent context.\n\n{}",
+                document.name, skill_block
+            )
+        });
+    let task_input = json!({
+        "description": input
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(document.description.as_str()),
+        "prompt": prompt,
+        "subagent_type": agent,
+        "background": background,
+        "skill_name": document.name,
+        "skill_context": "fork",
+    });
+    Ok(Some(ForkSkillTask {
+        skill_name: document.name,
+        agent,
+        background,
+        task_input,
+    }))
+}
+
+fn skill_metadata_string(metadata: &BTreeMap<String, Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = metadata
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn skill_metadata_bool(metadata: &BTreeMap<String, Value>, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        let Some(value) = metadata.get(*key) else {
+            continue;
+        };
+        if let Some(value) = value.as_bool() {
+            return Some(value);
+        }
+        if let Some(raw) = value.as_str() {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "1" | "on" => return Some(true),
+                "false" | "no" | "0" | "off" => return Some(false),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn sampled_skill_files(skill_dir: &str, limit: usize) -> SampledSkillFiles {
+    let base = PathBuf::from(skill_dir);
+    let Ok(base) = fs::canonicalize(&base) else {
+        return SampledSkillFiles::default();
+    };
+    let mut sampled = SampledSkillFiles::default();
+    sample_skill_files_from_dir(&base, &base, 0, limit, &mut sampled);
+    sampled
+}
+
+fn sample_skill_files_from_dir(
+    base: &Path,
+    dir: &Path,
+    depth: usize,
+    limit: usize,
+    sampled: &mut SampledSkillFiles,
+) {
+    if sampled.files.len() >= limit || depth > 4 {
+        sampled.truncated = true;
+        return;
+    }
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        if sampled.files.len() >= limit {
+            sampled.truncated = true;
+            break;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let Ok(canonical) = fs::canonicalize(&path) else {
+                continue;
+            };
+            if canonical.starts_with(base) {
+                sample_skill_files_from_dir(base, &canonical, depth + 1, limit, sampled);
+            }
+            continue;
+        }
+        if !file_type.is_file() || path.file_name() == Some(OsStr::new("SKILL.md")) {
+            continue;
+        }
+        let Ok(canonical) = fs::canonicalize(&path) else {
+            continue;
+        };
+        if !canonical.starts_with(base) {
+            continue;
+        }
+        if let Ok(relative) = canonical.strip_prefix(base) {
+            sampled
+                .files
+                .push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
+fn xml_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn web_fetch_tool(input: Value) -> ToolResultValue<ToolOutput> {
@@ -2639,6 +3208,28 @@ fn skill_roots(ctx: &ToolContext) -> Option<Vec<String>> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     (!roots.is_empty()).then_some(roots)
+}
+
+fn builtin_skills_enabled(ctx: &ToolContext) -> bool {
+    for key in ["builtin_skills", "include_builtin_skills"] {
+        if let Some(enabled) = ctx.agent_options.get(key).and_then(Value::as_bool) {
+            return enabled;
+        }
+        if let Some(raw) = ctx.agent_options.get(key).and_then(Value::as_str) {
+            return !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "disabled"
+            );
+        }
+    }
+    std::env::var("OPENAGENT_BUILTIN_SKILLS")
+        .ok()
+        .is_none_or(|raw| {
+            !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "disabled"
+            )
+        })
 }
 
 fn report_metadata(

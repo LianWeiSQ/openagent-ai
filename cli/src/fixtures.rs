@@ -307,6 +307,54 @@ pub fn mcp_doctor_payload() -> Value {
 }
 
 #[must_use]
+pub fn skills_list_payload() -> Value {
+    json!({
+        "skills": [skill_info_fixture()],
+        "query": "root",
+        "loaded_count": 1,
+        "scanned_files": 1,
+        "invalid_count": 0,
+        "duplicate_count": 0,
+    })
+}
+
+#[must_use]
+pub fn skills_show_payload() -> Value {
+    json!({
+        "name": "rooted",
+        "description": "Rooted fixture skill",
+        "location": format!("{GOAL10_WORKSPACE}/.openagent/skills/rooted/SKILL.md"),
+        "directory": format!("{GOAL10_WORKSPACE}/.openagent/skills/rooted"),
+        "metadata": {"audience": "fixture"},
+        "content": "Use rooted fixture guidance.",
+        "rendered": "# Skill: rooted\n\nUse rooted fixture guidance.",
+    })
+}
+
+#[must_use]
+pub fn skills_doctor_payload() -> Value {
+    json!({
+        "loaded_count": 1,
+        "scanned_files": 1,
+        "invalid_count": 0,
+        "duplicate_count": 0,
+        "skills": [skill_info_fixture()],
+        "issues": [],
+    })
+}
+
+fn skill_info_fixture() -> Value {
+    json!({
+        "name": "rooted",
+        "description": "Rooted fixture skill",
+        "location": format!("{GOAL10_WORKSPACE}/.openagent/skills/rooted/SKILL.md"),
+        "directory": format!("{GOAL10_WORKSPACE}/.openagent/skills/rooted"),
+        "metadata": {"audience": "fixture"},
+        "score": 13,
+    })
+}
+
+#[must_use]
 pub fn cli_commands_fixture() -> Value {
     json!({
         "schema_version": 1,
@@ -358,6 +406,11 @@ pub fn cli_commands_fixture() -> Value {
             "add": run_result_json(&CliRunResult::ok_json(&mcp_add_payload()), Some(mcp_add_payload())),
             "list_table": run_result_json(&mcp_list_table_result(), None),
             "doctor": run_result_json(&CliRunResult::ok_json(&mcp_doctor_payload()), Some(mcp_doctor_payload())),
+        },
+        "skills_cli": {
+            "list": run_result_json(&CliRunResult::ok_json(&skills_list_payload()), Some(skills_list_payload())),
+            "show": run_result_json(&CliRunResult::ok_json(&skills_show_payload()), Some(skills_show_payload())),
+            "doctor": run_result_json(&CliRunResult::ok_json(&skills_doctor_payload()), Some(skills_doctor_payload())),
         },
     })
 }

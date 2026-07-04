@@ -91,6 +91,7 @@ pub(super) fn run_agent_loop(
     let tools = filter_tools_for_agent(toolkit.get_all_tools("local"), agent_profile);
     let mut ctx = ToolContext::new(workspace)
         .with_session_id(session.id.clone())
+        .with_agent_options(agent_tool_options(agent_profile))
         .with_permission_manager(permission_manager_for_agent(
             permission_ruleset.clone(),
             agent_profile,
@@ -319,9 +320,7 @@ pub(super) fn run_agent_loop(
         let assistant_index = session.messages.len() as u64;
         let assistant_message_id = cli_message_id(assistant_index);
         record_step_started(store, &session.id, run_id, step, None);
-        let provider_messages = store
-            .materialized_chat_messages(session)
-            .unwrap_or_else(|_| session.messages.clone());
+        let provider_messages = session.messages.clone();
         let mut on_provider_stream = |event: &ProviderStreamEvent| {
             if let ProviderStreamEvent::TextDelta { text } = event
                 && !text.is_empty()
@@ -743,6 +742,14 @@ pub(super) fn run_agent_loop(
                 }),
                 event_sink,
             );
+            record_skill_tool_session_event(
+                store,
+                &session.id,
+                run_id,
+                step,
+                &tool_call,
+                &tool_result,
+            );
             let _ = store.record_event(
                 &session.id,
                 run_id,
@@ -944,6 +951,49 @@ fn execute_loop_tool_call(
     ctx: &mut ToolContext,
     task_context: TaskExecutionContext<'_>,
 ) -> ToolResult {
+    if tool_call.name == "skill" {
+        if let Some(result) =
+            toolkit.permission_result_for_tool("skill", &tool_call.input, &tool_call.call_id, ctx)
+        {
+            return result;
+        }
+        match fork_skill_task_from_input(&tool_call.input, ctx) {
+            Ok(Some(fork)) => {
+                let task_call = ToolCall {
+                    call_id: tool_call.call_id.clone(),
+                    name: TASK_TOOL_ID.to_string(),
+                    input: fork.task_input,
+                };
+                let mut result = execute_task_tool_call(toolkit, &task_call, ctx, task_context);
+                result
+                    .metadata
+                    .insert("skill_context".to_string(), json!("fork"));
+                result
+                    .metadata
+                    .insert("skill_name".to_string(), json!(fork.skill_name));
+                result
+                    .metadata
+                    .insert("skill_agent".to_string(), json!(fork.agent));
+                result
+                    .metadata
+                    .insert("background".to_string(), json!(fork.background));
+                return result;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return ToolResult {
+                    call_id: tool_call.call_id.clone(),
+                    output: String::new(),
+                    error: Some(error),
+                    metadata: BTreeMap::from([
+                        ("tool".to_string(), json!("skill")),
+                        ("error_kind".to_string(), json!("fork_skill_error")),
+                        ("call_id".to_string(), json!(tool_call.call_id.clone())),
+                    ]),
+                };
+            }
+        }
+    }
     if tool_call.name == TASK_TOOL_ID {
         execute_task_tool_call(toolkit, tool_call, ctx, task_context)
     } else {
@@ -1744,6 +1794,14 @@ fn append_tool_result_to_session(
         }),
         context.event_sink,
     );
+    record_skill_tool_session_event(
+        context.store,
+        &context.session.id,
+        context.run_id,
+        step,
+        tool_call,
+        &tool_result,
+    );
     let _ = context.store.record_event(
         &context.session.id,
         context.run_id,
@@ -1819,6 +1877,72 @@ fn append_tool_result_to_session(
         .store
         .append_message(context.session, &tool_message, context.run_id, tool_index)
         .map_err(|error| format!("failed to record resumed tool message: {error}"))
+}
+
+fn record_skill_tool_session_event(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    step: u64,
+    tool_call: &ToolCall,
+    tool_result: &ToolResult,
+) {
+    if tool_call.name != "skill" || tool_result.error.is_some() {
+        return;
+    }
+    let mut attributes = BTreeMap::from([
+        ("call_id".to_string(), json!(tool_call.call_id.clone())),
+        ("name".to_string(), json!(tool_call.name.clone())),
+        ("input".to_string(), tool_call.input.clone()),
+        ("step".to_string(), json!(step)),
+        ("metadata".to_string(), json!(tool_result.metadata.clone())),
+    ]);
+    for key in [
+        "query",
+        "skill_count",
+        "loaded_count",
+        "scanned_files",
+        "invalid_count",
+        "duplicate_count",
+    ] {
+        if let Some(value) = tool_result.metadata.get(key) {
+            attributes.insert(key.to_string(), value.clone());
+        }
+    }
+    let event = if let Some(skill_name) = tool_result
+        .metadata
+        .get("skill_name")
+        .and_then(Value::as_str)
+    {
+        attributes.insert("skill_name".to_string(), json!(skill_name));
+        for key in [
+            "skill_location",
+            "skill_dir",
+            "skill_files",
+            "skill_files_truncated",
+            "skill_arguments",
+            "skill_context",
+            "skill_agent",
+            "background",
+        ] {
+            if let Some(value) = tool_result.metadata.get(key) {
+                attributes.insert(key.to_string(), value.clone());
+            }
+        }
+        "skill.loaded"
+    } else {
+        "skill.discovered"
+    };
+    let _ = store.record_event(
+        session_id,
+        run_id,
+        event,
+        SessionEventOptions {
+            kind: "skill".to_string(),
+            attributes,
+            ..SessionEventOptions::default()
+        },
+    );
 }
 
 fn emit_run_event(

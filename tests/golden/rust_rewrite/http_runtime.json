@@ -109,10 +109,14 @@
       "auth_required": true,
       "cors_origin": "*",
       "host": "0.0.0.0",
+      "max_queued_turns_per_session": 8,
+      "max_running_turn_workers": 4,
       "mdns_name": "openagent",
       "port": 8787,
       "serve_static": false,
       "session_store_root": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace/.openagent/sessions",
+      "turn_queue_lease_stale_ms": 30000,
+      "turn_queue_timeout_ms": 1800000,
       "workspace": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace"
     },
     "health": {
@@ -150,6 +154,25 @@
         },
         "status": 404
       }
+    },
+    "skills": {
+      "duplicate_count": 0,
+      "invalid_count": 0,
+      "issues": [],
+      "loaded_count": 1,
+      "scanned_files": 1,
+      "skills": [
+        {
+          "description": "Rooted fixture skill",
+          "directory": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace/.openagent/skills/rooted",
+          "location": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace/.openagent/skills/rooted/SKILL.md",
+          "metadata": {
+            "audience": "fixture"
+          },
+          "name": "rooted",
+          "score": null
+        }
+      ]
     }
   },
   "schema_version": 1,

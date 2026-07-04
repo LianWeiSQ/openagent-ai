@@ -373,9 +373,75 @@
       "stdout": "name  enabled  transport  timeout_ms  headers               url\n----  -------  ---------  ----------  --------------------  ----------------------------------------------------------\ndemo  True     http       45000       Authorization,X-Team  https://[redacted]@example.com/mcp?token=[redacted]&safe=1\n"
     }
   },
+  "skills_cli": {
+    "doctor": {
+      "exit_code": 0,
+      "json": {
+        "duplicate_count": 0,
+        "invalid_count": 0,
+        "issues": [],
+        "loaded_count": 1,
+        "scanned_files": 1,
+        "skills": [
+          {
+            "description": "Rooted fixture skill",
+            "directory": "/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted",
+            "location": "/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted/SKILL.md",
+            "metadata": {
+              "audience": "fixture"
+            },
+            "name": "rooted",
+            "score": 13
+          }
+        ]
+      },
+      "stderr": "",
+      "stdout": "{\"duplicate_count\": 0, \"invalid_count\": 0, \"issues\": [], \"loaded_count\": 1, \"scanned_files\": 1, \"skills\": [{\"description\": \"Rooted fixture skill\", \"directory\": \"/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted\", \"location\": \"/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted/SKILL.md\", \"metadata\": {\"audience\": \"fixture\"}, \"name\": \"rooted\", \"score\": 13}]}\n"
+    },
+    "list": {
+      "exit_code": 0,
+      "json": {
+        "duplicate_count": 0,
+        "invalid_count": 0,
+        "loaded_count": 1,
+        "query": "root",
+        "scanned_files": 1,
+        "skills": [
+          {
+            "description": "Rooted fixture skill",
+            "directory": "/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted",
+            "location": "/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted/SKILL.md",
+            "metadata": {
+              "audience": "fixture"
+            },
+            "name": "rooted",
+            "score": 13
+          }
+        ]
+      },
+      "stderr": "",
+      "stdout": "{\"duplicate_count\": 0, \"invalid_count\": 0, \"loaded_count\": 1, \"query\": \"root\", \"scanned_files\": 1, \"skills\": [{\"description\": \"Rooted fixture skill\", \"directory\": \"/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted\", \"location\": \"/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted/SKILL.md\", \"metadata\": {\"audience\": \"fixture\"}, \"name\": \"rooted\", \"score\": 13}]}\n"
+    },
+    "show": {
+      "exit_code": 0,
+      "json": {
+        "content": "Use rooted fixture guidance.",
+        "description": "Rooted fixture skill",
+        "directory": "/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted",
+        "location": "/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted/SKILL.md",
+        "metadata": {
+          "audience": "fixture"
+        },
+        "name": "rooted",
+        "rendered": "# Skill: rooted\n\nUse rooted fixture guidance."
+      },
+      "stderr": "",
+      "stdout": "{\"content\": \"Use rooted fixture guidance.\", \"description\": \"Rooted fixture skill\", \"directory\": \"/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted\", \"location\": \"/tmp/openagent-rust-rewrite-fixture-goal10/workspace/.openagent/skills/rooted/SKILL.md\", \"metadata\": {\"audience\": \"fixture\"}, \"name\": \"rooted\", \"rendered\": \"# Skill: rooted\\n\\nUse rooted fixture guidance.\"}\n"
+    }
+  },
   "model_env": {
     "default": {
-      "OPENAGENT_APP_MAX_STEPS": "30",
+      "OPENAGENT_APP_MAX_STEPS": "0",
       "OPENAI_BASE_URL": "http://localhost:8080",
       "OPENAI_MODEL": "gpt-5.5",
       "OPENAI_WIRE_API": "responses"

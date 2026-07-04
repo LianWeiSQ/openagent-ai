@@ -812,7 +812,7 @@ pub(super) fn route_dynamic_request(
             "GET" => json_response(200, get_session_payload(config, parts[2])),
             "PATCH" => match update_session_payload(config, parts[2], &request.body) {
                 Ok(payload) => json_response(200, payload),
-                Err(error) => json_response(400, json!({"error": error})),
+                Err(error) => session_mutation_error_response(error),
             },
             "DELETE" => match delete_session_payload(config, parts[2]) {
                 Ok(payload) => json_response(200, payload),
@@ -831,6 +831,9 @@ pub(super) fn route_dynamic_request(
             Ok(payload) => json_response(200, payload),
             Err(error) => json_response(400, json!({"error": error})),
         };
+    }
+    if parts.len() == 2 && parts[0] == "api" && parts[1] == "skills" && request.method == "GET" {
+        return json_response(200, skills_payload(config));
     }
     if parts.len() == 3
         && parts[0] == "api"
@@ -1064,6 +1067,23 @@ pub(super) fn route_dynamic_request(
         };
     }
     route_unknown()
+}
+
+fn session_mutation_error_response(error: String) -> HttpResponseSpec {
+    let normalized = error.to_lowercase();
+    if normalized == "session_not_found"
+        || normalized.contains("session state not found")
+        || normalized.contains("no such file or directory")
+    {
+        return json_response(
+            404,
+            json!({
+                "code": "session_not_found",
+                "error": "session not found",
+            }),
+        );
+    }
+    json_response(400, json!({"error": error}))
 }
 
 pub(super) fn authorized(request: &HttpRequest, config: &HttpRuntimeConfig) -> bool {

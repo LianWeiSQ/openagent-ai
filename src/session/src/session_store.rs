@@ -3519,8 +3519,38 @@ fn apply_compaction_boundaries(messages: &mut Vec<MessageWithParts>) {
         })
         .unwrap_or_else(|| boundary_index.saturating_sub(1));
     if cutoff_index < messages.len() {
-        *messages = messages.split_off(cutoff_index + 1);
+        let mut protected = messages[..=cutoff_index]
+            .iter()
+            .filter(|message| message_contains_loaded_skill_output(message))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut tail = messages.split_off(cutoff_index + 1);
+        if protected.is_empty() {
+            *messages = tail;
+        } else {
+            protected.append(&mut tail);
+            *messages = protected;
+            normalize_message_lineage(messages);
+        }
     }
+}
+
+fn message_contains_loaded_skill_output(message: &MessageWithParts) -> bool {
+    message.parts.iter().any(|part| {
+        if part.kind != MessagePartKind::Tool {
+            return false;
+        }
+        part.content
+            .get("metadata")
+            .and_then(|metadata| metadata.get("skill_name"))
+            .and_then(Value::as_str)
+            .is_some()
+            || part
+                .attributes
+                .get("skill_name")
+                .and_then(Value::as_str)
+                .is_some()
+    })
 }
 
 fn mark_incomplete_tool_parts_interrupted(messages: &mut [MessageWithParts]) {

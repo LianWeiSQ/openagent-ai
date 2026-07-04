@@ -8,7 +8,7 @@ use std::{
 use openagent_core::{
     ContextItem, ContextPackBuildOptions, ContextPackBuilder, ContextPackInput,
     InstructionContextLoader, InstructionLoadOptions, PermissionManager, SkillRegistry,
-    check_context_budget, estimate_text_tokens, format_context_budget_error,
+    SkillRegistryOptions, check_context_budget, estimate_text_tokens, format_context_budget_error,
     load_context_budget_options, pattern_for, permission_rule,
 };
 use openagent_protocol::{
@@ -87,7 +87,14 @@ fn instruction_loader_and_skill_registry_cover_filesystem_workflows() -> Result<
             .contains(&"truncated:OPENAGENT.md".to_string())
     );
 
-    let registry = SkillRegistry::new(Some(&workspace), None, Some(root.join("home")));
+    let registry = SkillRegistry::new_with_options(
+        Some(&workspace),
+        None,
+        Some(root.join("home")),
+        SkillRegistryOptions {
+            include_builtin_skills: false,
+        },
+    );
     let report = registry.report(Some("review"), Some(5));
     assert_eq!(report.loaded_count, 2);
     assert_eq!(report.invalid_count, 1);
@@ -96,6 +103,65 @@ fn instruction_loader_and_skill_registry_cover_filesystem_workflows() -> Result<
     assert_eq!(
         registry.search("external evidence", None)[0].name,
         "research"
+    );
+    Ok(())
+}
+
+#[test]
+fn skill_registry_discovers_builtin_skills_and_workspace_overrides() -> Result<(), Box<dyn Error>> {
+    let root = setup_goal6_fixture_named("builtin-skills")?;
+    let workspace = root.join("repo/project/workspace");
+    let empty_home = root.join("empty-home");
+    fs::create_dir_all(&empty_home)?;
+
+    let builtins = SkillRegistry::new_with_options(
+        Some(&workspace),
+        None,
+        Some(&empty_home),
+        SkillRegistryOptions {
+            include_builtin_skills: true,
+        },
+    );
+    assert!(
+        builtins
+            .get("openai-docs")
+            .is_some_and(|skill| skill.location.contains("skill/openagent"))
+    );
+
+    write_skill(
+        &workspace,
+        ".openagent/skills/openai-docs/SKILL.md",
+        "openai-docs",
+        "Workspace override for OpenAI docs",
+        "Workspace override wins.",
+    )?;
+    let overridden = SkillRegistry::new_with_options(
+        Some(&workspace),
+        None,
+        Some(&empty_home),
+        SkillRegistryOptions {
+            include_builtin_skills: true,
+        },
+    );
+    let loaded = overridden
+        .get("openai-docs")
+        .ok_or("missing overridden openai-docs skill")?;
+    assert!(loaded.location.contains(".openagent/skills/openai-docs"));
+    assert_eq!(loaded.content.trim(), "Workspace override wins.");
+
+    let disabled = SkillRegistry::new_with_options(
+        Some(&workspace),
+        None,
+        Some(&empty_home),
+        SkillRegistryOptions {
+            include_builtin_skills: false,
+        },
+    );
+    assert!(
+        disabled
+            .all()
+            .iter()
+            .all(|skill| !skill.location.contains("skill/openagent"))
     );
     Ok(())
 }
@@ -222,7 +288,14 @@ fn core_context_policy_fixture() -> Result<Value, Box<dyn Error>> {
     .load();
     let instruction_context_items = instructions.to_context_items();
 
-    let registry = SkillRegistry::new(Some(&workspace), None, Some(root.join("home")));
+    let registry = SkillRegistry::new_with_options(
+        Some(&workspace),
+        None,
+        Some(root.join("home")),
+        SkillRegistryOptions {
+            include_builtin_skills: false,
+        },
+    );
     let report = registry.report(Some("review"), Some(5));
     let loaded = registry
         .get("code-review")

@@ -737,6 +737,122 @@ fn file_session_store_compaction_boundary_skips_compacted_context() {
 }
 
 #[test]
+fn file_session_store_compaction_boundary_preserves_loaded_skill_output() {
+    let root = unique_temp_dir("openagent-compaction-boundary-skill");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_compact_skill", root.join("workspace"));
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_compact_skill".to_string(),
+                trace_id: "trace_compact_skill".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+
+    let old = ChatMessage {
+        role: Role::User,
+        content: "old context".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_skill_old"))]),
+    };
+    session.add(old.clone());
+    store
+        .append_message(&session, &old, "run_compact_skill", 0)
+        .expect("old message appends");
+
+    let mut skill_tool = ChatMessage {
+        role: Role::Tool,
+        content: "<skill_content name=\"code-review\">Use code review guidance.</skill_content>"
+            .to_string(),
+        name: Some("skill".to_string()),
+        tool_call_id: Some("call_skill".to_string()),
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_skill_loaded"))]),
+    };
+    skill_tool.metadata.insert(
+        "tool_result".to_string(),
+        json!({
+            "call_id": "call_skill",
+            "output": skill_tool.content.clone(),
+            "error": null,
+            "metadata": {
+                "skill_name": "code-review",
+                "skill_dir": "/tmp/skills/code-review",
+                "skill_files": ["/tmp/skills/code-review/references/checklist.md"]
+            }
+        }),
+    );
+    session.add(skill_tool.clone());
+    store
+        .append_message(&session, &skill_tool, "run_compact_skill", 1)
+        .expect("skill tool message appends");
+
+    let compacted_until = ChatMessage {
+        role: Role::User,
+        content: "also old".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_skill_cutoff"))]),
+    };
+    session.add(compacted_until.clone());
+    store
+        .append_message(&session, &compacted_until, "run_compact_skill", 2)
+        .expect("cutoff message appends");
+
+    let boundary_id = store
+        .append_compaction_boundary(
+            &mut session,
+            "run_compact_skill",
+            "Summary of compacted context.",
+            "msg_skill_cutoff",
+        )
+        .expect("compaction boundary appends");
+    let fresh = ChatMessage {
+        role: Role::User,
+        content: "fresh context".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_skill_fresh"))]),
+    };
+    session.add(fresh.clone());
+    store
+        .append_message(&session, &fresh, "run_compact_skill", 4)
+        .expect("fresh message appends");
+
+    let messages = store
+        .list_messages_with_parts("session_compact_skill", None, None)
+        .expect("messages load");
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].info.id, "msg_skill_loaded");
+    assert_eq!(messages[1].info.id, boundary_id);
+    assert_eq!(messages[2].info.id, "msg_skill_fresh");
+    let skill_part = messages[0]
+        .parts
+        .iter()
+        .find(|part| part.kind == MessagePartKind::Tool)
+        .expect("skill tool part preserved");
+    assert_eq!(skill_part.content["metadata"]["skill_name"], "code-review");
+    assert!(
+        skill_part.content["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("Use code review guidance."))
+    );
+    let projected = message_parts_to_chat_messages(&messages);
+    assert!(projected.iter().any(|message| message.role == Role::Tool
+        && message.content.contains("Use code review guidance.")));
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
 fn file_session_store_projects_legacy_v1_transcripts_to_message_v2() {
     let root = unique_temp_dir("openagent-message-v2-legacy");
     let session_dir = root.join("sessions/session_legacy");

@@ -489,6 +489,13 @@ fn skill_tool_lists_loads_filters_and_respects_explicit_roots() -> Result<(), Bo
         "Review code carefully",
         "Inspect diffs and tests.",
     )?;
+    let code_review_resource = workspace.join(".openagent/skills/code-review/references");
+    fs::create_dir_all(&code_review_resource)?;
+    fs::write(
+        code_review_resource.join("checklist.md"),
+        "Review checklist resource.",
+    )?;
+    fs::write(root.join("outside.txt"), "Outside skill directory.")?;
     write_skill(
         &workspace,
         ".openagent/skills/research/SKILL.md",
@@ -526,8 +533,25 @@ fn skill_tool_lists_loads_filters_and_respects_explicit_roots() -> Result<(), Bo
         &mut ctx,
     );
     assert!(loaded.error.is_none());
-    assert!(loaded.output.contains("## Skill: code-review"));
+    assert!(
+        loaded
+            .output
+            .contains("<skill_content name=\"code-review\">")
+    );
+    assert!(loaded.output.contains("<base_directory>"));
+    assert!(loaded.output.contains("<skill_files sampled=\"1\""));
+    assert!(
+        loaded
+            .output
+            .contains("<file>references/checklist.md</file>")
+    );
+    assert!(!loaded.output.contains("outside.txt"));
+    assert!(loaded.output.contains("Inspect diffs and tests."));
     assert_eq!(loaded.metadata["skill_name"], json!("code-review"));
+    assert_eq!(
+        loaded.metadata["skill_files"],
+        json!(["references/checklist.md"])
+    );
 
     let missing = toolkit.execute(
         "skill",
@@ -550,6 +574,221 @@ fn skill_tool_lists_loads_filters_and_respects_explicit_roots() -> Result<(), Bo
     let explicit = toolkit.execute("skill", json!({}), "call_skill_explicit", &mut ctx);
     assert!(explicit.output.contains("review"));
     assert!(!explicit.output.contains("code-review"));
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn skill_tool_supports_claude_frontmatter_subset() -> Result<(), Box<dyn Error>> {
+    let root = unique_temp_dir("openagent-tools-skill-frontmatter")?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n")?;
+    fs::create_dir_all(workspace.join(".openagent/skills/claude"))?;
+    fs::write(
+        workspace.join(".openagent/skills/claude/SKILL.md"),
+        r#"---
+name: claude
+description: Claude-style skill
+when_to_use: Use when editing Rust entrypoints.
+paths:
+  - src/*.rs
+allowed-tools:
+  - read
+disallowed-tools:
+  - write
+arguments:
+  - topic
+---
+Work on {{topic}} with $ARGUMENTS.
+"#,
+    )?;
+    fs::create_dir_all(workspace.join(".openagent/skills/hidden"))?;
+    fs::write(
+        workspace.join(".openagent/skills/hidden/SKILL.md"),
+        r#"---
+name: hidden
+description: Hidden skill
+user-invocable: false
+---
+Hidden guidance.
+"#,
+    )?;
+    fs::create_dir_all(workspace.join(".openagent/skills/disabled"))?;
+    fs::write(
+        workspace.join(".openagent/skills/disabled/SKILL.md"),
+        r#"---
+name: disabled
+description: Disabled skill
+disable-model-invocation: true
+---
+Disabled guidance.
+"#,
+    )?;
+
+    let toolkit = Toolkit::with_builtins();
+    let mut ctx = ToolContext::new(&workspace).with_session_id("session-skill-frontmatter");
+    let listed = toolkit.execute(
+        "skill",
+        json!({"path": "src/main.rs"}),
+        "call_skill_list_frontmatter",
+        &mut ctx,
+    );
+    assert!(listed.error.is_none());
+    assert!(listed.output.contains("claude"));
+    assert!(
+        listed
+            .output
+            .contains("When to use: Use when editing Rust entrypoints.")
+    );
+    assert!(!listed.output.contains("hidden"));
+    assert!(!listed.output.contains("disabled"));
+
+    let mismatched_list = toolkit.execute(
+        "skill",
+        json!({"path": "README.md"}),
+        "call_skill_list_mismatch",
+        &mut ctx,
+    );
+    assert!(!mismatched_list.output.contains("claude"));
+    let mismatched_load = toolkit.execute(
+        "skill",
+        json!({"name": "claude", "path": "README.md"}),
+        "call_skill_load_mismatch",
+        &mut ctx,
+    );
+    assert!(
+        mismatched_load
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("does not match requested path scope")
+    );
+
+    let hidden_load = toolkit.execute(
+        "skill",
+        json!({"name": "hidden"}),
+        "call_hidden_skill",
+        &mut ctx,
+    );
+    assert!(
+        hidden_load
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("disabled for model invocation")
+    );
+    let disabled_load = toolkit.execute(
+        "skill",
+        json!({"name": "disabled"}),
+        "call_disabled_skill",
+        &mut ctx,
+    );
+    assert!(
+        disabled_load
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("disabled for model invocation")
+    );
+
+    let loaded = toolkit.execute(
+        "skill",
+        json!({
+            "name": "claude",
+            "path": "src/main.rs",
+            "arguments": {"topic": "routing"}
+        }),
+        "call_skill_load_frontmatter",
+        &mut ctx,
+    );
+    assert!(loaded.error.is_none());
+    assert!(loaded.output.contains("Work on routing"));
+    assert!(loaded.output.contains(r#"{"topic":"routing"}"#));
+    assert_eq!(
+        loaded.metadata["skill_arguments"],
+        json!({"topic": "routing"})
+    );
+
+    let read = toolkit.execute(
+        "read",
+        json!({"file_path": "src/main.rs"}),
+        "call_read_allowed_by_skill",
+        &mut ctx,
+    );
+    assert!(read.error.is_none());
+    let write = toolkit.execute(
+        "write",
+        json!({"file_path": "blocked.txt", "content": "nope"}),
+        "call_write_blocked_by_skill",
+        &mut ctx,
+    );
+    assert!(
+        write
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("disallowed by loaded skill")
+    );
+    assert_eq!(write.metadata["error_kind"], json!("skill_tool_restricted"));
+    assert!(!workspace.join("blocked.txt").exists());
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn skill_tool_lists_builtin_skills_and_workspace_overrides() -> Result<(), Box<dyn Error>> {
+    let root = unique_temp_dir("openagent-tools-builtin-skill")?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let toolkit = Toolkit::with_builtins();
+    let mut ctx = ToolContext::new(&workspace).with_session_id("session-builtin-skill");
+    let listed = toolkit.execute(
+        "skill",
+        json!({"query": "openai-docs", "limit": 5}),
+        "call_skill_builtin",
+        &mut ctx,
+    );
+    assert!(listed.error.is_none());
+    assert!(listed.output.contains("openai-docs"));
+
+    write_skill(
+        &workspace,
+        ".openagent/skills/openai-docs/SKILL.md",
+        "openai-docs",
+        "Workspace OpenAI docs override",
+        "Workspace override content.",
+    )?;
+    let loaded = toolkit.execute(
+        "skill",
+        json!({"name": "openai-docs"}),
+        "call_skill_override",
+        &mut ctx,
+    );
+    assert!(loaded.error.is_none());
+    assert!(loaded.output.contains("Workspace override content."));
+    assert!(
+        loaded.metadata["skill_location"]
+            .as_str()
+            .is_some_and(|location| location.contains(".openagent/skills/openai-docs"))
+    );
+
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty)?;
+    let mut disabled = ToolContext::new(&empty).with_session_id("session-builtin-disabled");
+    disabled
+        .agent_options
+        .insert("include_builtin_skills".to_string(), json!(false));
+    let hidden = toolkit.execute(
+        "skill",
+        json!({"query": "openai-docs"}),
+        "call_skill_builtin_disabled",
+        &mut disabled,
+    );
+    assert!(hidden.output.contains("No skills matched query"));
 
     fs::remove_dir_all(root)?;
     Ok(())

@@ -10,6 +10,9 @@ pub(crate) struct RunAgentProfile {
     pub(super) provider: Option<String>,
     pub(super) permission: Option<String>,
     pub(super) task_permissions: Vec<TaskPermissionRule>,
+    pub(super) skills: Vec<String>,
+    pub(super) skill_roots: Vec<String>,
+    pub(super) skill_permissions: Vec<SkillPermissionRule>,
     pub(super) prompt: Option<String>,
     pub(super) tools: Vec<String>,
     pub(super) max_steps: Option<u64>,
@@ -421,6 +424,9 @@ fn agent_profile_from_value(
             .map(str::to_string),
         permission: profile_permission_ruleset_value(value).map(str::to_string),
         task_permissions: profile_task_permissions(value),
+        skills: profile_string_list(value.get("skills")),
+        skill_roots: profile_string_list(value.get("skill_roots")),
+        skill_permissions: profile_skill_permissions(value),
         prompt: value
             .get("prompt")
             .and_then(Value::as_str)
@@ -490,6 +496,11 @@ fn profile_model_options(value: &Value) -> BTreeMap<String, Value> {
         "permission",
         "task",
         "task_permissions",
+        "skill",
+        "skills",
+        "skill_roots",
+        "skill_permissions",
+        "skill_permission",
         "tools",
         "prompt",
         "steps",
@@ -530,11 +541,20 @@ fn profile_model_options(value: &Value) -> BTreeMap<String, Value> {
     for key in ["model_options", "options"] {
         if let Some(object) = value.get(key).and_then(Value::as_object) {
             for (option_key, option_value) in object {
-                options.insert(option_key.clone(), option_value.clone());
+                if !profile_model_option_key_reserved(option_key) {
+                    options.insert(option_key.clone(), option_value.clone());
+                }
             }
         }
     }
     options
+}
+
+fn profile_model_option_key_reserved(key: &str) -> bool {
+    matches!(
+        key,
+        "skill" | "skills" | "skill_roots" | "skill_permissions" | "skill_permission"
+    )
 }
 
 fn builtin_agent_profiles() -> Vec<RunAgentProfile> {
@@ -632,6 +652,9 @@ fn builtin_agent_profile(
         provider: None,
         permission: permission.map(str::to_string),
         task_permissions: Vec::new(),
+        skills: Vec::new(),
+        skill_roots: Vec::new(),
+        skill_permissions: Vec::new(),
         prompt: Some(prompt.trim_start_matches('\u{feff}').to_string()),
         tools: tools.iter().map(|item| (*item).to_string()).collect(),
         max_steps: None,
@@ -657,6 +680,9 @@ pub(crate) fn agent_profile_public_value(profile: &RunAgentProfile) -> Value {
         "provider": profile.provider.clone(),
         "permission": profile.permission.clone(),
         "task_permissions": profile.task_permissions.clone(),
+        "skills": profile.skills.clone(),
+        "skill_roots": profile.skill_roots.clone(),
+        "skill_permissions": profile.skill_permissions.clone(),
         "tools": profile.tools.clone(),
         "max_steps": profile.max_steps,
         "steps": profile.max_steps,
@@ -681,14 +707,6 @@ pub(super) fn bind_agent_profile_system_prompt(
     let Some(profile) = profile else {
         return Ok(());
     };
-    let Some(prompt) = profile
-        .prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(());
-    };
     let already_bound = session.messages.iter().any(|message| {
         message.role == Role::System
             && message
@@ -700,13 +718,67 @@ pub(super) fn bind_agent_profile_system_prompt(
     if already_bound {
         return Ok(());
     }
-    let mut message = chat_message(Role::System, prompt.to_string());
+    let mut prompt_parts = Vec::new();
+    if let Some(prompt) = profile
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt_parts.push(prompt.to_string());
+    }
+    let preloaded_skills = profile_preloaded_skill_documents(profile, &session.directory);
+    let preloaded_skill_names = preloaded_skills
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect::<Vec<_>>();
+    if let Some(skills) = render_preloaded_skills(&preloaded_skills) {
+        prompt_parts.push(skills);
+    }
+    if agent_allows_tool(profile, "skill") {
+        let registry = SkillRegistry::new_with_options(
+            Some(session.directory.clone()),
+            (!profile.skill_roots.is_empty()).then_some(profile.skill_roots.clone()),
+            Option::<PathBuf>::None,
+            SkillRegistryOptions {
+                include_builtin_skills: true,
+            },
+        );
+        let skills = registry
+            .all()
+            .into_iter()
+            .filter(|skill| skill_is_visible(&profile.skill_permissions, &skill.name))
+            .collect::<Vec<_>>();
+        if let Some(skills) = render_available_skills(&skills) {
+            prompt_parts.push(skills);
+        }
+    }
+    if prompt_parts.is_empty() {
+        return Ok(());
+    }
+    if !profile.skills.is_empty() {
+        session
+            .metadata
+            .insert("skills".to_string(), json!(profile.skills.clone()));
+    }
+    if !preloaded_skill_names.is_empty() {
+        session.metadata.insert(
+            "preloaded_skills".to_string(),
+            json!(preloaded_skill_names.clone()),
+        );
+    }
+    let mut message = chat_message(Role::System, prompt_parts.join("\n\n"));
     message
         .metadata
         .insert("agent_profile".to_string(), json!(profile.id.clone()));
     message
         .metadata
         .insert("agent_mode".to_string(), json!(profile.mode.clone()));
+    if !preloaded_skill_names.is_empty() {
+        message
+            .metadata
+            .insert("preloaded_skills".to_string(), json!(preloaded_skill_names));
+    }
     let index = session.messages.len() as u64;
     session.add(message.clone());
     store
@@ -735,6 +807,64 @@ pub(super) fn filter_tools_for_agent(
         .collect()
 }
 
+fn profile_preloaded_skill_documents(
+    profile: &RunAgentProfile,
+    session_root: &Path,
+) -> Vec<SkillDocument> {
+    if profile.skills.is_empty() {
+        return Vec::new();
+    }
+    let registry = SkillRegistry::new_with_options(
+        Some(session_root.to_path_buf()),
+        (!profile.skill_roots.is_empty()).then_some(profile.skill_roots.clone()),
+        Option::<PathBuf>::None,
+        SkillRegistryOptions {
+            include_builtin_skills: true,
+        },
+    );
+    let mut seen = BTreeSet::new();
+    profile
+        .skills
+        .iter()
+        .filter_map(|name| {
+            let name = name.trim();
+            if name.is_empty()
+                || !seen.insert(name.to_string())
+                || !skill_is_visible(&profile.skill_permissions, name)
+            {
+                return None;
+            }
+            registry.get(name).filter(skill_document_model_invocable)
+        })
+        .collect()
+}
+
+pub(super) fn agent_tool_options(
+    agent_profile: Option<&RunAgentProfile>,
+) -> BTreeMap<String, Value> {
+    let mut options = BTreeMap::new();
+    if let Some(profile) = agent_profile {
+        options.insert("agent_id".to_string(), json!(profile.id.clone()));
+        options.insert("agent".to_string(), json!(profile.id.clone()));
+        if !profile.skills.is_empty() {
+            options.insert("skills".to_string(), json!(profile.skills.clone()));
+        }
+        if !profile.skill_roots.is_empty() {
+            options.insert(
+                "skill_roots".to_string(),
+                json!(profile.skill_roots.clone()),
+            );
+        }
+        if !profile.skill_permissions.is_empty() {
+            options.insert(
+                "skill_permissions".to_string(),
+                json!(profile.skill_permissions.clone()),
+            );
+        }
+    }
+    options
+}
+
 fn wildcard_match(pattern: &str, value: &str) -> bool {
     let pattern = pattern.trim();
     if pattern == "*" || pattern == value {
@@ -750,6 +880,14 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
         return value.starts_with(prefix) && value.ends_with(suffix);
     }
     false
+}
+
+fn agent_allows_tool(profile: &RunAgentProfile, tool_name: &str) -> bool {
+    profile.tools.is_empty()
+        || profile
+            .tools
+            .iter()
+            .any(|pattern| wildcard_match(pattern, tool_name))
 }
 
 pub(super) fn permission_ruleset_from_args(
@@ -772,6 +910,13 @@ pub(super) fn permission_manager_for_agent(
         for rule in &profile.task_permissions {
             manager.add_rule(permission_rule(
                 TASK_TOOL_ID,
+                rule.action.clone(),
+                Some(&rule.pattern),
+            ));
+        }
+        for rule in &profile.skill_permissions {
+            manager.add_rule(permission_rule(
+                "skill",
                 rule.action.clone(),
                 Some(&rule.pattern),
             ));
@@ -830,6 +975,23 @@ fn profile_task_permissions(value: &Value) -> Vec<TaskPermissionRule> {
     parse_task_permission_rules(task)
 }
 
+fn profile_skill_permissions(value: &Value) -> Vec<SkillPermissionRule> {
+    let mut rules = Vec::new();
+    for skill in [
+        value
+            .get("permission")
+            .and_then(|permission| permission.get("skill")),
+        value.get("skill_permissions"),
+        value.get("skill_permission"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        rules.extend(parse_skill_permission_rules(skill));
+    }
+    rules
+}
+
 fn parse_task_permission_rules(value: &Value) -> Vec<TaskPermissionRule> {
     if let Some(object) = value.as_object() {
         return object
@@ -856,6 +1018,39 @@ fn parse_task_permission_rules(value: &Value) -> Vec<TaskPermissionRule> {
                 .filter(|value| !value.is_empty())?;
             let action = item.get("action").and_then(task_permission_action)?;
             Some(TaskPermissionRule {
+                pattern: pattern.to_string(),
+                action,
+            })
+        })
+        .collect()
+}
+
+fn parse_skill_permission_rules(value: &Value) -> Vec<SkillPermissionRule> {
+    if let Some(object) = value.as_object() {
+        return object
+            .iter()
+            .filter_map(|(pattern, action)| {
+                task_permission_action(action).map(|action| SkillPermissionRule {
+                    pattern: pattern.clone(),
+                    action,
+                })
+            })
+            .collect();
+    }
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let pattern = item
+                .get("pattern")
+                .or_else(|| item.get("skill"))
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let action = item.get("action").and_then(task_permission_action)?;
+            Some(SkillPermissionRule {
                 pattern: pattern.to_string(),
                 action,
             })

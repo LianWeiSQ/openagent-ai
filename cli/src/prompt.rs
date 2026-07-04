@@ -10,11 +10,12 @@ use agent_loop::{AgentLoopRequest, pending_resume_from_session, run_agent_loop};
 use mcp_runtime::{McpRuntime, execute_mcp_tool, load_mcp_runtime};
 pub(crate) use openagent_mcp::discover_mcp_server_tools;
 use profile::{
-    RunAgentProfile, bind_agent_profile_system_prompt, child_task_depth, child_task_lineage,
-    filter_tools_for_agent, is_subagent_mode, load_agent_profile_from_args, max_subagent_depth_cli,
-    parent_task_lineage, permission_manager_for_agent, permission_ruleset_for_profile,
-    permission_ruleset_from_args, provider_and_model_for_subagent, provider_and_model_from_args,
-    subagent_task_governance_error, task_root_session_id, task_subagent_descriptors,
+    RunAgentProfile, agent_tool_options, bind_agent_profile_system_prompt, child_task_depth,
+    child_task_lineage, filter_tools_for_agent, is_subagent_mode, load_agent_profile_from_args,
+    max_subagent_depth_cli, parent_task_lineage, permission_manager_for_agent,
+    permission_ruleset_for_profile, permission_ruleset_from_args, provider_and_model_for_subagent,
+    provider_and_model_from_args, subagent_task_governance_error, task_root_session_id,
+    task_subagent_descriptors,
 };
 pub(crate) use profile::{
     agent_profile_public_value, available_agent_profiles, load_agent_profile_by_name,
@@ -65,7 +66,8 @@ pub(super) fn run_prompt_command_with_events(
         .unwrap_or_else(|| "default".to_string());
     let max_steps = value_for(args, &["--max-steps"])
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_else(|| DEFAULT_MAX_STEPS.parse::<u64>().unwrap_or(30));
+        .filter(|value| *value > 0)
+        .unwrap_or(UNBOUNDED_MAX_STEPS);
     let run_selection = match prepare_run_session(args, &workspace, &provider, &model_id) {
         Ok(selection) => selection,
         Err(error) => return err_text(1, error),

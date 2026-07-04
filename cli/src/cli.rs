@@ -9,7 +9,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use openagent_core::{PermissionManager, permission_rule};
+use openagent_core::{
+    PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions, permission_rule,
+    render_available_skills, render_preloaded_skills, skill_document_model_invocable,
+};
 use openagent_mcp::{
     McpTransport, RemoteMcpManager, RemoteMcpToolDescriptor, bridge_tool_output,
     build_tool_descriptors_from_values, load_mcp_config, mcp_tool_definition,
@@ -32,8 +35,9 @@ use openagent_session::{
     SessionStatus, StartRunOptions,
 };
 use openagent_tools::{
-    TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor, ToolContext, Toolkit,
-    register_task_tool, task_subagent_is_visible,
+    SkillPermissionRule, TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor, ToolContext,
+    Toolkit, fork_skill_task_from_input, register_task_tool, skill_is_visible,
+    task_subagent_is_visible,
 };
 use serde_json::{Map, Value, json};
 
@@ -53,6 +57,7 @@ mod models;
 mod prompt;
 mod remote;
 mod sessions;
+mod skills;
 mod util;
 
 use agents::{agent_command, agent_registry_dir, plugin_command};
@@ -79,6 +84,7 @@ use remote::{
 use sessions::{
     latest_session_id, session_command, session_export, session_import, session_list, share_session,
 };
+use skills::skills_command;
 
 use util::*;
 
@@ -95,7 +101,8 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_WIRE_API: &str = "responses";
-pub const DEFAULT_MAX_STEPS: &str = "30";
+pub const DEFAULT_MAX_STEPS: &str = "0";
+pub const UNBOUNDED_MAX_STEPS: u64 = u64::MAX / 4;
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
 pub const DEFAULT_SERVER_TOKEN_ENV: &str = "OPENAGENT_SERVER_TOKEN";
 pub const GOAL10_ROOT: &str = "/tmp/openagent-rust-rewrite-fixture-goal10";
@@ -191,6 +198,7 @@ pub fn run_cli_command(argv: &[String]) -> CliRunResult {
         "models" => models_command(&argv[1..]),
         "stats" => stats_command(&argv[1..]),
         "command" => custom_command(&argv[1..]),
+        "skill" | "skills" => skills_command(&argv[1..]),
         "config" => config_command(&argv[1..]),
         "auth" | "providers" => auth_command(argv[0].as_str(), &argv[1..]),
         "mcp" => mcp_command(&argv[1..]),

@@ -102,8 +102,29 @@ fn apply_agent_model_options_to_payload(payload: &mut Value, profile: Option<&Ru
 fn provider_payload_option_allowed(key: &str) -> bool {
     !matches!(
         key,
-        "model" | "messages" | "input" | "tools" | "tool_choice" | "stream"
+        "model"
+            | "messages"
+            | "input"
+            | "tools"
+            | "tool_choice"
+            | "stream"
+            | "skill"
+            | "skills"
+            | "skill_roots"
+            | "skill_permissions"
+            | "skill_permission"
     )
+}
+
+fn system_prompt_from_messages(messages: &[ChatMessage]) -> Option<String> {
+    let prompt = messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!prompt.is_empty()).then_some(prompt)
 }
 
 fn subagent_profile_id(messages: &[ChatMessage]) -> Option<&str> {
@@ -145,6 +166,7 @@ fn call_openai_compatible_provider(
         });
     }
     let wire_api = provider_wire_api(provider, args);
+    let system_prompt = system_prompt_from_messages(messages);
     let timeout = Duration::from_secs(
         value_for(args, &["--timeout-s"])
             .and_then(|value| value.parse::<u64>().ok())
@@ -161,15 +183,28 @@ fn call_openai_compatible_provider(
     config.reasoning_effort = value_for(args, &["--variant"]);
     let stream = provider_streaming_enabled(args);
     let (endpoint, mut payload) = if wire_api == "chat" {
-        let mut payload =
-            build_openai_chat_payload(&config, None, messages, tools, None, None, None);
+        let mut payload = build_openai_chat_payload(
+            &config,
+            system_prompt.as_deref(),
+            messages,
+            tools,
+            None,
+            None,
+            None,
+        );
         if let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(stream));
         }
         (join_url(&base_url, "chat/completions"), payload)
     } else {
-        let mut payload =
-            build_openai_responses_payload(&config, None, messages, tools, None, None);
+        let mut payload = build_openai_responses_payload(
+            &config,
+            system_prompt.as_deref(),
+            messages,
+            tools,
+            None,
+            None,
+        );
         if stream && let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(true));
         }
@@ -351,7 +386,16 @@ fn call_anthropic_provider(
     let mut config = AnthropicLanguageModelConfig::new(api_key, model_id);
     config.base_url = Some(provider_base_url("anthropic", args));
     let stream = provider_streaming_enabled(args);
-    let mut payload = build_anthropic_payload(&config, None, messages, tools, None, None, None);
+    let system_prompt = system_prompt_from_messages(messages);
+    let mut payload = build_anthropic_payload(
+        &config,
+        system_prompt.as_deref(),
+        messages,
+        tools,
+        None,
+        None,
+        None,
+    );
     if let Some(object) = payload.as_object_mut() {
         object.insert("stream".to_string(), json!(stream));
     }

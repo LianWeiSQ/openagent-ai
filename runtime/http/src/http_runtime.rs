@@ -16,7 +16,11 @@ use openagent_app_server::{
     parse_turn_question_reply_path, question_dismiss_payload, question_reply_payload,
     record_control_response_payload, tui_control_request_for_path,
 };
-use openagent_core::{PermissionManager, permission_rule};
+use openagent_core::{
+    PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions, permission_rule,
+    render_available_skills, render_preloaded_skills, skill_document_model_invocable,
+    skill_info_model_invocable,
+};
 use openagent_mcp::{
     McpBridgeOutput, McpServerType, McpTransport, RemoteMcpManager, RemoteMcpServerConfig,
     RemoteMcpToolDescriptor, StdioMcpSession, bridge_tool_output,
@@ -39,9 +43,10 @@ use openagent_session::{
     StartRunOptions,
 };
 use openagent_tools::{
-    TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor, TaskSubagentRoute, ToolContext,
-    Toolkit, prepare_isolated_workspace, register_task_tool, resolve_path_in_root,
-    select_task_subagent_for_prompt, task_subagent_is_visible,
+    SkillPermissionRule, TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor,
+    TaskSubagentRoute, ToolContext, Toolkit, fork_skill_task_from_input,
+    prepare_isolated_workspace, register_task_tool, resolve_path_in_root,
+    select_task_subagent_for_prompt, skill_is_visible, task_subagent_is_visible,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -102,6 +107,7 @@ const DEFAULT_MAX_QUEUED_TURNS_PER_SESSION: usize = 8;
 const DEFAULT_MAX_RUNNING_TURN_WORKERS: usize = 4;
 const DEFAULT_TURN_QUEUE_LEASE_STALE_MS: u64 = 30_000;
 const DEFAULT_TURN_QUEUE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const UNBOUNDED_MAX_STEPS: u64 = u64::MAX / 4;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -696,6 +702,9 @@ struct RuntimeSubagentProfile {
     mode: String,
     permission: PermissionRuleset,
     task_permissions: Vec<TaskPermissionRule>,
+    skills: Vec<String>,
+    skill_roots: Vec<String>,
+    skill_permissions: Vec<SkillPermissionRule>,
     prompt: String,
     tools: Vec<String>,
     provider: Option<String>,
@@ -919,6 +928,9 @@ fn builtin_runtime_subagent_profile(
         mode: "subagent".to_string(),
         permission,
         task_permissions: Vec::new(),
+        skills: Vec::new(),
+        skill_roots: Vec::new(),
+        skill_permissions: Vec::new(),
         prompt: prompt.trim_start_matches('\u{feff}').to_string(),
         tools: tools.iter().map(|item| (*item).to_string()).collect(),
         provider: None,
@@ -980,6 +992,9 @@ fn runtime_agent_profile_from_value(
         mode,
         permission,
         task_permissions: runtime_profile_task_permissions(value),
+        skills: runtime_profile_string_list(value.get("skills")),
+        skill_roots: runtime_profile_string_list(value.get("skill_roots")),
+        skill_permissions: runtime_profile_skill_permissions(value),
         prompt: value
             .get("prompt")
             .and_then(Value::as_str)
@@ -1058,6 +1073,11 @@ fn runtime_profile_model_options(value: &Value) -> BTreeMap<String, Value> {
         "permission",
         "task",
         "task_permissions",
+        "skill",
+        "skills",
+        "skill_roots",
+        "skill_permissions",
+        "skill_permission",
         "tools",
         "prompt",
         "steps",
@@ -1096,11 +1116,20 @@ fn runtime_profile_model_options(value: &Value) -> BTreeMap<String, Value> {
     for key in ["model_options", "options"] {
         if let Some(object) = value.get(key).and_then(Value::as_object) {
             for (option_key, option_value) in object {
-                options.insert(option_key.clone(), option_value.clone());
+                if !runtime_model_option_key_reserved(option_key) {
+                    options.insert(option_key.clone(), option_value.clone());
+                }
             }
         }
     }
     options
+}
+
+fn runtime_model_option_key_reserved(key: &str) -> bool {
+    matches!(
+        key,
+        "skill" | "skills" | "skill_roots" | "skill_permissions" | "skill_permission"
+    )
 }
 
 fn runtime_subagent_profile(id: &str, workspace: &Path) -> Option<RuntimeSubagentProfile> {
@@ -1160,6 +1189,32 @@ fn runtime_agent_profile_for_session(session: &Session) -> Option<RuntimeSubagen
         .and_then(|id| runtime_agent_profile(id, &session.directory))
 }
 
+fn skills_payload(config: &HttpRuntimeConfig) -> Value {
+    let workspace = config
+        .workspace
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let registry = SkillRegistry::new_with_options(
+        Some(workspace),
+        Option::<Vec<String>>::None,
+        Option::<PathBuf>::None,
+        SkillRegistryOptions {
+            include_builtin_skills: true,
+        },
+    );
+    let mut report = registry.report(None, None);
+    report.skills.retain(skill_info_model_invocable);
+    json!({
+        "skills": report.skills,
+        "loaded_count": report.loaded_count,
+        "scanned_files": report.scanned_files,
+        "invalid_count": report.invalid_count,
+        "duplicate_count": report.duplicate_count,
+        "issues": report.issues,
+    })
+}
+
 fn filter_runtime_tools_for_profile(
     tools: Vec<ToolSchema>,
     profile: Option<&RuntimeSubagentProfile>,
@@ -1176,11 +1231,39 @@ fn filter_runtime_tools_for_profile(
         .collect()
 }
 
+fn runtime_agent_tool_options(profile: Option<&RuntimeSubagentProfile>) -> BTreeMap<String, Value> {
+    let mut options = BTreeMap::new();
+    if let Some(profile) = profile {
+        options.insert("agent_id".to_string(), json!(profile.id.clone()));
+        options.insert("agent".to_string(), json!(profile.id.clone()));
+        if !profile.skills.is_empty() {
+            options.insert("skills".to_string(), json!(profile.skills.clone()));
+        }
+        if !profile.skill_roots.is_empty() {
+            options.insert(
+                "skill_roots".to_string(),
+                json!(profile.skill_roots.clone()),
+            );
+        }
+        if !profile.skill_permissions.is_empty() {
+            options.insert(
+                "skill_permissions".to_string(),
+                json!(profile.skill_permissions.clone()),
+            );
+        }
+    }
+    options
+}
+
 fn runtime_tool_allowed_for_profile(tool_name: &str, profile: &RuntimeSubagentProfile) -> bool {
     profile
         .tools
         .iter()
         .any(|pattern| runtime_tool_pattern_matches(pattern, tool_name))
+}
+
+fn runtime_agent_allows_tool(profile: &RuntimeSubagentProfile, tool_name: &str) -> bool {
+    profile.tools.is_empty() || runtime_tool_allowed_for_profile(tool_name, profile)
 }
 
 fn runtime_tool_pattern_matches(pattern: &str, value: &str) -> bool {
@@ -1439,6 +1522,23 @@ fn runtime_profile_task_permissions(value: &Value) -> Vec<TaskPermissionRule> {
     runtime_parse_task_permission_rules(task)
 }
 
+fn runtime_profile_skill_permissions(value: &Value) -> Vec<SkillPermissionRule> {
+    let mut rules = Vec::new();
+    for skill in [
+        value
+            .get("permission")
+            .and_then(|permission| permission.get("skill")),
+        value.get("skill_permissions"),
+        value.get("skill_permission"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        rules.extend(runtime_parse_skill_permission_rules(skill));
+    }
+    rules
+}
+
 fn runtime_parse_task_permission_rules(value: &Value) -> Vec<TaskPermissionRule> {
     if let Some(object) = value.as_object() {
         return object
@@ -1474,6 +1574,41 @@ fn runtime_parse_task_permission_rules(value: &Value) -> Vec<TaskPermissionRule>
         .collect()
 }
 
+fn runtime_parse_skill_permission_rules(value: &Value) -> Vec<SkillPermissionRule> {
+    if let Some(object) = value.as_object() {
+        return object
+            .iter()
+            .filter_map(|(pattern, action)| {
+                runtime_task_permission_action(action).map(|action| SkillPermissionRule {
+                    pattern: pattern.clone(),
+                    action,
+                })
+            })
+            .collect();
+    }
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let pattern = item
+                .get("pattern")
+                .or_else(|| item.get("skill"))
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let action = item
+                .get("action")
+                .and_then(runtime_task_permission_action)?;
+            Some(SkillPermissionRule {
+                pattern: pattern.to_string(),
+                action,
+            })
+        })
+        .collect()
+}
+
 fn runtime_task_permission_action(value: &Value) -> Option<PermissionAction> {
     let raw = value.as_str()?;
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -1494,6 +1629,13 @@ fn runtime_permission_manager_for_agent(
         for rule in &profile.task_permissions {
             manager.add_rule(permission_rule(
                 TASK_TOOL_ID,
+                rule.action.clone(),
+                Some(&rule.pattern),
+            ));
+        }
+        for rule in &profile.skill_permissions {
+            manager.add_rule(permission_rule(
+                "skill",
                 rule.action.clone(),
                 Some(&rule.pattern),
             ));
@@ -1662,6 +1804,9 @@ fn update_session_payload(
     body: &str,
 ) -> Result<Value, String> {
     let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
     let store = FileSessionStore::new(session_root(config));
     let mut session = store
         .load_session(session_id)
@@ -1697,6 +1842,12 @@ fn update_session_payload(
         "updated": true,
         "session": session_summary_from_session(&session),
     }))
+}
+
+fn session_state_exists(config: &HttpRuntimeConfig, session_id: &str) -> bool {
+    let session_dir = session_root(config).join(session_id);
+    session_dir.join("state.latest.json").is_file()
+        || session_dir.join("transcript.jsonl").is_file()
 }
 
 fn delete_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<Value, String> {
@@ -2879,13 +3030,31 @@ fn restore_session_checkpoint_payload(
     let checkpoint = store
         .restore_checkpoint(session_id, &run_id, &session.directory, checkpoint_id)
         .map_err(|error| error.to_string())?;
+    let restored_at_ms = now_ms();
+    let restore_record = json!({
+        "checkpoint_id": checkpoint_id,
+        "run_id": run_id,
+        "restored_at_ms": restored_at_ms,
+        "checkpoint_kind": checkpoint.kind.clone(),
+        "file_count": checkpoint.file_count,
+        "total_bytes": checkpoint.total_bytes,
+        "message_id": checkpoint.message_id.clone(),
+        "part_id": checkpoint.part_id.clone(),
+    });
+    let mut restore_history = session
+        .metadata
+        .get("checkpoint_restore_history")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    restore_history.insert(0, restore_record.clone());
+    restore_history.truncate(20);
+    session
+        .metadata
+        .insert("latest_checkpoint_restore".to_string(), restore_record);
     session.metadata.insert(
-        "latest_checkpoint_restore".to_string(),
-        json!({
-            "checkpoint_id": checkpoint_id,
-            "run_id": run_id,
-            "restored_at_ms": now_ms(),
-        }),
+        "checkpoint_restore_history".to_string(),
+        Value::Array(restore_history),
     );
     store
         .save_state(&session, Some(&run_id))
@@ -4152,8 +4321,29 @@ fn apply_runtime_model_options_to_payload(
 fn runtime_provider_option_allowed(key: &str) -> bool {
     !matches!(
         key,
-        "model" | "messages" | "input" | "tools" | "tool_choice" | "stream"
+        "model"
+            | "messages"
+            | "input"
+            | "tools"
+            | "tool_choice"
+            | "stream"
+            | "skill"
+            | "skills"
+            | "skill_roots"
+            | "skill_permissions"
+            | "skill_permission"
     )
+}
+
+fn runtime_system_prompt_from_messages(messages: &[ChatMessage]) -> Option<String> {
+    let prompt = messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!prompt.is_empty()).then_some(prompt)
 }
 
 fn call_openai_compatible_provider_for_runtime(
@@ -4182,33 +4372,44 @@ fn call_openai_compatible_provider_for_runtime(
     config.provider_id = provider.to_string();
     config.base_url = base_url.to_string();
     config.wire_api = wire_api.to_string();
+    let system_prompt = runtime_system_prompt_from_messages(messages);
     let (endpoint, mut payload) = if wire_api == "chat" {
-        let mut payload =
-            build_openai_chat_payload(&config, None, messages, tools, None, None, None);
+        let mut payload = build_openai_chat_payload(
+            &config,
+            system_prompt.as_deref(),
+            messages,
+            tools,
+            None,
+            None,
+            None,
+        );
         if let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(stream));
         }
         (join_url(base_url, "chat/completions"), payload)
     } else {
-        let mut payload =
-            build_openai_responses_payload(&config, None, messages, tools, None, None);
+        let mut payload = build_openai_responses_payload(
+            &config,
+            system_prompt.as_deref(),
+            messages,
+            tools,
+            None,
+            None,
+        );
         if let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(stream));
         }
         (join_url(base_url, "responses"), payload)
     };
     apply_runtime_model_options_to_payload(&mut payload, &model_options);
-    let mut request = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .header("content-type", "application/json");
-    if stream {
-        request = request.header("accept", "text/event-stream");
-    }
-    let response = request
-        .json(&payload)
-        .send()
-        .map_err(|error| format!("provider request failed: {error}"))?;
+    let response = send_runtime_provider_request(
+        &client,
+        &endpoint,
+        api_key,
+        &payload,
+        stream,
+        runtime_provider_request_retries(),
+    )?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -4276,6 +4477,57 @@ fn call_openai_compatible_provider_for_runtime(
             Some(&value),
         ))
     }
+}
+
+fn send_runtime_provider_request(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    api_key: &str,
+    payload: &Value,
+    stream: bool,
+    max_retries: u64,
+) -> Result<reqwest::blocking::Response, String> {
+    let mut attempt = 0_u64;
+    loop {
+        let mut request = client
+            .post(endpoint)
+            .bearer_auth(api_key)
+            .header("content-type", "application/json");
+        if stream {
+            request = request.header("accept", "text/event-stream");
+        }
+        match request.json(payload).send() {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if runtime_provider_status_retryable(status) && attempt < max_retries {
+                    attempt += 1;
+                    thread::sleep(runtime_provider_retry_delay(attempt));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(_error) if attempt < max_retries => {
+                attempt += 1;
+                thread::sleep(runtime_provider_retry_delay(attempt));
+            }
+            Err(error) => return Err(format!("provider request failed: {error}")),
+        }
+    }
+}
+
+fn runtime_provider_status_retryable(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+fn runtime_provider_retry_delay(attempt: u64) -> Duration {
+    Duration::from_millis(750 * attempt.min(4))
+}
+
+fn runtime_provider_request_retries() -> u64 {
+    std::env::var("OPENAGENT_PROVIDER_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2)
 }
 
 fn read_sse_json_values_stream<R, F>(mut reader: R, mut on_value: F) -> Result<(), String>
@@ -4524,8 +4776,8 @@ fn provider_max_steps(payload: &Value) -> u64 {
         .get("max_steps")
         .or_else(|| payload.get("maxSteps"))
         .and_then(Value::as_u64)
-        .unwrap_or(4)
-        .clamp(1, 16)
+        .filter(|value| *value > 0)
+        .unwrap_or(UNBOUNDED_MAX_STEPS)
 }
 
 fn add_usage(total: &mut Usage, item: &Usage) {
@@ -4754,6 +5006,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         .collect::<BTreeSet<_>>();
     let mut ctx = ToolContext::new(&session.directory)
         .with_session_id(session.id.clone())
+        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()))
         .with_permission_manager(runtime_permission_manager_for_agent(
             permission_ruleset.clone(),
             agent_profile.as_ref(),
@@ -4765,6 +5018,12 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         .and_then(question_answers_from_json)
     {
         ctx.set_question_answers(answers);
+    }
+    if let Some(profile) = agent_profile.as_ref()
+        && let Some((system, system_index)) =
+            bind_runtime_agent_system_prompt(session, profile, &profile.mode)
+    {
+        let _ = store.append_message(session, &system, run_id, system_index);
     }
 
     let mut persisted_events = 0;
@@ -5024,6 +5283,50 @@ fn execute_runtime_tool_call(
     ctx: &mut ToolContext,
     task_context: RuntimeTaskExecutionContext<'_>,
 ) -> ToolResult {
+    if tool_call.name == "skill" {
+        if let Some(result) =
+            toolkit.permission_result_for_tool("skill", &tool_call.input, &tool_call.call_id, ctx)
+        {
+            return result;
+        }
+        match fork_skill_task_from_input(&tool_call.input, ctx) {
+            Ok(Some(fork)) => {
+                let task_call = ToolCall {
+                    call_id: tool_call.call_id.clone(),
+                    name: TASK_TOOL_ID.to_string(),
+                    input: fork.task_input,
+                };
+                let mut result =
+                    execute_runtime_task_tool_call(toolkit, &task_call, ctx, task_context);
+                result
+                    .metadata
+                    .insert("skill_context".to_string(), json!("fork"));
+                result
+                    .metadata
+                    .insert("skill_name".to_string(), json!(fork.skill_name));
+                result
+                    .metadata
+                    .insert("skill_agent".to_string(), json!(fork.agent));
+                result
+                    .metadata
+                    .insert("background".to_string(), json!(fork.background));
+                return result;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return ToolResult {
+                    call_id: tool_call.call_id.clone(),
+                    output: String::new(),
+                    error: Some(error),
+                    metadata: BTreeMap::from([
+                        ("tool".to_string(), json!("skill")),
+                        ("error_kind".to_string(), json!("fork_skill_error")),
+                        ("call_id".to_string(), json!(tool_call.call_id.clone())),
+                    ]),
+                };
+            }
+        }
+    }
     if let Some(result) = execute_runtime_mcp_tool(toolkit, mcp_runtime, tool_call, ctx) {
         return result;
     }
@@ -5769,10 +6072,14 @@ fn bind_runtime_subagent_system_prompt(
     session: &mut Session,
     profile: &RuntimeSubagentProfile,
 ) -> Option<(ChatMessage, u64)> {
-    let prompt = profile.prompt.trim_start_matches('\u{feff}').trim();
-    if prompt.is_empty() {
-        return None;
-    }
+    bind_runtime_agent_system_prompt(session, profile, "subagent")
+}
+
+fn bind_runtime_agent_system_prompt(
+    session: &mut Session,
+    profile: &RuntimeSubagentProfile,
+    agent_mode: &str,
+) -> Option<(ChatMessage, u64)> {
     let already_bound = session.messages.iter().any(|message| {
         message.role == Role::System
             && message
@@ -5784,16 +6091,98 @@ fn bind_runtime_subagent_system_prompt(
     if already_bound {
         return None;
     }
-    let mut system = runtime_chat_message(Role::System, prompt.to_string());
+    let mut prompt_parts = Vec::new();
+    let prompt = profile.prompt.trim_start_matches('\u{feff}').trim();
+    if !prompt.is_empty() {
+        prompt_parts.push(prompt.to_string());
+    }
+    let preloaded_skills = runtime_preloaded_skill_documents(profile, &session.directory);
+    let preloaded_skill_names = preloaded_skills
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect::<Vec<_>>();
+    if let Some(skills) = render_preloaded_skills(&preloaded_skills) {
+        prompt_parts.push(skills);
+    }
+    if runtime_agent_allows_tool(profile, "skill") {
+        let registry = SkillRegistry::new_with_options(
+            Some(session.directory.clone()),
+            (!profile.skill_roots.is_empty()).then_some(profile.skill_roots.clone()),
+            Option::<PathBuf>::None,
+            SkillRegistryOptions {
+                include_builtin_skills: true,
+            },
+        );
+        let skills = registry
+            .all()
+            .into_iter()
+            .filter(|skill| skill_is_visible(&profile.skill_permissions, &skill.name))
+            .collect::<Vec<_>>();
+        if let Some(skills) = render_available_skills(&skills) {
+            prompt_parts.push(skills);
+        }
+    }
+    if prompt_parts.is_empty() {
+        return None;
+    }
+    if !profile.skills.is_empty() {
+        session
+            .metadata
+            .insert("skills".to_string(), json!(profile.skills.clone()));
+    }
+    if !preloaded_skill_names.is_empty() {
+        session.metadata.insert(
+            "preloaded_skills".to_string(),
+            json!(preloaded_skill_names.clone()),
+        );
+    }
+    let mut system = runtime_chat_message(Role::System, prompt_parts.join("\n\n"));
     system
         .metadata
         .insert("agent_profile".to_string(), json!(profile.id.clone()));
     system
         .metadata
-        .insert("agent_mode".to_string(), json!("subagent"));
+        .insert("agent_mode".to_string(), json!(agent_mode));
+    if !preloaded_skill_names.is_empty() {
+        system
+            .metadata
+            .insert("preloaded_skills".to_string(), json!(preloaded_skill_names));
+    }
     let system_index = session.messages.len() as u64;
     session.add(system.clone());
     Some((system, system_index))
+}
+
+fn runtime_preloaded_skill_documents(
+    profile: &RuntimeSubagentProfile,
+    session_root: &Path,
+) -> Vec<SkillDocument> {
+    if profile.skills.is_empty() {
+        return Vec::new();
+    }
+    let registry = SkillRegistry::new_with_options(
+        Some(session_root.to_path_buf()),
+        (!profile.skill_roots.is_empty()).then_some(profile.skill_roots.clone()),
+        Option::<PathBuf>::None,
+        SkillRegistryOptions {
+            include_builtin_skills: true,
+        },
+    );
+    let mut seen = BTreeSet::new();
+    profile
+        .skills
+        .iter()
+        .filter_map(|name| {
+            let name = name.trim();
+            if name.is_empty()
+                || !seen.insert(name.to_string())
+                || !skill_is_visible(&profile.skill_permissions, name)
+            {
+                return None;
+            }
+            registry.get(name).filter(skill_document_model_invocable)
+        })
+        .collect()
 }
 
 fn runtime_subagent_public_value(profile: &RuntimeSubagentProfile) -> Value {
@@ -5804,6 +6193,9 @@ fn runtime_subagent_public_value(profile: &RuntimeSubagentProfile) -> Value {
         "mode": profile.mode.clone(),
         "permission": profile.permission.as_str(),
         "task_permissions": profile.task_permissions.clone(),
+        "skills": profile.skills.clone(),
+        "skill_roots": profile.skill_roots.clone(),
+        "skill_permissions": profile.skill_permissions.clone(),
         "tools": profile.tools.clone(),
         "provider": profile.provider.clone(),
         "model": profile.model.clone(),
@@ -6205,6 +6597,14 @@ fn append_tool_result_to_session(
     tool_result: &ToolResult,
 ) -> Result<(), String> {
     let failed = tool_result.error.is_some();
+    record_runtime_skill_tool_session_event(
+        store,
+        &session.id,
+        run_id,
+        step,
+        tool_call,
+        tool_result,
+    );
     let _ = store.record_event(
         &session.id,
         run_id,
@@ -6269,6 +6669,72 @@ fn append_tool_result_to_session(
     store
         .append_message(session, &tool_message, run_id, tool_index)
         .map_err(|error| format!("failed to record tool message: {error}"))
+}
+
+fn record_runtime_skill_tool_session_event(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    step: u64,
+    tool_call: &ToolCall,
+    tool_result: &ToolResult,
+) {
+    if tool_call.name != "skill" || tool_result.error.is_some() {
+        return;
+    }
+    let mut attributes = BTreeMap::from([
+        ("call_id".to_string(), json!(tool_call.call_id.clone())),
+        ("name".to_string(), json!(tool_call.name.clone())),
+        ("input".to_string(), tool_call.input.clone()),
+        ("step".to_string(), json!(step)),
+        ("metadata".to_string(), json!(tool_result.metadata.clone())),
+    ]);
+    for key in [
+        "query",
+        "skill_count",
+        "loaded_count",
+        "scanned_files",
+        "invalid_count",
+        "duplicate_count",
+    ] {
+        if let Some(value) = tool_result.metadata.get(key) {
+            attributes.insert(key.to_string(), value.clone());
+        }
+    }
+    let event = if let Some(skill_name) = tool_result
+        .metadata
+        .get("skill_name")
+        .and_then(Value::as_str)
+    {
+        attributes.insert("skill_name".to_string(), json!(skill_name));
+        for key in [
+            "skill_location",
+            "skill_dir",
+            "skill_files",
+            "skill_files_truncated",
+            "skill_arguments",
+            "skill_context",
+            "skill_agent",
+            "background",
+        ] {
+            if let Some(value) = tool_result.metadata.get(key) {
+                attributes.insert(key.to_string(), value.clone());
+            }
+        }
+        "skill.loaded"
+    } else {
+        "skill.discovered"
+    };
+    let _ = store.record_event(
+        session_id,
+        run_id,
+        event,
+        SessionEventOptions {
+            kind: "skill".to_string(),
+            attributes,
+            ..SessionEventOptions::default()
+        },
+    );
 }
 
 fn runtime_create_step_checkpoint(
@@ -6394,7 +6860,15 @@ fn append_interaction_resolution_part(
     else {
         return;
     };
-    if !session_has_message_id(session, message_id) {
+    if !ensure_interaction_message(
+        store,
+        session,
+        run_id,
+        message_id,
+        part_type,
+        pending,
+        resolution_status,
+    ) {
         return;
     }
     let part_status = match resolution_status {
@@ -6443,6 +6917,67 @@ fn append_interaction_resolution_part(
             ..SessionPartOptions::default()
         },
     );
+}
+
+fn ensure_interaction_message(
+    store: &FileSessionStore,
+    session: &Session,
+    run_id: &str,
+    message_id: &str,
+    part_type: &str,
+    pending: &Value,
+    resolution_status: &str,
+) -> bool {
+    if session_has_message_id(session, message_id) {
+        return true;
+    }
+    if store
+        .get_message_with_parts(&session.id, message_id)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
+    }
+
+    let mut assistant = runtime_chat_message(
+        Role::Assistant,
+        interaction_resolution_fallback_text(part_type, resolution_status),
+    );
+    assistant
+        .metadata
+        .insert("message_id".to_string(), json!(message_id));
+    if let Some(step) = pending.get("step").and_then(Value::as_u64) {
+        assistant.metadata.insert("step".to_string(), json!(step));
+    }
+    if let Some(call_id) = pending
+        .get("call_id")
+        .or_else(|| pending.get("tool_call_id"))
+        .and_then(Value::as_str)
+    {
+        assistant
+            .metadata
+            .insert("tool_call_id".to_string(), json!(call_id));
+    }
+
+    let index = store
+        .list_messages_with_parts(&session.id, None, None)
+        .map(|messages| messages.len() as u64)
+        .unwrap_or(session.messages.len() as u64);
+    store
+        .append_message(session, &assistant, run_id, index)
+        .is_ok()
+}
+
+fn interaction_resolution_fallback_text(part_type: &str, resolution_status: &str) -> String {
+    match (part_type, resolution_status) {
+        ("approval", "denied") => "approval denied",
+        ("approval", _) => "approval resolved",
+        ("question", "dismissed") => "question dismissed",
+        ("question", _) => "question resolved",
+        _ => "interaction resolved",
+    }
+    .to_string()
 }
 
 fn runtime_record_step_started(
@@ -6744,6 +7279,28 @@ fn spawn_async_turn_worker(
         .map_err(|error| format!("failed to start async turn: {error}"))
 }
 
+fn mark_turn_job_status_from_result(
+    config: &HttpRuntimeConfig,
+    turn_id: &str,
+    result: &Result<Value, String>,
+) {
+    match result {
+        Ok(payload) => {
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            mark_turn_job_status(config, turn_id, status);
+        }
+        Err(error) if is_turn_interrupted_error(error) => {
+            mark_turn_job_status(config, turn_id, "interrupted");
+        }
+        Err(_) => {
+            mark_turn_job_status(config, turn_id, "failed");
+        }
+    }
+}
+
 fn start_turn_payload_inner(
     config: &HttpRuntimeConfig,
     session_id: &str,
@@ -7020,6 +7577,7 @@ fn run_http_tool_turn(
     let empty_payload = json!({});
     let mut ctx = ToolContext::new(&session.directory)
         .with_session_id(session.id.clone())
+        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()))
         .with_permission_manager(runtime_permission_manager_for_agent(
             permission_ruleset.clone(),
             agent_profile.as_ref(),
@@ -7263,6 +7821,7 @@ fn respond_approval_payload(
             .unwrap_or(false);
         let mut ctx = ToolContext::new(&session.directory)
             .with_session_id(session.id.clone())
+            .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()))
             .with_permission_manager(runtime_permission_manager_for_agent(
                 parse_permission_ruleset(
                     session
@@ -7325,7 +7884,7 @@ fn respond_approval_payload(
                 approval_start_checkpoint.as_deref(),
             );
             session.status = SessionStatus::Running;
-            return run_provider_loop(RuntimeProviderLoopInput {
+            let result = run_provider_loop(RuntimeProviderLoopInput {
                 config,
                 store: &store,
                 session: &mut session,
@@ -7336,6 +7895,8 @@ fn respond_approval_payload(
                 events,
                 carry: resume.carry,
             });
+            mark_turn_job_status_from_result(config, &run_id, &result);
+            return result;
         }
         let failed = tool_result.error.is_some();
         response_status = if failed { "failed" } else { "completed" };
@@ -7407,6 +7968,7 @@ fn respond_approval_payload(
     }
     let _ = store.save_state(&session, Some(&run_id));
     append_app_events(&store.root, &session.id, &run_id, &mut events);
+    mark_turn_job_status(config, &run_id, response_status);
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
@@ -7499,6 +8061,7 @@ fn respond_question_payload(
         }));
         let _ = store.save_state(&session, Some(&run_id));
         append_app_events(&store.root, &session.id, &run_id, &mut events);
+        mark_turn_job_status(config, &run_id, "failed");
         return Ok(json!({
             "session_id": session.id,
             "turn_id": run_id,
@@ -7510,13 +8073,15 @@ fn respond_question_payload(
     }
 
     let tool_call = pending_question_tool_call(&question)?;
-    let mut ctx = ToolContext::new(&session.directory).with_session_id(session.id.clone());
+    let agent_profile = runtime_agent_profile_for_session(&session);
+    let mut ctx = ToolContext::new(&session.directory)
+        .with_session_id(session.id.clone())
+        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()));
     let answers = response
         .get("answers")
         .and_then(question_answers_from_json)
         .unwrap_or_default();
     ctx.set_question_answers(answers);
-    let agent_profile = runtime_agent_profile_for_session(&session);
     let toolkit = toolkit_with_runtime_task_tool(&session, agent_profile.as_ref());
     let mut tool_result = toolkit.execute(
         "question",
@@ -7540,7 +8105,7 @@ fn respond_question_payload(
 
     if let Some(resume) = take_pending_provider_turn(&mut session) {
         session.status = SessionStatus::Running;
-        return run_provider_loop(RuntimeProviderLoopInput {
+        let result = run_provider_loop(RuntimeProviderLoopInput {
             config,
             store: &store,
             session: &mut session,
@@ -7551,6 +8116,8 @@ fn respond_question_payload(
             events,
             carry: resume.carry,
         });
+        mark_turn_job_status_from_result(config, &run_id, &result);
+        return result;
     }
     session.status = SessionStatus::Idle;
     let answer = "question answered".to_string();
@@ -7572,6 +8139,7 @@ fn respond_question_payload(
         }
     }));
     append_app_events(&store.root, &session.id, &run_id, &mut events);
+    mark_turn_job_status(config, &run_id, "completed");
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
@@ -8358,6 +8926,7 @@ pub fn http_runtime_fixture() -> Value {
         "runtime": {
             "config": config.to_public_value(),
             "health": health_payload(&config),
+            "skills": skills_fixture_payload(workspace),
             "routes": {
                 "health": route_health().to_value(),
                 "unauthorized": route_unauthorized().to_value(),
@@ -8374,6 +8943,24 @@ pub fn http_runtime_fixture() -> Value {
             }),
             "daemon_required": true,
         },
+    })
+}
+
+fn skills_fixture_payload(workspace: &str) -> Value {
+    json!({
+        "skills": [{
+            "name": "rooted",
+            "description": "Rooted fixture skill",
+            "location": format!("{workspace}/.openagent/skills/rooted/SKILL.md"),
+            "directory": format!("{workspace}/.openagent/skills/rooted"),
+            "metadata": {"audience": "fixture"},
+            "score": null,
+        }],
+        "loaded_count": 1,
+        "scanned_files": 1,
+        "invalid_count": 0,
+        "duplicate_count": 0,
+        "issues": [],
     })
 }
 
@@ -8535,6 +9122,17 @@ mod tests {
         assert_eq!(crate_name(), "openagent-http-runtime");
         assert_eq!(command_name(), "openagent-http-runtime");
         assert_eq!(app_server_crate_name(), "openagent-app-server");
+    }
+
+    #[test]
+    fn provider_max_steps_matches_opencode_unbounded_default() {
+        assert_eq!(provider_max_steps(&json!({})), UNBOUNDED_MAX_STEPS);
+        assert_eq!(
+            provider_max_steps(&json!({"max_steps": 0})),
+            UNBOUNDED_MAX_STEPS
+        );
+        assert_eq!(provider_max_steps(&json!({"max_steps": 25})), 25);
+        assert_eq!(provider_max_steps(&json!({"maxSteps": 100})), 100);
     }
 
     #[test]

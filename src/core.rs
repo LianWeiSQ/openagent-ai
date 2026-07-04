@@ -1104,6 +1104,20 @@ pub struct SkillRegistry {
     session_root: PathBuf,
     roots: Vec<String>,
     home_dir: PathBuf,
+    include_builtin_skills: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SkillRegistryOptions {
+    pub include_builtin_skills: bool,
+}
+
+impl Default for SkillRegistryOptions {
+    fn default() -> Self {
+        Self {
+            include_builtin_skills: true,
+        }
+    }
 }
 
 impl SkillRegistry {
@@ -1112,6 +1126,21 @@ impl SkillRegistry {
         session_root: Option<impl Into<PathBuf>>,
         roots: Option<Vec<String>>,
         home_dir: Option<impl Into<PathBuf>>,
+    ) -> Self {
+        Self::new_with_options(
+            session_root,
+            roots,
+            home_dir,
+            SkillRegistryOptions::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_options(
+        session_root: Option<impl Into<PathBuf>>,
+        roots: Option<Vec<String>>,
+        home_dir: Option<impl Into<PathBuf>>,
+        options: SkillRegistryOptions,
     ) -> Self {
         Self {
             session_root: canonicalize_existing(
@@ -1123,6 +1152,7 @@ impl SkillRegistry {
             home_dir: canonicalize_existing(
                 &home_dir.map(Into::into).unwrap_or_else(default_home_dir),
             ),
+            include_builtin_skills: options.include_builtin_skills,
         }
     }
 
@@ -1266,6 +1296,17 @@ impl SkillRegistry {
             result.extend(iter_pattern_matches(&base, &mut seen));
         }
         result.extend(iter_pattern_matches(&self.home_dir, &mut seen));
+        if self.include_builtin_skills {
+            for root in builtin_skill_roots() {
+                if root.is_dir() {
+                    for path in recursive_skill_files(&root) {
+                        if seen.insert(path.clone()) {
+                            result.push(path);
+                        }
+                    }
+                }
+            }
+        }
         result
     }
 
@@ -1383,6 +1424,134 @@ pub fn render_skill_document(document: &SkillDocument, include_header: bool) -> 
     }
     lines.push(document.content.clone());
     lines.join("\n").trim().to_string()
+}
+
+#[must_use]
+pub fn render_available_skills(skills: &[SkillInfo]) -> Option<String> {
+    let mut described = skills
+        .iter()
+        .filter(|skill| skill_info_model_invocable(skill))
+        .filter(|skill| !skill.description.trim().is_empty())
+        .collect::<Vec<_>>();
+    if described.is_empty() {
+        return None;
+    }
+    described.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut lines = vec![
+        "Skills provide specialized instructions and workflows for specific tasks.".to_string(),
+        "Use the skill tool to load a skill when a task matches its description.".to_string(),
+        "<available_skills>".to_string(),
+    ];
+    for skill in described {
+        lines.extend([
+            "  <skill>".to_string(),
+            format!("    <name>{}</name>", xml_escape(&skill.name)),
+            format!(
+                "    <description>{}</description>",
+                xml_escape(&skill_display_description(skill))
+            ),
+            format!("    <location>{}</location>", xml_escape(&skill.location)),
+            "  </skill>".to_string(),
+        ]);
+    }
+    lines.push("</available_skills>".to_string());
+    Some(lines.join("\n"))
+}
+
+#[must_use]
+pub fn skill_info_model_invocable(skill: &SkillInfo) -> bool {
+    skill_metadata_model_invocable(&skill.metadata)
+}
+
+#[must_use]
+pub fn skill_document_model_invocable(skill: &SkillDocument) -> bool {
+    skill_metadata_model_invocable(&skill.metadata)
+}
+
+#[must_use]
+pub fn skill_display_description(skill: &SkillInfo) -> String {
+    let description = skill.description.trim();
+    let when_to_use = skill
+        .metadata
+        .get("when_to_use")
+        .or_else(|| skill.metadata.get("when-to-use"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match when_to_use {
+        Some(when_to_use) => format!("{description} When to use: {when_to_use}"),
+        None => description.to_string(),
+    }
+}
+
+fn skill_metadata_model_invocable(metadata: &BTreeMap<String, Value>) -> bool {
+    if metadata_bool(metadata, "disable-model-invocation").unwrap_or(false)
+        || metadata_bool(metadata, "disable_model_invocation").unwrap_or(false)
+    {
+        return false;
+    }
+    !matches!(
+        metadata_bool(metadata, "user-invocable")
+            .or_else(|| metadata_bool(metadata, "user_invocable")),
+        Some(false)
+    )
+}
+
+fn metadata_bool(metadata: &BTreeMap<String, Value>, key: &str) -> Option<bool> {
+    let value = metadata.get(key)?;
+    if let Some(value) = value.as_bool() {
+        return Some(value);
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" | "on" => Some(true),
+            "false" | "no" | "0" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(None)
+}
+
+#[must_use]
+pub fn render_preloaded_skills(skills: &[SkillDocument]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let mut loaded = skills.iter().collect::<Vec<_>>();
+    loaded.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut lines = vec![
+        "The following skills are already loaded in this agent context.".to_string(),
+        "<preloaded_skills>".to_string(),
+    ];
+    for skill in loaded {
+        lines.extend([
+            format!("  <skill name=\"{}\">", xml_escape(&skill.name)),
+            format!(
+                "    <description>{}</description>",
+                xml_escape(&skill.description)
+            ),
+            format!("    <location>{}</location>", xml_escape(&skill.location)),
+            format!(
+                "    <base_directory>{}</base_directory>",
+                xml_escape(&skill.directory)
+            ),
+            "    <skill_content>".to_string(),
+            skill.content.trim().to_string(),
+            "    </skill_content>".to_string(),
+            "  </skill>".to_string(),
+        ]);
+    }
+    lines.push("</preloaded_skills>".to_string());
+    Some(lines.join("\n"))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -2321,6 +2490,13 @@ fn iter_pattern_matches(base_dir: &Path, seen: &mut BTreeSet<PathBuf>) -> Vec<Pa
         }
     }
     result
+}
+
+fn builtin_skill_roots() -> Vec<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    vec![canonicalize_existing(
+        &manifest_dir.join("../skill/openagent"),
+    )]
 }
 
 fn recursive_skill_files(root: &Path) -> Vec<PathBuf> {
