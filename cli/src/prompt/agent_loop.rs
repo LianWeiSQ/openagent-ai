@@ -724,37 +724,28 @@ pub(super) fn run_agent_loop(
                 Some(&assistant_message_id),
                 Some(new_cli_id("msg")),
             );
-            if let Some(skill_event) = settlement.skill_event.clone() {
+            for intent in &settlement.event_intents {
                 let _ = store.record_event(
                     &session.id,
                     run_id,
-                    &skill_event.event_name,
+                    &intent.event_name,
                     SessionEventOptions {
-                        kind: "skill".to_string(),
-                        attributes: skill_event.attributes,
+                        kind: intent.kind.clone(),
+                        status: intent.status.clone(),
+                        attributes: intent.attributes.clone(),
                         ..SessionEventOptions::default()
                     },
                 );
             }
-            let projection = settlement.projection;
-            let _ = store.record_event(
-                &session.id,
-                run_id,
-                &projection.event_name,
-                SessionEventOptions {
-                    kind: "tool".to_string(),
-                    status: projection.event_status,
-                    attributes: projection.event_attributes,
-                    ..SessionEventOptions::default()
-                },
-            );
+            let part_intent = &settlement.part_intent;
             let _ = store.append_part(
                 &session.id,
                 run_id,
-                "tool_result",
+                &part_intent.part_type,
                 SessionPartOptions {
-                    attributes: projection.part_attributes,
-                    step_index: Some(step),
+                    attributes: part_intent.attributes.clone(),
+                    step_index: part_intent.step_index,
+                    status: part_intent.status.clone(),
                     ..SessionPartOptions::default()
                 },
             );
@@ -1758,37 +1749,28 @@ fn append_tool_result_to_session(
         assistant_message_id.as_deref(),
         Some(new_cli_id("msg")),
     );
-    if let Some(skill_event) = settlement.skill_event.clone() {
+    for intent in &settlement.event_intents {
         let _ = context.store.record_event(
             &context.session.id,
             context.run_id,
-            &skill_event.event_name,
+            &intent.event_name,
             SessionEventOptions {
-                kind: "skill".to_string(),
-                attributes: skill_event.attributes,
+                kind: intent.kind.clone(),
+                status: intent.status.clone(),
+                attributes: intent.attributes.clone(),
                 ..SessionEventOptions::default()
             },
         );
     }
-    let projection = settlement.projection;
-    let _ = context.store.record_event(
-        &context.session.id,
-        context.run_id,
-        &projection.event_name,
-        SessionEventOptions {
-            kind: "tool".to_string(),
-            status: projection.event_status,
-            attributes: projection.event_attributes,
-            ..SessionEventOptions::default()
-        },
-    );
+    let part_intent = &settlement.part_intent;
     let _ = context.store.append_part(
         &context.session.id,
         context.run_id,
-        "tool_result",
+        &part_intent.part_type,
         SessionPartOptions {
-            attributes: projection.part_attributes,
-            step_index: Some(step),
+            attributes: part_intent.attributes.clone(),
+            step_index: part_intent.step_index,
+            status: part_intent.status.clone(),
             ..SessionPartOptions::default()
         },
     );

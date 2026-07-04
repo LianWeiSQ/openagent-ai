@@ -70,6 +70,7 @@ SessionRunner
 - `item/toolCall/completed` / `failed` event construction。
 - tool-result message/session projection payload construction；
 - tool-result settlement construction；
+- tool-result event/part application intent construction；
 - skill session-event payload construction。
 - terminal turn event envelope construction。
 - shared usage/trace payload construction。

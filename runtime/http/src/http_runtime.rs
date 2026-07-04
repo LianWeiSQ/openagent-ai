@@ -6530,37 +6530,28 @@ fn append_tool_result_to_session(
         assistant_message_id.as_deref(),
         None,
     );
-    if let Some(skill_event) = settlement.skill_event.clone() {
+    for intent in &settlement.event_intents {
         let _ = store.record_event(
             &session.id,
             run_id,
-            &skill_event.event_name,
+            &intent.event_name,
             SessionEventOptions {
-                kind: "skill".to_string(),
-                attributes: skill_event.attributes,
+                kind: intent.kind.clone(),
+                status: intent.status.clone(),
+                attributes: intent.attributes.clone(),
                 ..SessionEventOptions::default()
             },
         );
     }
-    let projection = settlement.projection;
-    let _ = store.record_event(
-        &session.id,
-        run_id,
-        &projection.event_name,
-        SessionEventOptions {
-            kind: "tool".to_string(),
-            status: projection.event_status,
-            attributes: projection.event_attributes,
-            ..SessionEventOptions::default()
-        },
-    );
+    let part_intent = &settlement.part_intent;
     let _ = store.append_part(
         &session.id,
         run_id,
-        "tool_result",
+        &part_intent.part_type,
         SessionPartOptions {
-            attributes: projection.part_attributes,
-            step_index: Some(step),
+            attributes: part_intent.attributes.clone(),
+            step_index: part_intent.step_index,
+            status: part_intent.status.clone(),
             ..SessionPartOptions::default()
         },
     );

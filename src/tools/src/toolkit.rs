@@ -1156,11 +1156,29 @@ pub struct SkillToolSessionEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SettlementEventIntent {
+    pub event_name: String,
+    pub kind: String,
+    pub status: String,
+    pub attributes: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SettlementPartIntent {
+    pub part_type: String,
+    pub status: String,
+    pub step_index: Option<u64>,
+    pub attributes: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ToolResultSettlement {
     pub failed: bool,
     pub message: ChatMessage,
     pub projection: ToolResultSessionProjection,
     pub skill_event: Option<SkillToolSessionEvent>,
+    pub event_intents: Vec<SettlementEventIntent>,
+    pub part_intent: SettlementPartIntent,
 }
 
 impl SessionRunnerFacade {
@@ -1492,11 +1510,36 @@ impl SessionRunnerFacade {
         assistant_message_id: Option<&str>,
         message_id: Option<String>,
     ) -> ToolResultSettlement {
+        let projection = self.tool_result_session_projection(step, call, result);
+        let skill_event = self.skill_tool_session_event(step, call, result);
+        let mut event_intents = Vec::new();
+        if let Some(skill_event) = skill_event.clone() {
+            event_intents.push(SettlementEventIntent {
+                event_name: skill_event.event_name,
+                kind: "skill".to_string(),
+                status: "ok".to_string(),
+                attributes: skill_event.attributes,
+            });
+        }
+        event_intents.push(SettlementEventIntent {
+            event_name: projection.event_name.clone(),
+            kind: "tool".to_string(),
+            status: projection.event_status.clone(),
+            attributes: projection.event_attributes.clone(),
+        });
+        let part_intent = SettlementPartIntent {
+            part_type: "tool_result".to_string(),
+            status: "ok".to_string(),
+            step_index: Some(step),
+            attributes: projection.part_attributes.clone(),
+        };
         ToolResultSettlement {
             failed: result.error.is_some(),
             message: self.tool_result_message(step, call, result, assistant_message_id, message_id),
-            projection: self.tool_result_session_projection(step, call, result),
-            skill_event: self.skill_tool_session_event(step, call, result),
+            projection,
+            skill_event,
+            event_intents,
+            part_intent,
         }
     }
 

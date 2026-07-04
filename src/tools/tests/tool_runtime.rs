@@ -322,6 +322,17 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
             .event_name,
         "skill.loaded"
     );
+    assert_eq!(settlement.event_intents.len(), 2);
+    assert_eq!(settlement.event_intents[0].event_name, "skill.loaded");
+    assert_eq!(settlement.event_intents[0].kind, "skill");
+    assert_eq!(settlement.event_intents[0].status, "ok");
+    assert_eq!(settlement.event_intents[1].event_name, "tool.call.finished");
+    assert_eq!(settlement.event_intents[1].kind, "tool");
+    assert_eq!(settlement.event_intents[1].status, "ok");
+    assert_eq!(settlement.part_intent.part_type, "tool_result");
+    assert_eq!(settlement.part_intent.step_index, Some(3));
+    assert_eq!(settlement.part_intent.status, "ok");
+    assert_eq!(settlement.part_intent.attributes["failed"], false);
 
     let failed_result = ToolResult {
         call_id: "call_skill".to_string(),
@@ -345,6 +356,14 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
     assert_eq!(failed_settlement.message.content, "Tool failed: denied");
     assert_eq!(failed_settlement.projection.event_name, "tool.call.failed");
     assert!(failed_settlement.skill_event.is_none());
+    assert_eq!(failed_settlement.event_intents.len(), 1);
+    assert_eq!(
+        failed_settlement.event_intents[0].event_name,
+        "tool.call.failed"
+    );
+    assert_eq!(failed_settlement.event_intents[0].kind, "tool");
+    assert_eq!(failed_settlement.event_intents[0].status, "error");
+    assert_eq!(failed_settlement.part_intent.attributes["failed"], true);
 }
 
 #[test]
