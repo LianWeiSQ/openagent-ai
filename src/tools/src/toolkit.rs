@@ -1057,6 +1057,99 @@ impl ToolContext {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionRunnerFacade {
+    session_root: PathBuf,
+    session_id: String,
+    agent_options: BTreeMap<String, Value>,
+    permission_manager: Option<PermissionManager>,
+    dangerously_skip_permissions: bool,
+    question_answers: Option<Vec<Vec<String>>>,
+}
+
+impl SessionRunnerFacade {
+    #[must_use]
+    pub fn new(session_root: impl Into<PathBuf>, session_id: impl Into<String>) -> Self {
+        Self {
+            session_root: session_root.into(),
+            session_id: session_id.into(),
+            agent_options: BTreeMap::new(),
+            permission_manager: None,
+            dangerously_skip_permissions: false,
+            question_answers: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_agent_options(mut self, options: BTreeMap<String, Value>) -> Self {
+        self.agent_options = options;
+        self
+    }
+
+    #[must_use]
+    pub fn with_permission_manager(mut self, manager: PermissionManager) -> Self {
+        self.permission_manager = Some(manager);
+        self
+    }
+
+    #[must_use]
+    pub fn with_dangerously_skip_permissions(mut self, enabled: bool) -> Self {
+        self.dangerously_skip_permissions = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_question_answers(mut self, answers: Vec<Vec<String>>) -> Self {
+        if !answers.is_empty() {
+            self.question_answers = Some(answers);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn tool_context(&self) -> ToolContext {
+        let mut context = ToolContext::new(self.session_root.clone())
+            .with_session_id(self.session_id.clone())
+            .with_agent_options(self.agent_options.clone())
+            .with_dangerously_skip_permissions(self.dangerously_skip_permissions);
+        if let Some(manager) = self.permission_manager.clone() {
+            context = context.with_permission_manager(manager);
+        }
+        if let Some(answers) = self.question_answers.clone() {
+            context.set_question_answers(answers);
+        }
+        context
+    }
+
+    #[must_use]
+    pub fn contract_value(&self) -> Value {
+        json!({
+            "session_id": self.session_id,
+            "agent_id": self.agent_options
+                .get("agent_id")
+                .or_else(|| self.agent_options.get("agent"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "skills": self.agent_options
+                .get("skills")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "skill_roots": self.agent_options
+                .get("skill_roots")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "has_skill_permissions": self.agent_options.contains_key("skill_permissions"),
+            "dangerously_skip_permissions": self.dangerously_skip_permissions,
+            "question_answer_groups": self
+                .question_answers
+                .as_ref()
+                .map(|answers| answers.len())
+                .unwrap_or(0),
+            "has_permission_manager": self.permission_manager.is_some(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CommandResult {
     pub returncode: i32,

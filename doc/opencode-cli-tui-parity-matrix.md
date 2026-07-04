@@ -99,9 +99,10 @@ Remaining parity risk:
 - Skill CLI/API observability is now closed for Step10: CLI skills golden,
   HTTP `/api/skills` golden, `skill.discovered`/`skill.loaded` session events,
   and compaction protection are covered. AgentProfile/SkillConfig/TaskConfig
-  parsing is now shared; the next runtime risk is duplicated CLI/HTTP
-  tool/task/skill/provider loops, which should move behind a shared
-  SessionRunner facade.
+  parsing is now shared, and the first `SessionRunnerFacade` layer now
+  centralizes ToolContext construction for CLI and HTTP. The next runtime risk
+  is the still-duplicated provider-step/tool-call/task loop, which should move
+  behind the same facade.
 - HTTP provider catalog and fallback handling now keep catalog filtering
   separate from execution model selection: explicit session/profile models are
   preserved for provider calls while the model list can still curate supported
@@ -117,6 +118,7 @@ Current local verification anchors:
 | CLI agents/subagents | Built-in agents, OpenCode Markdown agents, task routing, workspace isolation | `cli/tests/cli_commands.rs::binary_agent_registry_exposes_builtin_subagents`, `binary_agent_registry_loads_opencode_markdown_agents`, and task-subagent tests |
 | TUI controls | Session, file, model, agent, variant/thinking pickers; approval/question/diff docks | `runtime/tui/src/tests.rs` picker, interaction, render, and App Bridge tests |
 | HTTP/App Bridge | Sessions, turns, approvals/questions, diff/checkpoint, MCP, agents, skills, task trees, provider catalog/fallback contract | `cargo test -p openagent-http-runtime --test http_runtime -q` covers the full HTTP runtime contract |
+| Shared runner contract | Shared profile schema and first SessionRunner facade layer | `cargo test -p openagent-tools -q`; `cargo check -p openagent-cli -p openagent-http-runtime` |
 
 ## CLI Matrix
 
@@ -158,11 +160,10 @@ Current local verification anchors:
 
 P0 rows are the first implementation tranche after this matrix:
 
-1. Shared SessionRunner facade: AgentProfile/SkillConfig/TaskConfig parsing is
-   shared, but CLI and HTTP still execute separate tool/task/skill/provider
-   loops. Extract a common runner facade so provider calls, task handoff, skill
-   loading, pending approval/question resume, and session events share one
-   runtime contract.
+1. Shared SessionRunner facade: the first facade layer now owns shared
+   ToolContext construction for CLI and HTTP. Continue moving provider calls,
+   task handoff, skill loading, pending approval/question resume, and session
+   events into the common runner until the duplicated loops disappear.
 2. [CLI-14 / Task background](#cli-matrix): complete background task state
    machine across queued/running/completed/failed/cancelled plus
    wait/promote/cancel/resume. HTTP has the queue foundation; CLI is still

@@ -5,8 +5,9 @@ use super::tool::{
 };
 use super::*;
 use openagent_tools::{
-    TASK_TOOL_ID, TaskSubagentRoute, benchmark_mode_value_allows_shell_command,
-    prepare_isolated_workspace, select_task_subagent_for_prompt,
+    SessionRunnerFacade, TASK_TOOL_ID, TaskSubagentRoute,
+    benchmark_mode_value_allows_shell_command, prepare_isolated_workspace,
+    select_task_subagent_for_prompt,
 };
 
 #[derive(Debug)]
@@ -89,17 +90,18 @@ pub(super) fn run_agent_loop(
         register_task_tool(&mut toolkit.registry, &subagent_descriptors);
     }
     let tools = filter_tools_for_agent(toolkit.get_all_tools("local"), agent_profile);
-    let mut ctx = ToolContext::new(workspace)
-        .with_session_id(session.id.clone())
+    let runner_facade = SessionRunnerFacade::new(workspace, session.id.clone())
         .with_agent_options(agent_tool_options(agent_profile))
         .with_permission_manager(permission_manager_for_agent(
             permission_ruleset.clone(),
             agent_profile,
         ))
         .with_dangerously_skip_permissions(skip_permissions);
-    if let Some(answers) = configured_question_answers(args) {
-        ctx.set_question_answers(answers);
-    }
+    let mut ctx = if let Some(answers) = configured_question_answers(args) {
+        runner_facade.with_question_answers(answers).tool_context()
+    } else {
+        runner_facade.tool_context()
+    };
     if let Some(runtime) = mcp_runtime.as_ref() {
         let _ = store.record_event(
             &session.id,

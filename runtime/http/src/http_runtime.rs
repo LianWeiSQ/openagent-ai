@@ -43,8 +43,8 @@ use openagent_session::{
     StartRunOptions,
 };
 use openagent_tools::{
-    SkillPermissionRule, TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor,
-    TaskSubagentRoute, ToolContext, Toolkit, fork_skill_task_from_input,
+    SessionRunnerFacade, SkillPermissionRule, TASK_TOOL_ID, TaskPermissionRule,
+    TaskSubagentDescriptor, TaskSubagentRoute, ToolContext, Toolkit, fork_skill_task_from_input,
     parse_agent_profile_schema, prepare_isolated_workspace, register_task_tool,
     resolve_path_in_root, select_task_subagent_for_prompt, skill_is_visible,
     task_subagent_is_visible,
@@ -1416,6 +1416,21 @@ fn runtime_permission_manager_for_agent(
         }
     }
     manager
+}
+
+fn runtime_session_runner_facade(
+    session: &Session,
+    agent_profile: Option<&RuntimeSubagentProfile>,
+    permission_ruleset: PermissionRuleset,
+    skip_permissions: bool,
+) -> SessionRunnerFacade {
+    SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+        .with_agent_options(runtime_agent_tool_options(agent_profile))
+        .with_permission_manager(runtime_permission_manager_for_agent(
+            permission_ruleset,
+            agent_profile,
+        ))
+        .with_dangerously_skip_permissions(skip_permissions)
 }
 
 fn sanitize_runtime_agent_id(value: &str) -> String {
@@ -4932,21 +4947,21 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<BTreeSet<_>>();
-    let mut ctx = ToolContext::new(&session.directory)
-        .with_session_id(session.id.clone())
-        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()))
-        .with_permission_manager(runtime_permission_manager_for_agent(
-            permission_ruleset.clone(),
-            agent_profile.as_ref(),
-        ))
-        .with_dangerously_skip_permissions(skip_permissions);
-    if let Some(answers) = payload
+    let runner_facade = runtime_session_runner_facade(
+        session,
+        agent_profile.as_ref(),
+        permission_ruleset.clone(),
+        skip_permissions,
+    );
+    let mut ctx = if let Some(answers) = payload
         .get("question_answers")
         .or_else(|| payload.get("answers"))
         .and_then(question_answers_from_json)
     {
-        ctx.set_question_answers(answers);
-    }
+        runner_facade.with_question_answers(answers).tool_context()
+    } else {
+        runner_facade.tool_context()
+    };
     if let Some(profile) = agent_profile.as_ref()
         && let Some((system, system_index)) =
             bind_runtime_agent_system_prompt(session, profile, &profile.mode)
@@ -7510,14 +7525,13 @@ fn run_http_tool_turn(
     let mcp_runtime = register_runtime_mcp_tools(config, &session.directory, &mut toolkit);
     let tool_call_count = tool_calls.len() as u64;
     let empty_payload = json!({});
-    let mut ctx = ToolContext::new(&session.directory)
-        .with_session_id(session.id.clone())
-        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()))
-        .with_permission_manager(runtime_permission_manager_for_agent(
-            permission_ruleset.clone(),
-            agent_profile.as_ref(),
-        ))
-        .with_dangerously_skip_permissions(skip_permissions);
+    let mut ctx = runtime_session_runner_facade(
+        session,
+        agent_profile.as_ref(),
+        permission_ruleset.clone(),
+        skip_permissions,
+    )
+    .tool_context();
     let mut events = vec![turn_started_event(session, run_id)];
     let assistant_message_id = runtime_message_id(session.messages.len() as u64 + tool_call_count);
     let start_checkpoint = runtime_create_step_checkpoint(
@@ -7754,21 +7768,20 @@ fn respond_approval_payload(
             .and_then(|pending| pending.get("skip_permissions"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let mut ctx = ToolContext::new(&session.directory)
-            .with_session_id(session.id.clone())
-            .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()))
-            .with_permission_manager(runtime_permission_manager_for_agent(
-                parse_permission_ruleset(
-                    session
-                        .metadata
-                        .get("permission")
-                        .and_then(Value::as_str)
-                        .unwrap_or("FULL"),
-                )
-                .unwrap_or(PermissionRuleset::Full),
-                agent_profile.as_ref(),
-            ))
-            .with_dangerously_skip_permissions(true);
+        let mut ctx = runtime_session_runner_facade(
+            &session,
+            agent_profile.as_ref(),
+            parse_permission_ruleset(
+                session
+                    .metadata
+                    .get("permission")
+                    .and_then(Value::as_str)
+                    .unwrap_or("FULL"),
+            )
+            .unwrap_or(PermissionRuleset::Full),
+            true,
+        )
+        .tool_context();
         let change_before = capture_file_change_before(&session, &tool_call);
         let mut tool_result = execute_runtime_tool_call(
             &toolkit,
@@ -8009,14 +8022,14 @@ fn respond_question_payload(
 
     let tool_call = pending_question_tool_call(&question)?;
     let agent_profile = runtime_agent_profile_for_session(&session);
-    let mut ctx = ToolContext::new(&session.directory)
-        .with_session_id(session.id.clone())
-        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()));
     let answers = response
         .get("answers")
         .and_then(question_answers_from_json)
         .unwrap_or_default();
-    ctx.set_question_answers(answers);
+    let mut ctx = SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()))
+        .with_question_answers(answers)
+        .tool_context();
     let toolkit = toolkit_with_runtime_task_tool(&session, agent_profile.as_ref());
     let mut tool_result = toolkit.execute(
         "question",

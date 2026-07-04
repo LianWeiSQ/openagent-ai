@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fs,
     io::{Read, Write},
@@ -8,13 +9,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use openagent_core::PermissionManager;
 use openagent_protocol::{PermissionAction, PermissionRuleset};
 use openagent_tools::{
-    LocalWorkspaceRuntime, TaskSubagentDescriptor, TodoItem, ToolContext, ToolRegistry, Toolkit,
-    benchmark_mode_allows_shell_command, benchmark_mode_value_allows_shell_command,
-    blocked_command, ensure_within_root, exclusive_schema, format_read_output_from_text,
-    parse_agent_profile_schema, prepare_isolated_workspace, qualify_tool_id, readonly_schema,
-    register_builtin_tools, select_task_subagent_for_prompt, truncate_output,
+    LocalWorkspaceRuntime, SessionRunnerFacade, TaskSubagentDescriptor, TodoItem, ToolContext,
+    ToolRegistry, Toolkit, benchmark_mode_allows_shell_command,
+    benchmark_mode_value_allows_shell_command, blocked_command, ensure_within_root,
+    exclusive_schema, format_read_output_from_text, parse_agent_profile_schema,
+    prepare_isolated_workspace, qualify_tool_id, readonly_schema, register_builtin_tools,
+    select_task_subagent_for_prompt, truncate_output,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -101,6 +104,50 @@ fn shared_agent_profile_schema_parses_skill_task_config_without_model_option_lea
     let error = parse_agent_profile_schema(&json!({"mode": "worker"}), "bad", "Bad")
         .expect_err("invalid mode should fail");
     assert!(error.contains("invalid mode"));
+}
+
+#[test]
+fn session_runner_facade_builds_shared_tool_context_contract() {
+    let mut manager = PermissionManager::new();
+    manager.set_ruleset(PermissionRuleset::Readonly);
+    let facade = SessionRunnerFacade::new("/tmp/openagent-session-runner", "session_runner")
+        .with_agent_options(BTreeMap::from([
+            ("agent_id".to_string(), json!("researcher")),
+            ("agent".to_string(), json!("researcher")),
+            ("skills".to_string(), json!(["brief"])),
+            ("skill_roots".to_string(), json!(["shared-skills"])),
+            (
+                "skill_permissions".to_string(),
+                json!([{"pattern": "hidden", "action": "deny"}]),
+            ),
+        ]))
+        .with_permission_manager(manager)
+        .with_dangerously_skip_permissions(true)
+        .with_question_answers(vec![vec!["yes".to_string(), "ship it".to_string()]]);
+
+    let context = facade.tool_context();
+    assert_eq!(context.session_id, "session_runner");
+    assert_eq!(context.agent_options["agent_id"], json!("researcher"));
+    assert_eq!(context.agent_options["skills"], json!(["brief"]));
+    assert_eq!(
+        context.agent_options["skill_roots"],
+        json!(["shared-skills"])
+    );
+    assert!(context.permission_manager.is_some());
+    assert!(context.dangerously_skip_permissions);
+    assert_eq!(
+        context.question_answers,
+        Some(vec![vec!["yes".to_string(), "ship it".to_string()]])
+    );
+
+    let contract = facade.contract_value();
+    assert_eq!(contract["session_id"], "session_runner");
+    assert_eq!(contract["agent_id"], "researcher");
+    assert_eq!(contract["skills"], json!(["brief"]));
+    assert_eq!(contract["skill_roots"], json!(["shared-skills"]));
+    assert_eq!(contract["has_skill_permissions"], true);
+    assert_eq!(contract["has_permission_manager"], true);
+    assert_eq!(contract["question_answer_groups"], 1);
 }
 
 #[test]
