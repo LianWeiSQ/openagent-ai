@@ -717,17 +717,26 @@ pub(super) fn run_agent_loop(
                 ),
                 event_sink,
             );
-            record_skill_tool_session_event(
-                store,
-                &session.id,
-                run_id,
+            let settlement = runner_facade.tool_result_settlement(
                 step,
                 &tool_call,
                 &tool_result,
-                &runner_facade,
+                Some(&assistant_message_id),
+                Some(new_cli_id("msg")),
             );
-            let projection =
-                runner_facade.tool_result_session_projection(step, &tool_call, &tool_result);
+            if let Some(skill_event) = settlement.skill_event.clone() {
+                let _ = store.record_event(
+                    &session.id,
+                    run_id,
+                    &skill_event.event_name,
+                    SessionEventOptions {
+                        kind: "skill".to_string(),
+                        attributes: skill_event.attributes,
+                        ..SessionEventOptions::default()
+                    },
+                );
+            }
+            let projection = settlement.projection;
             let _ = store.record_event(
                 &session.id,
                 run_id,
@@ -750,13 +759,7 @@ pub(super) fn run_agent_loop(
                 },
             );
 
-            let tool_message = runner_facade.tool_result_message(
-                step,
-                &tool_call,
-                &tool_result,
-                Some(&assistant_message_id),
-                Some(new_cli_id("msg")),
-            );
+            let tool_message = settlement.message;
             let tool_index = session.messages.len() as u64;
             session.add(tool_message.clone());
             store
@@ -1737,16 +1740,37 @@ fn append_tool_result_to_session(
         ),
         context.event_sink,
     );
-    record_skill_tool_session_event(
-        context.store,
-        &context.session.id,
-        context.run_id,
+    let assistant_message_id = context
+        .session
+        .metadata
+        .get(if tool_call.name == "question" {
+            "pending_question"
+        } else {
+            "pending_approval"
+        })
+        .and_then(|value| value.get("assistant_message_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let settlement = runner_facade.tool_result_settlement(
         step,
         tool_call,
         &tool_result,
-        &runner_facade,
+        assistant_message_id.as_deref(),
+        Some(new_cli_id("msg")),
     );
-    let projection = runner_facade.tool_result_session_projection(step, tool_call, &tool_result);
+    if let Some(skill_event) = settlement.skill_event.clone() {
+        let _ = context.store.record_event(
+            &context.session.id,
+            context.run_id,
+            &skill_event.event_name,
+            SessionEventOptions {
+                kind: "skill".to_string(),
+                attributes: skill_event.attributes,
+                ..SessionEventOptions::default()
+            },
+        );
+    }
+    let projection = settlement.projection;
     let _ = context.store.record_event(
         &context.session.id,
         context.run_id,
@@ -1768,55 +1792,13 @@ fn append_tool_result_to_session(
             ..SessionPartOptions::default()
         },
     );
-    let assistant_message_id = context
-        .session
-        .metadata
-        .get(if tool_call.name == "question" {
-            "pending_question"
-        } else {
-            "pending_approval"
-        })
-        .and_then(|value| value.get("assistant_message_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let tool_message = runner_facade.tool_result_message(
-        step,
-        tool_call,
-        &tool_result,
-        assistant_message_id.as_deref(),
-        Some(new_cli_id("msg")),
-    );
+    let tool_message = settlement.message;
     let tool_index = context.session.messages.len() as u64;
     context.session.add(tool_message.clone());
     context
         .store
         .append_message(context.session, &tool_message, context.run_id, tool_index)
         .map_err(|error| format!("failed to record resumed tool message: {error}"))
-}
-
-fn record_skill_tool_session_event(
-    store: &FileSessionStore,
-    session_id: &str,
-    run_id: &str,
-    step: u64,
-    tool_call: &ToolCall,
-    tool_result: &ToolResult,
-    runner_facade: &SessionRunnerFacade,
-) {
-    let Some(skill_event) = runner_facade.skill_tool_session_event(step, tool_call, tool_result)
-    else {
-        return;
-    };
-    let _ = store.record_event(
-        session_id,
-        run_id,
-        &skill_event.event_name,
-        SessionEventOptions {
-            kind: "skill".to_string(),
-            attributes: skill_event.attributes,
-            ..SessionEventOptions::default()
-        },
-    );
 }
 
 fn emit_run_event(

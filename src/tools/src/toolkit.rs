@@ -1155,6 +1155,14 @@ pub struct SkillToolSessionEvent {
     pub attributes: BTreeMap<String, Value>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ToolResultSettlement {
+    pub failed: bool,
+    pub message: ChatMessage,
+    pub projection: ToolResultSessionProjection,
+    pub skill_event: Option<SkillToolSessionEvent>,
+}
+
 impl SessionRunnerFacade {
     #[must_use]
     pub fn new(session_root: impl Into<PathBuf>, session_id: impl Into<String>) -> Self {
@@ -1472,6 +1480,23 @@ impl SessionRunnerFacade {
             name: Some(call.name.clone()),
             tool_call_id: Some(call.call_id.clone()),
             metadata,
+        }
+    }
+
+    #[must_use]
+    pub fn tool_result_settlement(
+        &self,
+        step: u64,
+        call: &ToolCall,
+        result: &ToolResult,
+        assistant_message_id: Option<&str>,
+        message_id: Option<String>,
+    ) -> ToolResultSettlement {
+        ToolResultSettlement {
+            failed: result.error.is_some(),
+            message: self.tool_result_message(step, call, result, assistant_message_id, message_id),
+            projection: self.tool_result_session_projection(step, call, result),
+            skill_event: self.skill_tool_session_event(step, call, result),
         }
     }
 

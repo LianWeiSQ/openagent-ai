@@ -6522,16 +6522,27 @@ fn append_tool_result_to_session(
     tool_result: &ToolResult,
 ) -> Result<(), String> {
     let runner_facade = SessionRunnerFacade::new(session.directory.clone(), session.id.clone());
-    record_runtime_skill_tool_session_event(
-        store,
-        &session.id,
-        run_id,
+    let assistant_message_id = latest_assistant_message_id_for_tool(session, tool_call);
+    let settlement = runner_facade.tool_result_settlement(
         step,
         tool_call,
         tool_result,
-        &runner_facade,
+        assistant_message_id.as_deref(),
+        None,
     );
-    let projection = runner_facade.tool_result_session_projection(step, tool_call, tool_result);
+    if let Some(skill_event) = settlement.skill_event.clone() {
+        let _ = store.record_event(
+            &session.id,
+            run_id,
+            &skill_event.event_name,
+            SessionEventOptions {
+                kind: "skill".to_string(),
+                attributes: skill_event.attributes,
+                ..SessionEventOptions::default()
+            },
+        );
+    }
+    let projection = settlement.projection;
     let _ = store.record_event(
         &session.id,
         run_id,
@@ -6553,44 +6564,12 @@ fn append_tool_result_to_session(
             ..SessionPartOptions::default()
         },
     );
-    let assistant_message_id = latest_assistant_message_id_for_tool(session, tool_call);
-    let tool_message = runner_facade.tool_result_message(
-        step,
-        tool_call,
-        tool_result,
-        assistant_message_id.as_deref(),
-        None,
-    );
+    let tool_message = settlement.message;
     let tool_index = session.messages.len() as u64;
     session.add(tool_message.clone());
     store
         .append_message(session, &tool_message, run_id, tool_index)
         .map_err(|error| format!("failed to record tool message: {error}"))
-}
-
-fn record_runtime_skill_tool_session_event(
-    store: &FileSessionStore,
-    session_id: &str,
-    run_id: &str,
-    step: u64,
-    tool_call: &ToolCall,
-    tool_result: &ToolResult,
-    runner_facade: &SessionRunnerFacade,
-) {
-    let Some(skill_event) = runner_facade.skill_tool_session_event(step, tool_call, tool_result)
-    else {
-        return;
-    };
-    let _ = store.record_event(
-        session_id,
-        run_id,
-        &skill_event.event_name,
-        SessionEventOptions {
-            kind: "skill".to_string(),
-            attributes: skill_event.attributes,
-            ..SessionEventOptions::default()
-        },
-    );
 }
 
 fn runtime_create_step_checkpoint(

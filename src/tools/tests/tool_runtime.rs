@@ -301,6 +301,27 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
         skill_event.attributes["skill_files"][0],
         "references/checklist.md"
     );
+    let settlement = facade.tool_result_settlement(
+        3,
+        &call,
+        &result,
+        Some("msg_assistant"),
+        Some("msg_tool_settlement".to_string()),
+    );
+    assert!(!settlement.failed);
+    assert_eq!(
+        settlement.message.metadata["message_id"],
+        "msg_tool_settlement"
+    );
+    assert_eq!(settlement.projection.event_name, "tool.call.finished");
+    assert_eq!(
+        settlement
+            .skill_event
+            .as_ref()
+            .expect("settled skill event")
+            .event_name,
+        "skill.loaded"
+    );
 
     let failed_result = ToolResult {
         call_id: "call_skill".to_string(),
@@ -319,6 +340,11 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
             .skill_tool_session_event(4, &call, &failed_result)
             .is_none()
     );
+    let failed_settlement = facade.tool_result_settlement(4, &call, &failed_result, None, None);
+    assert!(failed_settlement.failed);
+    assert_eq!(failed_settlement.message.content, "Tool failed: denied");
+    assert_eq!(failed_settlement.projection.event_name, "tool.call.failed");
+    assert!(failed_settlement.skill_event.is_none());
 }
 
 #[test]
