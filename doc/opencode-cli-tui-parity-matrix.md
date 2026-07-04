@@ -98,8 +98,14 @@ Remaining parity risk:
   full wait/promote/cancel lifecycle are not yet OpenCode-level.
 - Skill CLI/API observability is now closed for Step10: CLI skills golden,
   HTTP `/api/skills` golden, `skill.discovered`/`skill.loaded` session events,
-  and compaction protection are covered. The next risk is duplicated CLI/HTTP
-  profile parsing, which should move into a shared schema.
+  and compaction protection are covered. AgentProfile/SkillConfig/TaskConfig
+  parsing is now shared; the next runtime risk is duplicated CLI/HTTP
+  tool/task/skill/provider loops, which should move behind a shared
+  SessionRunner facade.
+- HTTP provider catalog and fallback handling now keep catalog filtering
+  separate from execution model selection: explicit session/profile models are
+  preserved for provider calls while the model list can still curate supported
+  display records. Broader provider login/catalog parity remains open.
 - Long-running local TUI rendering is covered by Rust state/render snapshots and
   App Bridge tests; it is not yet a full terminal automation suite.
 
@@ -110,7 +116,7 @@ Current local verification anchors:
 | CLI command surface | Root/subcommand help, OpenCode `run` flags, JSON run/model output | `cli/tests/cli_commands.rs::binary_help_smoke_covers_legacy_command_surface` and `binary_run_and_models_smokes_are_machine_readable` |
 | CLI agents/subagents | Built-in agents, OpenCode Markdown agents, task routing, workspace isolation | `cli/tests/cli_commands.rs::binary_agent_registry_exposes_builtin_subagents`, `binary_agent_registry_loads_opencode_markdown_agents`, and task-subagent tests |
 | TUI controls | Session, file, model, agent, variant/thinking pickers; approval/question/diff docks | `runtime/tui/src/tests.rs` picker, interaction, render, and App Bridge tests |
-| HTTP/App Bridge | Sessions, turns, approvals/questions, diff/checkpoint, MCP, agents, skills, task trees | `runtime/http/tests/http_runtime.rs` remote runtime and task/subagent cases |
+| HTTP/App Bridge | Sessions, turns, approvals/questions, diff/checkpoint, MCP, agents, skills, task trees, provider catalog/fallback contract | `cargo test -p openagent-http-runtime --test http_runtime -q` covers the full HTTP runtime contract |
 
 ## CLI Matrix
 
@@ -128,7 +134,7 @@ Current local verification anchors:
 | CLI-10 | GitHub agent and PR helpers | `packages/opencode/src/cli/cmd/github.ts` and `pr.ts` implement GitHub agent install/run and PR checkout/share import. | Partial | `github status/issue/pr/workflow` and `pr list/view/checkout/template/review` exist using `gh` and local workflow scaffolds. Missing OpenCode-level GitHub agent install/run and share import flows. | P2 | [#50](https://github.com/LianWeiSQ/openagent-ai/issues/50) | `cargo test -p openagent-cli binary_models_catalog_and_backlog_commands_are_deep_local_workflows -q` | Local workflow scaffold and PR helper surface exist; row stays Partial for full GitHub agent parity. |
 | CLI-11 | Debug and session-store inspection | `packages/opencode/src/cli/cmd/db.ts` and `debug/snapshot.ts` expose database and snapshot diagnostics. | Partial | `debug info/paths/env/sessions/file/rg/bundle` and `db path/summary/rebuild/query/schema/export-sql` exist. OpenCode snapshot/debug parity is still broader than current file-ledger diagnostics. | P3 | [#51](https://github.com/LianWeiSQ/openagent-ai/issues/51) | `cargo test -p openagent-cli binary_models_catalog_and_backlog_commands_are_deep_local_workflows -q` | DB rebuild/query and debug bundle surfaces exist; row stays Partial for snapshot-level parity. |
 | CLI-12 | Lifecycle commands | OpenCode docs expose `upgrade` and `uninstall` lifecycle commands. | Deferred | `upgrade`/`uninstall` return explicit source-tree-managed dry-run plans. Destructive lifecycle behavior is a packaging decision, not a local harness parity blocker. | P3 | [#52](https://github.com/LianWeiSQ/openagent-ai/issues/52) | `openagent upgrade --help`; `openagent uninstall --help` | Deferred until a packaged distribution owns upgrade/uninstall semantics. |
-| CLI-13 | Skills CLI and diagnostics | `packages/opencode/src/cli/cmd/debug/skill.ts` and skill services expose skill discovery/debug workflows. | Supported | `openagent skills list/show/doctor`, HTTP `/api/skills`, model-invocable filtering, profile skill roots, permission hiding, `skill.discovered`/`skill.loaded` events, loaded-skill compaction protection, built-in skill discovery, workspace override, Claude frontmatter subset, and fork-skill task handoff are implemented. | P1 | Skill Step10 | `cargo test -p openagent-cli --test cli_commands -q`; `cargo test -p openagent-http-runtime --test http_runtime -q`; `cargo test -p openagent-session --test session_trace -q`; `cargo test -p openagent-tools -q` | Step10 closed in `e145353`: CLI skills golden, HTTP `/api/skills` golden, session skill events, and compaction protection are covered. Remaining skill-adjacent work is shared profile/schema extraction, not missing Step10 behavior. |
+| CLI-13 | Skills CLI and diagnostics | `packages/opencode/src/cli/cmd/debug/skill.ts` and skill services expose skill discovery/debug workflows. | Supported | `openagent skills list/show/doctor`, HTTP `/api/skills`, model-invocable filtering, profile skill roots, permission hiding, `skill.discovered`/`skill.loaded` events, loaded-skill compaction protection, built-in skill discovery, workspace override, Claude frontmatter subset, and fork-skill task handoff are implemented. | P1 | Skill Step10 | `cargo test -p openagent-cli --test cli_commands -q`; `cargo test -p openagent-http-runtime --test http_runtime -q`; `cargo test -p openagent-session --test session_trace -q`; `cargo test -p openagent-tools -q` | Step10 closed in `e145353`: CLI skills golden, HTTP `/api/skills` golden, session skill events, and compaction protection are covered. Shared profile/schema extraction is closed in `4354027`; remaining skill-adjacent work is the shared SessionRunner loop, not missing Step10 behavior. |
 | CLI-14 | Task/subagent routing from CLI run | `packages/opencode/src/tool/task` and prompt guidance encourage Task tool use for search and delegated work. | Partial | CLI run supports explicit Task tool calls, `@subagent` manual routing, description-based auto routing, nesting guards, permissions, resume, and workspace isolation. CLI background task execution is not implemented yet. | P0 | Subagent task parity | `cargo test -p openagent-cli binary_run_executes_task_subagent_tool -q`; `cargo test -p openagent-cli binary_run_auto_routes_prompt_to_matching_subagent_description -q`; `cargo test -p openagent-cli binary_run_executes_subagent_in_isolated_workspace -q` | Foreground/nested/isolation paths are covered; row stays Partial for background lifecycle parity. |
 
 ## TUI Matrix
@@ -152,10 +158,11 @@ Current local verification anchors:
 
 P0 rows are the first implementation tranche after this matrix:
 
-1. Shared AgentProfile/SkillConfig/TaskConfig schema: CLI and HTTP currently
-   parse overlapping profile fields separately. Extract one shared parser/model
-   so skills/task permissions/model options stay consistent and profile config
-   fields cannot leak into provider payloads.
+1. Shared SessionRunner facade: AgentProfile/SkillConfig/TaskConfig parsing is
+   shared, but CLI and HTTP still execute separate tool/task/skill/provider
+   loops. Extract a common runner facade so provider calls, task handoff, skill
+   loading, pending approval/question resume, and session events share one
+   runtime contract.
 2. [CLI-14 / Task background](#cli-matrix): complete background task state
    machine across queued/running/completed/failed/cancelled plus
    wait/promote/cancel/resume. HTTP has the queue foundation; CLI is still

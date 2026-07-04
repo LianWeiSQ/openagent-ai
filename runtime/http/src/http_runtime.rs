@@ -272,42 +272,57 @@ fn model_records_for_runtime(
     probe: &RuntimeModelProbe,
 ) -> Vec<Value> {
     let mut models = if probe.model_ids.is_empty() {
-        vec![config.model.clone()]
+        supported_runtime_models()
     } else {
         probe.model_ids.clone()
     }
     .into_iter()
-    .filter(|model| !model.is_empty())
+    .filter(|model| runtime_model_supported(model))
     .collect::<Vec<_>>();
-    if !models.iter().any(|model| model == &config.model) {
-        models.insert(0, config.model.clone());
+    let configured_model = config.model.trim().to_string();
+    if !configured_model.is_empty() && !models.iter().any(|model| model == &configured_model) {
+        models.insert(0, configured_model.clone());
     }
-    if !models.iter().any(|model| model == "server-local") {
-        models.push("server-local".to_string());
-    }
+    models.sort();
+    models.dedup();
     models
         .into_iter()
         .map(|model| {
-            let provider_id = if model == "server-local" {
-                "openagent".to_string()
-            } else {
-                config.provider.clone()
-            };
-            let name = if model == "server-local" {
-                "OpenAgent Server Local".to_string()
-            } else {
-                model.clone()
-            };
-            let default = model == config.model;
+            let provider_id = config.provider.clone();
+            let name = model.clone();
+            let default = model == configured_model;
             json!({
                 "id": model,
                 "provider_id": provider_id,
                 "name": name,
                 "capabilities": {"tools": true, "streaming": true, "reasoning": true},
+                "catalog_supported": runtime_model_supported(&model),
                 "default": default,
             })
         })
         .collect()
+}
+
+fn supported_runtime_models() -> Vec<String> {
+    ["gpt-5.4", "gpt-5.5", "gpt-image-1.5", "gpt-image-2"]
+        .iter()
+        .map(|model| (*model).to_string())
+        .collect()
+}
+
+fn runtime_model_supported(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-5.4" | "gpt-5.5" | "gpt-image-1.5" | "gpt-image-2"
+    )
+}
+
+fn runtime_text_model_supported(model: &str) -> bool {
+    matches!(model, "gpt-5.4" | "gpt-5.5")
+}
+
+fn runtime_image_model_supported(model: &str) -> bool {
+    matches!(model, "gpt-image-1.5" | "gpt-image-2")
 }
 
 #[derive(Clone, Debug)]
@@ -412,6 +427,25 @@ fn runtime_provider_config(
         auth_record.as_ref(),
     )
     .expect("model has default");
+    let model = if model.source == "session" && model.value == default_model_id() {
+        runtime_provider_field(
+            "model",
+            env.get("model")
+                .map(String::as_str)
+                .unwrap_or("OPENAI_MODEL"),
+            &["OPENAGENT_MODEL"],
+            provider_default_model(&provider)
+                .ok()
+                .flatten()
+                .or_else(|| Some(default_model_id())),
+            payload,
+            None,
+            auth_record.as_ref(),
+        )
+        .expect("model has default")
+    } else {
+        model
+    };
     let wire_api = runtime_provider_field(
         "wire_api",
         env.get("wire_api")
@@ -3741,6 +3775,15 @@ struct RuntimeProfile {
 }
 
 fn apply_turn_runtime_profile(session: &mut Session, payload: &Value) -> RuntimeProfile {
+    let model_was_explicit = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+        || session
+            .metadata
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
     set_session_text_metadata(session, payload, "agent");
     set_session_text_metadata(session, payload, "model");
     set_session_text_metadata(session, payload, "variant");
@@ -3754,9 +3797,11 @@ fn apply_turn_runtime_profile(session: &mut Session, payload: &Value) -> Runtime
     session
         .metadata
         .insert("agent".to_string(), json!(profile.agent.clone()));
-    session
-        .metadata
-        .insert("model".to_string(), json!(profile.model.clone()));
+    if model_was_explicit {
+        session
+            .metadata
+            .insert("model".to_string(), json!(profile.model.clone()));
+    }
     session
         .metadata
         .insert("variant".to_string(), json!(profile.variant.clone()));
@@ -3904,6 +3949,12 @@ struct OpenAiRuntimeProviderRequest<'a> {
     messages: &'a [ChatMessage],
     tools: &'a [openagent_protocol::ToolSchema],
     model_options: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeProviderCallError {
+    message: String,
+    retryable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4120,34 +4171,79 @@ fn call_openai_compatible_provider_for_runtime(
         .timeout(Duration::from_secs(timeout_s.max(1)))
         .build()
         .map_err(|error| error.to_string())?;
+    let system_prompt = runtime_system_prompt_from_messages(messages);
+    let models = runtime_provider_model_candidates(model);
+    let mut last_error = None;
+    for (index, candidate_model) in models.iter().enumerate() {
+        let result = call_openai_compatible_provider_model(
+            &client,
+            provider,
+            candidate_model,
+            api_key,
+            base_url,
+            wire_api,
+            stream,
+            messages,
+            tools,
+            &model_options,
+            system_prompt.as_deref(),
+            &mut stream_sink,
+            should_cancel,
+        );
+        match result {
+            Ok(mut result) => {
+                if candidate_model != model {
+                    result.source = format!(
+                        "{};primary_model={};fallback_model={}",
+                        result.source, model, candidate_model
+                    );
+                }
+                return Ok(result);
+            }
+            Err(error) => {
+                let can_try_next = error.retryable && index + 1 < models.len();
+                last_error = Some(error);
+                if can_try_next {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(last_error
+        .map(|error| error.message)
+        .unwrap_or_else(|| "provider request failed".to_string()))
+}
+
+fn call_openai_compatible_provider_model(
+    client: &reqwest::blocking::Client,
+    provider: &str,
+    model: &str,
+    api_key: &str,
+    base_url: &str,
+    wire_api: &str,
+    stream: bool,
+    messages: &[ChatMessage],
+    tools: &[openagent_protocol::ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+    system_prompt: Option<&str>,
+    stream_sink: &mut Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<RuntimeProviderResult, RuntimeProviderCallError> {
     let mut config = OpenAiLanguageModelConfig::new(api_key, model);
     config.provider_id = provider.to_string();
     config.base_url = base_url.to_string();
     config.wire_api = wire_api.to_string();
-    let system_prompt = runtime_system_prompt_from_messages(messages);
     let (endpoint, mut payload) = if wire_api == "chat" {
-        let mut payload = build_openai_chat_payload(
-            &config,
-            system_prompt.as_deref(),
-            messages,
-            tools,
-            None,
-            None,
-            None,
-        );
+        let mut payload =
+            build_openai_chat_payload(&config, system_prompt, messages, tools, None, None, None);
         if let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(stream));
         }
         (join_url(base_url, "chat/completions"), payload)
     } else {
-        let mut payload = build_openai_responses_payload(
-            &config,
-            system_prompt.as_deref(),
-            messages,
-            tools,
-            None,
-            None,
-        );
+        let mut payload =
+            build_openai_responses_payload(&config, system_prompt, messages, tools, None, None);
         if let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(stream));
         }
@@ -4155,7 +4251,7 @@ fn call_openai_compatible_provider_for_runtime(
     };
     apply_runtime_model_options_to_payload(&mut payload, &model_options);
     let response = send_runtime_provider_request(
-        &client,
+        client,
         &endpoint,
         api_key,
         &payload,
@@ -4173,12 +4269,8 @@ fn call_openai_compatible_provider_for_runtime(
         if !status.is_success() {
             let raw = response
                 .text()
-                .map_err(|error| format!("provider response read failed: {error}"))?;
-            return Err(format!(
-                "provider returned HTTP {}: {}",
-                status.as_u16(),
-                summarize_http_error_body(&raw, &content_type)
-            ));
+                .map_err(|error| provider_read_error(error, Some(status.as_u16())))?;
+            return Err(provider_http_error(status.as_u16(), &raw, &content_type));
         }
         let mut chunks = Vec::new();
         read_sse_json_values_stream(response, |chunk| {
@@ -4192,7 +4284,8 @@ fn call_openai_compatible_provider_for_runtime(
             }
             chunks.push(chunk);
             Ok(())
-        })?;
+        })
+        .map_err(|error| provider_stream_error(error))?;
         let events = if wire_api == "chat" {
             normalize_openai_chat_sse_chunks(&chunks)
         } else {
@@ -4206,16 +4299,14 @@ fn call_openai_compatible_provider_for_runtime(
     }
     let raw = response
         .text()
-        .map_err(|error| format!("provider response read failed: {error}"))?;
+        .map_err(|error| provider_read_error(error, Some(status.as_u16())))?;
     if !status.is_success() {
-        return Err(format!(
-            "provider returned HTTP {}: {}",
-            status.as_u16(),
-            summarize_http_error_body(&raw, &content_type)
-        ));
+        return Err(provider_http_error(status.as_u16(), &raw, &content_type));
     }
-    let value: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("provider response was not JSON: {error}"))?;
+    let value: Value = serde_json::from_str(&raw).map_err(|error| RuntimeProviderCallError {
+        message: format!("provider response was not JSON: {error}"),
+        retryable: false,
+    })?;
     if wire_api == "chat" {
         Ok(openai_chat_response_to_runtime_result(
             &value,
@@ -4231,6 +4322,86 @@ fn call_openai_compatible_provider_for_runtime(
     }
 }
 
+fn runtime_provider_model_candidates(primary_model: &str) -> Vec<String> {
+    runtime_provider_model_candidates_with_fallback(
+        primary_model,
+        std::env::var("OPENAGENT_PROVIDER_FALLBACK_MODELS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn runtime_provider_model_candidates_with_fallback(
+    primary_model: &str,
+    configured_fallbacks: Option<&str>,
+) -> Vec<String> {
+    let primary = if primary_model.trim().is_empty() {
+        "gpt-5.5".to_string()
+    } else {
+        primary_model.trim().to_string()
+    };
+    let configured = configured_fallbacks
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty() && !runtime_image_model_supported(model))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|models| !models.is_empty())
+        .unwrap_or_else(|| {
+            if runtime_text_model_supported(&primary) {
+                match primary.as_str() {
+                    "gpt-5.5" => vec!["gpt-5.4".to_string()],
+                    "gpt-5.4" => vec!["gpt-5.5".to_string()],
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            }
+        });
+    let mut models = Vec::with_capacity(1 + configured.len());
+    models.push(primary);
+    for model in configured {
+        if !models.iter().any(|existing| existing == &model) {
+            models.push(model);
+        }
+    }
+    models
+}
+
+fn provider_http_error(status: u16, raw: &str, content_type: &str) -> RuntimeProviderCallError {
+    RuntimeProviderCallError {
+        message: format!(
+            "provider returned HTTP {}: {}",
+            status,
+            summarize_http_error_body(raw, content_type)
+        ),
+        retryable: runtime_provider_status_retryable(status),
+    }
+}
+
+fn provider_read_error(error: reqwest::Error, status: Option<u16>) -> RuntimeProviderCallError {
+    RuntimeProviderCallError {
+        message: format!("provider response read failed: {error}"),
+        retryable: status.is_some_and(runtime_provider_status_retryable),
+    }
+}
+
+fn provider_stream_error(error: String) -> RuntimeProviderCallError {
+    let interrupted = is_turn_interrupted_error(&error);
+    let retryable = !interrupted
+        && (error.contains("timed out")
+            || error.contains("connection")
+            || error.contains("reset")
+            || error.contains("closed"));
+    RuntimeProviderCallError {
+        message: error,
+        retryable,
+    }
+}
+
 fn send_runtime_provider_request(
     client: &reqwest::blocking::Client,
     endpoint: &str,
@@ -4238,7 +4409,7 @@ fn send_runtime_provider_request(
     payload: &Value,
     stream: bool,
     max_retries: u64,
-) -> Result<reqwest::blocking::Response, String> {
+) -> Result<reqwest::blocking::Response, RuntimeProviderCallError> {
     let mut attempt = 0_u64;
     loop {
         let mut request = client
@@ -4262,7 +4433,12 @@ fn send_runtime_provider_request(
                 attempt += 1;
                 thread::sleep(runtime_provider_retry_delay(attempt));
             }
-            Err(error) => return Err(format!("provider request failed: {error}")),
+            Err(error) => {
+                return Err(RuntimeProviderCallError {
+                    message: format!("provider request failed: {error}"),
+                    retryable: false,
+                });
+            }
         }
     }
 }
@@ -4272,14 +4448,14 @@ fn runtime_provider_status_retryable(status: u16) -> bool {
 }
 
 fn runtime_provider_retry_delay(attempt: u64) -> Duration {
-    Duration::from_millis(750 * attempt.min(4))
+    Duration::from_millis(750 * (1_u64 << attempt.saturating_sub(1).min(3)))
 }
 
 fn runtime_provider_request_retries() -> u64 {
     std::env::var("OPENAGENT_PROVIDER_RETRIES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(2)
+        .unwrap_or(4)
 }
 
 fn read_sse_json_values_stream<R, F>(mut reader: R, mut on_value: F) -> Result<(), String>
@@ -6874,12 +7050,12 @@ fn start_turn_response(
     if turn_async_requested(request_path, &payload) {
         match start_turn_async_payload(config, session_id, payload) {
             Ok((status, payload)) => json_response(status, payload),
-            Err(error) => json_response(400, json!({"error": error})),
+            Err(error) => session_error_response(error),
         }
     } else {
         match start_turn_payload_inner(config, session_id, payload, None) {
             Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
+            Err(error) => session_error_response(error),
         }
     }
 }
@@ -6890,6 +7066,9 @@ fn start_turn_async_payload(
     payload: Value,
 ) -> Result<(u16, Value), String> {
     validate_start_turn_payload(&payload)?;
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
     let run_id = new_id("turn");
     let registration = match register_turn_job(config, session_id, &run_id, payload.clone()) {
         Ok(registration) => registration,
@@ -7068,11 +7247,15 @@ fn start_turn_payload_inner(
     let permission_ruleset = permission_ruleset_for_turn(&payload)?;
     let skip_permissions = skip_permissions_for_turn(&payload);
     let store = FileSessionStore::new(session_root(config));
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
     let mut session = store
         .load_session(session_id)
-        .unwrap_or_else(|_| Session::new(session_id.to_string(), workspace(config)));
+        .map_err(|error| error.to_string())?;
     let runtime_profile = apply_turn_runtime_profile(&mut session, &payload);
     let run_id = run_id_override.unwrap_or_else(|| new_id("turn"));
+    let max_steps = provider_max_steps(&payload);
     session.status = SessionStatus::Running;
     let _ = store.start_run(
         &mut session,
@@ -7087,7 +7270,7 @@ fn start_turn_payload_inner(
             } else {
                 permission_ruleset.as_str().to_string()
             },
-            max_steps: 1,
+            max_steps,
             started_at_ms: None,
         },
     );
@@ -7252,9 +7435,9 @@ fn record_async_turn_failure(
     error: &str,
 ) {
     let store = FileSessionStore::new(session_root(config));
-    let mut session = store
-        .load_session(session_id)
-        .unwrap_or_else(|_| Session::new(session_id.to_string(), workspace(config)));
+    let Ok(mut session) = store.load_session(session_id) else {
+        return;
+    };
     session.status = SessionStatus::Idle;
     session.metadata.remove("pending_provider_turn");
     let _ = store.finish_run(
@@ -8885,6 +9068,68 @@ mod tests {
         );
         assert_eq!(provider_max_steps(&json!({"max_steps": 25})), 25);
         assert_eq!(provider_max_steps(&json!({"maxSteps": 100})), 100);
+    }
+
+    #[test]
+    fn runtime_model_catalog_filters_unsupported_models() {
+        let config = RuntimeProviderConfig {
+            provider: "openai".to_string(),
+            provider_label: "OpenAI".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_key_source: Some("test".to_string()),
+            base_url: "https://example.test/v1".to_string(),
+            base_url_source: "test".to_string(),
+            model: "gpt-5.5".to_string(),
+            model_source: "test".to_string(),
+            wire_api: "responses".to_string(),
+            wire_api_source: "test".to_string(),
+            requires_api_key: true,
+        };
+        let probe = RuntimeModelProbe {
+            checked: true,
+            ok: true,
+            message: "ok".to_string(),
+            endpoint: Some("https://example.test/v1/models".to_string()),
+            model_ids: vec![
+                "gpt-5.4".to_string(),
+                "gpt-5.3".to_string(),
+                "gpt-5.5".to_string(),
+                "gpt-image-1.5".to_string(),
+                "gpt-image-2".to_string(),
+                "server-local".to_string(),
+            ],
+            configured_model_available: Some(true),
+        };
+
+        let ids = model_records_for_runtime(&config, &probe)
+            .into_iter()
+            .map(|model| model["id"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec!["gpt-5.4", "gpt-5.5", "gpt-image-1.5", "gpt-image-2"]
+        );
+    }
+
+    #[test]
+    fn runtime_provider_fallback_candidates_filter_unsupported_models() {
+        assert_eq!(
+            runtime_provider_model_candidates_with_fallback(
+                "gpt-5.5",
+                Some("gpt-5.3,gpt-5.4,gpt-image-2,gpt-5.5")
+            ),
+            vec!["gpt-5.5", "gpt-5.3", "gpt-5.4"]
+        );
+        assert_eq!(
+            runtime_provider_model_candidates_with_fallback("gpt-5.3", Some("gpt-5.3,gpt-5.4")),
+            vec!["gpt-5.3", "gpt-5.4"]
+        );
+        assert_eq!(
+            runtime_provider_model_candidates_with_fallback("custom-child-model", None),
+            vec!["custom-child-model"]
+        );
     }
 
     #[test]

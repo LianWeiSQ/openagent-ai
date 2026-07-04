@@ -633,7 +633,7 @@ fn app_bridge_provider_health_uses_runtime_provider_config_without_leaking_key()
 -> Result<(), Box<dyn Error>> {
     let (provider_port, provider_thread, _provider_requests) =
         spawn_fake_openai_responses_provider_sequence(vec![serde_json::json!({
-            "data": [{"id": "gpt-runtime"}, {"id": "gpt-alt"}]
+            "data": [{"id": "gpt-5.5"}, {"id": "gpt-5.4"}]
         })])?;
     let port = free_port()?;
     let temp = temp_dir("openagent-http-runtime-provider-health")?;
@@ -649,7 +649,7 @@ fn app_bridge_provider_health_uses_runtime_provider_config_without_leaking_key()
         &[
             ("OPENAI_API_KEY", "runtime-secret"),
             ("OPENAI_BASE_URL", provider_base_url.as_str()),
-            ("OPENAI_MODEL", "gpt-runtime"),
+            ("OPENAI_MODEL", "gpt-5.5"),
             ("OPENAI_WIRE_API", "responses"),
             ("OPENAGENT_AUTH_FILE", auth_file.to_str().unwrap_or("")),
         ],
@@ -660,7 +660,7 @@ fn app_bridge_provider_health_uses_runtime_provider_config_without_leaking_key()
         .with_auth(RemoteAuth::bearer("secret"));
     let cached = client.models()?;
     assert_eq!(cached["model_endpoint_checked"], false);
-    assert_eq!(cached["model"], "gpt-runtime");
+    assert_eq!(cached["model"], "gpt-5.5");
     assert_eq!(cached["api_key"], "set");
     assert!(!cached.to_string().contains("runtime-secret"));
 
@@ -668,7 +668,7 @@ fn app_bridge_provider_health_uses_runtime_provider_config_without_leaking_key()
     assert_eq!(health["provider"], "openai");
     assert_eq!(health["base_url"], provider_base_url);
     assert_eq!(health["base_url_source"], "env");
-    assert_eq!(health["model"], "gpt-runtime");
+    assert_eq!(health["model"], "gpt-5.5");
     assert_eq!(health["model_source"], "env");
     assert_eq!(health["wire_api"], "responses");
     assert_eq!(health["api_key"], "set");
@@ -681,7 +681,7 @@ fn app_bridge_provider_health_uses_runtime_provider_config_without_leaking_key()
     assert!(
         health["models"]
             .as_array()
-            .is_some_and(|models| models.iter().any(|model| model["id"] == "gpt-runtime"))
+            .is_some_and(|models| models.iter().any(|model| model["id"] == "gpt-5.4"))
     );
     assert!(!health.to_string().contains("runtime-secret"));
 
@@ -731,6 +731,70 @@ fn remote_runtime_client_uses_real_provider_endpoint_for_plain_turn() -> Result<
             .any(|event| event["method"] == "item/agentMessage/delta"
                 && event["params"]["delta"] == "real provider answer")
     );
+
+    let _ = server.kill();
+    let _ = provider_thread.join();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn remote_runtime_client_falls_back_from_retryable_provider_502() -> Result<(), Box<dyn Error>> {
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_http_sequence(vec![
+            (
+                502,
+                serde_json::json!({
+                    "error": {
+                        "message": "Upstream service temporarily unavailable",
+                        "type": "upstream_error"
+                    }
+                }),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "resp_fallback",
+                    "output_text": "fallback provider answer",
+                    "usage": {"input_tokens": 3, "output_tokens": 2}
+                }),
+            ),
+        ])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-provider-fallback")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "gpt-5.5"),
+            ("OPENAGENT_PROVIDER_RETRIES", "0"),
+            ("OPENAGENT_PROVIDER_FALLBACK_MODELS", "gpt-5.4,gpt-5.3"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let started = client.start_turn(&session_id, "ask provider", serde_json::json!({}))?;
+
+    assert_eq!(started["status"], "completed");
+    assert_eq!(started["turn"]["final_answer"], "fallback provider answer");
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 2);
+    let first: Value = serde_json::from_str(&requests[0])?;
+    let second: Value = serde_json::from_str(&requests[1])?;
+    assert_eq!(first["model"], "gpt-5.5");
+    assert_eq!(second["model"], "gpt-5.4");
+    assert!(!requests.iter().any(|request| request.contains("gpt-5.3")));
 
     let _ = server.kill();
     let _ = provider_thread.join();
@@ -5535,6 +5599,8 @@ fn spawn_runtime_with_env(
         "OPENAGENT_MAX_RUNNING_TURN_WORKERS",
         "OPENAGENT_TURN_QUEUE_LEASE_STALE_MS",
         "OPENAGENT_TURN_QUEUE_TIMEOUT_MS",
+        "OPENAGENT_PROVIDER_RETRIES",
+        "OPENAGENT_PROVIDER_FALLBACK_MODELS",
     ] {
         command.env_remove(key);
     }
@@ -5602,6 +5668,42 @@ fn spawn_fake_openai_responses_provider_sequence(
                 let body = body_value.to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }),
+        requests,
+    ))
+}
+
+fn spawn_fake_openai_responses_provider_http_sequence(
+    responses: Vec<(u16, Value)>,
+) -> Result<FakeProviderServer, Box<dyn Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    Ok((
+        port,
+        thread::spawn(move || {
+            for (status, body_value) in responses {
+                let Ok((mut stream, _addr)) = listener.accept() else {
+                    break;
+                };
+                let mut buffer = [0_u8; 16384];
+                let read = stream.read(&mut buffer).unwrap_or_default();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                if let Some((_, body)) = request.split_once("\r\n\r\n")
+                    && let Ok(mut items) = captured.lock()
+                {
+                    items.push(body.to_string());
+                }
+                let reason = if status == 200 { "OK" } else { "ERROR" };
+                let body = body_value.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
