@@ -184,29 +184,42 @@ pub(super) fn run_prompt_command_with_events(
     let loop_result = match loop_result {
         Ok(result) => result,
         Err(error) => {
+            let fallback_finish_reason = if error.paused { "paused" } else { "error" };
+            let finish_reason = error
+                .finish_reason
+                .clone()
+                .unwrap_or_else(|| fallback_finish_reason.to_string());
+            let outcome = if error.paused {
+                SessionRunnerFacade::paused_turn_outcome(
+                    error.steps,
+                    finish_reason,
+                    error.message.clone(),
+                )
+            } else {
+                SessionRunnerFacade::failed_turn_outcome(
+                    error.steps,
+                    finish_reason,
+                    error.message.clone(),
+                )
+            };
             session.status = if error.paused {
                 SessionStatus::Paused
             } else {
                 SessionStatus::Stop
             };
-            let finish_reason = error.finish_reason.as_deref().unwrap_or(if error.paused {
-                "paused"
-            } else {
-                "error"
-            });
             let _ = store.finish_run(
                 &session,
                 &run_id,
-                "failed",
-                error.steps.max(1),
-                Some(finish_reason),
-                Some(&error.message),
+                &outcome.run_status,
+                outcome.steps,
+                Some(&outcome.finish_reason),
+                outcome.error.as_deref(),
             );
             if format == "json" && !error.events.is_empty() {
                 return err_json_events(
                     error.events,
                     error.message,
-                    if error.paused { "paused" } else { "failed" },
+                    &outcome.event_status,
                     &mut event_sink,
                 );
             }
@@ -229,13 +242,15 @@ pub(super) fn run_prompt_command_with_events(
             ..SessionEventOptions::default()
         },
     );
+    let outcome =
+        SessionRunnerFacade::completed_turn_outcome(loop_result.steps, loop_result.finish_reason);
     if let Err(error) = store.finish_run(
         &session,
         &run_id,
-        "completed",
-        loop_result.steps.max(1),
-        Some(&loop_result.finish_reason),
-        None,
+        &outcome.run_status,
+        outcome.steps,
+        Some(&outcome.finish_reason),
+        outcome.error.as_deref(),
     ) {
         return err_text(1, format!("failed to finish session run: {error}"));
     }
@@ -250,9 +265,9 @@ pub(super) fn run_prompt_command_with_events(
     if format == "json" {
         let mut completed = SessionRunnerFacade::new(&workspace, session.id.clone())
             .turn_terminal_event(
-                "turn/completed",
+                &outcome.event_method,
                 &run_id,
-                "completed",
+                &outcome.event_status,
                 false,
                 false,
                 true,

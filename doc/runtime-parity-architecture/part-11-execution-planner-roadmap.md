@@ -72,6 +72,7 @@ SessionRunner
 - skill session-event payload construction。
 - terminal turn event envelope construction。
 - shared usage/trace payload construction。
+- terminal outcome state construction。
 
 近期验证覆盖：
 

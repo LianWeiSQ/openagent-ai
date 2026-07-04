@@ -364,6 +364,41 @@ fn session_runner_facade_builds_shared_turn_terminal_events() {
 }
 
 #[test]
+fn session_runner_facade_builds_shared_turn_terminal_outcomes() {
+    let completed = SessionRunnerFacade::completed_turn_outcome(0, "stop");
+    assert_eq!(completed.event_method, "turn/completed");
+    assert_eq!(completed.run_status, "completed");
+    assert_eq!(completed.event_status, "completed");
+    assert_eq!(completed.steps, 1);
+    assert_eq!(completed.finish_reason, "stop");
+    assert_eq!(completed.error, None);
+
+    let failed = SessionRunnerFacade::failed_turn_outcome(3, "provider_error", "timeout");
+    assert_eq!(failed.event_method, "turn/failed");
+    assert_eq!(failed.run_status, "failed");
+    assert_eq!(failed.event_status, "failed");
+    assert_eq!(failed.steps, 3);
+    assert_eq!(failed.finish_reason, "provider_error");
+    assert_eq!(failed.error.as_deref(), Some("timeout"));
+
+    let paused = SessionRunnerFacade::paused_turn_outcome(2, "approval_required", "needs approval");
+    assert_eq!(paused.event_method, "turn/completed");
+    assert_eq!(paused.run_status, "failed");
+    assert_eq!(paused.event_status, "paused");
+    assert_eq!(paused.steps, 2);
+    assert_eq!(paused.finish_reason, "approval_required");
+    assert_eq!(paused.error.as_deref(), Some("needs approval"));
+
+    let interrupted = SessionRunnerFacade::interrupted_turn_outcome("cancelled");
+    assert_eq!(interrupted.event_method, "turn/interrupted");
+    assert_eq!(interrupted.run_status, "interrupted");
+    assert_eq!(interrupted.event_status, "interrupted");
+    assert_eq!(interrupted.steps, 1);
+    assert_eq!(interrupted.finish_reason, "interrupted");
+    assert_eq!(interrupted.error.as_deref(), Some("cancelled"));
+}
+
+#[test]
 fn session_runner_facade_builds_shared_turn_usage_and_trace_payloads() {
     let facade = SessionRunnerFacade::new("/tmp/openagent-session-runner", "session_trace");
 

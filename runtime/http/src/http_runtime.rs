@@ -6859,14 +6859,14 @@ fn finish_provider_loop(
 ) -> Result<Value, String> {
     session.status = SessionStatus::Idle;
     session.metadata.remove("pending_provider_turn");
-    let steps = carry.next_step.max(1);
+    let outcome = SessionRunnerFacade::completed_turn_outcome(carry.next_step, finish_reason);
     let _ = store.finish_run(
         session,
         run_id,
-        "completed",
-        steps,
-        Some(finish_reason),
-        None,
+        &outcome.run_status,
+        outcome.steps,
+        Some(&outcome.finish_reason),
+        outcome.error.as_deref(),
     );
     let usage = usage_value_from_provider(
         &carry.usage,
@@ -6879,9 +6879,9 @@ fn finish_provider_loop(
     events.push(
         SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
             .turn_terminal_event(
-                "turn/completed",
+                &outcome.event_method,
                 run_id,
-                "completed",
+                &outcome.event_status,
                 true,
                 true,
                 false,
@@ -6889,7 +6889,10 @@ fn finish_provider_loop(
                     ("final_answer".to_string(), json!(carry.answer.clone())),
                     ("usage".to_string(), usage.clone()),
                     ("trace".to_string(), trace.clone()),
-                    ("finish_reason".to_string(), json!(finish_reason)),
+                    (
+                        "finish_reason".to_string(),
+                        json!(outcome.finish_reason.clone()),
+                    ),
                 ]),
             ),
     );
@@ -6903,11 +6906,11 @@ fn finish_provider_loop(
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
-        "status": "completed",
+        "status": outcome.event_status.clone(),
         "turn": {
             "id": run_id,
             "session_id": session.id,
-            "status": "completed",
+            "status": outcome.event_status.clone(),
             "final_answer": events.last().and_then(|event| event.get("params")).and_then(|params| params.get("final_answer")).cloned().unwrap_or_else(|| json!("")),
             "agent": session_text_metadata(session, "agent", "server"),
             "model": session_text_metadata(session, "model", &default_model_id()),
@@ -7362,21 +7365,22 @@ fn record_async_turn_failure(
     };
     session.status = SessionStatus::Idle;
     session.metadata.remove("pending_provider_turn");
+    let outcome = SessionRunnerFacade::failed_turn_outcome(1, "async_turn_error", error);
     let _ = store.finish_run(
         &session,
         run_id,
-        "failed",
-        1,
-        Some("async_turn_error"),
-        Some(error),
+        &outcome.run_status,
+        outcome.steps,
+        Some(&outcome.finish_reason),
+        outcome.error.as_deref(),
     );
     let _ = store.save_state(&session, Some(run_id));
     let mut events = vec![
         SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
             .turn_terminal_event(
-                "turn/failed",
+                &outcome.event_method,
                 run_id,
-                "failed",
+                &outcome.event_status,
                 false,
                 true,
                 false,
@@ -7394,21 +7398,22 @@ fn record_turn_interrupted(
 ) -> Vec<Value> {
     session.status = SessionStatus::Stop;
     session.metadata.remove("pending_provider_turn");
+    let outcome = SessionRunnerFacade::interrupted_turn_outcome(error);
     let _ = store.finish_run(
         session,
         turn_id,
-        "interrupted",
-        1,
-        Some("interrupted"),
-        Some(error),
+        &outcome.run_status,
+        outcome.steps,
+        Some(&outcome.finish_reason),
+        outcome.error.as_deref(),
     );
     let _ = store.save_state(session, Some(turn_id));
-    mark_turn_job_status_at_root(&store.root, turn_id, "interrupted");
+    mark_turn_job_status_at_root(&store.root, turn_id, &outcome.event_status);
     let event = SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
         .turn_terminal_event(
-            "turn/interrupted",
+            &outcome.event_method,
             turn_id,
-            "interrupted",
+            &outcome.event_status,
             true,
             true,
             false,

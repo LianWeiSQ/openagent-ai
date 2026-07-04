@@ -1113,6 +1113,16 @@ pub struct ToolResultSessionProjection {
     pub part_attributes: BTreeMap<String, Value>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TurnTerminalOutcome {
+    pub event_method: String,
+    pub run_status: String,
+    pub event_status: String,
+    pub steps: u64,
+    pub finish_reason: String,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SkillToolSessionEvent {
     pub event_name: String,
@@ -1256,6 +1266,84 @@ impl SessionRunnerFacade {
             "method": method,
             "params": Value::Object(params),
         })
+    }
+
+    #[must_use]
+    pub fn turn_terminal_outcome(
+        event_method: impl Into<String>,
+        run_status: impl Into<String>,
+        event_status: impl Into<String>,
+        steps: u64,
+        finish_reason: impl Into<String>,
+        error: Option<String>,
+    ) -> TurnTerminalOutcome {
+        TurnTerminalOutcome {
+            event_method: event_method.into(),
+            run_status: run_status.into(),
+            event_status: event_status.into(),
+            steps: steps.max(1),
+            finish_reason: finish_reason.into(),
+            error,
+        }
+    }
+
+    #[must_use]
+    pub fn completed_turn_outcome(
+        steps: u64,
+        finish_reason: impl Into<String>,
+    ) -> TurnTerminalOutcome {
+        Self::turn_terminal_outcome(
+            "turn/completed",
+            "completed",
+            "completed",
+            steps,
+            finish_reason,
+            None,
+        )
+    }
+
+    #[must_use]
+    pub fn failed_turn_outcome(
+        steps: u64,
+        finish_reason: impl Into<String>,
+        error: impl Into<String>,
+    ) -> TurnTerminalOutcome {
+        Self::turn_terminal_outcome(
+            "turn/failed",
+            "failed",
+            "failed",
+            steps,
+            finish_reason,
+            Some(error.into()),
+        )
+    }
+
+    #[must_use]
+    pub fn paused_turn_outcome(
+        steps: u64,
+        finish_reason: impl Into<String>,
+        error: impl Into<String>,
+    ) -> TurnTerminalOutcome {
+        Self::turn_terminal_outcome(
+            "turn/completed",
+            "failed",
+            "paused",
+            steps,
+            finish_reason,
+            Some(error.into()),
+        )
+    }
+
+    #[must_use]
+    pub fn interrupted_turn_outcome(error: impl Into<String>) -> TurnTerminalOutcome {
+        Self::turn_terminal_outcome(
+            "turn/interrupted",
+            "interrupted",
+            "interrupted",
+            1,
+            "interrupted",
+            Some(error.into()),
+        )
     }
 
     #[must_use]
