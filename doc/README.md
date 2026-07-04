@@ -8,6 +8,7 @@ OpenAgent keeps the public docs intentionally small. Start with the README, then
 | [Context Engineering](context.md) | Context budget, compaction, instructions, file context, ContextPackBuilder |
 | [Operations](operations.md) | Observability, runtime logs, eval/replay, Terminal-Bench/Harbor adapters |
 | [OpenCode CLI/TUI Parity Matrix](opencode-cli-tui-parity-matrix.md) | Auditable CLI/TUI gap ledger, row issues, priorities, and verification evidence |
+| [Runtime Parity Architecture](runtime-parity-architecture/README.md) | Harness-level demand evolution and architecture notes for skills, subagents, MCP, sessions, product surfaces, and runner roadmap |
 | [Roadmap](roadmap.md) | Current gaps and the next engineering milestones |
 | [Rust Rewrite Plan](rust-rewrite-plan.md) | Goal-gated Python-to-Rust rewrite plan and terminal acceptance criteria |
 | [Rust Rewrite Parity Matrix](rust-rewrite-parity-matrix.md) | Final Rust crate ownership map and golden fixture gates |
