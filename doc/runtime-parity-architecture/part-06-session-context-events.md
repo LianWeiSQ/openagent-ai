@@ -1,173 +1,226 @@
 # Part 06 - Session, Context, And Events
 
-## Problem Statement
+## 1. 需求背景
 
-Agent work is stateful. A useful harness must preserve more than the final
-answer. It must preserve:
+Agent 工作不是一次函数调用。一个工程任务中会出现：
 
-- prompts and messages;
-- tool calls and results;
-- approvals and questions;
-- task/subagent metadata;
-- skill discovery and loading;
-- context and compaction boundaries;
-- checkpoint and restore data;
-- runtime warnings;
-- usage and trace evidence.
+- 多轮用户输入；
+- provider streaming；
+- tool calls；
+- approval/question pause；
+- skill discovery/load；
+- subagent child session；
+- MCP lifecycle；
+- 文件 diff 和 checkpoint；
+- compact；
+- interrupt/resume；
+- UI reload。
 
-This state is what lets the harness resume, explain, inspect, replay, and
-render work across CLI, HTTP, TUI, and Desktop.
+如果只保存最终 answer，harness 无法解释、恢复、审计，也无法让 TUI/Desktop 显示真实进度。因此 session/context/event 是 OpenHarness 的核心状态层。
 
-## Design Principle
+## 2. 对标参考
 
-Session state is the source of truth. Product surfaces are projections.
+### 2.1 OpenCode Session V2
+
+OpenCode V2 的 Session API 强调几件事：
+
+- prompt admission 和 execution 分离；
+- session input 先进入 durable inbox，再由 runner promote；
+- SessionExecution 从 session id 路由到 location runner；
+- SessionRunner 负责 provider turn、tool settlement、history reload；
+- Context Epoch 记录 privileged system context；
+- compaction 产生 durable checkpoint，而不是覆盖 transcript。
+
+对 OpenHarness 的启发是：session 不只是消息列表，而是执行生命周期的账本。
+
+### 2.2 Claude Code context lifecycle
+
+Claude Code 的 context 体系更像 Context OS：
+
+- system prompt 静态/动态分段；
+- attachments 注入文件、MCP、skills、agents、todo、diagnostics；
+- skill listing 和 invoked skill restore；
+- MCP instructions delta；
+- microcompact、session memory compact、full compact；
+- compact 后恢复 tool/agent/MCP/skill delta；
+- JSONL transcript 支持 resume。
+
+OpenHarness 当前没有完整复制，但已经在 ContextPackBuilder、compaction、skill preservation、session events、checkpoint restore 上对齐方向。
+
+## 3. Session store 的职责
+
+Session store 当前承担：
+
+- session latest state；
+- messages；
+- message parts；
+- run/turn records；
+- tool results；
+- events；
+- warnings；
+- metadata；
+- status；
+- checkpoint references；
+- restore history；
+- task metadata；
+- compaction boundaries；
+- skill loaded output protection。
+
+设计原则：
 
 ```text
 runtime action
-  -> session message / part / event
-  -> App Bridge event
-  -> CLI/TUI/Desktop projection
+  -> session event/message/part
+  -> App Bridge projection
+  -> CLI/TUI/Desktop view
 ```
 
-If a UI needs a state that does not exist in the session/event layer, the
-runtime contract is incomplete.
+如果 UI 要展示某个状态，应该先进入 session/event，而不是 UI 自己推导。
 
-## Current Session Model
+## 4. Context runtime
 
-The session layer stores:
+OpenHarness 的 context 已经不再是简单 prompt string：
 
-- latest session state;
-- messages;
-- parts;
-- run records;
-- events;
-- metadata;
-- status;
-- checkpoint references;
-- task metadata;
-- compaction boundaries.
+- instruction loading；
+- file context；
+- context budget；
+- ContextPackBuilder；
+- structured compaction；
+- compact boundary messages；
+- skill output preservation；
+- checkpoint/restore evidence。
 
-Tool results are stored as tool messages with structured metadata. App Bridge
-and TUI can then inspect the same state that the provider loop uses.
+目标是能回答：
 
-## Context Runtime
+- 模型为什么看到了这段内容；
+- 哪些上下文被纳入；
+- 哪些内容被 compact；
+- compact 后哪些语义锚点保留；
+- resume 后如何重建。
 
-Context is treated as runtime state, not a one-off prompt string.
+## 5. Event model
 
-Current context-related capabilities include:
+当前事件家族包括：
 
-- instruction loading;
-- file context;
-- context budgets;
-- ContextPackBuilder;
-- structured compaction;
-- compaction boundary messages;
-- skill output preservation across compaction.
+- turn/run started/completed/failed/interrupted；
+- step started/finished；
+- `item/toolCall/started`；
+- `item/toolCall/completed`；
+- `item/toolCall/failed`；
+- approval requested/resolved；
+- question asked/answered/dismissed；
+- skill.discovered；
+- skill.loaded；
+- MCP lifecycle/discovery/tool execution；
+- checkpoint/restore；
+- patch/diff；
+- task/subagent lifecycle。
 
-The design target is recoverability:
+近期已抽出的共享能力：
+
+- `SessionRunnerFacade::tool_call_started_event`；
+- `SessionRunnerFacade::tool_call_finished_event`；
+- CLI/HTTP 共享 tool call event 构造；
+- pending resume path 也使用共享 event builder。
+
+这一步很小，但意义明确：event shape 不能由每个 surface 自己拼。
+
+## 6. Approval 和 Question
+
+approval/question 是 session runtime 的暂停点，不是 UI 弹窗。
+
+需要保存：
+
+- request id；
+- turn id；
+- tool call id；
+- question/options；
+- approval risk/tool input；
+- resolved action；
+- denial/note；
+- resume 后的 tool result。
+
+TUI 和 Desktop approval dock 的能力来自这套 state：
+
+- allow once；
+- allow always；
+- deny with note；
+- question reply；
+- dismiss；
+- persisted history；
+- reload 后仍能看到 resolved flow。
+
+## 7. Skill 和 compaction
+
+Skill 给 compaction 提出了硬需求：已加载 skill 的内容不能因为 compact 消失。
+
+如果模型先加载一个 skill，随后历史被压缩，而 skill 内容没有被保留，后续行为就失去依据。OpenHarness 因此把 loaded skill output 作为 compaction 保护对象。
+
+这条原则可以推广：
 
 ```text
-Why did the model see this?
-Why was that file included?
-What was dropped?
-What survived compaction?
+compaction is semantic preservation, not blind truncation
 ```
 
-The answer should exist in session/context evidence.
+未来 task state、MCP instructions、agent listing、plan/todo 也应按语义锚点处理。
 
-## Events
+## 8. Checkpoint 和 restore
 
-Session events serve multiple roles:
+工程 agent 必须能回答“改了什么”和“能不能回退”。
 
-- debugging;
-- UI state reconstruction;
-- app bridge streaming;
-- golden contract verification;
-- eval/replay support.
+当前 checkpoint/restore 相关状态包括：
 
-Important event families include:
+- diff/patch parts；
+- checkpoint ids；
+- restore event；
+- restore history；
+- affected files；
+- Desktop timeline/detail cards；
+- packaged smoke 验证 reload 后仍能看到恢复状态。
 
-- run events;
-- step started/finished;
-- tool.call started/finished/failed;
-- approval/question events;
-- MCP discovery/lifecycle events;
-- skill.discovered / skill.loaded;
-- checkpoint/restore events;
-- task lifecycle events.
+这类状态必须存在 session metadata 中，否则 Desktop reload 会丢。
 
-The current event model is functional but not fully unified. Some event
-families still have surface-specific shapes.
+## 9. 开发过程
 
-## Skill And Compaction
+session/context/event 是被产品需求逐步逼出来的：
 
-Skill introduced a concrete session/context requirement: loaded skill content
-must survive compaction.
+1. Tool result 需要被 run 后检查。
+2. 多轮 session 需要 latest state。
+3. JSON/golden 输出需要稳定事件。
+4. App Bridge 需要 SSE turn events。
+5. TUI 需要远端 transcript 和 control state。
+6. Approval/question 需要 pause/resume。
+7. Checkpoint/restore 需要 durable metadata。
+8. MCP 需要 lifecycle event。
+9. Skill 需要 discovered/loaded event 和 compaction protection。
+10. Subagent 需要 parent/child/task tree metadata。
+11. SessionRunnerFacade 开始统一 event construction。
 
-Without protection, the runtime could load a skill, compact the prior tool
-message, and continue without the instruction body that was supposed to guide
-behavior. The session store now protects loaded skill tool output across
-compaction boundaries.
+每次产品 surface 暴露缺口，正确做法都是把事实补进 session/event 层，再投影出去。
 
-This is an important precedent: compaction cannot be a generic truncation
-mechanism. It must respect semantic anchors.
+## 10. 验收证据
 
-## Checkpoint And Diff State
-
-Engineering work needs rollback and inspection. The session layer carries
-checkpoint/restore metadata and diff/patch parts so product surfaces can
-display:
-
-- what changed;
-- what checkpoint exists;
-- whether restore happened;
-- which files were affected;
-- what event caused the state transition.
-
-The Desktop restore history work depends on this session metadata being
-durable.
-
-## Development Process
-
-The session model evolved in response to concrete failures:
-
-1. Tool results needed to be inspectable after a run.
-2. Multi-turn sessions needed latest state.
-3. App Bridge needed streamable events.
-4. TUI needed remote transcript and control state.
-5. Approvals/questions needed pause/resume state.
-6. Checkpoint/restore needed durable metadata.
-7. Skills needed event and compaction protection.
-8. Subagents needed parent/child task metadata.
-
-Each new product surface exposed missing session semantics. The correct
-pattern has been to add state to the session layer, then project it outward.
-
-## Verification Evidence
-
-Representative commands:
+代表性命令：
 
 ```bash
 cargo test -p openagent-session --test session_trace -q
 cargo test -p openagent-http-runtime --test http_runtime -q
 cargo test -p openagent-cli --test cli_commands -q
+cargo test -p openagent-tools -q
 ```
 
-Important coverage includes:
+近期 runner event 收口还覆盖：
 
-- session trace persistence;
-- compaction boundary behavior;
-- loaded skill output preservation;
-- HTTP runtime event contracts;
-- CLI event output;
-- approval/question resume paths;
-- checkpoint and restore flows.
+```bash
+cargo test -p openagent-tools session_runner_facade_builds_shared_tool_call_events -q
+cargo test -p openagent-http-runtime app_bridge_protocol_contract_and_client_live_subscription --test http_runtime -q
+```
 
-## Remaining Work
+## 11. 后续边界
 
-1. Unify permission/question/approval/diff/checkpoint event shapes.
-2. Make task lifecycle events first-class.
-3. Make ContextPackBuilder the single model-message assembly path.
-4. Improve crash recovery and session resume semantics.
-5. Add stronger long-term indexes for session history.
-6. Ensure SessionRunner writes one consistent event sequence across CLI/HTTP.
+1. 统一 permission/question/approval/diff/checkpoint/task event envelope。
+2. Task lifecycle event 一等化。
+3. ContextPackBuilder 成为唯一 provider-message assembly path。
+4. compact 后恢复 skill/task/MCP/agent deltas。
+5. crash recovery 和 session resume 更完整。
+6. SessionRunner 写出 CLI/HTTP 一致 event sequence。

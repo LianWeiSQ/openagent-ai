@@ -1,138 +1,216 @@
 # Part 09 - Product Surfaces
 
-## Problem Statement
+## 1. 需求背景
 
-A harness that only exposes a CLI is limited. Engineering agents need both
-automation and inspection. The product surfaces therefore evolved into:
+OpenHarness 现在不是一个 CLI-only 工具。它需要同时支持：
 
-- CLI for scripting and direct operation;
-- HTTP runtime for API and App Bridge;
-- TUI for terminal operation;
-- Desktop for richer project workflows.
+- 命令行自动化；
+- 本地 HTTP API；
+- TUI 交互；
+- Desktop 工作台；
+- future IDE/client；
+- packaged app smoke。
 
-The architectural problem is keeping these surfaces consistent.
+产品入口越多，越容易出现 runtime drift：同一件事 CLI 能做，HTTP 不能做；TUI 显示一个状态，Desktop reload 后消失；approval 在 UI 解决了，但 session 没有记录。
 
-## Design Principle
-
-Product surfaces should be thin projections over shared runtime state.
+因此 Product Surface 的架构目标是：
 
 ```text
-CLI command
-HTTP endpoint
-TUI action
-Desktop action
-  -> shared session/App Bridge/runtime contract
+all surfaces are projections over shared runtime state
 ```
 
-If each surface implements its own state model, parity collapses.
+## 2. 对标参考
 
-## CLI
+### OpenCode
 
-The CLI now covers:
+OpenCode 的 TUI/App/CLI 共享 session、provider、MCP、permission、agent、plugin 等 runtime contract。TUI 不是独立玩具，而是运行时状态的操作界面。
 
-- run;
-- session;
-- models;
-- agent;
-- plugin;
-- MCP;
-- auth/providers;
-- debug/db;
-- import/export;
-- skills;
-- attach;
-- approvals/questions and related runtime actions.
+对 OpenHarness 的启发：
 
-The CLI is still the fastest way to verify command contracts. Golden tests
-protect output shape.
+- TUI/Desktop 不应该自己维护 MCP/approval/task 状态；
+- App Bridge 需要稳定 API/SSE；
+- CLI golden 和 HTTP tests 都是产品 contract；
+- product smoke 能暴露纯 runtime test 看不到的问题。
 
-## HTTP Runtime And App Bridge
+### Claude Code
 
-HTTP runtime owns:
+Claude Code 在 UI 上强调 task/subagent、permission、tool progress、context、compact/resume 等运行时反馈。对 OpenHarness 来说，重点是让这些状态先进入 session/event，再投影到 TUI/Desktop。
 
-- sessions;
-- turns;
-- global and turn events;
-- approvals/questions;
-- models;
-- agents;
-- MCP;
-- skills;
-- task trees;
-- checkpoint/diff/restore APIs.
+## 3. CLI
 
-App Bridge is the contract that lets TUI/Desktop operate the same runtime
-state as CLI.
+CLI 是最早、最快的操作面，也是回归测试最稳定的入口。
 
-## TUI
+当前覆盖：
 
-The TUI has grown from display state into a runtime control surface:
+- `run`；
+- `session`；
+- `models`；
+- `agent`；
+- `plugin`；
+- `mcp`；
+- `auth/providers`；
+- `debug/db`；
+- `skills`；
+- `attach`；
+- `approval/question`；
+- import/export/share/checkpoint/restore；
+- OpenCode-style flags。
 
-- session picker;
-- file picker;
-- model picker;
-- agent picker;
-- variant/thinking picker;
-- approval/question docks;
-- diff/checkpoint rendering;
-- App Bridge attach/control.
+CLI 的价值：
 
-Remaining work is mainly around richer panes:
+- 适合 golden JSON；
+- 适合 binary smoke；
+- 适合验证 profile/provider/tool/task 入口；
+- 适合开发阶段快速确认。
 
-- subagent panes;
-- task tree navigation;
-- plugin panes;
-- command palette;
-- configurable keymap.
+限制：
 
-## Desktop
+- 长任务 UI 不如 TUI/Desktop；
+- background task lifecycle 还未完整；
+- plugin runtime 仍偏 scaffold。
 
-Desktop is a richer product surface over the same App Bridge:
+## 4. HTTP Runtime and App Bridge
 
-- workspace shell;
-- approval dock;
-- MCP panel;
-- checkpoint restore workflow;
-- history/detail cards;
-- packaged app smoke workflows.
+HTTP Runtime 是多产品入口的 runtime API。
 
-The Desktop direction is important because it exposes runtime gaps that CLI
-does not reveal, especially around persisted UI state, reload behavior, and
-long-running workflows.
+当前能力：
 
-## Development Process
+- sessions；
+- turns；
+- SSE events；
+- global events replay；
+- approvals/questions；
+- models/providers；
+- agents；
+- MCP config/lifecycle；
+- skills；
+- task tree；
+- checkpoint/diff/restore；
+- provider health；
+- TUI control routes。
 
-Surface development happened in layers:
+App Bridge 的设计不是“附带 web server”，而是把 runtime state 暴露给外部 surface 的协议层。
 
-1. Restore CLI command surface and golden tests.
-2. Build HTTP runtime and health/routes.
-3. Add App Bridge session and event contracts.
-4. Add TUI attach and control routes.
-5. Add MCP lifecycle and UI.
-6. Add approvals/questions.
-7. Add diff/checkpoint/restore.
-8. Add Desktop workflow smokes.
-9. Add skills and task tree visibility.
+## 5. TUI
 
-Each product surface forced runtime contracts to become more explicit.
+TUI 已从简单显示器演进为终端操作面：
 
-## Verification Evidence
+- session picker；
+- file picker；
+- model picker；
+- agent picker；
+- variant/thinking picker；
+- theme/color；
+- approval/question docks；
+- diff/checkpoint rendering；
+- App Bridge attach/control；
+- remote transcript。
 
-Representative commands:
+未完成：
+
+- subagent panes；
+- task tree navigation；
+- plugin panes；
+- full command palette；
+- configurable keymap；
+- 更完整 terminal automation。
+
+## 6. Desktop
+
+Desktop 是目前最能暴露产品化缺口的 surface。
+
+当前已经覆盖：
+
+- workspace shell；
+- MCP panel；
+- approval dock；
+- question reply/dismiss；
+- approval/question history；
+- checkpoint restore workflow；
+- timeline/detail cards；
+- packaged app smoke；
+- reload persistence。
+
+几个已完成的用户可见循环：
+
+### Desktop MCP panel
+
+能力：
+
+- Add/Edit/Delete/Test；
+- Start/Stop/Restart；
+- Enable/Disable；
+- tool trace；
+- reload state；
+- PID reuse；
+- packaged smoke。
+
+这证明 MCP lifecycle 是 App Bridge runtime state，而不是 Desktop 局部状态。
+
+### Approval dock
+
+能力：
+
+- pending approval card；
+- risk/permission chips；
+- Allow/Deny；
+- allow always；
+- question reply/dismiss；
+- persisted resolved history；
+- packaged smoke pending screenshot。
+
+这证明 approval/question 是 session pause/resume state，而不是 UI prompt。
+
+### Checkpoint restore
+
+能力：
+
+- checkpoint restore；
+- restore metadata；
+- restore history；
+- Desktop timeline/detail；
+- reload 后恢复；
+- packaged checkpoint smoke。
+
+这证明 checkpoint/restore 必须进入 session metadata。
+
+## 7. 开发过程
+
+产品 surface 不是一次性搭完，而是按 runtime contract 推进：
+
+1. 恢复 CLI command surface 和 golden tests。
+2. 建 HTTP Runtime health/session/turn routes。
+3. 增加 App Bridge SSE 和 turn lifecycle。
+4. TUI attach 到 App Bridge。
+5. MCP lifecycle 进入 HTTP/TUI/Desktop。
+6. Approval/question 进入 session pause/resume 和 UI dock。
+7. Diff/checkpoint/restore 进入 TUI/Desktop。
+8. Desktop smoke 覆盖真实用户 workflow。
+9. Skills API 和 CLI diagnostics 进入 surface。
+10. Task tree API 暴露给 attach/TUI 后续消费。
+
+每个产品阶段都倒逼 runtime 状态更明确。
+
+## 8. 验收证据
+
+代表性命令：
 
 ```bash
 cargo test -p openagent-cli --test cli_commands -q
 cargo test -p openagent-http-runtime --test http_runtime -q
 cargo test -p openagent-tui -q
+npm --prefix desktop run smoke:local-mcp-ui
+npm --prefix desktop run smoke:approval-dock
+npm --prefix desktop run smoke:checkpoint-restore-ui
 ```
 
-Desktop smoke tests provide additional product evidence, especially for MCP,
-approval dock, and checkpoint restore workflows.
+Desktop packaged smoke 还覆盖真实 Tauri app 的关键路径。
 
-## Remaining Work
+## 9. 后续边界
 
-1. Subagent panes and task tree navigation.
-2. Attachments beyond local file mentions.
-3. Plugin panes and plugin runtime controls.
-4. More terminal automation coverage for long-running TUI behavior.
-5. Product-level model/agent/provider consistency across all surfaces.
+1. TUI/Desktop subagent panes 和 task tree navigation。
+2. Plugin panes 和 plugin runtime controls。
+3. Attachment/media/resource 更完整。
+4. Product-level provider/model/agent consistency。
+5. Terminal automation 覆盖长运行场景。
+6. Desktop session restore 和 task background 操作继续产品化。

@@ -1,195 +1,273 @@
 # Part 05 - Subagent And Task Runtime
 
-## Problem Statement
+## 1. 需求背景
 
-Large engineering work cannot be handled well by one flat agent context.
-Search, planning, review, implementation, and external research often need
-different context, tools, permissions, and model choices.
+复杂工程任务不适合一直压在一个主上下文里。典型场景包括：
 
-The runtime therefore needs subagents.
+- 先只读搜索和代码理解；
+- 单独规划方案；
+- 并行实现不同模块；
+- 用 reviewer agent 检查变更；
+- 用专门 skill/agent 处理文档、MCP、测试、迁移；
+- 长任务后台运行，主会话继续处理其他问题。
 
-The key requirement is not just "start another prompt". The requirement is:
+如果没有 subagent，主上下文会不断膨胀，工具权限难以分层，执行记录也混在一起。需求自然升级为：
 
-- independent context;
-- scoped tools;
-- independent permission policy;
-- optional model/provider;
-- child session metadata;
-- parent/child lineage;
-- resumability;
-- nested guardrails;
-- foreground and background execution;
-- result projection back to the parent.
+- 独立 context；
+- 独立 system prompt；
+- 独立 tool access；
+- 独立 permission；
+- 可选 model/provider；
+- 可选 skills；
+- parent/child session lineage；
+- foreground/background；
+- resume/cancel/wait；
+- workspace/worktree isolation；
+- summary/result 回流。
 
-## Reference Direction
+## 2. 对标参考
 
-Claude Code treats subagent startup as an Agent tool. That is the most
-important idea: delegation is model-visible and uses the normal tool channel.
+### 2.1 Claude Code AgentTool
 
-OpenCode's Task tool follows the same basic shape. The model calls a task tool
-with a description, prompt, and subagent type. The harness then creates the
-child execution context.
+Claude Code 的 AgentTool 是最重要的参考。它不是内部 router，而是模型可调用的普通工具：
 
-The OpenHarness design combines the two:
+```text
+main session model
+  -> calls Agent tool
+  -> harness creates subagent runtime
+  -> subagent runs in its own context
+  -> parent receives result/summary
+```
+
+AgentTool 支持 subagent type、model override、background、worktree/remote isolation 等概念。内置 agent 包括 general-purpose、explore、plan 等。
+
+对 OpenHarness 的启发：
+
+- subagent 必须是一等运行时对象；
+- 启动 subagent 应该走工具路径；
+- child tool calls 不应该直接污染 parent context；
+- child session 需要 metadata 和 lineage；
+- background task 是 runtime lifecycle，不是 UI 小功能。
+
+### 2.2 OpenCode Task/SessionRunner
+
+OpenCode 的参考重点在 Task 工具概念和 runner/session contract：
+
+- task/subagent 通过 tool registry 暴露给模型；
+- session runner 负责 provider step、tool execution、event projection；
+- run coordinator 保证同一 session drain chain 串行，不同 session 可并行；
+- background job 和 session event 是 UI 可观察的运行时状态。
+
+OpenHarness 采用 Task tool 作为对外抽象，避免把 subagent 做成 CLI-only 参数。
+
+## 3. OpenHarness 当前设计
+
+当前链路：
 
 ```text
 Task tool call
-  -> resolve subagent profile
+  -> resolve subagent descriptor/profile
+  -> validate task permission and nesting guard
   -> create child session
-  -> bind prompt/tools/skills/permissions
-  -> execute child run
-  -> return result and metadata to parent
+  -> bind prompt/tools/model/permission/skills
+  -> optionally isolate workspace
+  -> execute foreground or queue background
+  -> write child metadata/task tree
+  -> return summary/metadata to parent
 ```
 
-## Current Capabilities
+这里的关键是 child session。subagent 不是一次 provider call，也不是 prompt prefix，而是有自己的 session state。
 
-### Built-In And Project Subagents
+## 4. Subagent profile
 
-OpenHarness supports built-in subagent profiles and project-defined agent
-profiles. Profiles can define:
+profile 可以描述：
 
-- id/name/description;
-- mode;
-- tools;
-- model/provider;
-- permissions;
-- task permissions;
-- skills and skill roots;
-- workspace isolation;
-- prompt.
+- `id` / `name` / `description`；
+- `mode: primary | subagent`；
+- system prompt/body；
+- model/provider；
+- tools；
+- permission；
+- task permissions；
+- skill config；
+- workspace isolation；
+- hidden/disabled；
+- max steps；
+- color/metadata。
 
-OpenCode markdown-style agents are supported through frontmatter parsing.
+OpenCode markdown agent 也能通过 frontmatter 加载，方便复用 `.opencode/agent/*.md` 的定义方式。
 
-### Task Tool
+## 5. Task tool
 
-Task is registered as a tool when subagent descriptors are available. The
-model can call it with:
+Task tool 是模型启动 subagent 的主入口。典型参数：
 
-- description;
-- prompt;
-- subagent type;
-- background flag;
-- resume/task identifiers where supported.
+- `description`：短任务描述；
+- `prompt`：给 child agent 的完整任务；
+- `subagent_type`：选择哪个 profile；
+- `background`：是否后台运行；
+- task/resume 相关 id；
+- isolation 相关选项。
 
-The Task tool is therefore part of the normal tool permission and trace path.
-
-### Auto Routing
-
-The harness can route direct prompts to matching subagents based on subagent
-description. This is not meant to replace explicit Task tool calls. It is a
-convenience path for obvious delegation requests.
-
-### Nested Guardrails
-
-The runtime tracks:
-
-- task depth;
-- task lineage;
-- parent session id;
-- root session id;
-- subagent type.
-
-This prevents self-calls, obvious recursion, and unbounded nesting.
-
-### Workspace Isolation
-
-Subagents can run in isolated workspaces. This is important for implementation
-tasks because it allows independent work and review without immediately
-mutating the parent workspace state.
-
-### Skill Preloading
-
-Subagent profiles can preload skills. The loaded skill content is injected
-into the child system context, not the parent. This keeps parent context small
-and preserves the child agent's specialized operating environment.
-
-### Fork Skill To Task
-
-Certain skills can request forked execution through a specific agent. This
-joins the skill system and Task runtime:
+Task tool 必须走普通 tool path：
 
 ```text
-Skill metadata says: run this in agent X
-Task runtime says: create isolated child session for agent X
+tool descriptor
+  -> permission
+  -> ToolContext
+  -> execution
+  -> ToolResult
+  -> session event
 ```
 
-## Current Limitation
+这样它才能和 skill/MCP/built-in tools 使用同一套审计和权限模型。
 
-The main missing piece is complete background lifecycle parity.
+## 6. 已完成阶段
 
-The desired lifecycle is:
+### Stage 1: profile loading
+
+先把 built-in subagents、project-defined agents、OpenCode markdown agents 纳入统一 registry。
+
+验收：
+
+- `agent list/show/run` 能看到 built-ins；
+- markdown agent frontmatter 被解析；
+- mode/model/tools/permission 生效。
+
+### Stage 2: Task tool registration
+
+当存在可用 subagent descriptor 时注册 Task tool，并把可用 subagent 描述暴露给模型。
+
+验收：
+
+- fake provider 能调用 Task tool；
+- Task tool 输入输出进入 session。
+
+### Stage 3: explicit Task execution
+
+实现 foreground child session 执行：
+
+- 创建 child session；
+- 写 parent/child metadata；
+- 运行 child prompt；
+- 父会话收到 result/summary。
+
+### Stage 4: description-based auto routing
+
+当用户请求明显匹配某个 subagent description 时，主 agent 可以自动委派。
+
+设计上 auto routing 是便利路径，不替代 Task tool。长期方向仍是模型显式调用 Task。
+
+### Stage 5: nesting guard
+
+加入：
+
+- task depth；
+- lineage；
+- parent/root session id；
+- self-call 检测；
+- recursion guard。
+
+这防止 subagent 无限创建同类 subagent。
+
+### Stage 6: workspace isolation
+
+实现 isolated workspace/worktree metadata 和行为，让实现型 subagent 可以在隔离空间里工作。
+
+后续还需要更完整的 merge-back、conflict review、approval policy。
+
+### Stage 7: task tree API
+
+HTTP Runtime 暴露 task tree payload，TUI/CLI attach 能查看 `/tasks`、`/task`。
+
+这让 subagent 不只是 tool result，而是可观察的 session tree。
+
+### Stage 8: skill preload
+
+subagent profile 支持 `skills: [...]`。启动 child session 时加载 skill body 到 child system context，并写 metadata。
+
+父上下文只看到 summary/metadata，不吃 child skill content。
+
+### Stage 9: fork skill to Task
+
+支持 skill metadata 指定 fork agent。加载这类 skill 时创建 child task/subagent。
+
+这把 Skill 的专业知识和 Task 的独立执行连接起来。
+
+### Stage 10: foreground/background foundations
+
+HTTP 侧已有 background queue 基础，foreground 路径更完整。CLI background lifecycle 尚未完全完成。
+
+## 7. 当前限制
+
+主要缺口是 background lifecycle 还不完整。
+
+目标状态机：
 
 ```text
-queued -> running -> completed
-                 -> failed
-                 -> cancelled
+queued
+  -> running
+  -> completed
+  -> failed
+  -> cancelled
 ```
 
-Current HTTP runtime has queue foundations and task tree APIs. CLI foreground
-paths are more complete than CLI background paths. Wait/promote/cancel/resume
-need to become stable runtime contracts, not surface-specific behavior.
+还需要稳定操作：
 
-## Architecture Direction
+- `wait`；
+- `promote`；
+- `cancel`；
+- `resume`；
+- `inspect`；
+- list task tree；
+- foreground/background 切换语义。
 
-Subagent execution should eventually be owned by SessionRunner:
+目前 HTTP queue foundation 有了，CLI foreground 更完整，但 CLI background 还不是 OpenCode/Claude Code 水平。
+
+## 8. SessionRunner 方向
+
+Subagent 最终不应由 CLI 或 HTTP 自己跑，而应进入 SessionRunner：
 
 ```text
 SessionRunner::run_task
-  -> validate parent
-  -> resolve profile
-  -> prepare child session
-  -> bind system prompt and skills
+  -> validate parent session
+  -> resolve child profile
+  -> prepare child ToolContext
+  -> bind preloaded skills
   -> claim task run lock
   -> execute provider/tool loop
-  -> update task status
-  -> summarize result
+  -> update task lifecycle event
+  -> summarize child result
 ```
 
-The status update should be event-backed so TUI/Desktop can render task trees
-without custom polling logic.
+这样 TUI/Desktop 可以消费相同 task events，而不是定制轮询。
 
-## Development Process
+## 9. 验收证据
 
-The current subagent/task path developed in stages:
-
-1. Add reusable agent profile loading.
-2. Add built-in subagents.
-3. Register Task tool with available subagent descriptors.
-4. Add explicit Task tool execution.
-5. Add description-based routing.
-6. Add nested lineage/depth guardrails.
-7. Add workspace isolation metadata and behavior.
-8. Add child session metadata and task tree payloads.
-9. Add skill preloading.
-10. Add fork-skill-to-task path.
-
-The next step is not adding more profile fields. The next step is lifecycle
-discipline.
-
-## Verification Evidence
-
-Representative tests cover:
-
-- explicit Task tool execution;
-- auto routing to matching subagent descriptions;
-- nested tree and governance guards;
-- isolated workspace execution;
-- OpenCode markdown agent loading;
-- preloaded subagent skills;
-- HTTP task tree payloads.
-
-Relevant commands:
+代表性命令：
 
 ```bash
-cargo test -p openagent-cli --test cli_commands -q
+cargo test -p openagent-cli binary_run_executes_task_subagent_tool --test cli_commands -q
+cargo test -p openagent-cli binary_run_auto_routes_prompt_to_matching_subagent_description --test cli_commands -q
+cargo test -p openagent-cli binary_run_executes_subagent_in_isolated_workspace --test cli_commands -q
 cargo test -p openagent-http-runtime --test http_runtime -q
 ```
 
-## Remaining Work
+覆盖点：
 
-1. Complete queued/running/completed/failed/cancelled state machine.
-2. Add wait/promote/cancel/resume commands and HTTP endpoints.
-3. Make background CLI execution first-class.
-4. Add TUI/Desktop subagent panes and task tree navigation.
-5. Move duplicated runner behavior into shared SessionRunner.
-6. Add clearer event model for task lifecycle transitions.
+- explicit Task tool；
+- auto routing；
+- nested guard；
+- workspace isolation；
+- child session metadata；
+- OpenCode markdown agent loading；
+- subagent preloaded skills；
+- HTTP task tree。
+
+## 10. 后续边界
+
+1. 完成 background lifecycle 状态机。
+2. CLI/HTTP 都支持 wait/promote/cancel/resume。
+3. Task events 统一成可重放 event family。
+4. TUI/Desktop 增加 subagent pane 和 task tree navigation。
+5. Worktree isolation 增强 merge-back 和冲突审查。
+6. SessionRunner 接管 task execution。

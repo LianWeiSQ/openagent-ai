@@ -1,116 +1,183 @@
 # Part 10 - Extension And Operations
 
-## Problem Statement
+## 1. 需求背景
 
-The core runtime is not enough for a full harness. Operators also need:
+当 harness 从 CLI 工具变成 runtime，外围能力也必须系统化：
 
-- plugin registration;
-- GitHub and PR workflows;
-- debug and DB inspection;
-- lifecycle commands;
-- eval and replay evidence;
-- operational diagnostics.
+- plugin；
+- GitHub/PR workflow；
+- debug/db；
+- eval/replay；
+- lifecycle；
+- packaging；
+- diagnostics；
+- runbooks。
 
-These capabilities should not be mixed into the core agent loop. They belong
-around the runtime as extension and operations surfaces.
+这些能力不应该塞进核心 agent loop。它们属于 extension and operations plane：围绕 runtime 提供扩展、配置、检查、回放、交付和运维。
 
-## Plugin Layer
+## 2. 对标参考
 
-Current plugin support includes:
+### OpenCode plugin/config lifecycle
 
-- install/register local, module, and remote entries;
-- list/show;
-- enable/disable;
-- remove;
-- manifest-backed dry-run dispatch.
+OpenCode 的 plugin/provider/catalog 设计强调：
 
-The important current limitation is that plugin `run` is not yet a real plugin
-runtime execution path. It is registry/config scaffolding.
+- plugin 可以贡献 provider、command、skill 等能力；
+- transform/registry 需要可重放；
+- disable plugin 后影响要能撤销；
+- config/auth/catalog/policy 变化要触发 runtime reload；
+- TUI/App 需要看到变化后的状态。
 
-The future design should treat plugins as providers of:
+对 OpenHarness 的启发：
 
-- skills;
-- MCP servers;
-- commands;
-- UI panes;
-- maybe provider catalog extensions.
+- plugin 不应只是 CLI install 记录；
+- plugin 最终应成为 skills、MCP servers、providers、commands、UI panes 的来源；
+- plugin 影响 runtime state 时必须有生命周期和 cleanup。
 
-## GitHub And PR Helpers
+### Claude Code operations
 
-GitHub/PR support currently behaves like local workflow scaffolding:
+Claude Code 的 task、swarm、worktree、remote、permissions、MCP、skills 都有较强的运行时操作面。对 OpenHarness 来说，operations 的关键是把复杂执行留下可解释证据。
 
-- status;
-- issue;
-- PR list/view/checkout/template/review;
-- workflow helpers.
+## 3. Plugin layer
 
-OpenCode-level GitHub agent install/run is not complete.
+当前 plugin 支持：
 
-The design direction should avoid hardwiring GitHub behavior into the agent
-loop. GitHub should be an extension capability that can supply tools,
-commands, or task templates.
+- local/module/remote registry install；
+- list/show；
+- enable/disable；
+- remove；
+- manifest-backed dry-run dispatch。
 
-## Debug And DB
+明确限制：
 
-Debug and DB commands exist to inspect runtime state:
+- `plugin run` 目前仍是 registry/config scaffolding；
+- 没有真实 npm/plugin runtime execution；
+- plugin-provided MCP/skills/providers 还未进入统一 registry。
 
-- paths;
-- env;
-- sessions;
-- files;
-- search;
-- bundle;
-- DB path/summary/rebuild/query/schema/export.
+未来设计：
 
-OpenCode snapshot-level debug parity is broader. The remaining need is a more
-complete snapshot/replay artifact that captures enough state for external
-inspection.
+```text
+plugin manifest
+  -> declared contributions
+  -> registry scope
+  -> runtime materialization
+  -> cleanup on disable/remove
+```
 
-## Lifecycle
+可能贡献：
 
-Upgrade/uninstall commands currently behave as explicit dry-run plans. This is
-intentional until packaging owns destructive lifecycle semantics.
+- skills；
+- MCP servers；
+- commands；
+- providers/models；
+- TUI/Desktop panes；
+- workflow templates。
 
-The rule should remain:
+## 4. GitHub and PR helpers
+
+当前 GitHub/PR 能力偏本地 workflow scaffolding：
+
+- status；
+- issue；
+- PR list/view/checkout/template/review；
+- workflow helpers；
+- `gh` integration。
+
+对标 OpenCode 仍缺：
+
+- GitHub agent install/run；
+- share/import 更深集成；
+- remote hosted workflow；
+- PR review agent 的 runtime 化。
+
+设计原则：
+
+```text
+GitHub should be an extension capability, not hardwired agent loop behavior
+```
+
+它应通过 tools、commands、skills、task templates 或 plugin 进入 runtime。
+
+## 5. Debug and DB
+
+Debug/DB 是运维入口：
+
+- paths；
+- env；
+- sessions；
+- files；
+- rg/search；
+- bundle；
+- DB path/summary/rebuild/query/schema/export。
+
+当前能力能做本地检查，但 OpenCode snapshot-level debug 还更强。
+
+后续需要：
+
+- snapshot-grade debug bundle；
+- event/session/provider/MCP/task 一体化快照；
+- failure reproduction artifact；
+- redaction policy；
+- support bundle。
+
+## 6. Eval and replay
+
+OpenHarness 有 Terminal-Bench、Harbor、Langfuse、JSONL-friendly observability 等方向。
+
+原则：
+
+- eval/replay 消费 session/trace；
+- 不再创造独立状态模型；
+- run receipt 和 score export 要能回链到 session evidence。
+
+这对长期迭代非常关键。没有 evidence，agent runtime 的质量会变成主观体验。
+
+## 7. Lifecycle and packaging
+
+当前 `upgrade`/`uninstall` 是 dry-run plan，而不是 destructive action。
+
+这是有意设计：
 
 ```text
 source-tree harness
   -> no destructive lifecycle mutation
+
 packaged distribution
   -> can own upgrade/uninstall behavior
 ```
 
-## Operations And Eval
+在本地源码工作区，runtime 不应该随意删除或替换自己。packaged app 具备明确安装位置和权限后，才能接管 lifecycle。
 
-Operations work includes:
+## 8. 开发过程
 
-- JSONL-friendly observability;
-- eval/replay support;
-- Terminal-Bench and Harbor adapters;
-- Langfuse export paths;
-- runtime logs and diagnostics.
+Extension/operations 的落地顺序应该保守：
 
-These are evidence systems. They should consume session and trace artifacts
-instead of adding another state model.
+1. 先定义命令边界。
+2. 增加安全 scaffold。
+3. 输出 machine-readable JSON。
+4. 增加 golden/integration tests。
+5. 接入 session/trace evidence。
+6. 再考虑真实 runtime execution。
 
-## Development Process
+这也是为什么 plugin runtime 和 destructive lifecycle 还没有直接打开。先有状态、权限、回滚和测试，再执行。
 
-Operations and extension work has followed this pattern:
+## 9. 当前能力分类
 
-1. Add explicit command boundary instead of unknown command.
-2. Add safe local scaffolding.
-3. Add machine-readable output.
-4. Add golden or integration tests.
-5. Add runtime execution only after the state and permission model is clear.
+| 需求域 | 当前状态 | 主要缺口 |
+| --- | --- | --- |
+| Plugin registry | Partial | runtime execution、贡献 skills/MCP/providers |
+| GitHub/PR | Partial | hosted agent/install/run parity |
+| Debug/DB | Partial | snapshot-grade bundle |
+| Eval/replay | Partial | 更完整 dataset/runbook/dashboard |
+| Lifecycle | Deferred | packaged distribution 之后启用 |
+| Operations docs | Partial | provider/MCP/task failure runbooks |
 
-This is why plugin execution and lifecycle mutation are intentionally not
-fully active yet.
+## 10. 后续边界
 
-## Remaining Work
-
-1. Real plugin runtime execution.
-2. Plugin-provided skills and MCP registration.
-3. GitHub agent install/run parity.
-4. Snapshot-grade debug bundles.
-5. Packaging-owned lifecycle commands.
-6. More complete operational runbooks for provider/MCP/task failures.
+1. 真实 plugin runtime execution。
+2. plugin-provided skills/MCP/providers。
+3. Plugin lifecycle cleanup 和 reload。
+4. GitHub agent workflow runtime 化。
+5. Snapshot debug bundle。
+6. Packaging-owned upgrade/uninstall。
+7. MCP/provider/task failure runbook。
+8. Eval/replay 与 session event 更深绑定。

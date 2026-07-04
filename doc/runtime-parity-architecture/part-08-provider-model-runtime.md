@@ -1,137 +1,188 @@
 # Part 08 - Provider And Model Runtime
 
-## Problem Statement
+## 1. 需求背景
 
-Provider support cannot be a single OpenAI-compatible environment variable
-path. A real harness needs:
+Provider 支持不能停留在一个 OpenAI-compatible `base_url + api_key + model`。真实 harness 要支持：
 
-- provider-aware auth;
-- provider-specific environment defaults;
-- native provider routing where needed;
-- model listing and catalog behavior;
-- health diagnostics;
-- payload isolation;
-- redaction;
-- stable test contracts.
+- 多 provider；
+- provider-aware auth；
+- provider-specific env defaults；
+- native provider routing；
+- model catalog；
+- model capability；
+- health diagnostics；
+- redaction；
+- profile/model option boundary；
+- HTTP/CLI/TUI/Desktop 一致选择。
 
-The most important architectural requirement is boundary control. Provider
-wire format should not leak into runtime logic, and runtime-only config should
-not leak into provider payloads.
+核心问题是边界控制：runtime config 不能泄漏进 provider payload，provider wire format 也不能污染 agent loop。
 
-## Reference Direction
+## 2. 对标参考
 
-OpenCode's provider layer includes provider login, list, logout, methods,
-model listing, and provider-specific behavior. The design lesson is that
-providers are part of the operator experience, not only a model API endpoint.
+### 2.1 OpenCode provider/model catalog
 
-OpenHarness adopts that direction while keeping the provider boundary explicit:
+OpenCode provider catalog 把 provider 和 model 做成 typed runtime resource：
 
-```text
-runtime profile/config
-  -> provider resolver
-  -> normalized provider config
-  -> provider payload builder
-  -> normalized stream events
-```
+- provider 有 id/name/enabled/env/endpoint/options；
+- model 有 providerID、apiID、capabilities、variants、limits、cost、status；
+- catalog 支持 provider/model get/all/available/default/small；
+- plugin/config/auth 可以通过 transform 影响 catalog。
 
-## Current Capabilities
+对 OpenHarness 的启发：
 
-### Provider-Aware Auth
+- provider/model 是可操作资源，不只是环境变量；
+- auth、catalog、policy、plugin 都会影响可用模型；
+- model selection 和 provider endpoint resolution 应该被封装。
 
-The CLI supports `auth` and `providers` flows:
+### 2.2 Claude Code provider boundary
 
-- login;
-- list;
-- methods;
-- logout;
-- provider-specific env metadata;
-- auth-file routing;
-- redaction.
+Claude Code 关注不同 model/tool/context 能力对 request assembly 的影响。对 OpenHarness 来说，当前最关键的是不要把 runtime-only fields 放进 provider request。
 
-### Model Runtime
+## 3. 当前 OpenHarness 能力
 
-Model listing supports:
+### Provider-aware auth
 
-- provider filtering;
-- refresh;
-- offline/catalog mode;
-- verbose capability metadata;
-- cache TTL;
-- snapshot fallback.
+CLI 支持：
 
-### Native Provider Routing
+- login；
+- list；
+- methods；
+- logout；
+- auth-file；
+- provider-specific env metadata；
+- redaction。
 
-Native provider support exists for Anthropic-style routing without forcing
-every provider through OpenAI-compatible `/models` assumptions.
+### Model listing
 
-### HTTP Provider Health
+支持：
 
-HTTP runtime can expose provider health and model diagnostics without leaking
-secrets.
+- provider filter；
+- refresh；
+- offline/catalog mode；
+- verbose capability metadata；
+- TTL/cache；
+- snapshot fallback。
 
-## Payload Boundary
+### Native provider routing
 
-Provider payloads should include:
+Anthropic 等 native provider path 不再被迫套 OpenAI-compatible `/models` 假设。
 
-- messages;
-- model;
-- tools;
-- allowed provider options;
-- temperature/top_p or equivalent model parameters.
+### HTTP provider health
 
-Provider payloads should not include:
+HTTP Runtime 暴露 provider/model health 和 diagnostics，供 App Bridge/TUI/Desktop 使用。
 
-- `skills`;
-- `skill_roots`;
-- `skill_permissions`;
-- `task_permissions`;
-- `permission`;
-- workspace isolation;
-- hidden/disabled flags;
-- runtime-only metadata.
+### Explicit model preservation
 
-The shared `AgentProfileSchema` stage exists partly to enforce this boundary
-consistently across CLI and HTTP.
+近期修复了 HTTP provider catalog fallback 与 explicit provider model 的关系：model list 可以做 catalog filtering，但执行时 profile/session 显式指定的 model 不能被 fallback 覆盖。
 
-## Development Process
+## 4. Provider payload boundary
 
-Provider work evolved through the following sequence:
+Provider request 应该包含：
 
-1. OpenAI-compatible provider path.
-2. Streaming normalization.
-3. CLI auth/provider commands.
-4. Provider-specific environment defaults.
-5. Auth-file runtime routing.
-6. Models catalog/cache/verbose output.
-7. Native provider routing.
-8. HTTP provider diagnostics.
-9. Shared profile schema to prevent provider payload leaks.
+- messages；
+- model；
+- tools；
+- provider options；
+- model-facing 参数，如 temperature/top_p；
+- provider-specific headers/body 中被允许的字段。
 
-This sequence reflects a shift from "call a model" to "operate multiple model
-providers safely".
+不应该包含：
 
-## Verification Evidence
+- `skills`；
+- `skill_roots`；
+- `skill_permissions`；
+- `task_permissions`；
+- `permission`；
+- `workspace_isolation`；
+- `hidden` / `disabled`；
+- internal task/skill metadata；
+- local filesystem runtime state。
 
-Representative commands:
+Shared AgentProfile schema 的一个核心验收点就是 provider payload 不泄漏 runtime fields。
+
+## 5. 分阶段增强过程
+
+### Stage 1: OpenAI-compatible path
+
+早期先保证 basic provider call、streaming、tool call 能跑。
+
+### Stage 2: Streaming normalization
+
+把 provider streaming 事件归一到 runtime 可消费的 delta/tool/finish 形态。
+
+### Stage 3: CLI auth/provider commands
+
+补：
+
+- `auth login/list/logout`；
+- `providers list/methods`；
+- auth-file routing；
+- secret redaction。
+
+### Stage 4: Model catalog
+
+补：
+
+- model list；
+- provider filter；
+- refresh/offline；
+- verbose capability；
+- cache/snapshot。
+
+### Stage 5: Native provider routing
+
+为非 OpenAI-compatible provider 加 native route，避免所有 provider 都强行走同一个 wire assumption。
+
+### Stage 6: HTTP diagnostics
+
+HTTP Runtime 暴露 provider health/model payload，给 product surfaces 使用。
+
+### Stage 7: Shared profile boundary
+
+把 SkillConfig/TaskConfig 等 runtime-only fields 从 model_options 剥离，防止 provider payload 污染。
+
+### Stage 8: Execution model preservation
+
+修复 catalog fallback 和 explicit execution model 的边界，保证 provider call 使用用户/profile/session 明确指定的 model。
+
+## 6. 当前差距
+
+对标 OpenCode，仍不足：
+
+- well-known provider URL login；
+- 更完整 provider catalog；
+- account-based provider enablement；
+- plugin-provided providers；
+- provider policy；
+- model capability 在 UI 中更深使用；
+- provider-specific failure classification。
+
+这些属于 provider runtime 深度，不是 CLI flag 问题。
+
+## 7. 验收证据
+
+代表性命令：
 
 ```bash
 cargo test -p openagent-cli --test cli_commands -q
 cargo test -p openagent-http-runtime --test http_runtime -q
+cargo check -p openagent-cli -p openagent-http-runtime
 ```
 
-Important checks include:
+覆盖点：
 
-- provider-specific env/model behavior;
-- auth-file provider routing;
-- native provider diagnostics;
-- model catalog output;
-- no provider payload leakage from skill/task config.
+- provider-specific env/model；
+- auth-file provider routing；
+- model catalog/cache/fallback；
+- native provider diagnostics；
+- profile runtime config 不泄漏；
+- HTTP explicit model preservation。
 
-## Remaining Work
+## 8. 后续边界
 
-1. Well-known provider URL login.
-2. Fuller provider catalog and login model.
-3. More native providers.
-4. Better provider capability mapping.
-5. Better operator diagnostics for provider-specific failures.
-6. Provider selection in product surfaces tied more tightly to session state.
+1. Provider catalog service 化。
+2. Account/provider login 设计对齐 OpenCode。
+3. Plugin-provided provider/model 进入 catalog。
+4. Provider policy 与 agent profile 合流。
+5. TUI/Desktop model/provider 选择与 session state 更紧密绑定。
+6. Provider error taxonomy 和 operator diagnostics 增强。

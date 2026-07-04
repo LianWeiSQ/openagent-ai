@@ -1,152 +1,207 @@
 # Part 07 - MCP Capability Plane
 
-## Problem Statement
+## 1. 需求背景
 
-MCP is not just another tool implementation. It introduces external capability
-servers with their own configuration, authentication, lifecycle, diagnostics,
-and execution contracts.
-
-The full requirement is:
+MCP 不是“多一种工具调用”。它引入的是外部 capability server，因此完整需求包含：
 
 ```text
-config -> auth -> discovery -> lifecycle -> tool execution -> diagnostics -> UI
+config
+  -> auth
+  -> discovery
+  -> lifecycle
+  -> tool execution
+  -> diagnostics
+  -> product visibility
 ```
 
-If only execution is implemented, operators cannot trust or manage MCP in a
-long-running harness.
+如果只实现 provider loop 调 MCP tool，用户仍然无法知道：
 
-## Reference Direction
+- server 怎么配置；
+- token 是否有效；
+- 当前是否 running；
+- 有哪些 tools；
+- 失败是启动失败、认证失败、schema 失败还是工具执行失败；
+- Desktop/TUI 是否看到同一状态。
 
-OpenCode treats MCP as a first-class capability domain. The useful reference
-points are:
+因此 MCP 必须作为 capability plane，而不是普通 tool branch。
 
-- CLI commands for MCP configuration and auth;
-- debug/doctor workflows;
-- remote OAuth and dynamic client registration;
-- TUI/App visibility into server and tool state;
-- tool execution through the normal provider loop.
+## 2. 对标参考
 
-OpenHarness has followed the same shape but with a local harness bias:
-explicit files, redaction, App Bridge lifecycle control, and reproducible
-tests.
+### 2.1 OpenCode MCP
 
-## Current Architecture
+OpenCode 对 MCP 的参考点包括：
 
-MCP lives in the capability plane and is coordinated through App Bridge where
-lifecycle is involved.
+- CLI `mcp` config/auth/debug；
+- remote OAuth；
+- dynamic client registration；
+- TUI/App 中的 MCP 状态；
+- MCP tool 进入普通 provider/tool execution path。
+
+OpenHarness 已经对齐 local/remote config、auth token、doctor/debug、App Bridge lifecycle、provider-loop execution。缺口主要在 OAuth 和 dynamic registration。
+
+### 2.2 Claude Code MCP instructions delta
+
+Claude Code 还有一个重要 context 思路：MCP server 可能 late connect、disconnect、reconnect。如果每次把 MCP instructions 重新拼进 system prompt，会破坏 prompt cache。它通过 MCP instructions delta 作为 attachment 处理变化。
+
+OpenHarness 当前还没有完整 delta attachment，但这个方向对后续 ContextPackBuilder 很重要。
+
+## 3. 当前 OpenHarness 架构
 
 ```text
 CLI / TUI / Desktop
-  -> MCP config/auth APIs
-  -> App Bridge MCP lifecycle registry
-  -> MCP discovery
-  -> provider loop tool execution
-  -> session/tool events
+  -> MCP config/auth commands or App Bridge routes
+  -> HTTP Runtime MCP lifecycle registry
+  -> discovery
+  -> tool registry materialization
+  -> provider/tool loop execution
+  -> session events and UI projection
 ```
 
-This avoids each surface maintaining a separate MCP runtime.
+设计重点：lifecycle state 由 App Bridge/HTTP Runtime 统一管理，产品入口不各自维护 MCP 进程状态。
 
-## Implemented Capabilities
+## 4. 分阶段增强过程
 
-### Config
+### Stage 1: Config
 
-The harness supports local and remote MCP configuration. Config handling
-includes:
+实现本地和远端 MCP 配置：
 
-- server records;
-- transport selection;
-- timeout settings;
-- headers;
-- enabled/disabled state;
-- redacted output for secrets and tokens.
+- server record；
+- transport；
+- command/args 或 URL；
+- headers；
+- timeout；
+- enabled/disabled；
+- secret redaction。
 
-### Auth
+验收重点：
 
-Current auth support includes:
+- CLI 能 list/show/add；
+- JSON 输出不泄漏 secrets；
+- HTTP 能读取相同 config。
 
-- token storage/status;
-- logout;
-- redacted display;
-- config-aware diagnostics.
+### Stage 2: Auth
 
-Browser OAuth and dynamic client registration remain open parity work.
+实现：
 
-### Discovery
+- token storage；
+- status；
+- logout；
+- redacted display；
+- config-aware doctor。
 
-MCP discovery produces tool descriptors that can be registered into the
-runtime tool registry. Discovery results are also usable for doctor/debug
-commands and UI state.
+目前缺口：
 
-### Lifecycle
+- browser OAuth；
+- dynamic client registration；
+- provider-like account flow。
 
-Lifecycle control belongs to App Bridge:
+### Stage 3: Discovery
 
-- start;
-- stop;
-- restart;
-- enable;
-- disable;
-- test.
+Discovery 把 server tools 转成 runtime descriptors。
 
-This matters because Desktop and TUI need to see the same running server state
-as CLI.
+要求：
 
-### Tool Execution
+- discovery failure 可诊断；
+- tool schema 可注册；
+- disabled server 不暴露 tools；
+- UI 能显示 tool count。
 
-Once discovered, MCP tools enter the normal provider/tool call path. They are
-subject to the same broad runtime concerns:
+### Stage 4: Lifecycle
 
-- permission;
-- trace;
-- tool result normalization;
-- session event persistence;
-- provider-loop continuation.
+App Bridge 管理生命周期：
 
-## Product Surface Integration
+- start；
+- stop；
+- restart；
+- enable；
+- disable；
+- test。
 
-MCP appears in:
+Desktop MCP panel 和 smoke test 覆盖 Add/Edit/Delete/Test/Start/Stop/Restart/Enable/Disable，证明 UI 操作的是同一 runtime state。
 
-- CLI commands;
-- HTTP/App Bridge endpoints;
-- TUI controls;
-- Desktop MCP panel;
-- smoke tests.
+### Stage 5: Tool execution
 
-The important design point is that UI surfaces do not create MCP state. They
-read and operate on App Bridge MCP state.
+MCP tools 进入 provider/tool loop：
 
-## Development Process
+```text
+provider tool call
+  -> tool registry lookup
+  -> MCP bridge execution
+  -> ToolResult
+  -> session event
+  -> continuation
+```
 
-MCP work progressed in phases:
+它应该和 built-in tools 一样接受 permission、trace、event、result normalization。
 
-1. File-based config and CLI command shape.
-2. Auth token and redaction.
-3. Discovery and doctor/debug.
-4. Provider-loop MCP tool execution.
-5. App Bridge lifecycle registry.
-6. TUI remote MCP commands.
-7. Desktop MCP panel and smoke coverage.
+### Stage 6: Product visibility
 
-That order made the runtime increasingly operational. Each stage added a
-missing operator concern rather than only expanding execution.
+MCP 状态进入：
 
-## Verification Evidence
+- CLI `mcp`；
+- HTTP/App Bridge；
+- TUI controls；
+- Desktop MCP panel；
+- smoke tests。
 
-Representative coverage:
+Desktop 的 MCP panel 暴露了很多 CLI 不会暴露的问题：reload 后状态是否恢复、PID 是否复用、错误 tool trace 是否能显示、按钮是否在真实 packaged app 可用。
+
+## 5. 当前能力
+
+已支持：
+
+- local/remote config；
+- auth token storage/status/logout；
+- secret redaction；
+- debug/doctor；
+- App Bridge lifecycle；
+- provider-loop MCP tool execution；
+- Desktop MCP panel；
+- TUI remote MCP controls；
+- MCP UI smoke 和 packaged smoke。
+
+仍未完全对齐：
+
+- browser OAuth；
+- dynamic client registration；
+- 跨重启 lifecycle recovery；
+- MCP instructions delta；
+- plugin-provided MCP registration。
+
+## 6. 架构原则
+
+1. MCP config/auth/lifecycle 是 runtime concern，不是 UI concern。
+2. MCP tools 一旦 materialize，就走普通 tool path。
+3. MCP secrets 任何输出都要 redacted。
+4. Discovery 和 execution 失败要分层记录，便于 doctor。
+5. UI 只消费 App Bridge MCP state。
+6. MCP instructions 未来应进入 ContextPackBuilder/delta，而不是每轮粗暴重写 system prompt。
+
+## 7. 验收证据
+
+代表性命令：
 
 ```bash
 cargo test -p openagent-cli --test cli_commands -q
 cargo test -p openagent-http-runtime --test http_runtime -q
+npm --prefix desktop run smoke:local-mcp-ui
 ```
 
-Desktop MCP UI smoke tests also cover product behavior, but those are separate
-from the core MCP contract.
+覆盖点：
 
-## Remaining Work
+- CLI MCP config/auth/debug；
+- HTTP MCP lifecycle；
+- provider-loop MCP tool execution；
+- Desktop panel Add/Edit/Delete/Test/Start/Stop/Restart/Enable/Disable；
+- reload 后 MCP state；
+- success/failure MCP tool trace；
+- packaged app MCP smoke。
 
-1. Browser OAuth flow.
-2. Dynamic client registration.
-3. Cross-restart lifecycle state recovery.
-4. Better MCP picker/panel behavior in TUI.
-5. Plugin-provided MCP server registration.
-6. More complete remote error classification and retry behavior.
+## 8. 后续边界
+
+1. 实现 browser OAuth。
+2. 实现 dynamic client registration。
+3. MCP lifecycle state 跨 runtime 重启恢复。
+4. MCP instructions delta 进入 context pipeline。
+5. plugin-provided MCP servers 注册。
+6. TUI/Desktop MCP picker 和错误恢复继续产品化。
