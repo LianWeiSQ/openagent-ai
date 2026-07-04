@@ -322,6 +322,48 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
 }
 
 #[test]
+fn session_runner_facade_builds_shared_turn_terminal_events() {
+    let facade = SessionRunnerFacade::new("/tmp/openagent-session-runner", "session_turn");
+
+    let cli_completed = facade.turn_terminal_event(
+        "turn/completed",
+        "run_cli",
+        "completed",
+        false,
+        false,
+        true,
+        BTreeMap::from([
+            ("final_answer".to_string(), json!("done")),
+            ("steps".to_string(), json!(2)),
+        ]),
+    );
+    assert_eq!(cli_completed["method"], "turn/completed");
+    assert_eq!(cli_completed["params"]["session_id"], "session_turn");
+    assert_eq!(cli_completed["params"]["run_id"], "run_cli");
+    assert_eq!(cli_completed["params"]["status"], "completed");
+    assert_eq!(cli_completed["params"]["final_answer"], "done");
+    assert!(cli_completed["params"].get("turn_id").is_none());
+    assert!(cli_completed["params"].get("thread_id").is_none());
+
+    let http_failed = facade.turn_terminal_event(
+        "turn/failed",
+        "turn_http",
+        "failed",
+        true,
+        true,
+        false,
+        BTreeMap::from([("error".to_string(), json!("provider failed"))]),
+    );
+    assert_eq!(http_failed["method"], "turn/failed");
+    assert_eq!(http_failed["params"]["session_id"], "session_turn");
+    assert_eq!(http_failed["params"]["thread_id"], "session_turn");
+    assert_eq!(http_failed["params"]["turn_id"], "turn_http");
+    assert_eq!(http_failed["params"]["status"], "failed");
+    assert_eq!(http_failed["params"]["error"], "provider failed");
+    assert!(http_failed["params"].get("run_id").is_none());
+}
+
+#[test]
 fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(), Box<dyn Error>> {
     let root = unique_temp_dir("openagent-tools-file")?;
     fs::write(root.join("notes.txt"), "alpha\nbeta\ngamma\n")?;

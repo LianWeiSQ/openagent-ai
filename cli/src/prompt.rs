@@ -9,6 +9,7 @@ mod tool;
 use agent_loop::{AgentLoopRequest, pending_resume_from_session, run_agent_loop};
 use mcp_runtime::{McpRuntime, execute_mcp_tool, load_mcp_runtime};
 pub(crate) use openagent_mcp::discover_mcp_server_tools;
+use openagent_tools::SessionRunnerFacade;
 use profile::{
     RunAgentProfile, agent_tool_options, bind_agent_profile_system_prompt, child_task_depth,
     child_task_lineage, filter_tools_for_agent, is_subagent_mode, load_agent_profile_from_args,
@@ -255,20 +256,23 @@ pub(super) fn run_prompt_command_with_events(
         None
     };
     if format == "json" {
-        let mut completed = json!({
-            "method": "turn/completed",
-            "params": {
-                "status": "completed",
-                "final_answer": answer.clone(),
-                "session_id": session.id.clone(),
-                "run_id": run_id.clone(),
-                "provider": provider.clone(),
-                "source": loop_result.source,
-                "forked": forked,
-                "steps": loop_result.steps,
-                "tool_calls": loop_result.tool_calls,
-            }
-        });
+        let mut completed = SessionRunnerFacade::new(&workspace, session.id.clone())
+            .turn_terminal_event(
+                "turn/completed",
+                &run_id,
+                "completed",
+                false,
+                false,
+                true,
+                BTreeMap::from([
+                    ("final_answer".to_string(), json!(answer.clone())),
+                    ("provider".to_string(), json!(provider.clone())),
+                    ("source".to_string(), json!(loop_result.source)),
+                    ("forked".to_string(), json!(forked)),
+                    ("steps".to_string(), json!(loop_result.steps)),
+                    ("tool_calls".to_string(), json!(loop_result.tool_calls)),
+                ]),
+            );
         if let Some(share) = share {
             completed["params"]["share"] = share;
         }

@@ -5182,17 +5182,22 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         &carry.answer,
     );
     let trace = trace_payload(session, run_id, carry.tool_calls);
-    events.push(json!({
-        "method": "turn/failed",
-        "params": {
-            "session_id": session.id.clone(),
-            "turn_id": run_id,
-            "status": "failed",
-            "error": "agent loop exceeded max_steps",
-            "usage": usage,
-            "trace": trace,
-        }
-    }));
+    events.push(
+        SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+            .turn_terminal_event(
+                "turn/failed",
+                run_id,
+                "failed",
+                false,
+                true,
+                false,
+                BTreeMap::from([
+                    ("error".to_string(), json!("agent loop exceeded max_steps")),
+                    ("usage".to_string(), usage.clone()),
+                    ("trace".to_string(), trace.clone()),
+                ]),
+            ),
+    );
     append_unpersisted_app_events(
         &store.root,
         &session.id,
@@ -6890,19 +6895,23 @@ fn finish_provider_loop(
     );
     let trace = trace_payload(session, run_id, carry.tool_calls);
     record_usage_event(store, session, run_id, &usage);
-    events.push(json!({
-        "method": "turn/completed",
-        "params": {
-            "thread_id": session.id.clone(),
-            "session_id": session.id.clone(),
-            "turn_id": run_id,
-            "status": "completed",
-            "final_answer": carry.answer,
-            "usage": usage,
-            "trace": trace,
-            "finish_reason": finish_reason,
-        }
-    }));
+    events.push(
+        SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+            .turn_terminal_event(
+                "turn/completed",
+                run_id,
+                "completed",
+                true,
+                true,
+                false,
+                BTreeMap::from([
+                    ("final_answer".to_string(), json!(carry.answer.clone())),
+                    ("usage".to_string(), usage.clone()),
+                    ("trace".to_string(), trace.clone()),
+                    ("finish_reason".to_string(), json!(finish_reason)),
+                ]),
+            ),
+    );
     append_unpersisted_app_events(
         &store.root,
         &session.id,
@@ -7381,15 +7390,18 @@ fn record_async_turn_failure(
         Some(error),
     );
     let _ = store.save_state(&session, Some(run_id));
-    let mut events = vec![json!({
-        "method": "turn/failed",
-        "params": {
-            "session_id": session.id,
-            "turn_id": run_id,
-            "status": "failed",
-            "error": error,
-        }
-    })];
+    let mut events = vec![
+        SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+            .turn_terminal_event(
+                "turn/failed",
+                run_id,
+                "failed",
+                false,
+                true,
+                false,
+                BTreeMap::from([("error".to_string(), json!(error))]),
+            ),
+    ];
     append_app_events(&store.root, session_id, run_id, &mut events);
 }
 
@@ -7411,16 +7423,16 @@ fn record_turn_interrupted(
     );
     let _ = store.save_state(session, Some(turn_id));
     mark_turn_job_status_at_root(&store.root, turn_id, "interrupted");
-    let event = json!({
-        "method": "turn/interrupted",
-        "params": {
-            "session_id": session.id.clone(),
-            "thread_id": session.id.clone(),
-            "turn_id": turn_id,
-            "status": "interrupted",
-            "error": error,
-        }
-    });
+    let event = SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+        .turn_terminal_event(
+            "turn/interrupted",
+            turn_id,
+            "interrupted",
+            true,
+            true,
+            false,
+            BTreeMap::from([("error".to_string(), json!(error))]),
+        );
     let mut events = vec![event];
     if !turn_event_recorded(&store.root, &session.id, turn_id, "turn/interrupted") {
         append_app_events(&store.root, &session.id, turn_id, &mut events);
@@ -7577,17 +7589,22 @@ fn run_http_tool_turn(
     let usage = usage_payload(&input, &answer, tool_call_count);
     let trace = trace_payload(session, run_id, tool_call_count);
     record_usage_event(store, session, run_id, &usage);
-    events.push(json!({
-        "method": "turn/completed",
-        "params": {
-            "thread_id": session.id.clone(),
-            "turn_id": run_id,
-            "status": "completed",
-            "final_answer": answer,
-            "usage": usage,
-            "trace": trace,
-        }
-    }));
+    events.push(
+        SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+            .turn_terminal_event(
+                "turn/completed",
+                run_id,
+                "completed",
+                true,
+                true,
+                false,
+                BTreeMap::from([
+                    ("final_answer".to_string(), json!(answer.clone())),
+                    ("usage".to_string(), usage.clone()),
+                    ("trace".to_string(), trace.clone()),
+                ]),
+            ),
+    );
     append_app_events(&store.root, &session.id, run_id, &mut events);
     Ok(json!({
         "session_id": session.id,
@@ -7789,17 +7806,22 @@ fn respond_approval_payload(
             Some(if failed { "tool_error" } else { "stop" }),
             None,
         );
-        events.push(json!({
-            "method": "turn/completed",
-            "params": {
-                "session_id": session.id.clone(),
-                "turn_id": run_id,
-                "status": if failed { "failed" } else { "completed" },
-                "final_answer": answer,
-                "usage": usage,
-                "trace": trace,
-            }
-        }));
+        events.push(
+            SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+                .turn_terminal_event(
+                    "turn/completed",
+                    &run_id,
+                    if failed { "failed" } else { "completed" },
+                    false,
+                    true,
+                    false,
+                    BTreeMap::from([
+                        ("final_answer".to_string(), json!(answer.clone())),
+                        ("usage".to_string(), usage.clone()),
+                        ("trace".to_string(), trace.clone()),
+                    ]),
+                ),
+        );
     } else {
         response_status = "failed";
         session.metadata.remove("pending_provider_turn");
@@ -7815,15 +7837,18 @@ fn respond_approval_payload(
             Some("permission_denied"),
             Some("approval denied"),
         );
-        events.push(json!({
-            "method": "turn/failed",
-            "params": {
-                "session_id": session.id.clone(),
-                "turn_id": run_id.clone(),
-                "status": "failed",
-                "error": "approval denied",
-            }
-        }));
+        events.push(
+            SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+                .turn_terminal_event(
+                    "turn/failed",
+                    &run_id,
+                    "failed",
+                    false,
+                    true,
+                    false,
+                    BTreeMap::from([("error".to_string(), json!("approval denied"))]),
+                ),
+        );
     }
     let _ = store.save_state(&session, Some(&run_id));
     append_app_events(&store.root, &session.id, &run_id, &mut events);
@@ -7909,15 +7934,26 @@ fn respond_question_payload(
             Some("question_dismissed"),
             Some("question dismissed"),
         );
-        events.push(json!({
-            "method": "turn/failed",
-            "params": {
-                "session_id": session.id.clone(),
-                "turn_id": run_id.clone(),
-                "status": "failed",
-                "error": response.get("note").and_then(Value::as_str).unwrap_or("question dismissed"),
-            }
-        }));
+        events.push(
+            SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+                .turn_terminal_event(
+                    "turn/failed",
+                    &run_id,
+                    "failed",
+                    false,
+                    true,
+                    false,
+                    BTreeMap::from([(
+                        "error".to_string(),
+                        json!(
+                            response
+                                .get("note")
+                                .and_then(Value::as_str)
+                                .unwrap_or("question dismissed")
+                        ),
+                    )]),
+                ),
+        );
         let _ = store.save_state(&session, Some(&run_id));
         append_app_events(&store.root, &session.id, &run_id, &mut events);
         mark_turn_job_status(config, &run_id, "failed");
@@ -7984,17 +8020,22 @@ fn respond_question_payload(
     record_usage_event(&store, &session, &run_id, &usage);
     let _ = store.finish_run(&session, &run_id, "completed", 1, Some("stop"), None);
     let _ = store.save_state(&session, Some(&run_id));
-    events.push(json!({
-        "method": "turn/completed",
-        "params": {
-            "session_id": session.id.clone(),
-            "turn_id": run_id.clone(),
-            "status": "completed",
-            "final_answer": answer,
-            "usage": usage,
-            "trace": trace,
-        }
-    }));
+    events.push(
+        SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+            .turn_terminal_event(
+                "turn/completed",
+                &run_id,
+                "completed",
+                false,
+                true,
+                false,
+                BTreeMap::from([
+                    ("final_answer".to_string(), json!(answer.clone())),
+                    ("usage".to_string(), usage.clone()),
+                    ("trace".to_string(), trace.clone()),
+                ]),
+            ),
+    );
     append_app_events(&store.root, &session.id, &run_id, &mut events);
     mark_turn_job_status(config, &run_id, "completed");
     Ok(json!({

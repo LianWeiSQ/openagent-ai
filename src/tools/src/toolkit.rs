@@ -1227,6 +1227,38 @@ impl SessionRunnerFacade {
     }
 
     #[must_use]
+    pub fn turn_terminal_event(
+        &self,
+        method: &str,
+        run_id: &str,
+        status: &str,
+        include_thread_id: bool,
+        include_turn_id: bool,
+        include_run_id: bool,
+        extra_params: BTreeMap<String, Value>,
+    ) -> Value {
+        let mut params = Map::new();
+        params.insert("session_id".to_string(), json!(self.session_id.clone()));
+        if include_thread_id {
+            params.insert("thread_id".to_string(), json!(self.session_id.clone()));
+        }
+        if include_turn_id {
+            params.insert("turn_id".to_string(), json!(run_id));
+        }
+        if include_run_id {
+            params.insert("run_id".to_string(), json!(run_id));
+        }
+        params.insert("status".to_string(), json!(status));
+        for (key, value) in extra_params {
+            params.insert(key, value);
+        }
+        json!({
+            "method": method,
+            "params": Value::Object(params),
+        })
+    }
+
+    #[must_use]
     pub fn tool_result_message(
         &self,
         step: u64,
