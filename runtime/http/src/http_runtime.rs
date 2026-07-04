@@ -2707,7 +2707,26 @@ fn is_hidden_runtime_dir(path: &Path) -> bool {
         .unwrap_or("");
     matches!(
         name,
-        ".git" | ".openagent" | "node_modules" | "target" | "dist" | ".DS_Store"
+        ".git"
+            | ".openagent"
+            | ".runtime_http"
+            | ".claude"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | "jobs"
+            | "runs"
+            | "coverage"
+            | "htmlcov"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | ".venv"
+            | "venv"
+            | "env"
+            | ".DS_Store"
     )
 }
 

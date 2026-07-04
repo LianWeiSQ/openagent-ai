@@ -505,6 +505,22 @@ fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(),
         root.join("src").join("main.rs"),
         "fn main() {\n  println!(\"beta\");\n}\n",
     )?;
+    for runtime_dir in ["target", "jobs/run-1", ".openagent/sessions", "dist"] {
+        fs::create_dir_all(root.join(runtime_dir))?;
+    }
+    fs::write(
+        root.join("target").join("generated.rs"),
+        "fn generated() {\n  println!(\"delta\");\n}\n",
+    )?;
+    fs::write(
+        root.join("jobs").join("run-1").join("job.rs"),
+        "fn job() {\n  println!(\"delta\");\n}\n",
+    )?;
+    fs::write(
+        root.join(".openagent").join("sessions").join("trace.rs"),
+        "delta\n",
+    )?;
+    fs::write(root.join("dist").join("bundle.rs"), "delta\n")?;
 
     let toolkit = Toolkit::with_builtins();
     let mut ctx = ToolContext::new(&root).with_session_id("session/file");
@@ -581,6 +597,10 @@ fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(),
 
     let glob = toolkit.execute("glob", json!({"pattern": "**/*.rs"}), "call_glob", &mut ctx);
     assert!(glob.output.contains("main.rs"));
+    assert!(!glob.output.contains("generated.rs"));
+    assert!(!glob.output.contains("job.rs"));
+    assert!(!glob.output.contains("trace.rs"));
+    assert!(!glob.output.contains("bundle.rs"));
     assert_eq!(glob.metadata["count"], json!(1));
 
     let grep = toolkit.execute(
@@ -590,11 +610,17 @@ fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(),
         &mut ctx,
     );
     assert!(grep.output.contains("Found 1 matches"));
+    assert!(!grep.output.contains("generated.rs"));
+    assert!(!grep.output.contains("job.rs"));
     assert_eq!(grep.metadata["include"], json!("*.rs"));
 
     let ls = toolkit.execute("ls", json!({"ignore": ["new.txt"]}), "call_ls", &mut ctx);
     assert!(ls.output.contains("notes.txt"));
     assert!(!ls.output.contains("new.txt"));
+    assert!(!ls.output.contains("target"));
+    assert!(!ls.output.contains("jobs"));
+    assert!(!ls.output.contains(".openagent"));
+    assert!(!ls.output.contains("dist"));
     assert!(ls.metadata["count"].as_u64().unwrap_or_default() >= 2);
 
     let code_search = toolkit.execute(
@@ -604,6 +630,10 @@ fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(),
         &mut ctx,
     );
     assert!(code_search.output.contains("notes.txt"));
+    assert!(!code_search.output.contains("generated.rs"));
+    assert!(!code_search.output.contains("job.rs"));
+    assert!(!code_search.output.contains("trace.rs"));
+    assert!(!code_search.output.contains("bundle.rs"));
     assert_eq!(code_search.metadata["count"], json!(1));
 
     fs::remove_dir_all(root)?;
@@ -860,8 +890,14 @@ fn prepare_isolated_workspace_copies_workspace_without_heavy_dirs() -> Result<()
     let isolation_root = root.join("isolated");
     fs::create_dir_all(source.join("src"))?;
     fs::create_dir_all(source.join("target"))?;
+    fs::create_dir_all(source.join("jobs"))?;
+    fs::create_dir_all(source.join(".openagent"))?;
+    fs::create_dir_all(source.join("dist"))?;
     fs::write(source.join("src").join("main.rs"), "fn main() {}\n")?;
     fs::write(source.join("target").join("cache.txt"), "heavy\n")?;
+    fs::write(source.join("jobs").join("job.log"), "heavy\n")?;
+    fs::write(source.join(".openagent").join("session.json"), "heavy\n")?;
+    fs::write(source.join("dist").join("bundle.js"), "heavy\n")?;
 
     let isolation = prepare_isolated_workspace(&source, &isolation_root, "task/one")?;
     let isolated = PathBuf::from(&isolation.workspace);
@@ -869,6 +905,9 @@ fn prepare_isolated_workspace_copies_workspace_without_heavy_dirs() -> Result<()
     assert_eq!(isolation.method, "directory_copy");
     assert!(isolated.join("src").join("main.rs").exists());
     assert!(!isolated.join("target").exists());
+    assert!(!isolated.join("jobs").exists());
+    assert!(!isolated.join(".openagent").exists());
+    assert!(!isolated.join("dist").exists());
     fs::write(isolated.join("child.txt"), "isolated\n")?;
     assert!(!source.join("child.txt").exists());
 

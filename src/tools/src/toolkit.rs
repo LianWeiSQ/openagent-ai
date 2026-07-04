@@ -43,13 +43,22 @@ const WEB_FETCH_DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const WEB_FETCH_MAX_BYTES: usize = 128 * 1024;
 const BENCHMARK_MODE_ENV: &str = "OPENAGENT_BENCHMARK_MODE";
 
-const DEFAULT_LS_IGNORE: &[&str] = &[
+const SOURCE_ONLY_SCAN_IGNORE: &[&str] = &[
+    ".git/",
+    ".openagent/",
+    ".runtime_http/",
+    ".claude/",
+    ".DS_Store",
     "node_modules/",
     "__pycache__/",
-    ".git/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
     "dist/",
     "build/",
     "target/",
+    "jobs/",
+    "runs/",
     "vendor/",
     ".idea/",
     ".vscode/",
@@ -57,6 +66,12 @@ const DEFAULT_LS_IGNORE: &[&str] = &[
     "venv/",
     "env/",
     "coverage/",
+    "htmlcov/",
+    "tests/.tmp/",
+    "tests/workdir/",
+    "openagent/tests/workdir/",
+    "examples/workdir*",
+    "desktop/src-tauri/gen/",
 ];
 
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -908,7 +923,25 @@ fn copy_workspace_dir(
 fn should_skip_isolation_entry(name: &OsStr) -> bool {
     matches!(
         name.to_str().unwrap_or_default(),
-        ".git" | "target" | "node_modules" | ".venv" | "venv" | "__pycache__"
+        ".git"
+            | ".openagent"
+            | ".runtime_http"
+            | ".claude"
+            | "target"
+            | "dist"
+            | "build"
+            | "jobs"
+            | "runs"
+            | "node_modules"
+            | ".venv"
+            | "venv"
+            | "env"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | "coverage"
+            | "htmlcov"
     )
 }
 
@@ -2850,7 +2883,7 @@ fn grep_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput>
 
 fn ls_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput> {
     let path = optional_string_arg(&input, "path")?;
-    let mut ignore = DEFAULT_LS_IGNORE
+    let mut ignore = SOURCE_ONLY_SCAN_IGNORE
         .iter()
         .map(|item| (*item).to_string())
         .collect::<Vec<_>>();
@@ -3790,21 +3823,41 @@ fn edited_output(root: &Path, target: &Path, replace_all: bool) -> ToolResultVal
 }
 
 fn walk_paths(base: &Path) -> ToolResultValue<Vec<PathBuf>> {
+    let ignore = SOURCE_ONLY_SCAN_IGNORE
+        .iter()
+        .map(|item| (*item).to_string())
+        .collect::<Vec<_>>();
+    walk_paths_inner(base, base, &ignore)
+}
+
+fn walk_paths_inner(
+    base: &Path,
+    current: &Path,
+    ignore: &[String],
+) -> ToolResultValue<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    if !base.exists() {
+    if !current.exists() {
         return Ok(paths);
     }
-    paths.push(base.to_path_buf());
-    if base.is_dir() {
-        let mut entries = fs::read_dir(base)
+    paths.push(current.to_path_buf());
+    if current.is_dir() {
+        let mut entries = fs::read_dir(current)
             .map_err(io_error)?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
         entries.sort();
         for path in entries {
+            let relative = path
+                .strip_prefix(base)
+                .map(path_to_string)
+                .unwrap_or_else(|_| path_to_string(&path));
+            let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+            if should_ignore(&relative, name, ignore) {
+                continue;
+            }
             if path.is_dir() {
-                paths.extend(walk_paths(&path)?);
+                paths.extend(walk_paths_inner(base, &path, ignore)?);
             } else {
                 paths.push(path);
             }

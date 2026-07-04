@@ -156,6 +156,81 @@ fn app_bridge_http_routes_cover_static_sse_auth_and_tui_control() -> Result<(), 
 }
 
 #[test]
+fn files_route_uses_source_only_scan_profile() -> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-files-source-only")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::write(workspace.join("src").join("main.rs"), "fn main() {}\n")?;
+    for runtime_dir in [
+        "target",
+        "jobs/run-1",
+        ".openagent/sessions",
+        ".runtime_http",
+        "dist",
+        "build",
+        "node_modules/pkg",
+        "runs",
+        "__pycache__",
+    ] {
+        fs::create_dir_all(workspace.join(runtime_dir))?;
+    }
+    fs::write(workspace.join("target").join("cache.rs"), "ignored\n")?;
+    fs::write(
+        workspace.join("jobs").join("run-1").join("job.log"),
+        "ignored\n",
+    )?;
+    fs::write(
+        workspace
+            .join(".openagent")
+            .join("sessions")
+            .join("session.json"),
+        "ignored\n",
+    )?;
+    fs::write(workspace.join("dist").join("bundle.js"), "ignored\n")?;
+
+    let mut server = spawn_runtime(port, &workspace, &session_root)?;
+    wait_for_server(port)?;
+
+    let payload = json_body(&authorized_request(
+        port,
+        "GET",
+        "/api/files?depth=3",
+        "",
+        false,
+    )?)?;
+    let paths = payload["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect::<Vec<_>>();
+    assert!(paths.iter().any(|path| *path == "src"));
+    assert!(paths.iter().any(|path| *path == "src/main.rs"));
+    for ignored in [
+        "target",
+        "jobs",
+        ".openagent",
+        ".runtime_http",
+        "dist",
+        "build",
+        "node_modules",
+        "runs",
+        "__pycache__",
+    ] {
+        assert!(
+            !paths.iter().any(|path| path.starts_with(ignored)),
+            "source-only file tree leaked {ignored}: {paths:?}"
+        );
+    }
+
+    let _ = server.kill();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn remote_runtime_client_round_trips_tui_approval() -> Result<(), Box<dyn Error>> {
     let port = free_port()?;
     let temp = temp_dir("openagent-http-runtime-client-approval")?;
