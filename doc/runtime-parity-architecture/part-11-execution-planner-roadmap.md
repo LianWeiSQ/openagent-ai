@@ -73,6 +73,7 @@ SessionRunner
 - terminal turn event envelope construction。
 - shared usage/trace payload construction。
 - terminal outcome state construction。
+- provider step complete/continue outcome construction。
 
 近期验证覆盖：
 

@@ -399,6 +399,21 @@ fn session_runner_facade_builds_shared_turn_terminal_outcomes() {
 }
 
 #[test]
+fn session_runner_facade_builds_shared_provider_step_outcomes() {
+    let complete = SessionRunnerFacade::provider_step_outcome(0, "stop");
+    assert!(complete.is_complete());
+    assert!(!complete.continues_with_tools());
+    assert_eq!(complete.tool_call_count, 0);
+    assert_eq!(complete.finish_reason, "stop");
+
+    let continue_with_tools = SessionRunnerFacade::provider_step_outcome(2, "tool_call");
+    assert!(!continue_with_tools.is_complete());
+    assert!(continue_with_tools.continues_with_tools());
+    assert_eq!(continue_with_tools.tool_call_count, 2);
+    assert_eq!(continue_with_tools.finish_reason, "tool_call");
+}
+
+#[test]
 fn session_runner_facade_builds_shared_turn_usage_and_trace_payloads() {
     let facade = SessionRunnerFacade::new("/tmp/openagent-session-runner", "session_trace");
 

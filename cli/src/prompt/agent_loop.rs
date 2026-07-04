@@ -408,14 +408,18 @@ pub(super) fn run_agent_loop(
                 paused: false,
             })?;
 
-        if provider_result.tool_calls.is_empty() {
+        let step_outcome = SessionRunnerFacade::provider_step_outcome(
+            provider_result.tool_calls.len() as u64,
+            &provider_result.finish_reason,
+        );
+        if step_outcome.is_complete() {
             record_step_finished(
                 store,
                 &session.id,
                 run_id,
                 step,
-                &provider_result.finish_reason,
-                0,
+                &step_outcome.finish_reason,
+                step_outcome.tool_call_count,
                 &provider_result.usage,
             );
             return Ok(AgentLoopOutcome {
@@ -425,9 +429,10 @@ pub(super) fn run_agent_loop(
                 events,
                 steps: step,
                 tool_calls: total_tool_calls,
-                finish_reason: provider_result.finish_reason,
+                finish_reason: step_outcome.finish_reason,
             });
         }
+        debug_assert!(step_outcome.continues_with_tools());
 
         let step_start_checkpoint = create_step_checkpoint(
             store,

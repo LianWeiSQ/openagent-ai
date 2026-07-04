@@ -5080,7 +5080,11 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         session.add(assistant.clone());
         let _ = store.append_message(session, &assistant, run_id, assistant_index);
 
-        if provider_result.tool_calls.is_empty() {
+        let step_outcome = SessionRunnerFacade::provider_step_outcome(
+            provider_result.tool_calls.len() as u64,
+            &provider_result.finish_reason,
+        );
+        if step_outcome.is_complete() {
             return finish_provider_loop(
                 store,
                 session,
@@ -5088,9 +5092,10 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                 events,
                 &mut persisted_events,
                 carry,
-                &provider_result.finish_reason,
+                &step_outcome.finish_reason,
             );
         }
+        debug_assert!(step_outcome.continues_with_tools());
 
         let step_start_checkpoint = runtime_create_step_checkpoint(
             store,
@@ -5148,13 +5153,18 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
     }
 
     session.status = SessionStatus::Idle;
+    let outcome = SessionRunnerFacade::failed_turn_outcome(
+        max_steps,
+        "max_steps",
+        "agent loop exceeded max_steps",
+    );
     let _ = store.finish_run(
         session,
         run_id,
-        "failed",
-        max_steps,
-        Some("max_steps"),
-        Some("agent loop exceeded max_steps"),
+        &outcome.run_status,
+        outcome.steps,
+        Some(&outcome.finish_reason),
+        outcome.error.as_deref(),
     );
     let usage = usage_value_from_provider(
         &carry.usage,
@@ -5166,9 +5176,9 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
     events.push(
         SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
             .turn_terminal_event(
-                "turn/failed",
+                &outcome.event_method,
                 run_id,
-                "failed",
+                &outcome.event_status,
                 false,
                 true,
                 false,
@@ -5189,7 +5199,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
-        "status": "failed",
+        "status": outcome.event_status,
         "events": events,
     }))
 }

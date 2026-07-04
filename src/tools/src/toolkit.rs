@@ -1123,6 +1123,32 @@ pub struct TurnTerminalOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderStepDisposition {
+    Complete,
+    ContinueWithTools,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderStepOutcome {
+    pub disposition: ProviderStepDisposition,
+    pub tool_call_count: u64,
+    pub finish_reason: String,
+}
+
+impl ProviderStepOutcome {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.disposition == ProviderStepDisposition::Complete
+    }
+
+    #[must_use]
+    pub fn continues_with_tools(&self) -> bool {
+        self.disposition == ProviderStepDisposition::ContinueWithTools
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SkillToolSessionEvent {
     pub event_name: String,
@@ -1344,6 +1370,22 @@ impl SessionRunnerFacade {
             "interrupted",
             Some(error.into()),
         )
+    }
+
+    #[must_use]
+    pub fn provider_step_outcome(
+        tool_call_count: u64,
+        finish_reason: impl Into<String>,
+    ) -> ProviderStepOutcome {
+        ProviderStepOutcome {
+            disposition: if tool_call_count == 0 {
+                ProviderStepDisposition::Complete
+            } else {
+                ProviderStepDisposition::ContinueWithTools
+            },
+            tool_call_count,
+            finish_reason: finish_reason.into(),
+        }
     }
 
     #[must_use]
