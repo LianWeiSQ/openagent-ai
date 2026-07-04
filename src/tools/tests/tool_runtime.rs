@@ -16,8 +16,8 @@ use openagent_tools::{
     ToolRegistry, Toolkit, benchmark_mode_allows_shell_command,
     benchmark_mode_value_allows_shell_command, blocked_command, ensure_within_root,
     exclusive_schema, format_read_output_from_text, parse_agent_profile_schema,
-    prepare_isolated_workspace, qualify_tool_id, readonly_schema, register_builtin_tools,
-    select_task_subagent_for_prompt, truncate_output,
+    prepare_isolated_workspace, qualify_tool_id, question_answers_from_json, readonly_schema,
+    register_builtin_tools, select_task_subagent_for_prompt, truncate_output,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -148,6 +148,34 @@ fn session_runner_facade_builds_shared_tool_context_contract() {
     assert_eq!(contract["has_skill_permissions"], true);
     assert_eq!(contract["has_permission_manager"], true);
     assert_eq!(contract["question_answer_groups"], 1);
+}
+
+#[test]
+fn session_runner_facade_parses_question_answers_from_json_contract() {
+    assert_eq!(
+        question_answers_from_json(&json!([["yes", true], [42, 3.5]])).unwrap(),
+        vec![
+            vec!["yes".to_string(), "true".to_string()],
+            vec!["42".to_string(), "3.5".to_string()],
+        ]
+    );
+    assert_eq!(
+        question_answers_from_json(&json!(["alpha", false, 7])).unwrap(),
+        vec![
+            vec!["alpha".to_string()],
+            vec!["false".to_string()],
+            vec!["7".to_string()],
+        ]
+    );
+    assert!(question_answers_from_json(&json!({"answer": "no"})).is_none());
+
+    let context = SessionRunnerFacade::new("/tmp/openagent-session-runner", "session_answers")
+        .with_question_answers_value(&json!([["fast", "careful"]]))
+        .tool_context();
+    assert_eq!(
+        context.question_answers,
+        Some(vec![vec!["fast".to_string(), "careful".to_string()]])
+    );
 }
 
 #[test]

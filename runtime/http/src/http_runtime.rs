@@ -4947,21 +4947,19 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<BTreeSet<_>>();
-    let runner_facade = runtime_session_runner_facade(
+    let mut runner_facade = runtime_session_runner_facade(
         session,
         agent_profile.as_ref(),
         permission_ruleset.clone(),
         skip_permissions,
     );
-    let mut ctx = if let Some(answers) = payload
+    if let Some(value) = payload
         .get("question_answers")
         .or_else(|| payload.get("answers"))
-        .and_then(question_answers_from_json)
     {
-        runner_facade.with_question_answers(answers).tool_context()
-    } else {
-        runner_facade.tool_context()
-    };
+        runner_facade = runner_facade.with_question_answers_value(value);
+    }
+    let mut ctx = runner_facade.tool_context();
     if let Some(profile) = agent_profile.as_ref()
         && let Some((system, system_index)) =
             bind_runtime_agent_system_prompt(session, profile, &profile.mode)
@@ -8022,14 +8020,12 @@ fn respond_question_payload(
 
     let tool_call = pending_question_tool_call(&question)?;
     let agent_profile = runtime_agent_profile_for_session(&session);
-    let answers = response
-        .get("answers")
-        .and_then(question_answers_from_json)
-        .unwrap_or_default();
-    let mut ctx = SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
-        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()))
-        .with_question_answers(answers)
-        .tool_context();
+    let mut runner_facade = SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()));
+    if let Some(value) = response.get("answers") {
+        runner_facade = runner_facade.with_question_answers_value(value);
+    }
+    let mut ctx = runner_facade.tool_context();
     let toolkit = toolkit_with_runtime_task_tool(&session, agent_profile.as_ref());
     let mut tool_result = toolkit.execute(
         "question",
@@ -8347,41 +8343,6 @@ fn question_payload_for_tool_call(
         "questions": call.input.get("questions").cloned().unwrap_or_else(|| json!([])),
         "created_at_ms": now_ms(),
     })
-}
-
-fn question_answers_from_json(value: &Value) -> Option<Vec<Vec<String>>> {
-    let items = value.as_array()?;
-    if items.iter().all(Value::is_array) {
-        return Some(
-            items
-                .iter()
-                .map(|item| {
-                    item.as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(value_to_answer_string)
-                        .collect::<Vec<_>>()
-                })
-                .collect(),
-        );
-    }
-    Some(
-        items
-            .iter()
-            .filter_map(value_to_answer_string)
-            .map(|answer| vec![answer])
-            .collect(),
-    )
-}
-
-fn value_to_answer_string(value: &Value) -> Option<String> {
-    value
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| value.as_bool().map(|item| item.to_string()))
-        .or_else(|| value.as_i64().map(|item| item.to_string()))
-        .or_else(|| value.as_u64().map(|item| item.to_string()))
-        .or_else(|| value.as_f64().map(|item| item.to_string()))
 }
 
 fn tool_calls_from_turn_payload(payload: &Value) -> Result<Vec<ToolCall>, String> {

@@ -1,4 +1,5 @@
 use super::*;
+use openagent_tools::question_answers_from_json;
 
 pub(super) fn execute_agent_tool(
     toolkit: &Toolkit,
@@ -116,41 +117,6 @@ pub(super) fn configured_question_answers(args: &[String]) -> Option<Vec<Vec<Str
             .map(split_answer_items)
             .collect(),
     )
-}
-
-pub(super) fn question_answers_from_json(value: &Value) -> Option<Vec<Vec<String>>> {
-    let items = value.as_array()?;
-    if items.iter().all(Value::is_array) {
-        return Some(
-            items
-                .iter()
-                .map(|item| {
-                    item.as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(value_to_answer_string)
-                        .collect::<Vec<_>>()
-                })
-                .collect(),
-        );
-    }
-    Some(
-        items
-            .iter()
-            .filter_map(value_to_answer_string)
-            .map(|answer| vec![answer])
-            .collect(),
-    )
-}
-
-pub(super) fn value_to_answer_string(value: &Value) -> Option<String> {
-    value
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| value.as_bool().map(|item| item.to_string()))
-        .or_else(|| value.as_i64().map(|item| item.to_string()))
-        .or_else(|| value.as_u64().map(|item| item.to_string()))
-        .or_else(|| value.as_f64().map(|item| item.to_string()))
 }
 
 pub(crate) fn split_answer_items(answer: &str) -> Vec<String> {

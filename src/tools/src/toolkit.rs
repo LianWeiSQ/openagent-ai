@@ -1057,6 +1057,43 @@ impl ToolContext {
     }
 }
 
+#[must_use]
+pub fn question_answers_from_json(value: &Value) -> Option<Vec<Vec<String>>> {
+    let items = value.as_array()?;
+    if items.iter().all(Value::is_array) {
+        return Some(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(value_to_answer_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+        );
+    }
+    Some(
+        items
+            .iter()
+            .filter_map(value_to_answer_string)
+            .map(|answer| vec![answer])
+            .collect(),
+    )
+}
+
+#[must_use]
+pub fn value_to_answer_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_bool().map(|item| item.to_string()))
+        .or_else(|| value.as_i64().map(|item| item.to_string()))
+        .or_else(|| value.as_u64().map(|item| item.to_string()))
+        .or_else(|| value.as_f64().map(|item| item.to_string()))
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionRunnerFacade {
     session_root: PathBuf,
@@ -1104,6 +1141,15 @@ impl SessionRunnerFacade {
             self.question_answers = Some(answers);
         }
         self
+    }
+
+    #[must_use]
+    pub fn with_question_answers_value(self, value: &Value) -> Self {
+        if let Some(answers) = question_answers_from_json(value) {
+            self.with_question_answers(answers)
+        } else {
+            self
+        }
     }
 
     #[must_use]
