@@ -6224,18 +6224,10 @@ fn execute_provider_tool_call(
     events: &mut Vec<Value>,
     persisted_events: &mut usize,
 ) -> Result<Option<Value>, String> {
-    events.push(json!({
-        "method": "item/toolCall/started",
-        "params": {
-            "session_id": session.id.clone(),
-            "turn_id": run_id,
-            "run_id": run_id,
-            "step": step,
-            "call_id": tool_call.call_id.clone(),
-            "name": tool_call.name.clone(),
-            "input": tool_call.input.clone(),
-        }
-    }));
+    events.push(
+        SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+            .tool_call_started_event(run_id, step, tool_call, Some(run_id), BTreeMap::new()),
+    );
     append_unpersisted_app_events(&store.root, &session.id, run_id, events, persisted_events);
     let _ = store.record_event(
         &session.id,
@@ -6487,7 +6479,6 @@ fn append_completed_tool_result(
     tool_result: &mut ToolResult,
     events: &mut Vec<Value>,
 ) -> Result<(), String> {
-    let failed = tool_result.error.is_some();
     let patch = complete_file_change(
         store,
         session,
@@ -6509,20 +6500,17 @@ fn append_completed_tool_result(
             change.get("diff").cloned().unwrap_or(Value::Null),
         );
     }
-    events.push(json!({
-        "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
-        "params": {
-            "session_id": session.id.clone(),
-            "turn_id": run_id,
-            "run_id": run_id,
-            "step": step,
-            "call_id": tool_call.call_id.clone(),
-            "name": tool_call.name.clone(),
-            "output": tool_result.output.clone(),
-            "error": tool_result.error.clone(),
-            "metadata": tool_result.metadata.clone(),
-        }
-    }));
+    events.push(
+        SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+            .tool_call_finished_event(
+                run_id,
+                step,
+                tool_call,
+                tool_result,
+                Some(run_id),
+                BTreeMap::new(),
+            ),
+    );
     if let Some(change) = patch.as_ref() {
         events.push(patch_detected_event(session, run_id, change));
     }
@@ -7545,16 +7533,10 @@ fn run_http_tool_turn(
 
     for (index, tool_call) in tool_calls.into_iter().enumerate() {
         let step = index as u64 + 1;
-        events.push(json!({
-            "method": "item/toolCall/started",
-            "params": {
-                "session_id": session.id.clone(),
-                "turn_id": run_id,
-                "call_id": tool_call.call_id.clone(),
-                "name": tool_call.name.clone(),
-                "input": tool_call.input.clone(),
-            }
-        }));
+        events.push(
+            SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+                .tool_call_started_event(run_id, step, &tool_call, Some(run_id), BTreeMap::new()),
+        );
         let change_before = capture_file_change_before(session, &tool_call);
         let mut tool_result = execute_runtime_tool_call(
             &toolkit,

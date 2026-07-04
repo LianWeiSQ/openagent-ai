@@ -89,18 +89,17 @@ pub(super) fn run_agent_loop(
         register_task_tool(&mut toolkit.registry, &subagent_descriptors);
     }
     let tools = filter_tools_for_agent(toolkit.get_all_tools("local"), agent_profile);
-    let runner_facade = SessionRunnerFacade::new(workspace, session.id.clone())
+    let mut runner_facade = SessionRunnerFacade::new(workspace, session.id.clone())
         .with_agent_options(agent_tool_options(agent_profile))
         .with_permission_manager(permission_manager_for_agent(
             permission_ruleset.clone(),
             agent_profile,
         ))
         .with_dangerously_skip_permissions(skip_permissions);
-    let mut ctx = if let Some(answers) = configured_question_answers(args) {
-        runner_facade.with_question_answers(answers).tool_context()
-    } else {
-        runner_facade.tool_context()
-    };
+    if let Some(answers) = configured_question_answers(args) {
+        runner_facade = runner_facade.with_question_answers(answers);
+    }
+    let mut ctx = runner_facade.tool_context();
     if let Some(runtime) = mcp_runtime.as_ref() {
         let _ = store.record_event(
             &session.id,
@@ -178,20 +177,17 @@ pub(super) fn run_agent_loop(
         );
         emit_run_event(
             &mut events,
-            json!({
-                "method": "item/toolCall/started",
-                "params": {
-                    "session_id": session.id.clone(),
-                    "run_id": run_id,
-                    "step": 1,
-                    "call_id": tool_call.call_id.clone(),
-                    "name": tool_call.name.clone(),
-                    "input": tool_call.input.clone(),
-                    "manual": route.manual,
-                    "auto": route.auto,
-                    "auto_route": route_metadata.clone(),
-                }
-            }),
+            runner_facade.tool_call_started_event(
+                run_id,
+                1,
+                &tool_call,
+                None,
+                BTreeMap::from([
+                    ("manual".to_string(), json!(route.manual)),
+                    ("auto".to_string(), json!(route.auto)),
+                    ("auto_route".to_string(), route_metadata.clone()),
+                ]),
+            ),
             event_sink,
         );
         let mut assistant =
@@ -237,22 +233,18 @@ pub(super) fn run_agent_loop(
         let failed = tool_result.error.is_some();
         emit_run_event(
             &mut events,
-            json!({
-                "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
-                "params": {
-                    "session_id": session.id.clone(),
-                    "run_id": run_id,
-                    "step": 1,
-                    "call_id": tool_call.call_id.clone(),
-                    "name": tool_call.name.clone(),
-                    "output": tool_result.output.clone(),
-                    "error": tool_result.error.clone(),
-                    "metadata": tool_result.metadata.clone(),
-                    "manual": route.manual,
-                    "auto": route.auto,
-                    "auto_route": route_metadata.clone(),
-                }
-            }),
+            runner_facade.tool_call_finished_event(
+                run_id,
+                1,
+                &tool_call,
+                &tool_result,
+                None,
+                BTreeMap::from([
+                    ("manual".to_string(), json!(route.manual)),
+                    ("auto".to_string(), json!(route.auto)),
+                    ("auto_route".to_string(), route_metadata.clone()),
+                ]),
+            ),
             event_sink,
         );
         let mut tool_message = chat_message(
@@ -460,17 +452,13 @@ pub(super) fn run_agent_loop(
             total_tool_calls += 1;
             emit_run_event(
                 &mut events,
-                json!({
-                    "method": "item/toolCall/started",
-                    "params": {
-                        "session_id": session.id.clone(),
-                        "run_id": run_id,
-                        "step": step,
-                        "call_id": tool_call.call_id.clone(),
-                        "name": tool_call.name.clone(),
-                        "input": tool_call.input.clone(),
-                    }
-                }),
+                runner_facade.tool_call_started_event(
+                    run_id,
+                    step,
+                    &tool_call,
+                    None,
+                    BTreeMap::new(),
+                ),
                 event_sink,
             );
             let _ = store.record_event(
@@ -723,24 +711,16 @@ pub(super) fn run_agent_loop(
                 });
             }
             let failed = tool_result.error.is_some();
-            let tool_output = tool_result.output.clone();
-            let tool_error = tool_result.error.clone();
-            let tool_metadata = tool_result.metadata.clone();
             emit_run_event(
                 &mut events,
-                json!({
-                    "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
-                    "params": {
-                        "session_id": session.id.clone(),
-                        "run_id": run_id,
-                        "step": step,
-                        "call_id": tool_call.call_id.clone(),
-                        "name": tool_call.name.clone(),
-                        "output": tool_output,
-                        "error": tool_error,
-                        "metadata": tool_metadata,
-                    }
-                }),
+                runner_facade.tool_call_finished_event(
+                    run_id,
+                    step,
+                    &tool_call,
+                    &tool_result,
+                    None,
+                    BTreeMap::new(),
+                ),
                 event_sink,
             );
             record_skill_tool_session_event(
@@ -1780,19 +1760,15 @@ fn append_tool_result_to_session(
     let failed = tool_result.error.is_some();
     emit_run_event(
         context.events,
-        json!({
-            "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
-            "params": {
-                "session_id": context.session.id.clone(),
-                "run_id": context.run_id,
-                "step": step,
-                "call_id": tool_call.call_id.clone(),
-                "name": tool_call.name.clone(),
-                "output": tool_result.output.clone(),
-                "error": tool_result.error.clone(),
-                "metadata": tool_result.metadata.clone(),
-            }
-        }),
+        SessionRunnerFacade::new(context.workspace, context.session.id.clone())
+            .tool_call_finished_event(
+                context.run_id,
+                step,
+                tool_call,
+                &tool_result,
+                None,
+                BTreeMap::new(),
+            ),
         context.event_sink,
     );
     record_skill_tool_session_event(

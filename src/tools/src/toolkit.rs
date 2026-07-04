@@ -17,12 +17,12 @@ use openagent_core::{
     skill_document_model_invocable, skill_info_model_invocable,
 };
 use openagent_protocol::{
-    PermissionAction, PermissionRuleset, ToolConcurrency, ToolExecutionSchema, ToolExecutionScope,
-    ToolResult, ToolSchema,
+    PermissionAction, PermissionRuleset, ToolCall, ToolConcurrency, ToolExecutionSchema,
+    ToolExecutionScope, ToolResult, ToolSchema,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const TASK_TOOL_ID: &str = "task";
@@ -1165,6 +1165,69 @@ impl SessionRunnerFacade {
             context.set_question_answers(answers);
         }
         context
+    }
+
+    #[must_use]
+    pub fn tool_call_started_event(
+        &self,
+        run_id: &str,
+        step: u64,
+        call: &ToolCall,
+        turn_id: Option<&str>,
+        extra_params: BTreeMap<String, Value>,
+    ) -> Value {
+        let mut params = self.tool_call_event_base_params(run_id, step, call, turn_id);
+        params.insert("input".to_string(), call.input.clone());
+        for (key, value) in extra_params {
+            params.insert(key, value);
+        }
+        json!({
+            "method": "item/toolCall/started",
+            "params": Value::Object(params),
+        })
+    }
+
+    #[must_use]
+    pub fn tool_call_finished_event(
+        &self,
+        run_id: &str,
+        step: u64,
+        call: &ToolCall,
+        result: &ToolResult,
+        turn_id: Option<&str>,
+        extra_params: BTreeMap<String, Value>,
+    ) -> Value {
+        let failed = result.error.is_some();
+        let mut params = self.tool_call_event_base_params(run_id, step, call, turn_id);
+        params.insert("output".to_string(), json!(result.output.clone()));
+        params.insert("error".to_string(), json!(result.error.clone()));
+        params.insert("metadata".to_string(), json!(result.metadata.clone()));
+        for (key, value) in extra_params {
+            params.insert(key, value);
+        }
+        json!({
+            "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
+            "params": Value::Object(params),
+        })
+    }
+
+    fn tool_call_event_base_params(
+        &self,
+        run_id: &str,
+        step: u64,
+        call: &ToolCall,
+        turn_id: Option<&str>,
+    ) -> Map<String, Value> {
+        let mut params = Map::new();
+        params.insert("session_id".to_string(), json!(self.session_id.clone()));
+        params.insert("run_id".to_string(), json!(run_id));
+        if let Some(turn_id) = turn_id {
+            params.insert("turn_id".to_string(), json!(turn_id));
+        }
+        params.insert("step".to_string(), json!(step));
+        params.insert("call_id".to_string(), json!(call.call_id.clone()));
+        params.insert("name".to_string(), json!(call.name.clone()));
+        params
     }
 
     #[must_use]

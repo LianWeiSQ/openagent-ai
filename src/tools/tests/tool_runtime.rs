@@ -10,7 +10,7 @@ use std::{
 };
 
 use openagent_core::PermissionManager;
-use openagent_protocol::{PermissionAction, PermissionRuleset};
+use openagent_protocol::{PermissionAction, PermissionRuleset, ToolCall, ToolResult};
 use openagent_tools::{
     LocalWorkspaceRuntime, SessionRunnerFacade, TaskSubagentDescriptor, TodoItem, ToolContext,
     ToolRegistry, Toolkit, benchmark_mode_allows_shell_command,
@@ -176,6 +176,63 @@ fn session_runner_facade_parses_question_answers_from_json_contract() {
         context.question_answers,
         Some(vec![vec!["fast".to_string(), "careful".to_string()]])
     );
+}
+
+#[test]
+fn session_runner_facade_builds_shared_tool_call_events() {
+    let facade = SessionRunnerFacade::new("/tmp/openagent-session-runner", "session_events");
+    let call = ToolCall {
+        name: "read".to_string(),
+        input: json!({"file_path": "README.md"}),
+        call_id: "call_read".to_string(),
+    };
+    let started = facade.tool_call_started_event(
+        "turn_1",
+        2,
+        &call,
+        Some("turn_1"),
+        BTreeMap::from([("manual".to_string(), json!(true))]),
+    );
+    assert_eq!(started["method"], "item/toolCall/started");
+    assert_eq!(started["params"]["session_id"], "session_events");
+    assert_eq!(started["params"]["turn_id"], "turn_1");
+    assert_eq!(started["params"]["run_id"], "turn_1");
+    assert_eq!(started["params"]["step"], 2);
+    assert_eq!(started["params"]["call_id"], "call_read");
+    assert_eq!(started["params"]["name"], "read");
+    assert_eq!(started["params"]["input"]["file_path"], "README.md");
+    assert_eq!(started["params"]["manual"], true);
+
+    let result = ToolResult {
+        call_id: "call_read".to_string(),
+        output: "ok".to_string(),
+        error: None,
+        metadata: BTreeMap::from([("bytes".to_string(), json!(12))]),
+    };
+    let completed =
+        facade.tool_call_finished_event("turn_1", 2, &call, &result, None, BTreeMap::new());
+    assert_eq!(completed["method"], "item/toolCall/completed");
+    assert_eq!(completed["params"]["output"], "ok");
+    assert_eq!(completed["params"]["error"], Value::Null);
+    assert_eq!(completed["params"]["metadata"]["bytes"], 12);
+    assert!(completed["params"].get("turn_id").is_none());
+
+    let failed = facade.tool_call_finished_event(
+        "turn_1",
+        2,
+        &call,
+        &ToolResult {
+            call_id: "call_read".to_string(),
+            output: String::new(),
+            error: Some("boom".to_string()),
+            metadata: BTreeMap::new(),
+        },
+        Some("turn_1"),
+        BTreeMap::from([("auto".to_string(), json!(true))]),
+    );
+    assert_eq!(failed["method"], "item/toolCall/failed");
+    assert_eq!(failed["params"]["error"], "boom");
+    assert_eq!(failed["params"]["auto"], true);
 }
 
 #[test]
