@@ -19,9 +19,7 @@ use openagent_mcp::{
     normalize_tool_call_result, sanitize_mcp_observation_value, unavailable_tool_result,
 };
 use openagent_protocol::ToolResult;
-use openagent_protocol::{
-    ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolSchema, Usage,
-};
+use openagent_protocol::{ChatMessage, PermissionRuleset, Role, ToolCall, ToolSchema, Usage};
 use openagent_provider::{
     AnthropicLanguageModelConfig, OpenAiLanguageModelConfig, ProviderStreamEvent, anthropic_model,
     build_anthropic_payload, build_openai_chat_payload, build_openai_responses_payload,
@@ -36,8 +34,8 @@ use openagent_session::{
 };
 use openagent_tools::{
     SkillPermissionRule, TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor, ToolContext,
-    Toolkit, fork_skill_task_from_input, register_task_tool, skill_is_visible,
-    task_subagent_is_visible,
+    Toolkit, fork_skill_task_from_input, parse_agent_profile_schema, register_task_tool,
+    skill_is_visible, task_subagent_is_visible,
 };
 use serde_json::{Map, Value, json};
 

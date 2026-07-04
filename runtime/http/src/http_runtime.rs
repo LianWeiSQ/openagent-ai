@@ -29,7 +29,7 @@ use openagent_mcp::{
     unavailable_tool_result,
 };
 use openagent_protocol::{
-    ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema, Usage,
+    ChatMessage, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema, Usage,
 };
 use openagent_provider::{
     OpenAiLanguageModelConfig, ProviderStreamEvent, build_openai_chat_payload,
@@ -45,8 +45,9 @@ use openagent_session::{
 use openagent_tools::{
     SkillPermissionRule, TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor,
     TaskSubagentRoute, ToolContext, Toolkit, fork_skill_task_from_input,
-    prepare_isolated_workspace, register_task_tool, resolve_path_in_root,
-    select_task_subagent_for_prompt, skill_is_visible, task_subagent_is_visible,
+    parse_agent_profile_schema, prepare_isolated_workspace, register_task_tool,
+    resolve_path_in_root, select_task_subagent_for_prompt, skill_is_visible,
+    task_subagent_is_visible,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -955,181 +956,41 @@ fn runtime_agent_profile_from_value(
     if value.as_object().is_none_or(Map::is_empty) {
         return None;
     }
-    let mode = value
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("primary")
-        .trim()
-        .to_ascii_lowercase();
-    if !matches!(mode.as_str(), "primary" | "subagent" | "all") {
-        return None;
-    }
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .map(sanitize_runtime_agent_id)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| sanitize_runtime_agent_id(fallback_id));
-    let permission = runtime_profile_permission_ruleset_value(value)
+    let schema = parse_agent_profile_schema(value, fallback_id, fallback_id).ok()?;
+    let permission = schema
+        .permission
+        .as_deref()
         .and_then(|raw| parse_permission_ruleset(raw).ok())
         .unwrap_or(PermissionRuleset::PlanOnly);
     Some(RuntimeSubagentProfile {
-        id: if id.is_empty() {
-            "agent".to_string()
-        } else {
-            id
-        },
-        name: value
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(fallback_id)
-            .to_string(),
-        description: value
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        mode,
+        id: schema.id,
+        name: schema.name,
+        description: schema.description.unwrap_or_default(),
+        mode: schema.mode,
         permission,
-        task_permissions: runtime_profile_task_permissions(value),
-        skills: runtime_profile_string_list(value.get("skills")),
-        skill_roots: runtime_profile_string_list(value.get("skill_roots")),
-        skill_permissions: runtime_profile_skill_permissions(value),
-        prompt: value
-            .get("prompt")
-            .and_then(Value::as_str)
+        task_permissions: schema.task.permissions,
+        skills: schema.skill.skills,
+        skill_roots: schema.skill.roots,
+        skill_permissions: schema.skill.permissions,
+        prompt: schema
+            .prompt
+            .as_deref()
             .unwrap_or(BUILD_AGENT_PROMPT)
             .trim_start_matches('\u{feff}')
             .to_string(),
-        tools: runtime_profile_string_list(value.get("tools")),
-        provider: value
-            .get("provider")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        model: value
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        max_steps: value
-            .get("max_steps")
-            .or_else(|| value.get("steps"))
-            .or_else(|| value.get("maxSteps"))
-            .and_then(Value::as_u64),
-        temperature: value.get("temperature").and_then(Value::as_f64),
-        top_p: value
-            .get("top_p")
-            .or_else(|| value.get("topP"))
-            .and_then(Value::as_f64),
-        color: value
-            .get("color")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        disabled: value
-            .get("disabled")
-            .or_else(|| value.get("disable"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        model_options: runtime_profile_model_options(value),
-        workspace_isolation: value
-            .get("workspace_isolation")
-            .or_else(|| value.get("isolate_workspace"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        hidden: value
-            .get("hidden")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        tools: schema.tools,
+        provider: schema.provider,
+        model: schema.model,
+        max_steps: schema.max_steps,
+        temperature: schema.temperature,
+        top_p: schema.top_p,
+        color: schema.color,
+        disabled: schema.disabled,
+        model_options: schema.model_options,
+        workspace_isolation: schema.workspace_isolation,
+        hidden: schema.hidden,
         source_path,
     })
-}
-
-fn runtime_profile_string_list(value: Option<&Value>) -> Vec<String> {
-    match value {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect(),
-        Some(Value::String(item)) => item
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn runtime_profile_model_options(value: &Value) -> BTreeMap<String, Value> {
-    const KNOWN_KEYS: &[&str] = &[
-        "id",
-        "name",
-        "description",
-        "mode",
-        "model",
-        "provider",
-        "permission",
-        "task",
-        "task_permissions",
-        "skill",
-        "skills",
-        "skill_roots",
-        "skill_permissions",
-        "skill_permission",
-        "tools",
-        "prompt",
-        "steps",
-        "max_steps",
-        "maxSteps",
-        "hidden",
-        "color",
-        "disabled",
-        "disable",
-        "temperature",
-        "top_p",
-        "topP",
-        "model_options",
-        "options",
-        "workspace_isolation",
-        "isolate_workspace",
-    ];
-    let mut options = BTreeMap::new();
-    if let Some(object) = value.as_object() {
-        for (key, item) in object {
-            if !KNOWN_KEYS.contains(&key.as_str()) {
-                options.insert(key.clone(), item.clone());
-            }
-        }
-    }
-    if let Some(temperature) = value.get("temperature").and_then(Value::as_f64) {
-        options.insert("temperature".to_string(), json!(temperature));
-    }
-    if let Some(top_p) = value
-        .get("top_p")
-        .or_else(|| value.get("topP"))
-        .and_then(Value::as_f64)
-    {
-        options.insert("top_p".to_string(), json!(top_p));
-    }
-    for key in ["model_options", "options"] {
-        if let Some(object) = value.get(key).and_then(Value::as_object) {
-            for (option_key, option_value) in object {
-                if !runtime_model_option_key_reserved(option_key) {
-                    options.insert(option_key.clone(), option_value.clone());
-                }
-            }
-        }
-    }
-    options
-}
-
-fn runtime_model_option_key_reserved(key: &str) -> bool {
-    matches!(
-        key,
-        "skill" | "skills" | "skill_roots" | "skill_permissions" | "skill_permission"
-    )
 }
 
 fn runtime_subagent_profile(id: &str, workspace: &Path) -> Option<RuntimeSubagentProfile> {
@@ -1498,127 +1359,6 @@ fn runtime_is_subagent_mode(mode: &str) -> bool {
     matches!(mode, "subagent" | "all")
 }
 
-fn runtime_profile_permission_ruleset_value(value: &Value) -> Option<&str> {
-    let permission = value.get("permission")?;
-    if let Some(raw) = permission.as_str() {
-        return Some(raw);
-    }
-    permission
-        .get("ruleset")
-        .or_else(|| permission.get("default"))
-        .or_else(|| permission.get("mode"))
-        .and_then(Value::as_str)
-}
-
-fn runtime_profile_task_permissions(value: &Value) -> Vec<TaskPermissionRule> {
-    let Some(task) = value
-        .get("permission")
-        .and_then(|permission| permission.get("task"))
-        .or_else(|| value.get("task_permissions"))
-        .or_else(|| value.get("task_permission"))
-    else {
-        return Vec::new();
-    };
-    runtime_parse_task_permission_rules(task)
-}
-
-fn runtime_profile_skill_permissions(value: &Value) -> Vec<SkillPermissionRule> {
-    let mut rules = Vec::new();
-    for skill in [
-        value
-            .get("permission")
-            .and_then(|permission| permission.get("skill")),
-        value.get("skill_permissions"),
-        value.get("skill_permission"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        rules.extend(runtime_parse_skill_permission_rules(skill));
-    }
-    rules
-}
-
-fn runtime_parse_task_permission_rules(value: &Value) -> Vec<TaskPermissionRule> {
-    if let Some(object) = value.as_object() {
-        return object
-            .iter()
-            .filter_map(|(pattern, action)| {
-                runtime_task_permission_action(action).map(|action| TaskPermissionRule {
-                    pattern: pattern.clone(),
-                    action,
-                })
-            })
-            .collect();
-    }
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            let pattern = item
-                .get("pattern")
-                .or_else(|| item.get("subagent"))
-                .or_else(|| item.get("agent"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            let action = item
-                .get("action")
-                .and_then(runtime_task_permission_action)?;
-            Some(TaskPermissionRule {
-                pattern: pattern.to_string(),
-                action,
-            })
-        })
-        .collect()
-}
-
-fn runtime_parse_skill_permission_rules(value: &Value) -> Vec<SkillPermissionRule> {
-    if let Some(object) = value.as_object() {
-        return object
-            .iter()
-            .filter_map(|(pattern, action)| {
-                runtime_task_permission_action(action).map(|action| SkillPermissionRule {
-                    pattern: pattern.clone(),
-                    action,
-                })
-            })
-            .collect();
-    }
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            let pattern = item
-                .get("pattern")
-                .or_else(|| item.get("skill"))
-                .or_else(|| item.get("name"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            let action = item
-                .get("action")
-                .and_then(runtime_task_permission_action)?;
-            Some(SkillPermissionRule {
-                pattern: pattern.to_string(),
-                action,
-            })
-        })
-        .collect()
-}
-
-fn runtime_task_permission_action(value: &Value) -> Option<PermissionAction> {
-    let raw = value.as_str()?;
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "allow" | "allowed" => Some(PermissionAction::Allow),
-        "deny" | "denied" => Some(PermissionAction::Deny),
-        "ask" | "prompt" => Some(PermissionAction::Ask),
-        _ => None,
-    }
-}
-
 fn runtime_permission_manager_for_agent(
     ruleset: PermissionRuleset,
     agent_profile: Option<&RuntimeSubagentProfile>,
@@ -1761,6 +1501,9 @@ fn session_messages_payload(
     session_id: &str,
     request_path: &str,
 ) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
     let store = FileSessionStore::new(session_root(config));
     let session = store
         .load_session(session_id)
@@ -2958,6 +2701,9 @@ fn parse_git_branch_line(raw: &str) -> (String, i64, i64) {
 }
 
 fn session_diff_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
     let store = FileSessionStore::new(session_root(config));
     let session = store
         .load_session(session_id)
@@ -2991,6 +2737,9 @@ fn session_checkpoints_payload(
     if !valid_session_id(session_id) {
         return Err("invalid session id".to_string());
     }
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
     let store = FileSessionStore::new(session_root(config));
     let _ = store
         .load_session(session_id)
@@ -3021,6 +2770,9 @@ fn restore_session_checkpoint_payload(
 ) -> Result<Value, String> {
     if !valid_session_id(session_id) || !valid_checkpoint_id(checkpoint_id) {
         return Err("invalid checkpoint request".to_string());
+    }
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
     }
     let store = FileSessionStore::new(session_root(config));
     let mut session = store

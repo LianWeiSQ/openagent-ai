@@ -195,12 +195,384 @@ pub struct SkillPermissionRule {
     pub action: PermissionAction,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SkillConfig {
+    pub skills: Vec<String>,
+    pub roots: Vec<String>,
+    pub permissions: Vec<SkillPermissionRule>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct TaskConfig {
+    pub permissions: Vec<TaskPermissionRule>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct AgentProfileSchema {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mode: String,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub permission: Option<String>,
+    pub task: TaskConfig,
+    pub skill: SkillConfig,
+    pub prompt: Option<String>,
+    pub tools: Vec<String>,
+    pub max_steps: Option<u64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub color: Option<String>,
+    pub disabled: bool,
+    pub hidden: bool,
+    pub workspace_isolation: bool,
+    pub model_options: BTreeMap<String, Value>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ForkSkillTask {
     pub skill_name: String,
     pub agent: String,
     pub background: bool,
     pub task_input: Value,
+}
+
+pub fn parse_agent_profile_schema(
+    value: &Value,
+    fallback_id: &str,
+    fallback_name: &str,
+) -> Result<AgentProfileSchema, String> {
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("primary")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(mode.as_str(), "primary" | "subagent" | "all") {
+        return Err(format!(
+            "agent profile {fallback_id} has invalid mode '{mode}'; expected primary, subagent, or all"
+        ));
+    }
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(sanitize_agent_profile_identifier)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| sanitize_agent_profile_identifier(fallback_id));
+    Ok(AgentProfileSchema {
+        id: if id.is_empty() {
+            "agent".to_string()
+        } else {
+            id
+        },
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_name)
+            .to_string(),
+        description: value
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        mode,
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        provider: value
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        permission: agent_profile_permission_ruleset_value(value).map(str::to_string),
+        task: TaskConfig {
+            permissions: agent_profile_task_permissions(value),
+        },
+        skill: SkillConfig {
+            skills: agent_profile_string_list(value.get("skills")),
+            roots: agent_profile_string_list(value.get("skill_roots")),
+            permissions: agent_profile_skill_permissions(value),
+        },
+        prompt: value
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        tools: agent_profile_string_list(value.get("tools")),
+        max_steps: value
+            .get("max_steps")
+            .or_else(|| value.get("steps"))
+            .or_else(|| value.get("maxSteps"))
+            .and_then(Value::as_u64),
+        temperature: value.get("temperature").and_then(Value::as_f64),
+        top_p: value
+            .get("top_p")
+            .or_else(|| value.get("topP"))
+            .and_then(Value::as_f64),
+        color: value
+            .get("color")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        disabled: value
+            .get("disabled")
+            .or_else(|| value.get("disable"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        hidden: value
+            .get("hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        workspace_isolation: value
+            .get("workspace_isolation")
+            .or_else(|| value.get("isolate_workspace"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        model_options: agent_profile_model_options(value),
+    })
+}
+
+#[must_use]
+pub fn sanitize_agent_profile_identifier(raw: &str) -> String {
+    let mut output = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    while output.contains("--") {
+        output = output.replace("--", "-");
+    }
+    output
+}
+
+fn agent_profile_string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(item)) => item
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn agent_profile_model_options(value: &Value) -> BTreeMap<String, Value> {
+    const KNOWN_KEYS: &[&str] = &[
+        "id",
+        "name",
+        "description",
+        "mode",
+        "model",
+        "provider",
+        "permission",
+        "task",
+        "task_permissions",
+        "task_permission",
+        "skill",
+        "skills",
+        "skill_roots",
+        "skill_permissions",
+        "skill_permission",
+        "tools",
+        "prompt",
+        "steps",
+        "max_steps",
+        "maxSteps",
+        "hidden",
+        "color",
+        "disabled",
+        "disable",
+        "temperature",
+        "top_p",
+        "topP",
+        "model_options",
+        "options",
+        "workspace_isolation",
+        "isolate_workspace",
+        "source_path",
+        "loaded",
+    ];
+    let mut options = BTreeMap::new();
+    if let Some(object) = value.as_object() {
+        for (key, item) in object {
+            if !KNOWN_KEYS.contains(&key.as_str()) {
+                options.insert(key.clone(), item.clone());
+            }
+        }
+    }
+    if let Some(temperature) = value.get("temperature").and_then(Value::as_f64) {
+        options.insert("temperature".to_string(), json!(temperature));
+    }
+    if let Some(top_p) = value
+        .get("top_p")
+        .or_else(|| value.get("topP"))
+        .and_then(Value::as_f64)
+    {
+        options.insert("top_p".to_string(), json!(top_p));
+    }
+    for key in ["model_options", "options"] {
+        if let Some(object) = value.get(key).and_then(Value::as_object) {
+            for (option_key, option_value) in object {
+                if !agent_profile_model_option_key_reserved(option_key) {
+                    options.insert(option_key.clone(), option_value.clone());
+                }
+            }
+        }
+    }
+    options
+}
+
+fn agent_profile_model_option_key_reserved(key: &str) -> bool {
+    matches!(
+        key,
+        "task"
+            | "task_permissions"
+            | "task_permission"
+            | "skill"
+            | "skills"
+            | "skill_roots"
+            | "skill_permissions"
+            | "skill_permission"
+    )
+}
+
+fn agent_profile_permission_ruleset_value(value: &Value) -> Option<&str> {
+    let permission = value.get("permission")?;
+    if let Some(raw) = permission.as_str() {
+        return Some(raw);
+    }
+    permission
+        .get("ruleset")
+        .or_else(|| permission.get("default"))
+        .or_else(|| permission.get("mode"))
+        .and_then(Value::as_str)
+}
+
+fn agent_profile_task_permissions(value: &Value) -> Vec<TaskPermissionRule> {
+    let mut rules = Vec::new();
+    for task in [
+        value
+            .get("permission")
+            .and_then(|permission| permission.get("task")),
+        value.get("task_permissions"),
+        value.get("task_permission"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        rules.extend(parse_task_permission_rules(task));
+    }
+    rules
+}
+
+fn agent_profile_skill_permissions(value: &Value) -> Vec<SkillPermissionRule> {
+    let mut rules = Vec::new();
+    for skill in [
+        value
+            .get("permission")
+            .and_then(|permission| permission.get("skill")),
+        value.get("skill_permissions"),
+        value.get("skill_permission"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        rules.extend(parse_skill_permission_rules(skill));
+    }
+    rules
+}
+
+#[must_use]
+pub fn parse_task_permission_rules(value: &Value) -> Vec<TaskPermissionRule> {
+    if let Some(object) = value.as_object() {
+        return object
+            .iter()
+            .filter_map(|(pattern, action)| {
+                permission_rule_action(action).map(|action| TaskPermissionRule {
+                    pattern: pattern.clone(),
+                    action,
+                })
+            })
+            .collect();
+    }
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let pattern = item
+                .get("pattern")
+                .or_else(|| item.get("subagent"))
+                .or_else(|| item.get("agent"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let action = item.get("action").and_then(permission_rule_action)?;
+            Some(TaskPermissionRule {
+                pattern: pattern.to_string(),
+                action,
+            })
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn parse_skill_permission_rules(value: &Value) -> Vec<SkillPermissionRule> {
+    if let Some(object) = value.as_object() {
+        return object
+            .iter()
+            .filter_map(|(pattern, action)| {
+                permission_rule_action(action).map(|action| SkillPermissionRule {
+                    pattern: pattern.clone(),
+                    action,
+                })
+            })
+            .collect();
+    }
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let pattern = item
+                .get("pattern")
+                .or_else(|| item.get("skill"))
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let action = item.get("action").and_then(permission_rule_action)?;
+            Some(SkillPermissionRule {
+                pattern: pattern.to_string(),
+                action,
+            })
+        })
+        .collect()
+}
+
+fn permission_rule_action(value: &Value) -> Option<PermissionAction> {
+    let raw = value.as_str()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "allow" | "allowed" => Some(PermissionAction::Allow),
+        "deny" | "denied" => Some(PermissionAction::Deny),
+        "ask" | "prompt" => Some(PermissionAction::Ask),
+        _ => None,
+    }
 }
 
 #[must_use]

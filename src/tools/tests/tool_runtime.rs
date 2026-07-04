@@ -8,13 +8,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use openagent_protocol::PermissionRuleset;
+use openagent_protocol::{PermissionAction, PermissionRuleset};
 use openagent_tools::{
     LocalWorkspaceRuntime, TaskSubagentDescriptor, TodoItem, ToolContext, ToolRegistry, Toolkit,
     benchmark_mode_allows_shell_command, benchmark_mode_value_allows_shell_command,
     blocked_command, ensure_within_root, exclusive_schema, format_read_output_from_text,
-    prepare_isolated_workspace, qualify_tool_id, readonly_schema, register_builtin_tools,
-    select_task_subagent_for_prompt, truncate_output,
+    parse_agent_profile_schema, prepare_isolated_workspace, qualify_tool_id, readonly_schema,
+    register_builtin_tools, select_task_subagent_for_prompt, truncate_output,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -26,6 +26,81 @@ fn tool_runtime_fixture_matches_legacy_oracle() -> Result<(), Box<dyn Error>> {
     ))?;
     assert_eq!(fixture, tool_runtime_fixture()?);
     Ok(())
+}
+
+#[test]
+fn shared_agent_profile_schema_parses_skill_task_config_without_model_option_leaks() {
+    let schema = parse_agent_profile_schema(
+        &json!({
+            "id": "Skillful Agent",
+            "name": "Skillful Agent",
+            "description": "Shared parser fixture",
+            "mode": "subagent",
+            "permission": {
+                "ruleset": "READONLY",
+                "task": {"reviewer": "allow"},
+                "skill": {"hidden": "deny"}
+            },
+            "skills": "brief, review",
+            "skill_roots": ["shared-skills"],
+            "skill_permissions": [{"name": "visible", "action": "allow"}],
+            "task_permissions": [{"subagent": "planner", "action": "ask"}],
+            "tools": ["read", "skill"],
+            "steps": 4,
+            "temperature": 0.2,
+            "topP": 0.8,
+            "options": {
+                "reasoning_effort": "medium",
+                "skill_roots": ["must-not-leak"],
+                "task_permissions": {"leaked": "deny"}
+            },
+            "model_options": {
+                "verbosity": "low",
+                "skill_permissions": {"leaked": "deny"}
+            }
+        }),
+        "fallback-agent",
+        "Fallback Agent",
+    )
+    .expect("schema parses");
+
+    assert_eq!(schema.id, "skillful-agent");
+    assert_eq!(schema.mode, "subagent");
+    assert_eq!(schema.permission.as_deref(), Some("READONLY"));
+    assert_eq!(schema.skill.skills, vec!["brief", "review"]);
+    assert_eq!(schema.skill.roots, vec!["shared-skills"]);
+    assert!(
+        schema.skill.permissions.iter().any(|rule| {
+            rule.pattern == "hidden" && matches!(rule.action, PermissionAction::Deny)
+        })
+    );
+    assert!(schema.skill.permissions.iter().any(|rule| {
+        rule.pattern == "visible" && matches!(rule.action, PermissionAction::Allow)
+    }));
+    assert!(schema.task.permissions.iter().any(|rule| {
+        rule.pattern == "reviewer" && matches!(rule.action, PermissionAction::Allow)
+    }));
+    assert!(
+        schema.task.permissions.iter().any(|rule| {
+            rule.pattern == "planner" && matches!(rule.action, PermissionAction::Ask)
+        })
+    );
+    assert_eq!(schema.model_options["reasoning_effort"], "medium");
+    assert_eq!(schema.model_options["verbosity"], "low");
+    assert_eq!(schema.model_options["temperature"], 0.2);
+    assert_eq!(schema.model_options["top_p"], 0.8);
+    for reserved in [
+        "skill_roots",
+        "skill_permissions",
+        "task_permissions",
+        "skills",
+    ] {
+        assert!(schema.model_options.get(reserved).is_none());
+    }
+
+    let error = parse_agent_profile_schema(&json!({"mode": "worker"}), "bad", "Bad")
+        .expect_err("invalid mode should fail");
+    assert!(error.contains("invalid mode"));
 }
 
 #[test]
