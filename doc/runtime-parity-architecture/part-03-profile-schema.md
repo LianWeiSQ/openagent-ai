@@ -197,3 +197,137 @@ git diff --check
 3. provider catalog 与 profile model/provider 选择更紧密结合。
 4. plugin-provided agents 进入同一 schema。
 5. SessionRunner 接管 profile/system prompt/tool materialization。
+
+## 9. Schema 需求演化
+
+Profile 的演化可以分成四个阶段。
+
+### 9.1 参数阶段
+
+最早的 profile 更像 CLI 参数集合：
+
+- model；
+- provider；
+- prompt；
+- tools；
+- temperature/top_p。
+
+这个阶段的重点是让 `run --agent` 能选择不同配置。
+
+### 9.2 Agent definition 阶段
+
+当 subagent 出现后，profile 不再只是主 agent 的参数，而是 agent definition：
+
+- `mode: primary | subagent`；
+- description 用于 auto routing；
+- tools/permission 限定 agent 能力；
+- model/provider 可独立覆盖；
+- workspace isolation 决定执行边界。
+
+这一步使 profile 成为 subagent 的运行时说明书。
+
+### 9.3 Capability binding 阶段
+
+Skill、Task、MCP 进入后，profile 需要描述能力绑定：
+
+- 允许哪些 skill；
+- skill roots 来自哪里；
+- task/subagent 是否 allow/deny/ask；
+- tool allowlist 和 MCP tool 是否可见；
+- hidden/disabled 是否影响 discovery。
+
+这一步把 profile 从“模型配置”升级成“capability routing 配置”。
+
+### 9.4 Runner input 阶段
+
+下一阶段 profile 会成为 SessionRunner 的标准输入。Runner 不应该再从 CLI flags 或 HTTP JSON 里东拼西凑，而应该拿到一个已 normalize 的 profile，然后完成：
+
+- system prompt binding；
+- available skills injection；
+- tool materialization；
+- permission gate；
+- provider request lowering；
+- session metadata 写入。
+
+## 10. 字段分层
+
+Profile 字段可以按归属分层。
+
+| 层级 | 字段例子 | 消费者 |
+| --- | --- | --- |
+| Identity | id、name、description、mode | agent registry、Task tool、UI |
+| Prompt | prompt/body、instructions | ContextPackBuilder、provider messages |
+| Model | provider、model、temperature、top_p | provider resolver |
+| Tooling | tools、MCP enablement | tool registry |
+| Permission | permission、skill_permissions、task_permissions | permission engine |
+| Skill | skills、skill_roots、frontmatter policy | skill registry/tool |
+| Task | task config、workspace isolation、max depth | Task runtime |
+| Presentation | color、hidden、disabled | CLI/TUI/Desktop |
+| Escape hatch | model_options | provider-specific lowering after filtering |
+
+这个分层的意义是避免字段被错误消费者读取。比如 `color` 不应影响 provider request，`skill_roots` 不应出现在 model options，`hidden` 不应改变已指定 profile 的执行权限。
+
+## 11. 开发过程细化
+
+这一链路实际开发时应按下面顺序推进。
+
+### Step 1: 建共享类型
+
+先在 shared crate 建立结构体和 serde/parser 单测，不改 CLI/HTTP 执行路径。验收重点是 JSON/Markdown 输入能解析成同一 internal shape。
+
+### Step 2: 迁移权限解析
+
+把 `permission.skill`、`skill_permissions`、`permission.task`、`task_permissions` 的兼容写法收进 helper。这个阶段要特别防止 allow/deny/ask 默认值漂移。
+
+### Step 3: 剥离 runtime-only options
+
+建立 known runtime keys 表，把 runtime 字段从 `model_options` 中移除。验收必须看 fake provider request，而不是只看 parser 输出。
+
+### Step 4: surface adapter 变薄
+
+CLI/HTTP 只负责 discovery 和 IO，不再自己解释字段。adapter 只做：
+
+```text
+source file/request
+  -> raw value/frontmatter
+  -> AgentProfileSchema
+  -> surface runtime profile
+```
+
+### Step 5: public value 对齐
+
+API/TUI/Desktop 需要看到 profile 的真实 runtime 配置，所以 public value 不能只返回 model/provider。SkillConfig、TaskConfig、permissions、hidden/disabled 都要投影出来，但 secrets 和本地敏感路径要按策略处理。
+
+### Step 6: runner 接入
+
+最后由 SessionRunner 消费 normalize 后的 profile。此时 CLI/HTTP 不应再重复构造 ToolContext、system prompt、available skills。
+
+## 12. 设计取舍
+
+### 为什么放在 `openagent-tools`
+
+严格看，profile schema 也可以放到 `protocol`。当前放在 `openagent-tools` 的原因是它和 ToolContext、skill/task permission、tool registry 更近，能减少依赖反转。等 SessionRunner crate 成型后，可以重新评估是否拆出 `runtime-config`。
+
+### 为什么 discovery 不完全共享
+
+不同 surface 的 profile 来源不完全一样。CLI 有本地文件和 flags，HTTP 有 request override 和 workspace root，未来 plugin 也会贡献 agents。先共享解析，不强行共享 discovery，可以降低改动风险。
+
+### 为什么兼容 OpenCode markdown
+
+OpenCode agent markdown 已经是一种实用生态格式。OpenHarness 兼容它，是为了迁移成本和用户心智，而不是要复制所有字段。关键是 frontmatter 最终进入 shared schema，不让 markdown 特性穿透到执行 loop。
+
+## 13. 缺口和验收追踪
+
+后续 profile 工作可以按这个表追踪：
+
+| 能力 | 当前判断 | 需要的验收 |
+| --- | --- | --- |
+| JSON/Markdown 等效解析 | 已落地 | shared parser tests |
+| runtime-only provider filtering | 已落地 | fake provider payload |
+| SkillConfig 一等化 | 已落地 | CLI/HTTP profile tests |
+| TaskConfig 一等化 | 已落地 | Task tool/profile tests |
+| built-in profile registry 共享 | 部分 | CLI/HTTP list/show 对齐 |
+| plugin-provided agents | 未完成 | plugin manifest -> registry tests |
+| SessionRunner profile binding | 部分 | runner-level integration |
+
+Profile 链路的完成标准不是字段多，而是一个 profile 在 CLI、HTTP、TUI/Desktop 间具有同一个 runtime 含义。

@@ -186,3 +186,93 @@ OpenHarness 的稳定性依赖测试证据，而不是手工确认。原因很�
 - TUI/Desktop 的 subagent/task projection 仍不足。
 
 下一阶段的结构性投资应继续围绕 SessionRunner，而不是在每个 surface 继续补重复逻辑。
+
+## 11. 架构演化过程
+
+OpenHarness 的分层不是一开始设计出来的，而是被需求逐步逼出来的。
+
+### 11.1 从 CLI loop 到 runtime
+
+最初 CLI loop 足够支撑：
+
+```text
+prompt -> provider -> tool -> answer
+```
+
+但一旦加入 session、approval、MCP、skill、subagent、Desktop，就会发现 loop 内部有太多隐含状态。于是第一步是把事实从 loop 里抽出来：messages 进 session，tool call 进 event，profile 进 schema，MCP 进 registry。
+
+### 11.2 从 surface ownership 到 shared ownership
+
+早期每个 surface 为了快速可用，会自己解释一部分状态：
+
+- CLI 解析 profile；
+- HTTP 也解析 profile；
+- TUI 维护显示状态；
+- Desktop 维护局部 workflow state。
+
+这种方式推进快，但会产生 runtime drift。后续架构调整的原则变成：surface 可以拥有交互，但不能拥有事实。事实必须下沉到 shared crate、HTTP Runtime、session store 或 registry。
+
+### 11.3 从 helper 到 runner
+
+直接重写完整 SessionRunner 风险太高，所以目前采用“先 helper，后 runner”的路线：
+
+1. 先把纯函数和低风险结构抽进 `openagent-tools`；
+2. 让 CLI/HTTP 同时调用；
+3. 补工具层单测和 surface integration；
+4. 等边界稳定后，再上移到真正 runner。
+
+`SessionRunnerFacade` 属于这个过渡层。它不是最终架构，但能在不大爆炸重构的情况下，逐步减少重复 loop。
+
+## 12. Ownership 规则
+
+后续开发可以按下面规则判断代码应该放哪里。
+
+| 问题 | 应放位置 | 不应放位置 |
+| --- | --- | --- |
+| Wire/event/session 类型 | `src/protocol` | CLI/HTTP 私有 struct |
+| ToolContext、profile helper、skill/task policy | `src/tools` | surface command parser |
+| Session 持久状态、trace、compaction | `src/session` | TUI/Desktop local state |
+| MCP server config/auth/lifecycle helper | `src/mcp` + HTTP runtime | Desktop component |
+| App Bridge route 和 SSE 投影 | `runtime/http` | CLI output formatter |
+| TUI render/control | `runtime/tui` | core runtime crate |
+| Desktop workflow UI | `desktop` | session store |
+
+这张表不是固定不变，但能防止常见错误：为了实现一个 UI 功能，把 runtime state 写在 UI 层。
+
+## 13. 典型反模式
+
+后续对齐 OpenCode/Claude Code 时，应避免几类反模式。
+
+### 13.1 Provider payload 背 runtime config
+
+如果 `skills`、`skill_roots`、`permission`、`task_permissions`、`workspace_isolation` 出现在 provider request 里，说明 profile boundary 失守。
+
+### 13.2 UI 自己判断执行状态
+
+如果 Desktop 通过按钮点击结果推断 task completed，而不是读 session event/task tree，reload 后就会漂。
+
+### 13.3 Subagent 只是 prompt prefix
+
+如果 subagent 没有 child session、独立 ToolContext、permission、metadata，就不是一等 subagent，只是一次 prompt 拼接。
+
+### 13.4 Skill 只是文件读取
+
+如果 skill 没有 registry、available listing、permission、load event、compaction protection，就无法支撑长期上下文。
+
+### 13.5 MCP 只是工具调用
+
+如果 MCP 没有 config/auth/discovery/lifecycle/doctor，用户无法运营外部 capability。
+
+## 14. 阶段验收
+
+架构分层是否有效，可以用这些问题验收：
+
+- CLI 和 HTTP 是否复用同一 profile schema；
+- skill/task/MCP 是否都经过 ToolContext；
+- session event 是否能被 App Bridge replay；
+- TUI/Desktop reload 后是否能恢复同一状态；
+- provider request 是否只包含 provider-facing 字段；
+- child session 是否能独立追踪；
+- docs/parity matrix 是否能指出已完成和未完成边界。
+
+只要这些问题有一个需要“某个 surface 特殊处理”才能回答，就说明 shared runtime 还需要继续收口。

@@ -183,3 +183,86 @@ SessionRunner
 ```
 
 当这个边界稳定后，CLI、HTTP、TUI、Desktop 的差异会变成产品交互差异，而不是 runtime 行为差异。
+
+## 9. Harness 级需求拆解
+
+为了避免把需求写成“功能清单”，这里按 harness 的责任域重新拆一遍。
+
+### 9.1 执行域
+
+执行域关心的是模型一次 turn 如何从输入走到结果。早期只需要 provider call 和 tool call；后续要求变成：
+
+- provider streaming、tool call、tool result、final answer 都有稳定状态；
+- approval/question 可以暂停、恢复、拒绝、带 note；
+- tool result 能进入 session ledger，而不是只进入内存；
+- CLI 和 HTTP 对同一个工具调用产生相同事件语义；
+- child task 和 fork skill 的中间执行不污染 parent context。
+
+这条线最终指向 SessionRunner。
+
+### 9.2 能力域
+
+能力域关心“模型能调用什么”。从内置工具扩展到 MCP、Skill、Task、Plugin、Provider Catalog 后，能力必须有 descriptor、permission、lifecycle 和 event。
+
+关键变化是：能力不再是命令分支，而是 runtime resource。Skill 需要 registry，MCP 需要 lifecycle，Task 需要 child session，Provider 需要 catalog，Plugin 需要贡献点。
+
+### 9.3 状态域
+
+状态域关心“发生过什么”和“能不能恢复”。真实工程任务需要保留：
+
+- messages 和 parts；
+- run/turn records；
+- tool call state；
+- approval/question queues；
+- skill discovered/loaded；
+- task tree；
+- checkpoint/restore；
+- compact boundary；
+- provider/MCP diagnostics。
+
+这就是为什么 session store 从 transcript 升级为 runtime ledger。
+
+### 9.4 产品域
+
+产品域关心 CLI、HTTP、TUI、Desktop 是否看到同一个事实。一个状态如果只在 Desktop React state 里存在，reload 后就会丢；如果只在 CLI stdout 里存在，HTTP/TUI 就不能接管。
+
+因此产品入口必须是 projection，事实来源必须回到 session、App Bridge、runtime registry。
+
+### 9.5 运维域
+
+运维域关心可诊断、可复现、可回滚。MCP doctor、provider health、debug/db、eval/replay、packaged smoke、checkpoint restore 都属于这一层。
+
+这层能力决定 OpenHarness 能不能从个人实验工具变成长期可维护的本地 agent runtime。
+
+## 10. 需求演化时间线
+
+下面的时间线不是按 commit 排序，而是按需求成熟度排序。
+
+| 阶段 | 触发问题 | 形成的 runtime 对象 | 代表性验收 |
+| --- | --- | --- | --- |
+| CLI agent loop | 需要在本地仓库执行代码任务 | prompt、provider request、built-in tools | CLI run smoke |
+| Session ledger | 多轮和工具结果需要保留 | session、message、part、event | session trace tests |
+| Rust workspace | Python/单体边界难维护 | protocol/tools/session/mcp/http/tui crates | cargo check/fmt |
+| App Bridge | TUI/Desktop 需要共享状态 | HTTP routes、SSE、turn event | HTTP runtime tests |
+| Approval/question | 工具风险和用户补充输入需要暂停 | pending request、resume state | CLI/HTTP approval tests |
+| MCP plane | 外部工具需要配置、认证、生命周期 | MCP server registry、auth、lifecycle | MCP CLI/HTTP/Desktop smoke |
+| Provider catalog | 多 provider/model 选择需要运行时资源 | provider/model catalog、health | model/provider tests |
+| Skill runtime | 专业知识需要按需加载和权限控制 | SkillConfig、registry、Skill tool V2 | skill CLI/HTTP tests |
+| Task/subagent | 复杂任务需要独立上下文 | child session、task tree、lineage | task/subagent tests |
+| Checkpoint/restore | 文件修改需要证据和回退 | checkpoint id、restore metadata | Desktop restore smoke |
+| Shared runner | CLI/HTTP loop 重复导致 drift | SessionRunnerFacade、event builders | tools + CLI/HTTP tests |
+
+每个阶段都不是孤立功能，而是在补 runtime 所缺的一类事实。
+
+## 11. 架构判断
+
+当前 OpenHarness 已经跨过“能不能调用工具”的阶段，主要风险变成运行时一致性：
+
+- 同一 profile 在不同入口的解释是否一致；
+- 同一 tool call 在不同入口的事件是否一致；
+- skill/task/MCP/provider 是否都能被 permission 和 session 管住；
+- Desktop/TUI 是否只消费 runtime state；
+- compact/resume 后语义是否还稳定；
+- background task 和 fork skill 是否有完整 lifecycle。
+
+后续排期应该优先处理这些结构性问题。继续补单个命令会有短期收益，但如果不收进 runner/session/event，长期会重新变成多套 runtime。

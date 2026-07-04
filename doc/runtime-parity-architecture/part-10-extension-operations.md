@@ -181,3 +181,143 @@ Extension/operations 的落地顺序应该保守：
 6. Packaging-owned upgrade/uninstall。
 7. MCP/provider/task failure runbook。
 8. Eval/replay 与 session event 更深绑定。
+
+## 11. Extension plane 的边界
+
+Extension plane 负责把外部能力接入 harness，但不能破坏核心 runtime 的边界。它应遵守：
+
+```text
+extension declaration
+  -> registry
+  -> permission/policy
+  -> runtime materialization
+  -> session/event evidence
+  -> lifecycle cleanup
+```
+
+Plugin、GitHub、debug/db、eval、packaging 都属于这个平面。它们不是 agent loop 的特例，而是围绕 runtime 的能力入口和运维工具。
+
+## 12. Plugin 设计方向
+
+Plugin 最终应该能贡献：
+
+- skills；
+- MCP servers；
+- providers/models；
+- commands；
+- workflows；
+- TUI/Desktop panes；
+- templates；
+- eval fixtures。
+
+但每一种贡献都必须进入对应 registry，而不是 plugin 自己绕过 runtime。例如 plugin-provided skill 进入 skill registry，plugin-provided MCP server 进入 MCP config/lifecycle，plugin-provided provider 进入 provider catalog。
+
+这样 disable/remove plugin 时，runtime 才能清理贡献项。
+
+## 13. Operations 设计方向
+
+Operations 能力解决“出问题时怎么查”的问题。
+
+### Debug bundle
+
+理想 debug bundle 应包含：
+
+- runtime version/build info；
+- workspace roots；
+- redacted config；
+- provider/model status；
+- MCP status；
+- session/event slice；
+- task tree；
+- skill registry snapshot；
+- recent errors；
+- checkpoint/restore metadata；
+- redaction report。
+
+### DB tools
+
+DB/debug 命令应支持 schema、query、export、rebuild，但要避免 destructive 默认行为。任何修复型命令都应先 dry-run。
+
+### Eval/replay
+
+Eval 不应绕过 session/event。好的 replay 应能从 session trace 还原 provider/tool/task/skill 关键路径，输出 run receipt 和评分。
+
+## 14. 开发过程细化
+
+### Step 1: 安全 scaffold
+
+先实现 list/show/plan/dry-run，不直接执行危险操作。
+
+### Step 2: Machine-readable 输出
+
+所有 operations 命令都应支持 JSON，便于 smoke、CI、Desktop/TUI 消费。
+
+### Step 3: Registry 接入
+
+Plugin 或 extension 的贡献项进入对应 registry，不在 CLI 命令里私自生效。
+
+### Step 4: Lifecycle cleanup
+
+enable/disable/remove 必须能撤销影响。没有 cleanup，就不能打开真实 runtime execution。
+
+### Step 5: Evidence binding
+
+操作结果写入 session/trace/debug artifact，方便复现。
+
+### Step 6: Product visibility
+
+TUI/Desktop 只显示 runtime registry 和 operation status，不维护另一份 extension 状态。
+
+## 15. GitHub/PR workflow 的定位
+
+GitHub 能力不应硬编码在 agent loop 里。更合理的形态是：
+
+```text
+GitHub plugin/skill/tool
+  -> PR/issue capability
+  -> permission
+  -> task template
+  -> session evidence
+```
+
+比如 PR review agent 可以是 profile + skill + GitHub tools + task template 的组合，而不是在核心 loop 中加入 `if github` 分支。
+
+## 16. Packaging lifecycle
+
+源码工作区和 packaged distribution 的 lifecycle 不一样：
+
+- 源码工作区：upgrade/uninstall 默认 dry-run，避免删除开发环境；
+- packaged app：可以拥有安装路径、版本更新、卸载清理；
+- enterprise/remote：需要更强的 policy 和 audit。
+
+这个边界解释了为什么当前 lifecycle 偏保守。
+
+## 17. 对标差距
+
+| 能力 | OpenCode/Claude Code 参考 | OpenHarness 状态 |
+| --- | --- | --- |
+| Plugin registry | OpenCode plugin/config | 部分 |
+| Plugin runtime execution | OpenCode plugin runtime | 未完成 |
+| Plugin contributions | skills/MCP/providers/commands | 未完成 |
+| GitHub workflow | hosted/agent workflow | 部分 |
+| Debug snapshot | support bundle | 部分 |
+| Eval/replay | quality loop | 部分 |
+| Packaged lifecycle | distribution-owned ops | 部分 |
+| Runbooks | operator docs | 待补 |
+
+Extension/operations 的原则是先可诊断、可回滚，再打开更强执行能力。
+
+## 18. 验收口径
+
+这类能力不能只看命令能否跑，还要看：
+
+- JSON 输出是否稳定；
+- secrets 是否 redacted；
+- enable/disable/remove 是否可回滚；
+- plugin 贡献项是否进入正确 registry；
+- debug bundle 是否能复现问题；
+- eval/replay 是否回链 session evidence；
+- destructive 操作是否默认 dry-run 或有明确确认；
+- packaged app 与源码工作区是否走不同 lifecycle。
+
+这能避免 operations 变成一堆难以维护的脚本。

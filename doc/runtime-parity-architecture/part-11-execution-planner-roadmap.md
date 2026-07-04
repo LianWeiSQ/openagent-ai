@@ -297,3 +297,180 @@ session state
 5. 再启动 background lifecycle 状态机。
 
 这条线比继续补 surface 更关键，因为它决定 OpenHarness 是否真正成为一个统一 runtime。
+
+## 10. Roadmap 的实施原则
+
+这个 roadmap 的重点不是“重写 runner”，而是用可验证的小阶段把重复执行逻辑逐步收进共享层。
+
+实施原则：
+
+1. 每次只抽一个边界。
+2. 抽取对象必须是 CLI/HTTP 都在用的逻辑。
+3. 先加 shared tests，再改 surface。
+4. 不在同一阶段同时改 provider、task、UI 和 compaction。
+5. 每个阶段更新 parity matrix 或本组文档。
+6. 一个阶段能独立提交、回滚、推送。
+
+这样做的原因很现实：runner 是全系统热路径，大爆炸重构很容易把已有 CLI/HTTP/Desktop 验收打散。
+
+## 11. SessionRunner 分阶段路线
+
+### Phase A: Facade helpers
+
+目标：先抽纯构造逻辑。
+
+已包含或应包含：
+
+- ToolContext construction；
+- question-answer parsing；
+- tool-call started/completed/failed event；
+- tool-result projection；
+- skill event payload；
+- terminal turn event envelope。
+
+验收：`openagent-tools` 单测 + CLI/HTTP focused tests。
+
+### Phase B: Session append helpers
+
+目标：把 tool result、assistant final、warnings、metadata append 收进共享 helper。
+
+风险：session store side effect 变多，需要防止 CLI/HTTP 顺序变化。
+
+验收：
+
+- session trace；
+- CLI golden；
+- HTTP event replay；
+- approval/question resume。
+
+### Phase C: System prompt and context binding
+
+目标：profile prompt、available skills、loaded skills、MCP instructions、file context 进入同一 ContextPackBuilder。
+
+风险：provider prompt cache、compact、skill restore 都会受影响。
+
+验收：
+
+- fake provider request；
+- skill available/load tests；
+- compact restore tests；
+- MCP instruction tests。
+
+### Phase D: Provider step model
+
+目标：runner 接收 provider normalized stream，产出统一 step result：
+
+```text
+Continue(tool calls)
+Pause(approval/question)
+Complete(answer)
+Fail(error)
+Interrupt(reason)
+```
+
+验收：CLI/HTTP turn completed/failed/interrupted events 一致。
+
+### Phase E: Tool execution settlement
+
+目标：built-in/MCP/skill/task tool 通过同一 settlement path：
+
+- permission；
+- execution；
+- result normalization；
+- event；
+- session append；
+- provider continuation。
+
+验收：tool、MCP、skill、Task 各一组 focused tests。
+
+### Phase F: Runner ownership
+
+目标：CLI/HTTP 只负责入口参数、IO、transport，真正执行由 SessionRunner 完成。
+
+验收：CLI/HTTP 行为保持，重复 loop 删除或变成薄 adapter。
+
+## 12. Task lifecycle 分阶段路线
+
+### Phase A: Event family
+
+先定义 task.created/started/completed/failed/cancelled，不急于实现所有操作。
+
+### Phase B: Queue and locks
+
+HTTP background queue 和 CLI background 共享 task run lock，防止同一个 child session 被多 runner 同时推进。
+
+### Phase C: Wait/inspect/output
+
+先做只读操作，让用户能观察 background task。
+
+### Phase D: Cancel/resume/promote
+
+再做改变生命周期的操作。这里必须处理 provider cancellation、tool cancellation、session terminal state。
+
+### Phase E: UI projection
+
+TUI/Desktop subagent pane 消费 task tree 和 task events。
+
+## 13. ToolBatchPlanner 分阶段路线
+
+并发执行要保守推进。
+
+### Phase A: Trace-only
+
+标记哪些 tool calls 理论上可并发，但仍串行执行。用 trace 验证分类是否合理。
+
+### Phase B: Read-only concurrency
+
+只允许 read/glob/grep/ls 这类无副作用工具并发。
+
+### Phase C: Resource-key concurrency
+
+工具声明 resource keys，比如 file path、workspace、MCP server id。冲突的写操作串行。
+
+### Phase D: Permission-aware batch
+
+ask/approval 可以暂停整个 batch 或拆分 batch，不能让部分写操作绕过审批。
+
+### Phase E: Deterministic settlement
+
+即便并发执行，session event/result 投影也要按确定顺序输出，保证 golden/replay 稳定。
+
+## 14. 风险控制
+
+| 风险 | 控制方式 |
+| --- | --- |
+| CLI/HTTP event shape 漂移 | shared event builders + golden |
+| Provider payload 被污染 | fake provider payload tests |
+| Tool result 顺序变化 | deterministic settlement |
+| Approval resume 回归 | focused resume tests |
+| Skill compact 丢失 | compaction tests |
+| Background task 卡死 | lifecycle timeout/cancel tests |
+| UI 状态重复 | App Bridge projection tests |
+
+每个 runner 阶段都应先列风险，再决定验收命令。
+
+## 15. 完成后的目标形态
+
+最终状态不是一个巨大的 `run()` 函数，而是一组清晰对象：
+
+```text
+SessionRunner
+  owns turn lifecycle
+
+ContextPackBuilder
+  owns provider message assembly
+
+ToolExecutor
+  owns built-in/MCP/skill/task dispatch
+
+TaskRuntime
+  owns child sessions and lifecycle
+
+EventProjector
+  owns session/App Bridge projection
+
+ProviderRuntime
+  owns provider request lowering and stream normalization
+```
+
+CLI、HTTP、TUI、Desktop 都围绕这些对象工作。到这一步，OpenHarness 才真正从“多个入口都能跑 agent”变成“多个入口共享同一个 agent runtime”。

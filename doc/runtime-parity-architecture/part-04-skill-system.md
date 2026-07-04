@@ -310,3 +310,149 @@ Skill 已经有完整骨架，后续重点是深度：
 4. Fork skill 与 background task lifecycle 深度融合。
 5. 更详细的“为什么选择这个 skill”可观测性。
 6. plugin-provided skills 进入同一 registry。
+
+## 8. Skill 设计主线
+
+Skill 的核心设计不是“让模型多读几段提示词”，而是把专业能力做成可发现、可加载、可授权、可审计、可恢复的 runtime resource。
+
+这条主线可以概括为：
+
+```text
+lightweight listing
+  -> permission-filtered visibility
+  -> explicit load by name
+  -> scoped resource access
+  -> session event
+  -> compaction preservation
+  -> optional forked execution
+```
+
+OpenCode 给出的关键参考是两段式加载：先在 system prompt 中暴露 available skills，再通过 `skill` tool 加载完整内容。Claude Code 给出的关键参考是 lifecycle：skill 被调用后要能进入上下文历史、compact 后恢复，必要时还能 fork 到独立 agent。
+
+OpenHarness 的实现吸收了这两个方向：主路径对齐 OpenCode 的 Skill tool V2，生命周期对齐 Claude Code 的 invoked skill/compaction/fork 思路。
+
+## 9. Runtime 对象
+
+Skill 链路涉及的 runtime 对象如下。
+
+| 对象 | 责任 |
+| --- | --- |
+| `SkillConfig` | profile 级配置，声明 roots、preloaded skills、permission |
+| Skill root | skill 文件搜索根，包括 workspace、user、built-in、profile roots |
+| Skill descriptor | name、description、location、frontmatter、visibility |
+| Skill registry | discovery、override、path matching、permission filtering |
+| Skill tool | list/search 诊断，load-by-name 主路径 |
+| ToolContext | 当前 agent、workspace、skill roots、active skills、permission |
+| Session event | `skill.discovered`、`skill.loaded` |
+| Compaction guard | compact 后保留 loaded skill output |
+| Task bridge | fork skill 转 Task/subagent |
+
+这套对象让 skill 进入正常 runtime，而不是作为 prompt 文件旁路存在。
+
+## 10. 开发过程细化
+
+### Step 1: Profile 字段一等化
+
+先让 CLI/HTTP profile 能稳定表达 skill 配置。这个阶段的重点不是读取 skill，而是确认配置边界：
+
+- public profile 能看到 skill 配置；
+- provider payload 不带 skill 配置；
+- JSON/Markdown profile 行为一致。
+
+### Step 2: ToolContext 注入
+
+Skill tool 不能自己去猜 workspace 或 profile。它必须从 ToolContext 拿当前 agent 的 skill scope。这个阶段把 CLI loop 和 HTTP runtime 都改到同一个 context 输入。
+
+### Step 3: Root 优先级
+
+Skill root 的覆盖顺序很关键：
+
+```text
+workspace/project
+  > explicit profile roots
+  > user roots
+  > built-in roots
+```
+
+这样项目能覆盖内置 skill，用户也能保留个人 skill。built-in root 是兜底，不是最高优先级。
+
+### Step 4: available skills 注入
+
+只有当 agent 允许 `skill` tool 时才注入 `<available_skills>`。注入内容只包括 name、description、location，避免 system prompt 被所有 skill body 撑爆。
+
+### Step 5: 权限前置
+
+deny 的 skill 不仅不能 load，也不应该出现在 available list 中。这样模型不会被诱导调用不可用能力，安全边界也更清楚。
+
+### Step 6: Tool V2 输出
+
+主路径改成 `skill({ name })`。输出必须包含：
+
+- `<skill_content>`；
+- base directory；
+- sampled skill files；
+- 安全过滤后的资源列表。
+
+这一步解决了 skill 内相对路径和资源文件的解释问题。
+
+### Step 7: Frontmatter 语义
+
+Claude frontmatter 子集不是为了格式兼容，而是为了把 skill 的适用条件和工具边界结构化：
+
+- `paths` 做路径匹配；
+- `allowed-tools` / `disallowed-tools` 做 tool scope；
+- `user-invocable` / `disable-model-invocation` 做可见性；
+- `arguments` 做参数替换；
+- `when_to_use` 做 discovery 说明。
+
+### Step 8: Subagent preload 和 fork
+
+预加载 skill 是 child session 的 system context，不进入 parent context。fork skill 更进一步：它不是把 skill body 返回给主模型，而是启动 child task 去执行专业流程。
+
+这一步让 Skill 和 Subagent 形成组合能力。
+
+### Step 9: 可观测和 compact
+
+Skill 加载必须写 event，compact 必须保护 loaded output。否则 session 恢复后模型无法解释自己为什么采用某个工作方式。
+
+## 11. 对标差距
+
+| 能力 | OpenCode/Claude Code 参考 | OpenHarness 状态 |
+| --- | --- | --- |
+| available skills listing | OpenCode 两段式加载 | 已落地 |
+| load by name | OpenCode Skill V2 | 已落地 |
+| base dir/resource files | OpenCode V2 输出 | 已落地 |
+| invoked skill restore | Claude Code compact restore | 部分落地，继续增强 |
+| forked skill agent | Claude Code fork/context | 已有基础，依赖 Task lifecycle 深化 |
+| skill install/update | 产品化 skill marketplace | 部分，仍需 workflow |
+| UI skill panel | OpenCode/TUI capability view | 待补 |
+| plugin-provided skills | OpenCode plugin registry | 待补 |
+
+Skill 主链已经收口，后续差距主要在产品化、plugin 集成和 fork/background lifecycle。
+
+## 12. 验收口径
+
+Skill 相关改动必须同时过三类验收。
+
+### 配置验收
+
+- profile JSON/Markdown 能解析；
+- public value 暴露 SkillConfig；
+- provider payload 不泄漏 skill 字段。
+
+### 执行验收
+
+- available list 受 permission 过滤；
+- load-by-name 返回完整 `<skill_content>`；
+- base directory 和 sampled files 正确；
+- deny 后 direct load 返回权限错误；
+- path/frontmatter/argument 单测通过。
+
+### 生命周期验收
+
+- `skill.discovered` / `skill.loaded` event 存在；
+- subagent preload 只进入 child context；
+- fork skill 创建 child session；
+- compact 后 loaded skill 不丢。
+
+只满足其中一类，都不能算 Skill runtime 完整。

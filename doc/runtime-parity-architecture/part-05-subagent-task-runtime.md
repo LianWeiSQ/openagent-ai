@@ -271,3 +271,159 @@ cargo test -p openagent-http-runtime --test http_runtime -q
 4. TUI/Desktop 增加 subagent pane 和 task tree navigation。
 5. Worktree isolation 增强 merge-back 和冲突审查。
 6. SessionRunner 接管 task execution。
+
+## 11. Subagent 的一等对象边界
+
+判断 subagent 是否真正一等，不能只看有没有 `--agent xxx` 或 Task tool。需要看它是否拥有独立 runtime 边界。
+
+| 边界 | 要求 |
+| --- | --- |
+| Context | child 有自己的 system prompt、messages、loaded skills、context budget |
+| Tooling | child 有自己的 tool access 和 MCP/skill/task 可见性 |
+| Permission | child 的 permission 可以不同于 parent |
+| Model | child 可以覆盖 model/provider |
+| Session | child 有独立 session id、events、metadata |
+| Lineage | parent/root/child 关系可追踪 |
+| Result | parent 只接收 summary/result/metadata |
+| Lifecycle | foreground/background/wait/cancel/resume 可表达 |
+| Isolation | workspace/worktree 可选隔离 |
+
+如果缺少 session 和 lineage，subagent 就只是一次函数调用；如果 child tool calls 全部塞回 parent context，主上下文会被污染；如果没有 lifecycle，background task 就只是隐藏进程。
+
+## 12. Task tool 为什么是主入口
+
+对标 Claude Code 的 AgentTool 和 OpenCode 的 Task 工具，OpenHarness 选择 Task tool 作为 subagent 主入口，有几个原因：
+
+1. 模型能显式决定何时委派，而不是完全依赖 harness 内部 router。
+2. Task tool 可以走普通 tool registry、permission、ToolContext、event。
+3. subagent 创建行为可以被 session 记录和测试。
+4. 后续 foreground/background、wait/cancel/promote 可以复用同一 task id。
+5. fork skill、auto routing、用户显式 `agent run` 都能收敛到同一个 runtime。
+
+内部 auto routing 仍然有价值，但应该是调用 Task 的便利层，而不是另一套 subagent runtime。
+
+## 13. 开发过程细化
+
+### Step 1: Agent registry
+
+先把 built-in agents、project agents、OpenCode markdown agents 放进统一 registry。这个阶段只解决“有哪些 agent 可选”，不急着跑 child session。
+
+验收重点：
+
+- list/show 能看到 agent；
+- hidden/disabled 生效；
+- markdown frontmatter 能解析；
+- mode 区分 primary/subagent。
+
+### Step 2: Task descriptor 暴露
+
+当 registry 中存在可用 subagent，tool registry 注册 Task tool，并把 subagent description 暴露给模型。
+
+这个阶段要避免把全部 profile 内容塞进 prompt，只暴露足够路由的信息。
+
+### Step 3: Foreground child session
+
+先实现 foreground，因为它最容易验证：
+
+```text
+parent tool call
+  -> create child session
+  -> run child agent loop
+  -> summarize
+  -> parent tool result
+```
+
+这个阶段必须确认 child messages/events 不直接进入 parent transcript。
+
+### Step 4: Lineage 和 recursion guard
+
+有了 child session 后马上补 lineage：
+
+- parent session id；
+- root session id；
+- depth；
+- subagent type；
+- origin tool call id；
+- self-call guard。
+
+这一步是安全边界，不能等 background 以后再补。
+
+### Step 5: Skill preload
+
+profile 中的 `skills` 应在 child context 创建时预加载。加载结果写 child session metadata/system context，parent 只看到 metadata。
+
+这一步验证 Skill 和 Subagent 两条链是否真正解耦。
+
+### Step 6: Workspace/worktree isolation
+
+实现型 subagent 需要隔离时，Task runtime 负责准备 workspace。初期可以先记录 isolation metadata 和基础路径，后续再完善 merge-back、冲突处理和审批。
+
+### Step 7: Task tree API
+
+child session 一旦存在，HTTP/App Bridge 就需要能投影 task tree。TUI/Desktop 后续不应从 parent transcript 猜 task 状态。
+
+### Step 8: Background lifecycle
+
+最后进入 queued/running/completed/failed/cancelled 状态机。原因是 background 需要更强的锁、队列、取消、恢复和 UI 投影，不能在 child session 未稳时贸然实现。
+
+## 14. Parent/Child 上下文规则
+
+Subagent 的上下文隔离规则应写清楚：
+
+1. Parent prompt 可以产生 Task tool call。
+2. Child prompt 接收任务描述、profile prompt、预加载 skill、必要 workspace metadata。
+3. Child 中间 tool calls 只进入 child session。
+4. Child final answer 被压成 summary/result 返回 parent。
+5. Parent session 记录 Task tool result、child session id、status、metadata。
+6. Parent compact 不应吞 child transcript；child session 自己负责 compact。
+
+这套规则是对标 Claude Code subagent 的核心：child 不是 parent context 的展开，而是独立 context 的工作结果。
+
+## 15. Foreground 与 Background 语义
+
+Foreground task：
+
+- parent 等 child 完成；
+- parent turn 结束前拿到 summary；
+- 适合短任务、review、单点查询。
+
+Background task：
+
+- parent 立即拿到 task id；
+- child 在队列中运行；
+- 用户可以 wait/inspect/cancel/promote；
+- 适合长时间测试、批量扫描、并行实现。
+
+这两个模式不应是两套实现。它们应该共享 child session 创建、profile binding、permission、event，只在 scheduling 和 parent continuation 上不同。
+
+## 16. 对标差距
+
+| 能力 | Claude Code/OpenCode 参考 | OpenHarness 状态 |
+| --- | --- | --- |
+| Agent/Task tool | Claude AgentTool / OpenCode Task | 已有主路径 |
+| Independent context | Claude subagent context | 已有 child session 基础 |
+| Optional model/tools/skills | Claude subagent fields | 已有 profile/schema 基础 |
+| Nested subagent | Claude nested capability | 有 guard，深度语义待增强 |
+| Background/resume | Claude foreground/background/resume | 部分 |
+| Worktree isolation | Claude/OpenCode isolation | 部分 |
+| Task tree UI | OpenCode/TUI task view | HTTP 基础，TUI/Desktop 待补 |
+| Auto routing by description | Claude description routing | 已有基础 |
+
+当前最关键的差距不是能否创建 child，而是 lifecycle 是否完整、UI 是否能观察、runner 是否统一。
+
+## 17. 验收口径
+
+Subagent/Task 改动至少要覆盖：
+
+- profile/agent discovery；
+- Task tool descriptor；
+- foreground child session；
+- parent/child metadata；
+- nested guard；
+- skill preload；
+- workspace isolation；
+- task tree API；
+- background queue 或明确不在本阶段；
+- parent context 不接收 child 中间工具调用。
+
+只有这些都能被测试或 session evidence 证明，才算对标到一等 subagent，而不是实现了一个“调用另一个 prompt”的快捷方式。

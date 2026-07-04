@@ -72,3 +72,38 @@ OpenHarness 不是复制两者的产品形态，而是吸收这些 runtime 思�
 - “对标”指架构能力和运行时边界对齐，不代表 API 或 UI 完全复制。
 - 已完成能力会写明验收面；未完成能力会写在“后续边界”，避免混在已完成叙述里。
 - 需求演化按 harness 层面分类，不按单次 session 或单个 commit 分类。
+
+## 使用方式
+
+这组文档面向后续架构推进和工程排期，不是发布说明。阅读时建议按三层理解：
+
+1. `Part 01` 看整体需求为什么从 CLI coding agent 演化成本地 agent runtime。
+2. `Part 02` 到 `Part 10` 看每条能力链的 runtime 边界、对标对象、落地阶段和验收口径。
+3. `Part 11` 看下一阶段如何把分散能力继续收进 SessionRunner、Task lifecycle 和 ToolBatchPlanner。
+
+文档中的“已完成”表示当前代码树已经有对应实现和至少一组本地验收；“部分完成”表示主路径可用，但 lifecycle、UI 投影或异常恢复还没有完全对标；“后续边界”表示不应混进当前已完成叙述里的工程债。
+
+## 范围声明
+
+本文档覆盖的是 OpenHarness 作为 harness 的整体演化，包括历史上已经完成的 CLI 恢复、Rust workspace 拆分、HTTP Runtime/App Bridge、TUI/Desktop、MCP、Provider、Plugin、Skill、Subagent、Session/Event、Checkpoint、Eval/Debug 等方向。某一次 session 做过的修改只会作为阶段证据出现，不会成为文档主线。
+
+换句话说，主线是：
+
+```text
+用户需求和对标对象
+  -> harness 级架构问题
+  -> runtime 对象和边界
+  -> 分阶段开发过程
+  -> 验收证据
+  -> 后续差距
+```
+
+不是：
+
+```text
+某次对话
+  -> 改了哪些文件
+  -> 跑了哪些命令
+```
+
+这也是后续继续对齐 OpenCode/Claude Code 时应遵守的写法：先讲需求为什么成立，再讲为什么要进 runtime，再讲 OpenHarness 如何按 crate、API、session state、permission、event、UI projection 落地。
