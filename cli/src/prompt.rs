@@ -221,19 +221,11 @@ pub(super) fn run_prompt_command_with_events(
         "model.usage",
         SessionEventOptions {
             kind: "model".to_string(),
-            attributes: BTreeMap::from([
-                (
-                    "input_tokens".to_string(),
-                    json!(loop_result.usage.input_tokens),
-                ),
-                (
-                    "output_tokens".to_string(),
-                    json!(loop_result.usage.output_tokens),
-                ),
-                ("cost".to_string(), json!(loop_result.usage.cost)),
-                ("source".to_string(), json!(loop_result.source.clone())),
-                ("tool_calls".to_string(), json!(loop_result.tool_calls)),
-            ]),
+            attributes: SessionRunnerFacade::model_usage_event_attributes(
+                &loop_result.usage,
+                &loop_result.source,
+                loop_result.tool_calls,
+            ),
             ..SessionEventOptions::default()
         },
     );

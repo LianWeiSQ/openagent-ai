@@ -10,7 +10,7 @@ use std::{
 };
 
 use openagent_core::PermissionManager;
-use openagent_protocol::{PermissionAction, PermissionRuleset, ToolCall, ToolResult};
+use openagent_protocol::{PermissionAction, PermissionRuleset, ToolCall, ToolResult, Usage};
 use openagent_tools::{
     LocalWorkspaceRuntime, SessionRunnerFacade, TaskSubagentDescriptor, TodoItem, ToolContext,
     ToolRegistry, Toolkit, benchmark_mode_allows_shell_command,
@@ -361,6 +361,44 @@ fn session_runner_facade_builds_shared_turn_terminal_events() {
     assert_eq!(http_failed["params"]["status"], "failed");
     assert_eq!(http_failed["params"]["error"], "provider failed");
     assert!(http_failed["params"].get("run_id").is_none());
+}
+
+#[test]
+fn session_runner_facade_builds_shared_turn_usage_and_trace_payloads() {
+    let facade = SessionRunnerFacade::new("/tmp/openagent-session-runner", "session_trace");
+
+    let usage = SessionRunnerFacade::estimated_turn_usage_payload("hello world", "done", 2);
+    assert_eq!(usage["input_tokens"], 3);
+    assert_eq!(usage["output_tokens"], 1);
+    assert_eq!(usage["tool_tokens"], 32);
+    assert_eq!(usage["total_tokens"], 36);
+    assert_eq!(usage["tool_calls"], 2);
+    assert_eq!(usage["estimated"], true);
+
+    let trace =
+        facade.turn_trace_payload("run_trace", "reviewer", "gpt-test", "default", "medium", 2);
+    assert_eq!(trace["run_id"], "run_trace");
+    assert_eq!(trace["session_id"], "session_trace");
+    assert_eq!(trace["agent"], "reviewer");
+    assert_eq!(trace["model"], "gpt-test");
+    assert_eq!(trace["variant"], "default");
+    assert_eq!(trace["thinking"], "medium");
+    assert_eq!(trace["tool_calls"], 2);
+
+    let attrs = SessionRunnerFacade::model_usage_event_attributes(
+        &Usage {
+            input_tokens: 11,
+            output_tokens: 7,
+            cost: 0.25,
+        },
+        "openai:chat",
+        3,
+    );
+    assert_eq!(attrs["input_tokens"], 11);
+    assert_eq!(attrs["output_tokens"], 7);
+    assert_eq!(attrs["cost"], 0.25);
+    assert_eq!(attrs["source"], "openai:chat");
+    assert_eq!(attrs["tool_calls"], 3);
 }
 
 #[test]

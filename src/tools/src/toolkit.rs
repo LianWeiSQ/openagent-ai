@@ -18,7 +18,7 @@ use openagent_core::{
 };
 use openagent_protocol::{
     ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolConcurrency,
-    ToolExecutionSchema, ToolExecutionScope, ToolResult, ToolSchema,
+    ToolExecutionSchema, ToolExecutionScope, ToolResult, ToolSchema, Usage,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1259,6 +1259,59 @@ impl SessionRunnerFacade {
     }
 
     #[must_use]
+    pub fn estimated_turn_usage_payload(input: &str, output: &str, tool_calls: u64) -> Value {
+        let input_tokens = estimate_turn_tokens(input);
+        let output_tokens = estimate_turn_tokens(output);
+        let tool_tokens = tool_calls.saturating_mul(16);
+        let total_tokens = input_tokens + output_tokens + tool_tokens;
+        json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "tool_tokens": tool_tokens,
+            "total_tokens": total_tokens,
+            "tool_calls": tool_calls,
+            "cost": 0.0,
+            "estimated": true,
+        })
+    }
+
+    #[must_use]
+    pub fn turn_trace_payload(
+        &self,
+        run_id: &str,
+        agent: &str,
+        model: &str,
+        variant: &str,
+        thinking: &str,
+        tool_calls: u64,
+    ) -> Value {
+        json!({
+            "run_id": run_id,
+            "session_id": self.session_id.clone(),
+            "agent": agent,
+            "model": model,
+            "variant": variant,
+            "thinking": thinking,
+            "tool_calls": tool_calls,
+        })
+    }
+
+    #[must_use]
+    pub fn model_usage_event_attributes(
+        usage: &Usage,
+        source: &str,
+        tool_calls: u64,
+    ) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("input_tokens".to_string(), json!(usage.input_tokens)),
+            ("output_tokens".to_string(), json!(usage.output_tokens)),
+            ("cost".to_string(), json!(usage.cost)),
+            ("source".to_string(), json!(source)),
+            ("tool_calls".to_string(), json!(tool_calls)),
+        ])
+    }
+
+    #[must_use]
     pub fn tool_result_message(
         &self,
         step: u64,
@@ -1429,6 +1482,12 @@ impl SessionRunnerFacade {
             "has_permission_manager": self.permission_manager.is_some(),
         })
     }
+}
+
+fn estimate_turn_tokens(value: &str) -> u64 {
+    let by_words = value.split_whitespace().count() as u64;
+    let by_chars = (value.chars().count() as u64).div_ceil(4);
+    by_words.max(by_chars).max(u64::from(!value.is_empty()))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

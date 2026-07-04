@@ -71,6 +71,7 @@ SessionRunner
 - tool-result message/session projection payload construction；
 - skill session-event payload construction。
 - terminal turn event envelope construction。
+- shared usage/trace payload construction。
 
 近期验证覆盖：
 

@@ -3884,37 +3884,18 @@ fn latest_user_message(session: &Session) -> String {
 }
 
 fn usage_payload(input: &str, output: &str, tool_calls: u64) -> Value {
-    let input_tokens = estimate_tokens(input);
-    let output_tokens = estimate_tokens(output);
-    let tool_tokens = tool_calls.saturating_mul(16);
-    let total_tokens = input_tokens + output_tokens + tool_tokens;
-    json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "tool_tokens": tool_tokens,
-        "total_tokens": total_tokens,
-        "tool_calls": tool_calls,
-        "cost": 0.0,
-        "estimated": true,
-    })
-}
-
-fn estimate_tokens(value: &str) -> u64 {
-    let by_words = value.split_whitespace().count() as u64;
-    let by_chars = (value.chars().count() as u64).div_ceil(4);
-    by_words.max(by_chars).max(u64::from(!value.is_empty()))
+    SessionRunnerFacade::estimated_turn_usage_payload(input, output, tool_calls)
 }
 
 fn trace_payload(session: &Session, run_id: &str, tool_calls: u64) -> Value {
-    json!({
-        "run_id": run_id,
-        "session_id": session.id,
-        "agent": session_text_metadata(session, "agent", "server"),
-        "model": session_text_metadata(session, "model", &default_model_id()),
-        "variant": session_text_metadata(session, "variant", "default"),
-        "thinking": session_text_metadata(session, "thinking", "medium"),
-        "tool_calls": tool_calls,
-    })
+    SessionRunnerFacade::new(PathBuf::new(), session.id.clone()).turn_trace_payload(
+        run_id,
+        &session_text_metadata(session, "agent", "server"),
+        &session_text_metadata(session, "model", &default_model_id()),
+        &session_text_metadata(session, "variant", "default"),
+        &session_text_metadata(session, "thinking", "medium"),
+        tool_calls,
+    )
 }
 
 fn record_usage_event(store: &FileSessionStore, session: &Session, run_id: &str, usage: &Value) {
