@@ -13,6 +13,7 @@ use std::{
 };
 
 use openagent_cli::cli_commands_fixture;
+use openagent_lsp::command_available;
 use openagent_protocol::{ChatMessage, Role};
 use openagent_session::{FileSessionStore, Session, StartRunOptions};
 use serde_json::{Value, json};
@@ -104,6 +105,73 @@ Use rooted CLI command guidance.
     let doctor_payload: Value = serde_json::from_slice(&doctor.stdout)?;
     assert!(doctor_payload["loaded_count"].as_u64().unwrap_or_default() >= 1);
     assert_eq!(doctor_payload["invalid_count"], 0);
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_lsp_cli_reports_status_and_queries_symbols() -> Result<(), Box<dyn Error>> {
+    if !command_available("python3") {
+        return Ok(());
+    }
+    let Some(python) = python3_executable()? else {
+        return Ok(());
+    };
+    let temp = temp_dir("openagent-cli-lsp-command")?;
+    fs::write(temp.join("Cargo.toml"), "[package]\nname = \"fake\"\n")?;
+    fs::create_dir_all(temp.join("src"))?;
+    fs::write(temp.join("src/main.rs"), "fn main() {}\n")?;
+    let fake = write_fake_lsp_server(&temp)?;
+    fs::create_dir_all(temp.join(".openagent"))?;
+    fs::write(
+        temp.join(".openagent/lsp.json"),
+        serde_json::to_string_pretty(&json!({
+            "servers": {
+                "fake": {
+                    "command": [python, fake],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"]
+                }
+            }
+        }))?,
+    )?;
+
+    let status = run_openagent(["lsp", "status", "--workspace", path_str(&temp)], None)?;
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_payload: Value = serde_json::from_slice(&status.stdout)?;
+    let fake_available = status_payload["servers"].as_array().is_some_and(|servers| {
+        servers
+            .iter()
+            .any(|server| server["id"] == "fake" && server["available"] == true)
+    });
+    assert!(fake_available);
+
+    let query = run_openagent(
+        [
+            "lsp",
+            "query",
+            "documentSymbol",
+            "src/main.rs",
+            "--workspace",
+            path_str(&temp),
+            "--timeout-ms",
+            "3000",
+        ],
+        None,
+    )?;
+    assert!(
+        query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let query_payload: Value = serde_json::from_slice(&query.stdout)?;
+    assert_eq!(query_payload["server_id"], "fake");
+    assert_eq!(query_payload["result"][0]["name"], "main");
 
     let _ = fs::remove_dir_all(temp);
     Ok(())
@@ -1302,6 +1370,7 @@ fn binary_agent_registry_exposes_builtin_subagents() -> Result<(), Box<dyn Error
             "glob",
             "grep",
             "ls",
+            "lsp",
             "code_search",
             "skill",
             "todoread"
@@ -3285,6 +3354,81 @@ fn temp_dir(prefix: &str) -> Result<PathBuf, Box<dyn Error>> {
         .to_string();
     let path = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
     fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn python3_executable() -> Result<Option<String>, Box<dyn Error>> {
+    let output = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let path = String::from_utf8(output.stdout)?.trim().to_string();
+    Ok((!path.is_empty()).then_some(path))
+}
+
+fn write_fake_lsp_server(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let path = root.join("fake_lsp.py");
+    fs::write(
+        &path,
+        r#"
+import json
+import sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode("utf-8").split(":", 1)
+        headers[key.lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    if length <= 0:
+        return None
+    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+def result(id, value):
+    send({"jsonrpc": "2.0", "id": id, "result": value})
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    id = message.get("id")
+    params = message.get("params") or {}
+    uri = ((params.get("textDocument") or {}).get("uri")) or "file:///fake.rs"
+    if method == "initialize":
+        result(id, {"capabilities": {"textDocumentSync": {"change": 1}}})
+    elif method in ("initialized", "workspace/didChangeConfiguration"):
+        pass
+    elif method == "shutdown":
+        result(id, None)
+    elif method == "exit":
+        break
+    elif method == "textDocument/documentSymbol":
+        result(id, [{
+            "name": "main",
+            "kind": 12,
+            "location": {
+                "uri": uri,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 9}}
+            }
+        }])
+    elif id is not None:
+        result(id, [])
+"#,
+    )?;
     Ok(path)
 }
 

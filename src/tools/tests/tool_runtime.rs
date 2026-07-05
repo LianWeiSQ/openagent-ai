@@ -10,6 +10,7 @@ use std::{
 };
 
 use openagent_core::PermissionManager;
+use openagent_lsp::command_available;
 use openagent_protocol::{PermissionAction, PermissionRuleset, ToolCall, ToolResult, Usage};
 use openagent_tools::{
     LocalWorkspaceRuntime, SessionRunnerFacade, TaskSubagentDescriptor, TodoItem, ToolContext,
@@ -635,6 +636,73 @@ fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(),
     assert!(!code_search.output.contains("trace.rs"));
     assert!(!code_search.output.contains("bundle.rs"));
     assert_eq!(code_search.metadata["count"], json!(1));
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn Error>> {
+    if !command_available("python3") {
+        return Ok(());
+    }
+    let root = unique_temp_dir("openagent-tools-lsp")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"fake\"\n")?;
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+    let fake = write_fake_lsp_server(&root)?;
+    fs::create_dir_all(root.join(".openagent"))?;
+    fs::write(
+        root.join(".openagent/lsp.json"),
+        serde_json::to_string_pretty(&json!({
+            "servers": {
+                "fake": {
+                    "command": ["python3", fake],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"]
+                }
+            }
+        }))?,
+    )?;
+
+    let toolkit = Toolkit::with_builtins();
+    let mut ctx = ToolContext::new(&root).with_session_id("session-lsp");
+    let status = toolkit.execute(
+        "lsp",
+        json!({"operation": "status"}),
+        "call_lsp_status",
+        &mut ctx,
+    );
+    assert!(status.error.is_none());
+    assert_eq!(
+        status.metadata["server_count"].as_u64().unwrap_or_default() >= 1,
+        true
+    );
+    assert!(status.output.contains("\"fake\""));
+
+    let symbols = toolkit.execute(
+        "lsp",
+        json!({"operation": "documentSymbol", "file_path": "src/main.rs", "timeout_ms": 3000}),
+        "call_lsp_symbols",
+        &mut ctx,
+    );
+    assert!(symbols.error.is_none(), "{symbols:?}");
+    assert_eq!(symbols.metadata["server_id"], json!("fake"));
+    assert!(symbols.output.contains("\"name\": \"main\""));
+
+    let escaped = toolkit.execute(
+        "lsp",
+        json!({"operation": "documentSymbol", "file_path": "../main.rs"}),
+        "call_lsp_escape",
+        &mut ctx,
+    );
+    assert!(
+        escaped
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Path escapes session root")
+    );
 
     fs::remove_dir_all(root)?;
     Ok(())
@@ -1313,6 +1381,7 @@ fn tool_runtime_fixture() -> Result<Value, Box<dyn Error>> {
         "ls",
         "bash",
         "code_search",
+        "lsp",
         "memory_read",
         "memory_write",
         "todowrite",
@@ -1453,4 +1522,68 @@ fn write_skill(
         format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
     )?;
     Ok(())
+}
+
+fn write_fake_lsp_server(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let path = root.join("fake_lsp.py");
+    fs::write(
+        &path,
+        r#"
+import json
+import sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode("utf-8").split(":", 1)
+        headers[key.lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    if length <= 0:
+        return None
+    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+def result(id, value):
+    send({"jsonrpc": "2.0", "id": id, "result": value})
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    id = message.get("id")
+    params = message.get("params") or {}
+    uri = ((params.get("textDocument") or {}).get("uri")) or "file:///fake.rs"
+    if method == "initialize":
+        result(id, {"capabilities": {"textDocumentSync": {"change": 1}}})
+    elif method in ("initialized", "workspace/didChangeConfiguration"):
+        pass
+    elif method == "shutdown":
+        result(id, None)
+    elif method == "exit":
+        break
+    elif method == "textDocument/documentSymbol":
+        result(id, [{
+            "name": "main",
+            "kind": 12,
+            "location": {
+                "uri": uri,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 9}}
+            }
+        }])
+    elif id is not None:
+        result(id, [])
+"#,
+    )?;
+    Ok(path)
 }

@@ -207,6 +207,36 @@
         "required": []
       }
     },
+    "lsp": {
+      "dangerous": false,
+      "execution_schema": {
+        "batch_group": "lsp",
+        "concurrency": "safe",
+        "conflict_key_template": null,
+        "external_io": false,
+        "max_parallelism": 4,
+        "mutates_external": false,
+        "mutates_session": false,
+        "mutates_workspace": false,
+        "read_only": true,
+        "requires_user_interaction": false
+      },
+      "execution_scope": "workspace",
+      "group": "lsp",
+      "parameter_schema": {
+        "properties": [
+          "character",
+          "file_path",
+          "line",
+          "operation",
+          "query",
+          "timeout_ms"
+        ],
+        "required": [
+          "operation"
+        ]
+      }
+    },
     "memory_read": {
       "dangerous": false,
       "execution_schema": {

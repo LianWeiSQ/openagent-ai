@@ -248,6 +248,7 @@ pub(super) fn root_help() -> String {
         ("command", "manage custom prompt commands"),
         ("config", "inspect and initialize CLI configuration"),
         ("doctor", "check provider and gateway configuration"),
+        ("lsp", "inspect and query Language Server Protocol servers"),
     ];
     let integrations = [
         ("auth", "manage provider credentials"),

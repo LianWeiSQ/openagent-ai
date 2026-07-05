@@ -50,6 +50,7 @@ mod fixtures;
 mod github;
 mod help;
 mod interactions;
+mod lsp;
 mod mcp;
 mod models;
 mod prompt;
@@ -71,6 +72,7 @@ use doctor::{doctor_payload_from_args, doctor_text_from_payload};
 use github::{github_command, pr_command};
 use help::*;
 use interactions::{approval_command, question_command};
+use lsp::lsp_command;
 use mcp::mcp_command;
 use models::{models_cache_path, models_command};
 use prompt::{run_prompt_command, run_prompt_command_with_events, split_answer_items};
@@ -129,6 +131,7 @@ const RUN_POSITIONAL_VALUE_FLAGS: &[&str] = &[
     "--max-steps",
     "--max-output-tokens",
     "--timeout-s",
+    "--timeout-ms",
     "--agent",
     "--title",
     "--attach",
@@ -142,6 +145,7 @@ const RUN_POSITIONAL_VALUE_FLAGS: &[&str] = &[
     "-u",
     "--variant",
     "--port",
+    "--column",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +201,7 @@ pub fn run_cli_command(argv: &[String]) -> CliRunResult {
         "stats" => stats_command(&argv[1..]),
         "command" => custom_command(&argv[1..]),
         "skill" | "skills" => skills_command(&argv[1..]),
+        "lsp" => lsp_command(&argv[1..]),
         "config" => config_command(&argv[1..]),
         "auth" | "providers" => auth_command(argv[0].as_str(), &argv[1..]),
         "mcp" => mcp_command(&argv[1..]),

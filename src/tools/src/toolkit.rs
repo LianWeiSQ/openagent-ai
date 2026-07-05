@@ -16,6 +16,9 @@ use openagent_core::{
     SkillRegistryOptions, pattern_for, render_skill_document, skill_display_description,
     skill_document_model_invocable, skill_info_model_invocable,
 };
+use openagent_lsp::{
+    LspOperation, LspQuery, lsp_doctor, lsp_status, operation_from_str, query_workspace,
+};
 use openagent_protocol::{
     ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolConcurrency,
     ToolExecutionSchema, ToolExecutionScope, ToolResult, ToolSchema, Usage,
@@ -27,6 +30,7 @@ use serde_json::{Map, Value, json};
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const TASK_TOOL_ID: &str = "task";
 pub const WEB_FETCH_TOOL_ID: &str = "web_fetch";
+pub const LSP_TOOL_ID: &str = "lsp";
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
@@ -2521,6 +2525,17 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
         execution_schema: workspace_read,
     });
     registry.register(ToolDefinition {
+        id: LSP_TOOL_ID.to_string(),
+        description:
+            "Use Language Server Protocol servers for code navigation, symbols, hover, and diagnostics."
+                .to_string(),
+        parameter_schema: lsp_tool_schema(),
+        dangerous: false,
+        group: "lsp".to_string(),
+        execution_scope: ToolExecutionScope::Workspace,
+        execution_schema: readonly_schema("lsp", false, false, Some(4)),
+    });
+    registry.register(ToolDefinition {
         id: "memory_read".to_string(),
         description: "Read a JSON memory value.".to_string(),
         parameter_schema: schema(&["key"], &["key"]),
@@ -2725,6 +2740,7 @@ fn execute_builtin(name: &str, input: Value, ctx: &mut ToolContext) -> ToolResul
         "skill" => skill_tool(input, ctx),
         WEB_FETCH_TOOL_ID => web_fetch_tool(input),
         "code_search" => code_search_tool(input, ctx),
+        LSP_TOOL_ID => lsp_tool(input, ctx),
         "memory_read" => memory_read_tool(input, ctx),
         "memory_write" => memory_write_tool(input, ctx),
         "todowrite" => todo_write_tool(input, ctx),
@@ -3572,6 +3588,88 @@ fn code_search_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<Tool
     code_search_output(&root, &base, hits, preview_hits, false)
 }
 
+fn lsp_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput> {
+    let operation_name = string_arg_or(&input, "operation", "status")?;
+    if operation_name.trim().eq_ignore_ascii_case("doctor") {
+        let root = normalize_path(&ctx.session_root);
+        let report = lsp_doctor(&root)?;
+        let mut output = ToolOutput::new(
+            "LSP doctor",
+            serde_json::to_string_pretty(&report).map_err(json_error)?,
+        );
+        output
+            .metadata
+            .insert("server_count".to_string(), json!(report.server_count));
+        output
+            .metadata
+            .insert("available_count".to_string(), json!(report.available_count));
+        return Ok(output);
+    }
+
+    let operation = operation_from_str(&operation_name)
+        .ok_or_else(|| format!("Unsupported LSP operation: {operation_name}"))?;
+    let root = normalize_path(&ctx.session_root);
+
+    if operation == LspOperation::Status {
+        let statuses = lsp_status(&root)?;
+        let payload = json!({"servers": statuses});
+        let mut output = ToolOutput::new(
+            "LSP status",
+            serde_json::to_string_pretty(&payload).map_err(json_error)?,
+        );
+        output
+            .metadata
+            .insert("server_count".to_string(), json!(statuses.len()));
+        output
+            .metadata
+            .insert("servers".to_string(), json!(statuses));
+        return Ok(output);
+    }
+
+    let file_path = optional_string_arg(&input, "file_path")?
+        .or(optional_string_arg(&input, "path")?)
+        .ok_or_else(|| "LSP operation requires file_path".to_string())?;
+    let target = resolve_path_in_root(&root, &file_path)?;
+    let timeout_ms = optional_usize_arg(&input, "timeout_ms")?
+        .or(optional_usize_arg(&input, "timeout")?)
+        .and_then(|value| u64::try_from(value).ok());
+    let query = optional_string_arg(&input, "query")?;
+    let line = optional_usize_arg(&input, "line")?.and_then(|value| u64::try_from(value).ok());
+    let character = optional_usize_arg(&input, "character")?
+        .or(optional_usize_arg(&input, "column")?)
+        .and_then(|value| u64::try_from(value).ok());
+    let result = query_workspace(
+        &root,
+        LspQuery {
+            operation: operation.clone(),
+            file_path: target.clone(),
+            line,
+            character,
+            query,
+            timeout_ms,
+        },
+    )?;
+    let title = format!("{} {}", operation_name, display_path(&root, &target));
+    let mut output = ToolOutput::new(
+        title,
+        serde_json::to_string_pretty(&result).map_err(json_error)?,
+    );
+    output
+        .metadata
+        .insert("operation".to_string(), json!(operation_name));
+    output
+        .metadata
+        .insert("server_id".to_string(), json!(result.server_id));
+    output
+        .metadata
+        .insert("file_path".to_string(), json!(result.file_path));
+    output.metadata.insert("result".to_string(), result.result);
+    output
+        .metadata
+        .insert("diagnostics".to_string(), json!(result.diagnostics));
+    Ok(output)
+}
+
 fn memory_read_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput> {
     let key = string_arg(&input, "key")?;
     let value = ctx.memory.get(&key).cloned().unwrap_or(Value::Null);
@@ -3676,9 +3774,57 @@ fn schema(required: &[&str], properties: &[&str]) -> Value {
     })
 }
 
+fn lsp_tool_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "status",
+                    "doctor",
+                    "diagnostics",
+                    "goToDefinition",
+                    "findReferences",
+                    "hover",
+                    "documentSymbol",
+                    "workspaceSymbol",
+                    "goToImplementation",
+                    "prepareCallHierarchy",
+                    "incomingCalls",
+                    "outgoingCalls"
+                ],
+                "description": "The LSP operation to perform."
+            },
+            "file_path": {
+                "type": "string",
+                "description": "Workspace file used to select and query an LSP server. Required except for status and doctor."
+            },
+            "line": {
+                "type": "integer",
+                "description": "1-based line number for cursor-based operations."
+            },
+            "character": {
+                "type": "integer",
+                "description": "1-based character offset for cursor-based operations."
+            },
+            "query": {
+                "type": "string",
+                "description": "Workspace symbol search query."
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "description": "Request timeout in milliseconds."
+            }
+        },
+        "required": ["operation"]
+    })
+}
+
 fn property_schema(name: &str) -> Value {
     match name {
-        "offset" | "limit" | "timeout" | "max_bytes" => json!({"type": "integer"}),
+        "offset" | "limit" | "timeout" | "timeout_ms" | "max_bytes" | "line" | "character"
+        | "column" => json!({"type": "integer"}),
         "replace_all"
         | "multiple"
         | "include_content"
@@ -3728,6 +3874,10 @@ fn display_path(root: &Path, target: &Path) -> String {
 }
 
 fn io_error(error: io::Error) -> String {
+    error.to_string()
+}
+
+fn json_error(error: serde_json::Error) -> String {
     error.to_string()
 }
 

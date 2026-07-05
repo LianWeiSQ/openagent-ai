@@ -1,5 +1,5 @@
 [package]
-name = "openagent-tools"
+name = "openagent-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,16 +7,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-openagent-core.workspace = true
-openagent-lsp.workspace = true
-openagent-protocol.workspace = true
-regex.workspace = true
-reqwest = { workspace = true, features = ["blocking", "socks"] }
 serde.workspace = true
 serde_json.workspace = true
 
 [lib]
-path = "src/toolkit.rs"
+path = "src/lib.rs"
 
 [lints]
 workspace = true

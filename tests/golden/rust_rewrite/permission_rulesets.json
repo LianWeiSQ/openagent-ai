@@ -59,6 +59,12 @@
           "action": "allow",
           "condition": null,
           "pattern": "*",
+          "tool": "lsp"
+        },
+        {
+          "action": "allow",
+          "condition": null,
+          "pattern": "*",
           "tool": "skill"
         },
         {
@@ -119,6 +125,12 @@
           "condition": null,
           "pattern": "*",
           "tool": "ls"
+        },
+        {
+          "action": "allow",
+          "condition": null,
+          "pattern": "*",
+          "tool": "lsp"
         },
         {
           "action": "allow",
