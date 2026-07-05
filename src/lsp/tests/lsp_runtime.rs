@@ -262,6 +262,69 @@ fn diagnostics_merge_dynamic_related_and_workspace_reports() -> Result<(), Box<d
     Ok(())
 }
 
+#[test]
+fn startup_failure_marks_server_broken_and_skips_retry() -> Result<(), Box<dyn Error>> {
+    if !command_available("python3") {
+        return Ok(());
+    }
+    let root = temp_dir("openagent-lsp-broken")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"fake\"\n")?;
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+    let failing = write_failing_lsp_server(&root)?;
+    let attempt_log = root.join("attempts.log");
+    fs::create_dir_all(root.join(".openagent"))?;
+    fs::write(
+        root.join(".openagent/lsp.json"),
+        serde_json::to_string_pretty(&json!({
+            "servers": {
+                "fake": {
+                    "command": ["python3", failing],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"],
+                    "env": {
+                        "FAKE_LSP_ATTEMPT_LOG": attempt_log.to_string_lossy()
+                    }
+                }
+            }
+        }))?,
+    )?;
+
+    let request = || LspQuery {
+        operation: LspOperation::DocumentSymbol,
+        file_path: PathBuf::from("src/main.rs"),
+        line: None,
+        character: None,
+        query: None,
+        timeout_ms: Some(500),
+    };
+    let first = query_workspace(&root, request()).expect_err("first startup should fail");
+    assert!(
+        first.contains("disconnected") || first.contains("failed to write"),
+        "{first}"
+    );
+    let second = query_workspace(&root, request()).expect_err("broken client should be skipped");
+    assert!(second.contains("temporarily disabled"), "{second}");
+    assert_eq!(fs::read_to_string(&attempt_log)?.lines().count(), 1);
+
+    let status = lsp_status(&root)?;
+    let fake = status
+        .iter()
+        .find(|server| server.id == "fake")
+        .ok_or("missing fake server")?;
+    assert!(!fake.available);
+    assert!(
+        fake.reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("startup failed")
+    );
+
+    assert_eq!(shutdown_workspace_clients(&root), 0);
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
 fn write_fake_lsp_server(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let path = root.join("fake_lsp.py");
     fs::write(
@@ -428,6 +491,22 @@ while True:
             result(id, {"items": []})
     elif id is not None:
         result(id, [])
+"#,
+    )?;
+    Ok(path)
+}
+
+fn write_failing_lsp_server(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let path = root.join("failing_lsp.py");
+    fs::write(
+        &path,
+        r#"
+import os
+
+attempt_log = os.environ.get("FAKE_LSP_ATTEMPT_LOG")
+if attempt_log:
+    with open(attempt_log, "a", encoding="utf-8") as handle:
+        handle.write("start\n")
 "#,
     )?;
     Ok(path)

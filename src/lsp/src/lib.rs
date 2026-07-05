@@ -28,6 +28,7 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const DEFAULT_TIMEOUT_MS: u64 = 8_000;
 pub const DEFAULT_DIAGNOSTIC_WAIT_MS: u64 = 500;
 pub const DEFAULT_TOUCH_TIMEOUT_MS: u64 = 2_000;
+pub const DEFAULT_BROKEN_COOLDOWN_MS: u64 = 60_000;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -188,6 +189,7 @@ struct DiagnosticRequestResult {
 #[derive(Debug, Default)]
 struct LspClientPool {
     clients: BTreeMap<String, PooledClient>,
+    broken: BTreeMap<String, BrokenClient>,
 }
 
 #[derive(Debug)]
@@ -196,6 +198,15 @@ struct PooledClient {
     server_id: String,
     root: PathBuf,
     connection: RpcConnection,
+}
+
+#[derive(Debug)]
+struct BrokenClient {
+    workspace: PathBuf,
+    server_id: String,
+    root: PathBuf,
+    reason: String,
+    failed_at: Instant,
 }
 
 impl Drop for RpcConnection {
@@ -273,9 +284,24 @@ impl LspClientPool {
         timeout: Duration,
     ) -> Result<&mut PooledClient, String> {
         let key = pooled_client_key(workspace, &selected.server.id, &selected.root);
+        if let Some(reason) = self.active_broken_reason(&key) {
+            return Err(format!(
+                "LSP server '{}' is temporarily disabled after startup failure: {reason}",
+                selected.server.id
+            ));
+        }
         if !self.clients.contains_key(&key) {
-            let mut connection = RpcConnection::start(&selected.server, &selected.root)?;
-            connection.initialize(timeout)?;
+            let mut connection = match RpcConnection::start(&selected.server, &selected.root) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    self.mark_broken(&key, workspace, selected, error.clone());
+                    return Err(error);
+                }
+            };
+            if let Err(error) = connection.initialize(timeout) {
+                self.mark_broken(&key, workspace, selected, error.clone());
+                return Err(error);
+            }
             self.clients.insert(
                 key.clone(),
                 PooledClient {
@@ -285,6 +311,7 @@ impl LspClientPool {
                     connection,
                 },
             );
+            self.broken.remove(&key);
         }
         self.clients
             .get_mut(&key)
@@ -300,6 +327,65 @@ impl LspClientPool {
 
     fn remove_key(&mut self, key: &str) -> Option<PooledClient> {
         self.clients.remove(key)
+    }
+
+    fn active_broken_reason(&mut self, key: &str) -> Option<String> {
+        let expired = self
+            .broken
+            .get(key)
+            .is_some_and(|broken| broken.failed_at.elapsed() >= broken_cooldown());
+        if expired {
+            self.broken.remove(key);
+            return None;
+        }
+        self.broken.get(key).map(|broken| broken.reason.clone())
+    }
+
+    fn mark_broken(
+        &mut self,
+        key: &str,
+        workspace: &Path,
+        selected: &SelectedServer,
+        reason: String,
+    ) {
+        self.broken.insert(
+            key.to_string(),
+            BrokenClient {
+                workspace: workspace.to_path_buf(),
+                server_id: selected.server.id.clone(),
+                root: selected.root.clone(),
+                reason,
+                failed_at: Instant::now(),
+            },
+        );
+    }
+
+    fn broken_status(&mut self, workspace: &Path, server_id: &str) -> Option<(PathBuf, String)> {
+        let keys = self.broken.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            if self
+                .broken
+                .get(&key)
+                .is_some_and(|broken| broken.failed_at.elapsed() >= broken_cooldown())
+            {
+                self.broken.remove(&key);
+            }
+        }
+        self.broken
+            .values()
+            .find(|broken| broken.workspace == workspace && broken.server_id == server_id)
+            .map(|broken| (broken.root.clone(), broken.reason.clone()))
+    }
+
+    fn remove_workspace_broken(&mut self, workspace: &Path) {
+        let keys = self
+            .broken
+            .iter()
+            .filter_map(|(key, broken)| (broken.workspace == workspace).then(|| key.clone()))
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.broken.remove(&key);
+        }
     }
 }
 
@@ -522,6 +608,7 @@ pub fn shutdown_workspace_clients(workspace: impl AsRef<Path>) -> usize {
             removed += 1;
         }
     }
+    pool.remove_workspace_broken(&workspace);
     removed
 }
 
@@ -581,13 +668,19 @@ fn run_lsp_operation(
 }
 
 fn apply_running_status(status: &mut [LspStatus], workspace: &Path) -> Result<(), String> {
-    let pool = client_pool()
+    let mut pool = client_pool()
         .lock()
         .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
     for server in status {
         if let Some(root) = pool.running_root(workspace, &server.id) {
             server.running = true;
             server.root = path_to_string(&root);
+            continue;
+        }
+        if let Some((root, reason)) = pool.broken_status(workspace, &server.id) {
+            server.available = false;
+            server.root = path_to_string(&root);
+            server.reason = Some(format!("startup failed: {reason}"));
         }
     }
     Ok(())
@@ -1910,6 +2003,15 @@ fn command_name_candidates(command: &str) -> Vec<String> {
         }
     }
     candidates
+}
+
+fn broken_cooldown() -> Duration {
+    Duration::from_millis(
+        env::var("OPENAGENT_LSP_BROKEN_COOLDOWN_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_BROKEN_COOLDOWN_MS),
+    )
 }
 
 fn resolve_path(workspace: &Path, path: &Path) -> PathBuf {
