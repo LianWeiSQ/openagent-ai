@@ -8,6 +8,7 @@ use std::{
 
 use openagent_lsp::{
     LspOperation, LspQuery, command_available, lsp_doctor, lsp_status, query_workspace,
+    shutdown_workspace_clients,
 };
 use serde_json::json;
 
@@ -115,6 +116,77 @@ fn query_uses_stdio_lsp_server_for_symbols_navigation_and_diagnostics() -> Resul
         .ok_or("missing diagnostics")?;
     assert_eq!(diagnostic_payload[0]["message"], "fake diagnostic");
 
+    let _ = shutdown_workspace_clients(&root);
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn query_reuses_pooled_client_and_reports_running_status() -> Result<(), Box<dyn Error>> {
+    if !command_available("python3") {
+        return Ok(());
+    }
+    let root = temp_dir("openagent-lsp-pool")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"fake\"\n")?;
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+    let fake = write_fake_lsp_server(&root)?;
+    let init_log = root.join("init.log");
+    let event_log = root.join("events.log");
+    fs::create_dir_all(root.join(".openagent"))?;
+    fs::write(
+        root.join(".openagent/lsp.json"),
+        serde_json::to_string_pretty(&json!({
+            "servers": {
+                "fake": {
+                    "command": ["python3", fake],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"],
+                    "env": {
+                        "FAKE_LSP_INIT_LOG": init_log.to_string_lossy(),
+                        "FAKE_LSP_EVENT_LOG": event_log.to_string_lossy()
+                    }
+                }
+            }
+        }))?,
+    )?;
+
+    let first = query_workspace(
+        &root,
+        LspQuery {
+            operation: LspOperation::DocumentSymbol,
+            file_path: PathBuf::from("src/main.rs"),
+            line: None,
+            character: None,
+            query: None,
+            timeout_ms: Some(3_000),
+        },
+    )?;
+    assert_eq!(first.server_id, "fake");
+
+    let second = query_workspace(
+        &root,
+        LspQuery {
+            operation: LspOperation::GoToDefinition,
+            file_path: PathBuf::from("src/main.rs"),
+            line: Some(1),
+            character: Some(4),
+            query: None,
+            timeout_ms: Some(3_000),
+        },
+    )?;
+    assert_eq!(second.server_id, "fake");
+
+    let init_count = fs::read_to_string(&init_log)?.lines().count();
+    assert_eq!(init_count, 1, "pooled LSP client should initialize once");
+    let events = fs::read_to_string(&event_log)?;
+    assert!(events.contains("textDocument/didOpen"));
+    assert!(events.contains("textDocument/didChange"));
+    assert!(lsp_status(&root)?.iter().any(|server| server.id == "fake"
+        && server.running
+        && Path::new(&server.root) == root.as_path()));
+
+    assert_eq!(shutdown_workspace_clients(&root), 1);
     let _ = fs::remove_dir_all(root);
     Ok(())
 }
@@ -125,7 +197,15 @@ fn write_fake_lsp_server(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
         &path,
         r#"
 import json
+import os
 import sys
+
+def log_env(name, line):
+    path = os.environ.get(name)
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
 
 def read_message():
     headers = {}
@@ -177,15 +257,19 @@ while True:
     id = message.get("id")
     params = message.get("params") or {}
     uri = ((params.get("textDocument") or {}).get("uri")) or "file:///fake.rs"
+    log_env("FAKE_LSP_EVENT_LOG", method or "")
     if method == "initialize":
+        log_env("FAKE_LSP_INIT_LOG", "initialize")
         result(id, {"capabilities": {"textDocumentSync": {"change": 1}, "diagnosticProvider": {}}})
     elif method in ("initialized", "workspace/didChangeConfiguration", "exit"):
         if method == "exit":
             break
     elif method == "shutdown":
         result(id, None)
-    elif method == "textDocument/didOpen":
+    elif method in ("textDocument/didOpen", "textDocument/didChange"):
         publish(uri)
+    elif method == "workspace/didChangeWatchedFiles":
+        pass
     elif method == "textDocument/documentSymbol":
         result(id, [{
             "name": "main",

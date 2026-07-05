@@ -1,9 +1,9 @@
 //! Language Server Protocol support for OpenAgent.
 //!
 //! This crate intentionally keeps the first Rust implementation small and
-//! explicit: discover configured/built-in LSP servers, run one stdio JSON-RPC
-//! session for a query, and return structured results to tools/CLI/runtime
-//! callers. Long-lived client pools can be layered on top of this API later.
+//! explicit: discover configured/built-in LSP servers, keep reusable stdio
+//! JSON-RPC clients per workspace/root/server, and return structured results to
+//! tools/CLI/runtime callers.
 
 use std::{
     collections::BTreeMap,
@@ -13,7 +13,10 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Mutex, OnceLock,
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -24,6 +27,7 @@ use serde_json::{Map, Value, json};
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const DEFAULT_TIMEOUT_MS: u64 = 8_000;
 pub const DEFAULT_DIAGNOSTIC_WAIT_MS: u64 = 500;
+pub const DEFAULT_TOUCH_TIMEOUT_MS: u64 = 2_000;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -108,6 +112,13 @@ pub struct LspDoctorReport {
     pub servers: Vec<LspStatus>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LspTouchResult {
+    pub server_id: String,
+    pub root: String,
+    pub file_path: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct RawServer {
     command: Option<RawCommand>,
@@ -145,6 +156,25 @@ struct RpcConnection {
     root: PathBuf,
     initialization: Option<Value>,
     diagnostics: BTreeMap<String, Vec<Value>>,
+    documents: BTreeMap<String, OpenDocument>,
+}
+
+#[derive(Clone, Debug)]
+struct OpenDocument {
+    version: u64,
+}
+
+#[derive(Debug, Default)]
+struct LspClientPool {
+    clients: BTreeMap<String, PooledClient>,
+}
+
+#[derive(Debug)]
+struct PooledClient {
+    workspace: PathBuf,
+    server_id: String,
+    root: PathBuf,
+    connection: RpcConnection,
 }
 
 impl Drop for RpcConnection {
@@ -152,6 +182,21 @@ impl Drop for RpcConnection {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+static LSP_CLIENT_POOL: OnceLock<Mutex<LspClientPool>> = OnceLock::new();
+
+fn client_pool() -> &'static Mutex<LspClientPool> {
+    LSP_CLIENT_POOL.get_or_init(|| Mutex::new(LspClientPool::default()))
+}
+
+fn pooled_client_key(workspace: &Path, server_id: &str, root: &Path) -> String {
+    format!(
+        "{}\n{}\n{}",
+        path_to_string(workspace),
+        server_id,
+        path_to_string(root)
+    )
 }
 
 #[must_use]
@@ -190,6 +235,44 @@ pub fn operation_requires_position(operation: &LspOperation) -> bool {
             | LspOperation::IncomingCalls
             | LspOperation::OutgoingCalls
     )
+}
+
+impl LspClientPool {
+    fn client_for(
+        &mut self,
+        workspace: &Path,
+        selected: &SelectedServer,
+        timeout: Duration,
+    ) -> Result<&mut PooledClient, String> {
+        let key = pooled_client_key(workspace, &selected.server.id, &selected.root);
+        if !self.clients.contains_key(&key) {
+            let mut connection = RpcConnection::start(&selected.server, &selected.root)?;
+            connection.initialize(timeout)?;
+            self.clients.insert(
+                key.clone(),
+                PooledClient {
+                    workspace: workspace.to_path_buf(),
+                    server_id: selected.server.id.clone(),
+                    root: selected.root.clone(),
+                    connection,
+                },
+            );
+        }
+        self.clients
+            .get_mut(&key)
+            .ok_or_else(|| format!("failed to cache LSP client '{}'", selected.server.id))
+    }
+
+    fn running_root(&self, workspace: &Path, server_id: &str) -> Option<PathBuf> {
+        self.clients
+            .values()
+            .find(|client| client.workspace == workspace && client.server_id == server_id)
+            .map(|client| client.root.clone())
+    }
+
+    fn remove_key(&mut self, key: &str) -> Option<PooledClient> {
+        self.clients.remove(key)
+    }
 }
 
 pub fn load_workspace_config(workspace: impl AsRef<Path>) -> Result<LspConfig, String> {
@@ -239,13 +322,16 @@ pub fn load_workspace_config(workspace: impl AsRef<Path>) -> Result<LspConfig, S
 pub fn lsp_status(workspace: impl AsRef<Path>) -> Result<Vec<LspStatus>, String> {
     let workspace = normalize_path(workspace.as_ref());
     let config = load_workspace_config(&workspace)?;
-    Ok(status_from_config(&config, &workspace))
+    let mut status = status_from_config(&config, &workspace);
+    apply_running_status(&mut status, &workspace)?;
+    Ok(status)
 }
 
 pub fn lsp_doctor(workspace: impl AsRef<Path>) -> Result<LspDoctorReport, String> {
     let workspace = normalize_path(workspace.as_ref());
     let config = load_workspace_config(&workspace)?;
-    let servers = status_from_config(&config, &workspace);
+    let mut servers = status_from_config(&config, &workspace);
+    apply_running_status(&mut servers, &workspace)?;
     let available_count = servers.iter().filter(|server| server.available).count();
     Ok(LspDoctorReport {
         enabled: config.enabled,
@@ -289,69 +375,203 @@ pub fn query_workspace(
     }
 
     let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-    let mut rpc = RpcConnection::start(&selected.server, &selected.root)?;
-    rpc.initialize(timeout)?;
-    rpc.open_document(&file_path, timeout)?;
-
-    let result = match request.operation {
-        LspOperation::Status => json!(status_from_config(&config, &workspace)),
-        LspOperation::Diagnostics => {
-            rpc.collect_diagnostics(&file_path, timeout);
-            json!(rpc.diagnostics)
-        }
-        LspOperation::GoToDefinition => {
-            rpc.position_request("textDocument/definition", &file_path, &request, timeout)?
-        }
-        LspOperation::FindReferences => rpc.position_request_with_extra(
-            "textDocument/references",
-            &file_path,
-            &request,
-            json!({"context": {"includeDeclaration": true}}),
-            timeout,
-        )?,
-        LspOperation::Hover => {
-            rpc.position_request("textDocument/hover", &file_path, &request, timeout)?
-        }
-        LspOperation::DocumentSymbol => rpc.request(
-            "textDocument/documentSymbol",
-            json!({"textDocument": {"uri": file_uri(&file_path)}}),
-            timeout,
-        )?,
-        LspOperation::WorkspaceSymbol => rpc.request(
-            "workspace/symbol",
-            json!({"query": request.query.unwrap_or_default()}),
-            timeout,
-        )?,
-        LspOperation::GoToImplementation => {
-            rpc.position_request("textDocument/implementation", &file_path, &request, timeout)?
-        }
-        LspOperation::PrepareCallHierarchy => rpc.position_request(
-            "textDocument/prepareCallHierarchy",
+    let operation = request.operation.clone();
+    let client_key = pooled_client_key(&workspace, &selected.server.id, &selected.root);
+    let response = {
+        let mut pool = client_pool()
+            .lock()
+            .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
+        let client = pool.client_for(&workspace, &selected, timeout)?;
+        client.connection.open_document(&file_path, timeout)?;
+        let result = run_lsp_operation(
+            &mut client.connection,
+            &config,
+            &workspace,
             &file_path,
             &request,
             timeout,
-        )?,
-        LspOperation::IncomingCalls => {
-            rpc.call_hierarchy("callHierarchy/incomingCalls", &file_path, &request, timeout)?
-        }
-        LspOperation::OutgoingCalls => {
-            rpc.call_hierarchy("callHierarchy/outgoingCalls", &file_path, &request, timeout)?
+        )?;
+        client.connection.collect_for(Duration::from_millis(
+            DEFAULT_DIAGNOSTIC_WAIT_MS.min(timeout.as_millis() as u64),
+        ));
+        Ok::<_, String>((
+            client.server_id.clone(),
+            path_to_string(&client.root),
+            result,
+            client.connection.diagnostics.clone(),
+        ))
+    };
+    let (server_id, root, result, diagnostics) = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = shutdown_pooled_client_by_key(&client_key);
+            return Err(error);
         }
     };
-    rpc.collect_for(Duration::from_millis(
-        DEFAULT_DIAGNOSTIC_WAIT_MS.min(timeout.as_millis() as u64),
-    ));
-    let diagnostics = rpc.diagnostics.clone();
-    let _ = rpc.shutdown(Duration::from_millis(500));
 
     Ok(LspQueryResult {
-        operation: request.operation,
-        server_id: selected.server.id,
-        root: path_to_string(&selected.root),
+        operation,
+        server_id,
+        root,
         file_path: path_to_string(&file_path),
         result,
         diagnostics,
     })
+}
+
+pub fn touch_workspace_file(
+    workspace: impl AsRef<Path>,
+    file_path: impl AsRef<Path>,
+) -> Result<LspTouchResult, String> {
+    let workspace = normalize_path(workspace.as_ref());
+    let file_path = resolve_path(&workspace, file_path.as_ref());
+    if !file_path.exists() {
+        return Err(format!("File not found: {}", file_path.display()));
+    }
+    if file_path.is_dir() {
+        return Err(format!("Path is a directory: {}", file_path.display()));
+    }
+    let config = load_workspace_config(&workspace)?;
+    if !config.enabled {
+        return Err("LSP is disabled by configuration".to_string());
+    }
+    let selected = select_server(&config, &workspace, &file_path)?;
+    if !command_available(
+        selected
+            .server
+            .command
+            .first()
+            .map(String::as_str)
+            .unwrap_or(""),
+    ) {
+        return Err(format!(
+            "LSP server '{}' is not available: {}",
+            selected.server.id,
+            selected.server.command.join(" ")
+        ));
+    }
+
+    let timeout = Duration::from_millis(DEFAULT_TOUCH_TIMEOUT_MS);
+    let client_key = pooled_client_key(&workspace, &selected.server.id, &selected.root);
+    let response = {
+        let mut pool = client_pool()
+            .lock()
+            .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
+        let client = pool.client_for(&workspace, &selected, timeout)?;
+        client.connection.open_document(&file_path, timeout)?;
+        client.connection.collect_for(Duration::from_millis(50));
+        Ok::<_, String>(LspTouchResult {
+            server_id: client.server_id.clone(),
+            root: path_to_string(&client.root),
+            file_path: path_to_string(&file_path),
+        })
+    };
+    match response {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let _ = shutdown_pooled_client_by_key(&client_key);
+            Err(error)
+        }
+    }
+}
+
+pub fn shutdown_workspace_clients(workspace: impl AsRef<Path>) -> usize {
+    let workspace = normalize_path(workspace.as_ref());
+    let Ok(mut pool) = client_pool().lock() else {
+        return 0;
+    };
+    let keys = pool
+        .clients
+        .iter()
+        .filter_map(|(key, client)| (client.workspace == workspace).then(|| key.clone()))
+        .collect::<Vec<_>>();
+    let mut removed = 0usize;
+    for key in keys {
+        if let Some(mut client) = pool.remove_key(&key) {
+            let _ = client.connection.shutdown(Duration::from_millis(500));
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn run_lsp_operation(
+    rpc: &mut RpcConnection,
+    config: &LspConfig,
+    workspace: &Path,
+    file_path: &Path,
+    request: &LspQuery,
+    timeout: Duration,
+) -> Result<Value, String> {
+    match request.operation {
+        LspOperation::Status => Ok(json!(status_from_config(config, workspace))),
+        LspOperation::Diagnostics => {
+            rpc.collect_diagnostics(file_path, timeout);
+            Ok(json!(rpc.diagnostics))
+        }
+        LspOperation::GoToDefinition => {
+            rpc.position_request("textDocument/definition", file_path, request, timeout)
+        }
+        LspOperation::FindReferences => rpc.position_request_with_extra(
+            "textDocument/references",
+            file_path,
+            request,
+            json!({"context": {"includeDeclaration": true}}),
+            timeout,
+        ),
+        LspOperation::Hover => {
+            rpc.position_request("textDocument/hover", file_path, request, timeout)
+        }
+        LspOperation::DocumentSymbol => rpc.request(
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": file_uri(file_path)}}),
+            timeout,
+        ),
+        LspOperation::WorkspaceSymbol => rpc.request(
+            "workspace/symbol",
+            json!({"query": request.query.clone().unwrap_or_default()}),
+            timeout,
+        ),
+        LspOperation::GoToImplementation => {
+            rpc.position_request("textDocument/implementation", file_path, request, timeout)
+        }
+        LspOperation::PrepareCallHierarchy => rpc.position_request(
+            "textDocument/prepareCallHierarchy",
+            file_path,
+            request,
+            timeout,
+        ),
+        LspOperation::IncomingCalls => {
+            rpc.call_hierarchy("callHierarchy/incomingCalls", file_path, request, timeout)
+        }
+        LspOperation::OutgoingCalls => {
+            rpc.call_hierarchy("callHierarchy/outgoingCalls", file_path, request, timeout)
+        }
+    }
+}
+
+fn apply_running_status(status: &mut [LspStatus], workspace: &Path) -> Result<(), String> {
+    let pool = client_pool()
+        .lock()
+        .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
+    for server in status {
+        if let Some(root) = pool.running_root(workspace, &server.id) {
+            server.running = true;
+            server.root = path_to_string(&root);
+        }
+    }
+    Ok(())
+}
+
+fn shutdown_pooled_client_by_key(key: &str) -> bool {
+    let Ok(mut pool) = client_pool().lock() else {
+        return false;
+    };
+    let Some(mut client) = pool.remove_key(key) else {
+        return false;
+    };
+    let _ = client.connection.shutdown(Duration::from_millis(500));
+    true
 }
 
 fn merge_lsp_value(config: &mut LspConfig, value: &Value) -> Result<(), String> {
@@ -682,6 +902,7 @@ impl RpcConnection {
             root: root.to_path_buf(),
             initialization: server.initialization.clone(),
             diagnostics: BTreeMap::new(),
+            documents: BTreeMap::new(),
         })
     }
 
@@ -735,6 +956,49 @@ impl RpcConnection {
     fn open_document(&mut self, file_path: &Path, timeout: Duration) -> Result<(), String> {
         let text = fs::read_to_string(file_path)
             .map_err(|error| format!("failed to read {}: {error}", file_path.display()))?;
+        let path_key = path_to_string(file_path);
+        if let Some(document) = self.documents.get(&path_key).cloned() {
+            let next_version = document.version.saturating_add(1);
+            self.notify(
+                "workspace/didChangeWatchedFiles",
+                json!({
+                    "changes": [{
+                        "uri": file_uri(file_path),
+                        "type": 2
+                    }]
+                }),
+            )?;
+            self.notify(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {
+                        "uri": file_uri(file_path),
+                        "version": next_version,
+                    },
+                    "contentChanges": [{
+                        "text": text,
+                    }]
+                }),
+            )?;
+            self.documents.insert(
+                path_key,
+                OpenDocument {
+                    version: next_version,
+                },
+            );
+            self.collect_for(Duration::from_millis(100).min(timeout));
+            return Ok(());
+        }
+        self.notify(
+            "workspace/didChangeWatchedFiles",
+            json!({
+                "changes": [{
+                    "uri": file_uri(file_path),
+                    "type": 1
+                }]
+            }),
+        )?;
+        self.diagnostics.remove(&path_key);
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -746,6 +1010,7 @@ impl RpcConnection {
                 }
             }),
         )?;
+        self.documents.insert(path_key, OpenDocument { version: 0 });
         self.collect_for(Duration::from_millis(100).min(timeout));
         Ok(())
     }

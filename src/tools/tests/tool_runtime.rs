@@ -6,11 +6,11 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use openagent_core::PermissionManager;
-use openagent_lsp::command_available;
+use openagent_lsp::{command_available, lsp_status, shutdown_workspace_clients};
 use openagent_protocol::{PermissionAction, PermissionRuleset, ToolCall, ToolResult, Usage};
 use openagent_tools::{
     LocalWorkspaceRuntime, SessionRunnerFacade, TaskSubagentDescriptor, TodoItem, ToolContext,
@@ -698,6 +698,7 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
 
     let toolkit = Toolkit::with_builtins();
     let mut ctx = ToolContext::new(&root).with_session_id("session-lsp");
+    let runtime_root = ctx.session_root.clone();
     let status = toolkit.execute(
         "lsp",
         json!({"operation": "status"}),
@@ -720,6 +721,14 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
     assert!(symbols.error.is_none(), "{symbols:?}");
     assert_eq!(symbols.metadata["server_id"], json!("fake"));
     assert!(symbols.output.contains("\"name\": \"main\""));
+    assert!(
+        lsp_status(&runtime_root)?
+            .iter()
+            .any(|server| server.id == "fake"
+                && server.running
+                && Path::new(&server.root) == runtime_root.as_path())
+    );
+    assert_eq!(shutdown_workspace_clients(&runtime_root), 1);
 
     let read = toolkit.execute(
         "read",
@@ -728,6 +737,7 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
         &mut ctx,
     );
     assert!(read.error.is_none(), "{read:?}");
+    wait_for_lsp_running(&runtime_root, "fake")?;
     let write = toolkit.execute(
         "write",
         json!({"file_path": "src/main.rs", "content": "fn main() { broken(); }\n"}),
@@ -769,8 +779,22 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
             .contains("Path escapes session root")
     );
 
+    let _ = shutdown_workspace_clients(&runtime_root);
     fs::remove_dir_all(root)?;
     Ok(())
+}
+
+fn wait_for_lsp_running(root: &Path, server_id: &str) -> Result<(), Box<dyn Error>> {
+    for _ in 0..30 {
+        if lsp_status(root)?
+            .iter()
+            .any(|server| server.id == server_id && server.running)
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("LSP server '{server_id}' did not start after read warm-up").into())
 }
 
 #[test]

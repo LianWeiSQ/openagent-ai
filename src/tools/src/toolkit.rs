@@ -8,6 +8,7 @@ use std::{
     io::{self, Read},
     path::{Component, Path, PathBuf},
     process::Command,
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -18,6 +19,7 @@ use openagent_core::{
 };
 use openagent_lsp::{
     LspOperation, LspQuery, lsp_doctor, lsp_status, operation_from_str, query_workspace,
+    touch_workspace_file,
 };
 use openagent_protocol::{
     ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolConcurrency,
@@ -2811,12 +2813,21 @@ fn read_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput>
     let text = read_text_checked(&target)?;
     let formatted = format_read_output_from_text(&text, offset, limit);
     ctx.remember_read(&target);
+    warm_lsp_after_read(&root, &target);
     let mut output = ToolOutput::new(display_path(&root, &target), formatted.output);
     output
         .metadata
         .insert("preview".to_string(), json!(formatted.preview));
     output.truncated = formatted.truncated;
     Ok(output)
+}
+
+fn warm_lsp_after_read(root: &Path, target: &Path) {
+    let root = root.to_path_buf();
+    let target = target.to_path_buf();
+    thread::spawn(move || {
+        let _ = touch_workspace_file(root, target);
+    });
 }
 
 fn write_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput> {
