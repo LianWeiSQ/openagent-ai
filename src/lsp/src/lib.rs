@@ -47,6 +47,7 @@ pub struct LspServerConfig {
     pub command: Vec<String>,
     pub extensions: Vec<String>,
     pub root_markers: Vec<String>,
+    pub exclude_root_markers: Vec<String>,
     pub strict_root: bool,
     pub env: BTreeMap<String, String>,
     pub initialization: Option<Value>,
@@ -126,6 +127,9 @@ struct RawServer {
     root_markers: Option<Vec<String>>,
     #[serde(alias = "rootMarkers")]
     root_markers_camel: Option<Vec<String>>,
+    exclude_root_markers: Option<Vec<String>>,
+    #[serde(alias = "excludeRootMarkers")]
+    exclude_root_markers_camel: Option<Vec<String>>,
     strict_root: Option<bool>,
     #[serde(alias = "strictRoot")]
     strict_root_camel: Option<bool>,
@@ -198,6 +202,13 @@ impl Drop for RpcConnection {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl LspServerConfig {
+    fn excluding(mut self, markers: &[&str]) -> Self {
+        self.exclude_root_markers = markers.iter().map(|item| (*item).to_string()).collect();
+        self
     }
 }
 
@@ -376,13 +387,14 @@ pub fn query_workspace(
         return Err("LSP is disabled by configuration".to_string());
     }
     let selected = select_server(&config, &workspace, &file_path)?;
-    if !command_available(
+    if !command_available_for_root(
         selected
             .server
             .command
             .first()
             .map(String::as_str)
             .unwrap_or(""),
+        &selected.root,
     ) {
         return Err(format!(
             "LSP server '{}' is not available: {}",
@@ -453,13 +465,14 @@ pub fn touch_workspace_file(
         return Err("LSP is disabled by configuration".to_string());
     }
     let selected = select_server(&config, &workspace, &file_path)?;
-    if !command_available(
+    if !command_available_for_root(
         selected
             .server
             .command
             .first()
             .map(String::as_str)
             .unwrap_or(""),
+        &selected.root,
     ) {
         return Err(format!(
             "LSP server '{}' is not available: {}",
@@ -638,6 +651,7 @@ fn merge_server_map(
             command: Vec::new(),
             extensions: Vec::new(),
             root_markers: Vec::new(),
+            exclude_root_markers: Vec::new(),
             strict_root: false,
             env: BTreeMap::new(),
             initialization: None,
@@ -654,6 +668,11 @@ fn merge_server_map(
         }
         if let Some(root_markers) = raw.root_markers.or(raw.root_markers_camel) {
             server.root_markers = root_markers;
+        }
+        if let Some(exclude_root_markers) =
+            raw.exclude_root_markers.or(raw.exclude_root_markers_camel)
+        {
+            server.exclude_root_markers = exclude_root_markers;
         }
         if let Some(strict_root) = raw.strict_root.or(raw.strict_root_camel) {
             server.strict_root = strict_root;
@@ -721,7 +740,7 @@ fn status_from_config(config: &LspConfig, workspace: &Path) -> Vec<LspStatus> {
         .values()
         .map(|server| {
             let program = server.command.first().map(String::as_str).unwrap_or("");
-            let available = command_available(program);
+            let available = command_available_for_root(program, workspace);
             LspStatus {
                 id: server.id.clone(),
                 name: server.id.clone(),
@@ -743,37 +762,85 @@ fn select_server(
     workspace: &Path,
     file_path: &Path,
 ) -> Result<SelectedServer, String> {
-    let extension = file_path
-        .extension()
-        .and_then(OsStr::to_str)
-        .map(|ext| format!(".{ext}"))
-        .unwrap_or_default();
+    let selectors = file_selectors(file_path);
+    let mut selected: Option<(u32, usize, String, SelectedServer)> = None;
     for server in config.servers.values() {
-        if !server.extensions.is_empty() && !server.extensions.iter().any(|ext| ext == &extension) {
+        if !server.extensions.is_empty()
+            && !server
+                .extensions
+                .iter()
+                .any(|ext| selectors.iter().any(|selector| selector == ext))
+        {
             continue;
         }
         let Some(root) = nearest_root(file_path, workspace, server) else {
             continue;
         };
-        return Ok(SelectedServer {
+        let priority = server_priority(server);
+        let depth = root.components().count();
+        let candidate = SelectedServer {
             server: server.clone(),
             root,
-        });
+        };
+        let replace = selected
+            .as_ref()
+            .is_none_or(|(best_priority, best_depth, best_id, _)| {
+                priority < *best_priority
+                    || (priority == *best_priority
+                        && (depth > *best_depth || (depth == *best_depth && server.id < *best_id)))
+            });
+        if replace {
+            selected = Some((priority, depth, server.id.clone(), candidate));
+        }
     }
-    Err(format!(
-        "No LSP server configured for {}",
-        file_path.display()
-    ))
+    selected
+        .map(|(_, _, _, selected)| selected)
+        .ok_or_else(|| format!("No LSP server configured for {}", file_path.display()))
+}
+
+fn file_selectors(file_path: &Path) -> Vec<String> {
+    let mut selectors = Vec::new();
+    if let Some(ext) = file_path.extension().and_then(OsStr::to_str) {
+        selectors.push(format!(".{ext}"));
+    }
+    if let Some(name) = file_path.file_name().and_then(OsStr::to_str) {
+        selectors.push(name.to_string());
+    }
+    selectors
+}
+
+fn server_priority(server: &LspServerConfig) -> u32 {
+    if server.source == "config" {
+        return 0;
+    }
+    match server.id.as_str() {
+        "deno" => 0,
+        "rust-analyzer" | "typescript" | "vue" | "pyright" | "gopls" | "clangd" | "ruby-lsp"
+        | "elixir-ls" | "zls" | "yaml-ls" | "lua-ls" | "prisma" | "dart" | "ocaml-lsp" | "bash"
+        | "terraform" | "dockerfile" => 10,
+        "pylsp" | "ty" => 20,
+        "biome" | "oxlint" => 50,
+        _ => 100,
+    }
 }
 
 fn nearest_root(file_path: &Path, workspace: &Path, server: &LspServerConfig) -> Option<PathBuf> {
+    if !server.exclude_root_markers.is_empty()
+        && nearest_marker(file_path, workspace, &server.exclude_root_markers).is_some()
+    {
+        return None;
+    }
+    nearest_marker(file_path, workspace, &server.root_markers)
+        .or_else(|| (!server.strict_root).then(|| workspace.to_path_buf()))
+}
+
+fn nearest_marker(file_path: &Path, workspace: &Path, markers: &[String]) -> Option<PathBuf> {
+    if markers.is_empty() {
+        return None;
+    }
     let mut current = file_path.parent().unwrap_or(workspace).to_path_buf();
     loop {
-        if server
-            .root_markers
-            .iter()
-            .any(|marker| current.join(marker).exists())
-        {
+        if markers.iter().any(|marker| current.join(marker).exists()) {
             return Some(current);
         }
         if current == workspace {
@@ -783,7 +850,7 @@ fn nearest_root(file_path: &Path, workspace: &Path, server: &LspServerConfig) ->
             break;
         }
     }
-    (!server.strict_root).then(|| workspace.to_path_buf())
+    None
 }
 
 fn builtin_servers() -> BTreeMap<String, LspServerConfig> {
@@ -800,6 +867,57 @@ fn builtin_servers() -> BTreeMap<String, LspServerConfig> {
             &["typescript-language-server", "--stdio"],
             &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"],
             &[
+                "package-lock.json",
+                "bun.lockb",
+                "bun.lock",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "package.json",
+            ],
+            false,
+        )
+        .excluding(&["deno.json", "deno.jsonc"]),
+        builtin_server(
+            "vue",
+            &["vue-language-server", "--stdio"],
+            &[".vue"],
+            &[
+                "package-lock.json",
+                "bun.lockb",
+                "bun.lock",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "package.json",
+            ],
+            false,
+        ),
+        builtin_server(
+            "biome",
+            &["biome", "lsp-proxy", "--stdio"],
+            &[
+                ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".json", ".jsonc",
+                ".vue", ".astro", ".svelte", ".css", ".graphql", ".gql", ".html",
+            ],
+            &[
+                "biome.json",
+                "biome.jsonc",
+                "package-lock.json",
+                "bun.lockb",
+                "bun.lock",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+            ],
+            false,
+        ),
+        builtin_server(
+            "oxlint",
+            &["oxlint", "--lsp"],
+            &[
+                ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".astro",
+                ".svelte",
+            ],
+            &[
+                ".oxlintrc.json",
                 "package-lock.json",
                 "bun.lockb",
                 "bun.lock",
@@ -830,12 +948,115 @@ fn builtin_servers() -> BTreeMap<String, LspServerConfig> {
             &["pyproject.toml", "setup.py", "requirements.txt"],
             false,
         ),
+        builtin_server(
+            "ty",
+            &["ty", "server"],
+            &[".py", ".pyi"],
+            &[
+                "pyproject.toml",
+                "ty.toml",
+                "setup.py",
+                "setup.cfg",
+                "requirements.txt",
+                "Pipfile",
+                "pyrightconfig.json",
+            ],
+            false,
+        ),
         builtin_server("gopls", &["gopls"], &[".go"], &["go.mod", "go.work"], false),
+        builtin_server(
+            "ruby-lsp",
+            &["ruby-lsp"],
+            &[".rb"],
+            &["Gemfile", ".ruby-version"],
+            false,
+        ),
         builtin_server(
             "clangd",
             &["clangd", "--background-index"],
-            &[".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh"],
-            &["compile_commands.json", ".clangd"],
+            &[
+                ".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hpp", ".hh", ".hxx", ".h++",
+            ],
+            &["compile_commands.json", "compile_flags.txt", ".clangd"],
+            false,
+        ),
+        builtin_server(
+            "elixir-ls",
+            &["elixir-ls"],
+            &[".ex", ".exs"],
+            &["mix.exs", "mix.lock"],
+            false,
+        ),
+        builtin_server("zls", &["zls"], &[".zig", ".zon"], &["build.zig"], false),
+        builtin_server(
+            "yaml-ls",
+            &["yaml-language-server", "--stdio"],
+            &[".yaml", ".yml"],
+            &[
+                "package-lock.json",
+                "bun.lockb",
+                "bun.lock",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+            ],
+            false,
+        ),
+        builtin_server(
+            "lua-ls",
+            &["lua-language-server"],
+            &[".lua"],
+            &[
+                ".luarc.json",
+                ".luarc.jsonc",
+                ".luacheckrc",
+                ".stylua.toml",
+                "stylua.toml",
+                "selene.toml",
+                "selene.yml",
+            ],
+            false,
+        ),
+        builtin_server(
+            "prisma",
+            &["prisma", "language-server"],
+            &[".prisma"],
+            &["schema.prisma", "prisma/schema.prisma", "prisma"],
+            false,
+        )
+        .excluding(&["package.json"]),
+        builtin_server(
+            "dart",
+            &["dart", "language-server", "--lsp"],
+            &[".dart"],
+            &["pubspec.yaml", "analysis_options.yaml"],
+            false,
+        ),
+        builtin_server(
+            "ocaml-lsp",
+            &["ocamllsp"],
+            &[".ml", ".mli"],
+            &["dune-project", "dune-workspace", ".merlin", "opam"],
+            false,
+        ),
+        builtin_server(
+            "bash",
+            &["bash-language-server", "start"],
+            &[".sh", ".bash", ".zsh", ".ksh"],
+            &[],
+            false,
+        ),
+        builtin_server(
+            "terraform",
+            &["terraform-ls", "serve"],
+            &[".tf", ".tfvars"],
+            &[".terraform.lock.hcl", "terraform.tfstate"],
+            false,
+        ),
+        builtin_server(
+            "dockerfile",
+            &["docker-langserver", "--stdio"],
+            &[".dockerfile", "Dockerfile"],
+            &[],
             false,
         ),
     ]
@@ -859,6 +1080,7 @@ fn builtin_server(
             .iter()
             .map(|item| (*item).to_string())
             .collect(),
+        exclude_root_markers: Vec::new(),
         strict_root,
         env: BTreeMap::new(),
         initialization: None,
@@ -881,7 +1103,9 @@ impl RpcConnection {
             .command
             .first()
             .ok_or_else(|| format!("LSP server '{}' has no command", server.id))?;
-        let mut command = Command::new(program);
+        let program_path =
+            resolve_command_for_root(program, root).unwrap_or_else(|| PathBuf::from(program));
+        let mut command = Command::new(program_path);
         command
             .args(server.command.iter().skip(1))
             .current_dir(root)
@@ -1629,6 +1853,65 @@ pub fn command_available(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn command_available_for_root(command: &str, root: &Path) -> bool {
+    resolve_command_for_root(command, root).is_some()
+}
+
+fn resolve_command_for_root(command: &str, root: &Path) -> Option<PathBuf> {
+    if command.trim().is_empty() {
+        return None;
+    }
+    let path = Path::new(command);
+    if path.components().count() > 1 || path.is_absolute() {
+        return path.exists().then(|| path.to_path_buf());
+    }
+    local_bin_command(command, root).or_else(|| path_command(command))
+}
+
+fn local_bin_command(command: &str, root: &Path) -> Option<PathBuf> {
+    let mut current = normalize_path(root);
+    loop {
+        let bin = current.join("node_modules").join(".bin");
+        for candidate in command_name_candidates(command) {
+            let path = bin.join(candidate);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn path_command(command: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .flat_map(|path| {
+                command_name_candidates(command)
+                    .into_iter()
+                    .map(move |name| path.join(name))
+            })
+            .find(|path| path.exists())
+    })
+}
+
+fn command_name_candidates(command: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    candidates.push(command.to_string());
+    #[cfg(windows)]
+    {
+        if !command.ends_with(".cmd") {
+            candidates.push(format!("{command}.cmd"));
+        }
+        if !command.ends_with(".exe") {
+            candidates.push(format!("{command}.exe"));
+        }
+    }
+    candidates
+}
+
 fn resolve_path(workspace: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         normalize_path(path)
@@ -1698,6 +1981,97 @@ mod tests {
         assert!(config.enabled);
         assert!(config.servers.contains_key("rust-analyzer"));
         assert!(config.servers.contains_key("typescript"));
+        assert!(config.servers.contains_key("vue"));
+        assert!(config.servers.contains_key("biome"));
+        assert!(config.servers.contains_key("yaml-ls"));
+        assert_eq!(
+            config.servers["typescript"].exclude_root_markers,
+            vec!["deno.json", "deno.jsonc"]
+        );
+        let _ = fs::remove_dir_all(temp);
+        Ok(())
+    }
+
+    #[test]
+    fn config_parses_exclude_root_markers() -> Result<(), String> {
+        let mut config = LspConfig {
+            enabled: true,
+            servers: BTreeMap::new(),
+            config_path: None,
+        };
+        merge_lsp_value(
+            &mut config,
+            &json!({
+                "servers": {
+                    "fake": {
+                        "command": ["fake-lsp"],
+                        "extensions": [".ts"],
+                        "rootMarkers": ["package.json"],
+                        "excludeRootMarkers": ["deno.json"]
+                    }
+                }
+            }),
+        )?;
+        let fake = config.servers.get("fake").ok_or("missing fake server")?;
+        assert_eq!(fake.root_markers, vec!["package.json"]);
+        assert_eq!(fake.exclude_root_markers, vec!["deno.json"]);
+        Ok(())
+    }
+
+    #[test]
+    fn deno_root_marker_excludes_typescript_server() -> Result<(), String> {
+        let temp = unique_temp_dir("openagent-lsp-deno-root")?;
+        fs::write(temp.join("package.json"), "{}").map_err(|error| error.to_string())?;
+        fs::write(temp.join("deno.json"), "{}").map_err(|error| error.to_string())?;
+        fs::create_dir_all(temp.join("src")).map_err(|error| error.to_string())?;
+        fs::write(temp.join("src/main.ts"), "export const value = 1;\n")
+            .map_err(|error| error.to_string())?;
+
+        let config = load_workspace_config(&temp)?;
+        let selected = select_server(&config, &temp, &temp.join("src/main.ts"))?;
+        assert_eq!(selected.server.id, "deno");
+        assert_eq!(selected.root, temp);
+        let _ = fs::remove_dir_all(selected.root);
+        Ok(())
+    }
+
+    #[test]
+    fn status_detects_workspace_local_node_bin() -> Result<(), String> {
+        let temp = unique_temp_dir("openagent-lsp-local-bin")?;
+        fs::create_dir_all(temp.join("node_modules/.bin")).map_err(|error| error.to_string())?;
+        fs::write(temp.join("node_modules/.bin/fake-lsp"), "#!/bin/sh\n")
+            .map_err(|error| error.to_string())?;
+        fs::create_dir_all(temp.join(".openagent")).map_err(|error| error.to_string())?;
+        fs::write(
+            temp.join(".openagent/lsp.json"),
+            serde_json::to_string_pretty(&json!({
+                "servers": {
+                    "fake": {
+                        "command": ["fake-lsp"],
+                        "extensions": [".txt"]
+                    }
+                }
+            }))
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let status = lsp_status(&temp)?;
+        let fake = status
+            .iter()
+            .find(|server| server.id == "fake")
+            .ok_or("missing fake status")?;
+        assert!(fake.available);
+        let _ = fs::remove_dir_all(temp);
+        Ok(())
+    }
+
+    #[test]
+    fn dockerfile_builtin_matches_file_name_without_extension() -> Result<(), String> {
+        let temp = unique_temp_dir("openagent-lsp-dockerfile")?;
+        fs::write(temp.join("Dockerfile"), "FROM scratch\n").map_err(|error| error.to_string())?;
+        let config = load_workspace_config(&temp)?;
+        let selected = select_server(&config, &temp, &temp.join("Dockerfile"))?;
+        assert_eq!(selected.server.id, "dockerfile");
         let _ = fs::remove_dir_all(temp);
         Ok(())
     }
