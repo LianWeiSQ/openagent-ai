@@ -1173,11 +1173,40 @@ fn server_priority(server: &LspServerConfig) -> u32 {
     }
     match server.id.as_str() {
         "deno" => 0,
-        "rust-analyzer" | "typescript" | "vue" | "pyright" | "gopls" | "clangd" | "ruby-lsp"
-        | "elixir-ls" | "zls" | "yaml-ls" | "lua-ls" | "prisma" | "dart" | "ocaml-lsp" | "bash"
-        | "terraform" | "dockerfile" => 10,
+        "rust-analyzer"
+        | "typescript"
+        | "vue"
+        | "pyright"
+        | "gopls"
+        | "clangd"
+        | "ruby-lsp"
+        | "elixir-ls"
+        | "zls"
+        | "csharp"
+        | "fsharp"
+        | "sourcekit-lsp"
+        | "svelte"
+        | "astro"
+        | "jdtls"
+        | "kotlin-ls"
+        | "yaml-ls"
+        | "lua-ls"
+        | "php-intelephense"
+        | "prisma"
+        | "dart"
+        | "ocaml-lsp"
+        | "bash"
+        | "terraform"
+        | "texlab"
+        | "gleam"
+        | "clojure-lsp"
+        | "nixd"
+        | "tinymist"
+        | "haskell-language-server"
+        | "julials"
+        | "dockerfile" => 10,
         "pylsp" | "ty" => 20,
-        "biome" | "oxlint" => 50,
+        "eslint" | "biome" | "oxlint" => 50,
         _ => 100,
     }
 }
@@ -1239,6 +1268,50 @@ fn builtin_servers() -> BTreeMap<String, LspServerConfig> {
             "vue",
             &["vue-language-server", "--stdio"],
             &[".vue"],
+            &[
+                "package-lock.json",
+                "bun.lockb",
+                "bun.lock",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "package.json",
+            ],
+            false,
+        ),
+        builtin_server(
+            "svelte",
+            &["svelteserver", "--stdio"],
+            &[".svelte"],
+            &[
+                "package-lock.json",
+                "bun.lockb",
+                "bun.lock",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "package.json",
+            ],
+            false,
+        ),
+        builtin_server(
+            "astro",
+            &["astro-ls", "--stdio"],
+            &[".astro"],
+            &[
+                "package-lock.json",
+                "bun.lockb",
+                "bun.lock",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "package.json",
+            ],
+            false,
+        ),
+        builtin_server(
+            "eslint",
+            &["vscode-eslint-language-server", "--stdio"],
+            &[
+                ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue",
+            ],
             &[
                 "package-lock.json",
                 "bun.lockb",
@@ -1339,10 +1412,61 @@ fn builtin_servers() -> BTreeMap<String, LspServerConfig> {
             false,
         ),
         builtin_server(
+            "csharp",
+            &["roslyn-language-server", "--stdio", "--autoLoadProjects"],
+            &[".cs", ".csx"],
+            &[".slnx", ".sln", ".csproj", "global.json"],
+            false,
+        ),
+        builtin_server(
+            "fsharp",
+            &["fsautocomplete"],
+            &[".fs", ".fsi", ".fsx", ".fsscript"],
+            &[".slnx", ".sln", ".fsproj", "global.json"],
+            false,
+        ),
+        builtin_server(
+            "sourcekit-lsp",
+            &["sourcekit-lsp"],
+            &[".swift", ".objc", ".objcpp"],
+            &["Package.swift"],
+            false,
+        ),
+        builtin_server(
             "elixir-ls",
             &["elixir-ls"],
             &[".ex", ".exs"],
             &["mix.exs", "mix.lock"],
+            false,
+        ),
+        builtin_server(
+            "jdtls",
+            &["jdtls"],
+            &[".java"],
+            &[
+                "settings.gradle",
+                "settings.gradle.kts",
+                "gradlew",
+                "gradlew.bat",
+                "build.gradle",
+                "build.gradle.kts",
+                "pom.xml",
+            ],
+            false,
+        ),
+        builtin_server(
+            "kotlin-ls",
+            &["kotlin-lsp", "--stdio"],
+            &[".kt", ".kts"],
+            &[
+                "settings.gradle.kts",
+                "settings.gradle",
+                "gradlew",
+                "gradlew.bat",
+                "build.gradle.kts",
+                "build.gradle",
+                "pom.xml",
+            ],
             false,
         ),
         builtin_server("zls", &["zls"], &[".zig", ".zon"], &["build.zig"], false),
@@ -1383,6 +1507,13 @@ fn builtin_servers() -> BTreeMap<String, LspServerConfig> {
         )
         .excluding(&["package.json"]),
         builtin_server(
+            "php-intelephense",
+            &["intelephense", "--stdio"],
+            &[".php"],
+            &["composer.json", "composer.lock", ".php-version"],
+            false,
+        ),
+        builtin_server(
             "dart",
             &["dart", "language-server", "--lsp"],
             &[".dart"],
@@ -1408,6 +1539,61 @@ fn builtin_servers() -> BTreeMap<String, LspServerConfig> {
             &["terraform-ls", "serve"],
             &[".tf", ".tfvars"],
             &[".terraform.lock.hcl", "terraform.tfstate"],
+            false,
+        ),
+        builtin_server(
+            "texlab",
+            &["texlab"],
+            &[".tex", ".bib"],
+            &[".latexmkrc", "latexmkrc", ".texlabroot", "texlabroot"],
+            false,
+        ),
+        builtin_server(
+            "gleam",
+            &["gleam", "lsp"],
+            &[".gleam"],
+            &["gleam.toml"],
+            false,
+        ),
+        builtin_server(
+            "clojure-lsp",
+            &["clojure-lsp", "listen"],
+            &[".clj", ".cljs", ".cljc", ".edn"],
+            &[
+                "deps.edn",
+                "project.clj",
+                "shadow-cljs.edn",
+                "bb.edn",
+                "build.boot",
+            ],
+            false,
+        ),
+        builtin_server("nixd", &["nixd"], &[".nix"], &["flake.nix"], false),
+        builtin_server(
+            "tinymist",
+            &["tinymist"],
+            &[".typ", ".typc"],
+            &["typst.toml"],
+            false,
+        ),
+        builtin_server(
+            "haskell-language-server",
+            &["haskell-language-server-wrapper", "--lsp"],
+            &[".hs", ".lhs"],
+            &["stack.yaml", "cabal.project", "hie.yaml"],
+            false,
+        ),
+        builtin_server(
+            "julials",
+            &[
+                "julia",
+                "--startup-file=no",
+                "--history-file=no",
+                "-e",
+                "using LanguageServer; runserver()",
+            ],
+            &[".jl"],
+            &["Project.toml", "Manifest.toml"],
             false,
         ),
         builtin_server(
@@ -2351,6 +2537,18 @@ mod tests {
         assert!(config.servers.contains_key("vue"));
         assert!(config.servers.contains_key("biome"));
         assert!(config.servers.contains_key("yaml-ls"));
+        assert!(config.servers.contains_key("eslint"));
+        assert!(config.servers.contains_key("svelte"));
+        assert!(config.servers.contains_key("astro"));
+        assert!(config.servers.contains_key("jdtls"));
+        assert!(config.servers.contains_key("kotlin-ls"));
+        assert!(config.servers.contains_key("sourcekit-lsp"));
+        assert!(config.servers.contains_key("php-intelephense"));
+        assert!(config.servers.contains_key("texlab"));
+        assert!(config.servers.contains_key("nixd"));
+        assert!(config.servers.contains_key("tinymist"));
+        assert!(config.servers.contains_key("haskell-language-server"));
+        assert!(config.servers.contains_key("julials"));
         assert_eq!(
             config.servers["typescript"].exclude_root_markers,
             vec!["deno.json", "deno.jsonc"]
