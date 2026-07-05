@@ -378,6 +378,12 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
         metadata: BTreeMap::from([
             ("operation".to_string(), json!("documentSymbol")),
             ("server_id".to_string(), json!("fake")),
+            ("server_ids".to_string(), json!(["fake", "fallback"])),
+            ("root".to_string(), json!("/workspace")),
+            (
+                "roots".to_string(),
+                json!(["/workspace", "/workspace/packages/app"]),
+            ),
             ("file_path".to_string(), json!("/workspace/src/main.rs")),
             ("diagnostics".to_string(), json!({})),
         ]),
@@ -389,6 +395,15 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
     assert_eq!(lsp_event.kind, "lsp");
     assert_eq!(lsp_event.attributes["operation"], "documentSymbol");
     assert_eq!(lsp_event.attributes["server_id"], "fake");
+    assert_eq!(
+        lsp_event.attributes["server_ids"],
+        json!(["fake", "fallback"])
+    );
+    assert_eq!(lsp_event.attributes["root"], "/workspace");
+    assert_eq!(
+        lsp_event.attributes["roots"],
+        json!(["/workspace", "/workspace/packages/app"])
+    );
     let lsp_settlement = facade.tool_result_settlement(5, &lsp_call, &lsp_result, None, None);
     assert_eq!(lsp_settlement.event_intents.len(), 2);
     assert_eq!(lsp_settlement.event_intents[0].event_name, "lsp.updated");
@@ -720,6 +735,7 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
     );
     assert!(symbols.error.is_none(), "{symbols:?}");
     assert_eq!(symbols.metadata["server_id"], json!("fake"));
+    assert_eq!(symbols.metadata["server_ids"], json!(["fake"]));
     assert!(symbols.output.contains("\"name\": \"main\""));
     assert!(
         lsp_status(&runtime_root)?
@@ -749,6 +765,7 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
     assert!(write.output.contains("<diagnostics file="));
     assert!(write.output.contains("fake diagnostic"));
     assert_eq!(write.metadata["lsp_server_id"], json!("fake"));
+    assert_eq!(write.metadata["lsp_server_ids"], json!(["fake"]));
     assert_eq!(write.metadata["lsp_error_count"], json!(1));
 
     let edit = toolkit.execute(
@@ -780,6 +797,65 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
     );
 
     let _ = shutdown_workspace_clients(&runtime_root);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn lsp_tool_surfaces_multiple_matching_servers() -> Result<(), Box<dyn Error>> {
+    if !command_available("python3") {
+        return Ok(());
+    }
+    let root = unique_temp_dir("openagent-tools-lsp-multi")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"fake\"\n")?;
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+    let fake = write_fake_lsp_server(&root)?;
+    fs::create_dir_all(root.join(".openagent"))?;
+    fs::write(
+        root.join(".openagent/lsp.json"),
+        serde_json::to_string_pretty(&json!({
+            "servers": {
+                "rust-analyzer": {"disabled": true},
+                "fake-alpha": {
+                    "command": ["python3", fake],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"],
+                    "env": {"FAKE_LSP_SYMBOL_NAME": "alpha"}
+                },
+                "fake-beta": {
+                    "command": ["python3", fake],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"],
+                    "env": {"FAKE_LSP_SYMBOL_NAME": "beta"}
+                }
+            }
+        }))?,
+    )?;
+
+    let toolkit = Toolkit::with_builtins();
+    let mut ctx = ToolContext::new(&root).with_session_id("session-lsp-multi");
+    let runtime_root = ctx.session_root.clone();
+    let symbols = toolkit.execute(
+        "lsp",
+        json!({"operation": "documentSymbol", "file_path": "src/main.rs", "timeout_ms": 3000}),
+        "call_lsp_multi_symbols",
+        &mut ctx,
+    );
+    assert!(symbols.error.is_none(), "{symbols:?}");
+    assert_eq!(symbols.metadata["server_id"], json!("fake-alpha"));
+    assert_eq!(
+        symbols.metadata["server_ids"],
+        json!(["fake-alpha", "fake-beta"])
+    );
+    assert_eq!(symbols.metadata["roots"].as_array().map(Vec::len), Some(2));
+    let result = symbols.metadata["result"]
+        .as_array()
+        .ok_or("missing symbol result")?;
+    assert_eq!(result.len(), 2);
+    assert!(result.iter().any(|item| item["name"] == "alpha"));
+    assert!(result.iter().any(|item| item["name"] == "beta"));
+    assert_eq!(shutdown_workspace_clients(&runtime_root), 2);
     fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -1619,6 +1695,7 @@ fn write_fake_lsp_server(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
         &path,
         r#"
 import json
+import os
 import sys
 
 def read_message():
@@ -1662,8 +1739,9 @@ while True:
     elif method == "exit":
         break
     elif method == "textDocument/documentSymbol":
+        symbol_name = os.environ.get("FAKE_LSP_SYMBOL_NAME", "main")
         result(id, [{
-            "name": "main",
+            "name": symbol_name,
             "kind": 12,
             "location": {
                 "uri": uri,

@@ -1699,6 +1699,9 @@ impl SessionRunnerFacade {
         for key in [
             "operation",
             "server_id",
+            "server_ids",
+            "root",
+            "roots",
             "file_path",
             "server_count",
             "available_count",
@@ -3721,6 +3724,15 @@ fn lsp_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput> 
         .insert("server_id".to_string(), json!(result.server_id));
     output
         .metadata
+        .insert("server_ids".to_string(), json!(result.server_ids));
+    output
+        .metadata
+        .insert("root".to_string(), json!(result.root));
+    output
+        .metadata
+        .insert("roots".to_string(), json!(result.roots));
+    output
+        .metadata
         .insert("file_path".to_string(), json!(result.file_path));
     output.metadata.insert("result".to_string(), result.result);
     output
@@ -3755,6 +3767,15 @@ fn append_lsp_diagnostics_after_change(
     output
         .metadata
         .insert("lsp_server_id".to_string(), json!(result.server_id));
+    output
+        .metadata
+        .insert("lsp_server_ids".to_string(), json!(result.server_ids));
+    output
+        .metadata
+        .insert("lsp_root".to_string(), json!(result.root));
+    output
+        .metadata
+        .insert("lsp_roots".to_string(), json!(result.roots));
     output
         .metadata
         .insert("lsp_error_count".to_string(), json!(error_count));

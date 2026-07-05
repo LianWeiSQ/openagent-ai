@@ -9099,6 +9099,7 @@ mod tests {
         assert_eq!(query.status, 200);
         let payload = query.body.expect("lsp query body");
         assert_eq!(payload["server_id"], "fake");
+        assert_eq!(payload["server_ids"], json!(["fake"]));
         assert_eq!(payload["result"][0]["name"], "main");
 
         let _ = fs::remove_dir_all(root);

@@ -171,6 +171,7 @@ fn binary_lsp_cli_reports_status_and_queries_symbols() -> Result<(), Box<dyn Err
     );
     let query_payload: Value = serde_json::from_slice(&query.stdout)?;
     assert_eq!(query_payload["server_id"], "fake");
+    assert_eq!(query_payload["server_ids"], json!(["fake"]));
     assert_eq!(query_payload["result"][0]["name"], "main");
 
     let _ = fs::remove_dir_all(temp);
