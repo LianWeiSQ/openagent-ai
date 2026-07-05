@@ -1558,6 +1558,9 @@ impl SessionRunnerFacade {
                 attributes: skill_event.attributes,
             });
         }
+        if let Some(lsp_event) = self.lsp_tool_session_event(step, call, result) {
+            event_intents.push(lsp_event);
+        }
         event_intents.push(SettlementEventIntent {
             event_name: projection.event_name.clone(),
             kind: "tool".to_string(),
@@ -1667,6 +1670,43 @@ impl SessionRunnerFacade {
             };
         Some(SkillToolSessionEvent {
             event_name: event_name.to_string(),
+            attributes,
+        })
+    }
+
+    #[must_use]
+    pub fn lsp_tool_session_event(
+        &self,
+        step: u64,
+        call: &ToolCall,
+        result: &ToolResult,
+    ) -> Option<SettlementEventIntent> {
+        if call.name != LSP_TOOL_ID || result.error.is_some() {
+            return None;
+        }
+        let mut attributes = BTreeMap::from([
+            ("call_id".to_string(), json!(call.call_id.clone())),
+            ("name".to_string(), json!(call.name.clone())),
+            ("input".to_string(), call.input.clone()),
+            ("step".to_string(), json!(step)),
+            ("metadata".to_string(), json!(result.metadata.clone())),
+        ]);
+        for key in [
+            "operation",
+            "server_id",
+            "file_path",
+            "server_count",
+            "available_count",
+            "diagnostics",
+        ] {
+            if let Some(value) = result.metadata.get(key) {
+                attributes.insert(key.to_string(), value.clone());
+            }
+        }
+        Some(SettlementEventIntent {
+            event_name: "lsp.updated".to_string(),
+            kind: "lsp".to_string(),
+            status: "ok".to_string(),
             attributes,
         })
     }

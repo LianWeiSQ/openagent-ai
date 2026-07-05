@@ -365,6 +365,37 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
     assert_eq!(failed_settlement.event_intents[0].kind, "tool");
     assert_eq!(failed_settlement.event_intents[0].status, "error");
     assert_eq!(failed_settlement.part_intent.attributes["failed"], true);
+
+    let lsp_call = ToolCall {
+        name: "lsp".to_string(),
+        input: json!({"operation": "documentSymbol", "file_path": "src/main.rs"}),
+        call_id: "call_lsp".to_string(),
+    };
+    let lsp_result = ToolResult {
+        call_id: "call_lsp".to_string(),
+        output: "{}".to_string(),
+        error: None,
+        metadata: BTreeMap::from([
+            ("operation".to_string(), json!("documentSymbol")),
+            ("server_id".to_string(), json!("fake")),
+            ("file_path".to_string(), json!("/workspace/src/main.rs")),
+            ("diagnostics".to_string(), json!({})),
+        ]),
+    };
+    let lsp_event = facade
+        .lsp_tool_session_event(5, &lsp_call, &lsp_result)
+        .expect("lsp updated event");
+    assert_eq!(lsp_event.event_name, "lsp.updated");
+    assert_eq!(lsp_event.kind, "lsp");
+    assert_eq!(lsp_event.attributes["operation"], "documentSymbol");
+    assert_eq!(lsp_event.attributes["server_id"], "fake");
+    let lsp_settlement = facade.tool_result_settlement(5, &lsp_call, &lsp_result, None, None);
+    assert_eq!(lsp_settlement.event_intents.len(), 2);
+    assert_eq!(lsp_settlement.event_intents[0].event_name, "lsp.updated");
+    assert_eq!(
+        lsp_settlement.event_intents[1].event_name,
+        "tool.call.finished"
+    );
 }
 
 #[test]

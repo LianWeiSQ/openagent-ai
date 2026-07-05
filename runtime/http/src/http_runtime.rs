@@ -21,6 +21,9 @@ use openagent_core::{
     render_available_skills, render_preloaded_skills, skill_document_model_invocable,
     skill_info_model_invocable,
 };
+use openagent_lsp::{
+    LspOperation, LspQuery, lsp_doctor, lsp_status, operation_from_str, query_workspace,
+};
 use openagent_mcp::{
     McpBridgeOutput, McpServerType, McpTransport, RemoteMcpManager, RemoteMcpServerConfig,
     RemoteMcpToolDescriptor, StdioMcpSession, bridge_tool_output,
@@ -1108,6 +1111,60 @@ fn skills_payload(config: &HttpRuntimeConfig) -> Value {
         "duplicate_count": report.duplicate_count,
         "issues": report.issues,
     })
+}
+
+fn lsp_status_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
+    let workspace = workspace(config);
+    let servers = lsp_status(&workspace)?;
+    Ok(json!({
+        "workspace": workspace.to_string_lossy(),
+        "servers": servers,
+    }))
+}
+
+fn lsp_doctor_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
+    lsp_doctor(workspace(config)).map(|report| json!(report))
+}
+
+fn lsp_query_payload(config: &HttpRuntimeConfig, body: &str) -> Result<Value, String> {
+    let payload: Value =
+        serde_json::from_str(body).map_err(|error| format!("invalid lsp query JSON: {error}"))?;
+    let operation_name = payload
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("documentSymbol");
+    let operation = operation_from_str(operation_name)
+        .ok_or_else(|| format!("unsupported LSP operation: {operation_name}"))?;
+    if operation == LspOperation::Status {
+        return lsp_status_payload(config);
+    }
+    let file_path = payload
+        .get("file_path")
+        .or_else(|| payload.get("path"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "lsp query requires file_path".to_string())?;
+    let workspace = workspace(config);
+    let result = query_workspace(
+        &workspace,
+        LspQuery {
+            operation,
+            file_path: PathBuf::from(file_path),
+            line: payload.get("line").and_then(Value::as_u64),
+            character: payload
+                .get("character")
+                .or_else(|| payload.get("column"))
+                .and_then(Value::as_u64),
+            query: payload
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            timeout_ms: payload
+                .get("timeout_ms")
+                .or_else(|| payload.get("timeout"))
+                .and_then(Value::as_u64),
+        },
+    )?;
+    Ok(json!(result))
 }
 
 fn filter_runtime_tools_for_profile(
@@ -8970,6 +9027,158 @@ mod tests {
         assert_eq!(crate_name(), "openagent-http-runtime");
         assert_eq!(command_name(), "openagent-http-runtime");
         assert_eq!(app_server_crate_name(), "openagent-app-server");
+    }
+
+    #[test]
+    fn app_bridge_lsp_routes_report_status_and_query_symbols() {
+        if !openagent_lsp::command_available("python3") {
+            return;
+        }
+        let Some(python) = python3_executable() else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("openagent-http-lsp-{}", now_ms()));
+        fs::create_dir_all(root.join("src")).expect("workspace");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"fake\"\n").expect("manifest");
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("file");
+        let fake = write_fake_lsp_server(&root);
+        fs::create_dir_all(root.join(".openagent")).expect("config dir");
+        fs::write(
+            root.join(".openagent/lsp.json"),
+            serde_json::to_string_pretty(&json!({
+                "servers": {
+                    "fake": {
+                        "command": [python, fake],
+                        "extensions": [".rs"],
+                        "root_markers": ["Cargo.toml"]
+                    }
+                }
+            }))
+            .expect("config json"),
+        )
+        .expect("config");
+        let config = HttpRuntimeConfig {
+            workspace: Some(root.to_string_lossy().to_string()),
+            auth_token: None,
+            ..HttpRuntimeConfig::default()
+        };
+
+        for path in ["/api/lsp", "/lsp"] {
+            let response = route_http_request(
+                &HttpRequest {
+                    method: "GET".to_string(),
+                    path: path.to_string(),
+                    headers: BTreeMap::new(),
+                    body: String::new(),
+                },
+                &config,
+            );
+            assert_eq!(response.status, 200);
+            let body = response.body.expect("lsp status");
+            assert!(body["servers"].as_array().is_some_and(|servers| {
+                servers
+                    .iter()
+                    .any(|server| server["id"] == "fake" && server["available"] == true)
+            }));
+        }
+
+        let query = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/lsp/query".to_string(),
+                headers: BTreeMap::new(),
+                body: json!({
+                    "operation": "documentSymbol",
+                    "file_path": "src/main.rs",
+                    "timeout_ms": 3000,
+                })
+                .to_string(),
+            },
+            &config,
+        );
+        assert_eq!(query.status, 200);
+        let payload = query.body.expect("lsp query body");
+        assert_eq!(payload["server_id"], "fake");
+        assert_eq!(payload["result"][0]["name"], "main");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn python3_executable() -> Option<String> {
+        let output = Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (!path.is_empty()).then_some(path)
+    }
+
+    fn write_fake_lsp_server(root: &Path) -> PathBuf {
+        let path = root.join("fake_lsp.py");
+        fs::write(
+            &path,
+            r#"
+import json
+import sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode("utf-8").split(":", 1)
+        headers[key.lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    if length <= 0:
+        return None
+    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+def result(id, value):
+    send({"jsonrpc": "2.0", "id": id, "result": value})
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    id = message.get("id")
+    params = message.get("params") or {}
+    uri = ((params.get("textDocument") or {}).get("uri")) or "file:///fake.rs"
+    if method == "initialize":
+        result(id, {"capabilities": {"textDocumentSync": {"change": 1}}})
+    elif method in ("initialized", "workspace/didChangeConfiguration"):
+        pass
+    elif method == "shutdown":
+        result(id, None)
+    elif method == "exit":
+        break
+    elif method == "textDocument/documentSymbol":
+        result(id, [{
+            "name": "main",
+            "kind": 12,
+            "location": {
+                "uri": uri,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 9}}
+            }
+        }])
+    elif id is not None:
+        result(id, [])
+"#,
+        )
+        .expect("fake lsp script");
+        path
     }
 
     #[test]

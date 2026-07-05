@@ -166,6 +166,7 @@ pub fn app_bridge_protocol_payload() -> Value {
             "checkpoints": "GET /api/sessions/{session_id}/checkpoints; POST /api/sessions/{session_id}/checkpoints/{checkpoint_id}/restore",
             "files": "GET /api/files?path={path}&depth={depth}&content=true",
             "git": "GET /api/git",
+            "lsp": "GET /api/lsp; GET /lsp; GET /api/lsp/doctor; POST /api/lsp/query",
             "terminal_run": "POST /api/terminal/run",
             "mcp": "GET /api/mcp; POST /api/mcp/servers; PATCH|DELETE /api/mcp/servers/{name}; POST /api/mcp/servers/{name}/test|start|stop|restart",
             "models": "GET /api/models",
@@ -183,6 +184,7 @@ pub fn app_bridge_protocol_payload() -> Value {
             "turn/approval_requested",
             "turn/approval_resolved",
             "checkpoint/created",
+            "lsp.updated",
             "patch/detected",
             "turn/completed",
             "turn/failed",
@@ -757,6 +759,18 @@ pub(super) fn route_http_request(
         ("GET", "/api/protocol") => json_response(200, app_bridge_protocol_payload()),
         ("GET", "/api/models") => json_response(200, models_payload(&request.path)),
         ("GET", "/api/mcp") => json_response(200, mcp_payload(config, &request.path)),
+        ("GET", "/api/lsp") | ("GET", "/lsp") => match lsp_status_payload(config) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        },
+        ("GET", "/api/lsp/doctor") => match lsp_doctor_payload(config) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        },
+        ("POST", "/api/lsp/query") => match lsp_query_payload(config, &request.body) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        },
         ("GET", "/api/agents") => json_response(200, agents_payload(config)),
         ("GET", "/api/mdns") => json_response(200, mdns_payload(config)),
         ("GET", "/api/files") => match files_payload(config, &request.path) {

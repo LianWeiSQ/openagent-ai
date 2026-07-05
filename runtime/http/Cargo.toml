@@ -10,6 +10,7 @@ rust-version.workspace = true
 openagent-app-server.workspace = true
 openagent-app-server-client.workspace = true
 openagent-core.workspace = true
+openagent-lsp.workspace = true
 openagent-mcp.workspace = true
 openagent-protocol.workspace = true
 openagent-provider.workspace = true
