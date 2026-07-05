@@ -263,6 +263,73 @@ fn diagnostics_merge_dynamic_related_and_workspace_reports() -> Result<(), Box<d
 }
 
 #[test]
+fn query_aggregates_multiple_matching_lsp_servers() -> Result<(), Box<dyn Error>> {
+    if !command_available("python3") {
+        return Ok(());
+    }
+    let root = temp_dir("openagent-lsp-multi")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"fake\"\n")?;
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+    let fake = write_fake_lsp_server(&root)?;
+    fs::create_dir_all(root.join(".openagent"))?;
+    fs::write(
+        root.join(".openagent/lsp.json"),
+        serde_json::to_string_pretty(&json!({
+            "servers": {
+                "rust-analyzer": {"disabled": true},
+                "fake-alpha": {
+                    "command": ["python3", fake],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"],
+                    "env": {"FAKE_LSP_SYMBOL_NAME": "alpha"}
+                },
+                "fake-beta": {
+                    "command": ["python3", fake],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"],
+                    "env": {"FAKE_LSP_SYMBOL_NAME": "beta"}
+                }
+            }
+        }))?,
+    )?;
+
+    let symbols = query_workspace(
+        &root,
+        LspQuery {
+            operation: LspOperation::DocumentSymbol,
+            file_path: PathBuf::from("src/main.rs"),
+            line: None,
+            character: None,
+            query: None,
+            timeout_ms: Some(3_000),
+        },
+    )?;
+    assert_eq!(symbols.server_id, "fake-alpha");
+    assert_eq!(symbols.server_ids, vec!["fake-alpha", "fake-beta"]);
+    assert_eq!(symbols.result.as_array().map(Vec::len), Some(2));
+    assert!(
+        symbols
+            .result
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "alpha")
+    );
+    assert!(
+        symbols
+            .result
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "beta")
+    );
+    assert_eq!(shutdown_workspace_clients(&root), 2);
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn startup_failure_marks_server_broken_and_skips_retry() -> Result<(), Box<dyn Error>> {
     if !command_available("python3") {
         return Ok(());
@@ -445,8 +512,9 @@ while True:
     elif method == "workspace/didChangeWatchedFiles":
         pass
     elif method == "textDocument/documentSymbol":
+        symbol_name = os.environ.get("FAKE_LSP_SYMBOL_NAME", "main")
         result(id, [{
-            "name": "main",
+            "name": symbol_name,
             "kind": 12,
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 1}},
             "selectionRange": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 7}}

@@ -99,7 +99,9 @@ pub struct LspQuery {
 pub struct LspQueryResult {
     pub operation: LspOperation,
     pub server_id: String,
+    pub server_ids: Vec<String>,
     pub root: String,
+    pub roots: Vec<String>,
     pub file_path: String,
     pub result: Value,
     pub diagnostics: BTreeMap<String, Vec<Value>>,
@@ -117,7 +119,9 @@ pub struct LspDoctorReport {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct LspTouchResult {
     pub server_id: String,
+    pub server_ids: Vec<String>,
     pub root: String,
+    pub roots: Vec<String>,
     pub file_path: String,
 }
 
@@ -472,65 +476,22 @@ pub fn query_workspace(
     if !config.enabled {
         return Err("LSP is disabled by configuration".to_string());
     }
-    let selected = select_server(&config, &workspace, &file_path)?;
-    if !command_available_for_root(
-        selected
-            .server
-            .command
-            .first()
-            .map(String::as_str)
-            .unwrap_or(""),
-        &selected.root,
-    ) {
-        return Err(format!(
-            "LSP server '{}' is not available: {}",
-            selected.server.id,
-            selected.server.command.join(" ")
-        ));
-    }
-
+    let selected = available_selected_servers(&config, &workspace, &file_path)?;
     let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let operation = request.operation.clone();
-    let client_key = pooled_client_key(&workspace, &selected.server.id, &selected.root);
-    let response = {
-        let mut pool = client_pool()
-            .lock()
-            .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
-        let client = pool.client_for(&workspace, &selected, timeout)?;
-        client.connection.open_document(&file_path, timeout)?;
-        let result = run_lsp_operation(
-            &mut client.connection,
-            &config,
-            &workspace,
-            &file_path,
-            &request,
-            timeout,
-        )?;
-        client.connection.collect_for(Duration::from_millis(
-            DEFAULT_DIAGNOSTIC_WAIT_MS.min(timeout.as_millis() as u64),
-        ));
-        Ok::<_, String>((
-            client.server_id.clone(),
-            path_to_string(&client.root),
-            result,
-            client.connection.diagnostics.clone(),
-        ))
-    };
-    let (server_id, root, result, diagnostics) = match response {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = shutdown_pooled_client_by_key(&client_key);
-            return Err(error);
-        }
-    };
+    let response = query_selected_servers(
+        &workspace, &config, &file_path, &request, &selected, timeout,
+    )?;
 
     Ok(LspQueryResult {
         operation,
-        server_id,
-        root,
+        server_id: response.server_ids.first().cloned().unwrap_or_default(),
+        server_ids: response.server_ids,
+        root: response.roots.first().cloned().unwrap_or_default(),
+        roots: response.roots,
         file_path: path_to_string(&file_path),
-        result,
-        diagnostics,
+        result: response.result,
+        diagnostics: response.diagnostics,
     })
 }
 
@@ -550,45 +511,55 @@ pub fn touch_workspace_file(
     if !config.enabled {
         return Err("LSP is disabled by configuration".to_string());
     }
-    let selected = select_server(&config, &workspace, &file_path)?;
-    if !command_available_for_root(
-        selected
-            .server
-            .command
-            .first()
-            .map(String::as_str)
-            .unwrap_or(""),
-        &selected.root,
-    ) {
-        return Err(format!(
-            "LSP server '{}' is not available: {}",
-            selected.server.id,
-            selected.server.command.join(" ")
-        ));
-    }
-
+    let selected = available_selected_servers(&config, &workspace, &file_path)?;
     let timeout = Duration::from_millis(DEFAULT_TOUCH_TIMEOUT_MS);
-    let client_key = pooled_client_key(&workspace, &selected.server.id, &selected.root);
-    let response = {
-        let mut pool = client_pool()
-            .lock()
-            .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
-        let client = pool.client_for(&workspace, &selected, timeout)?;
-        client.connection.open_document(&file_path, timeout)?;
-        client.connection.collect_for(Duration::from_millis(50));
-        Ok::<_, String>(LspTouchResult {
-            server_id: client.server_id.clone(),
-            root: path_to_string(&client.root),
-            file_path: path_to_string(&file_path),
-        })
-    };
-    match response {
-        Ok(response) => Ok(response),
-        Err(error) => {
-            let _ = shutdown_pooled_client_by_key(&client_key);
-            Err(error)
+    let mut pool = client_pool()
+        .lock()
+        .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
+    let mut server_ids = Vec::new();
+    let mut roots = Vec::new();
+    let mut errors = Vec::new();
+    for selected in selected {
+        let client_key = pooled_client_key(&workspace, &selected.server.id, &selected.root);
+        let response = {
+            let client = pool.client_for(&workspace, &selected, timeout);
+            match client {
+                Ok(client) => {
+                    let opened = client.connection.open_document(&file_path, timeout);
+                    if opened.is_ok() {
+                        client.connection.collect_for(Duration::from_millis(50));
+                    }
+                    opened.map(|_| (client.server_id.clone(), path_to_string(&client.root)))
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match response {
+            Ok((server_id, root)) => {
+                server_ids.push(server_id);
+                roots.push(root);
+            }
+            Err(error) => {
+                if let Some(mut client) = pool.remove_key(&client_key) {
+                    let _ = client.connection.shutdown(Duration::from_millis(500));
+                }
+                errors.push(format!("{}: {error}", selected.server.id));
+            }
         }
     }
+    if server_ids.is_empty() {
+        return Err(format!(
+            "No LSP server could touch file: {}",
+            errors.join("; ")
+        ));
+    }
+    Ok(LspTouchResult {
+        server_id: server_ids.first().cloned().unwrap_or_default(),
+        server_ids,
+        root: roots.first().cloned().unwrap_or_default(),
+        roots,
+        file_path: path_to_string(&file_path),
+    })
 }
 
 pub fn shutdown_workspace_clients(workspace: impl AsRef<Path>) -> usize {
@@ -610,6 +581,131 @@ pub fn shutdown_workspace_clients(workspace: impl AsRef<Path>) -> usize {
     }
     pool.remove_workspace_broken(&workspace);
     removed
+}
+
+#[derive(Debug)]
+struct QueryAggregation {
+    server_ids: Vec<String>,
+    roots: Vec<String>,
+    result: Value,
+    diagnostics: BTreeMap<String, Vec<Value>>,
+}
+
+fn query_selected_servers(
+    workspace: &Path,
+    config: &LspConfig,
+    file_path: &Path,
+    request: &LspQuery,
+    selected_servers: &[SelectedServer],
+    timeout: Duration,
+) -> Result<QueryAggregation, String> {
+    let mut pool = client_pool()
+        .lock()
+        .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
+    let mut server_ids = Vec::new();
+    let mut roots = Vec::new();
+    let mut results = Vec::new();
+    let mut diagnostics = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for selected in selected_servers {
+        let client_key = pooled_client_key(workspace, &selected.server.id, &selected.root);
+        let response = {
+            let client = pool.client_for(workspace, selected, timeout);
+            match client {
+                Ok(client) => {
+                    let outcome = client
+                        .connection
+                        .open_document(file_path, timeout)
+                        .and_then(|_| {
+                            run_lsp_operation(
+                                &mut client.connection,
+                                config,
+                                workspace,
+                                file_path,
+                                request,
+                                timeout,
+                            )
+                        });
+                    if outcome.is_ok() {
+                        client.connection.collect_for(Duration::from_millis(
+                            DEFAULT_DIAGNOSTIC_WAIT_MS.min(timeout.as_millis() as u64),
+                        ));
+                    }
+                    outcome.map(|result| {
+                        (
+                            client.server_id.clone(),
+                            path_to_string(&client.root),
+                            result,
+                            client.connection.diagnostics.clone(),
+                        )
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match response {
+            Ok((server_id, root, result, server_diagnostics)) => {
+                server_ids.push(server_id);
+                roots.push(root);
+                results.push(result);
+                merge_diagnostics(&mut diagnostics, server_diagnostics);
+            }
+            Err(error) => {
+                if let Some(mut client) = pool.remove_key(&client_key) {
+                    let _ = client.connection.shutdown(Duration::from_millis(500));
+                }
+                errors.push(format!("{}: {error}", selected.server.id));
+            }
+        }
+    }
+
+    if server_ids.is_empty() {
+        return Err(format!(
+            "No LSP server completed query: {}",
+            errors.join("; ")
+        ));
+    }
+    let result = aggregate_lsp_result(&request.operation, results, &diagnostics);
+    Ok(QueryAggregation {
+        server_ids,
+        roots,
+        result,
+        diagnostics,
+    })
+}
+
+fn aggregate_lsp_result(
+    operation: &LspOperation,
+    mut results: Vec<Value>,
+    diagnostics: &BTreeMap<String, Vec<Value>>,
+) -> Value {
+    if *operation == LspOperation::Diagnostics {
+        return json!(diagnostics);
+    }
+    if results.len() == 1 {
+        return results.remove(0);
+    }
+    let mut flattened = Vec::new();
+    for result in results {
+        if let Some(items) = result.as_array() {
+            flattened.extend(items.clone());
+        } else {
+            flattened.push(result);
+        }
+    }
+    Value::Array(flattened)
+}
+
+fn merge_diagnostics(
+    target: &mut BTreeMap<String, Vec<Value>>,
+    source: BTreeMap<String, Vec<Value>>,
+) {
+    for (path, items) in source {
+        let entry = target.entry(path).or_default();
+        entry.extend(items);
+        *entry = dedupe_diagnostics(std::mem::take(entry));
+    }
 }
 
 fn run_lsp_operation(
@@ -684,17 +780,6 @@ fn apply_running_status(status: &mut [LspStatus], workspace: &Path) -> Result<()
         }
     }
     Ok(())
-}
-
-fn shutdown_pooled_client_by_key(key: &str) -> bool {
-    let Ok(mut pool) = client_pool().lock() else {
-        return false;
-    };
-    let Some(mut client) = pool.remove_key(key) else {
-        return false;
-    };
-    let _ = client.connection.shutdown(Duration::from_millis(500));
-    true
 }
 
 fn merge_lsp_value(config: &mut LspConfig, value: &Value) -> Result<(), String> {
@@ -850,13 +935,13 @@ fn status_from_config(config: &LspConfig, workspace: &Path) -> Vec<LspStatus> {
         .collect()
 }
 
-fn select_server(
+fn select_servers(
     config: &LspConfig,
     workspace: &Path,
     file_path: &Path,
-) -> Result<SelectedServer, String> {
+) -> Result<Vec<SelectedServer>, String> {
     let selectors = file_selectors(file_path);
-    let mut selected: Option<(u32, usize, String, SelectedServer)> = None;
+    let mut selected = Vec::new();
     for server in config.servers.values() {
         if !server.extensions.is_empty()
             && !server
@@ -871,24 +956,64 @@ fn select_server(
         };
         let priority = server_priority(server);
         let depth = root.components().count();
-        let candidate = SelectedServer {
-            server: server.clone(),
-            root,
-        };
-        let replace = selected
-            .as_ref()
-            .is_none_or(|(best_priority, best_depth, best_id, _)| {
-                priority < *best_priority
-                    || (priority == *best_priority
-                        && (depth > *best_depth || (depth == *best_depth && server.id < *best_id)))
-            });
-        if replace {
-            selected = Some((priority, depth, server.id.clone(), candidate));
-        }
+        selected.push((
+            priority,
+            std::cmp::Reverse(depth),
+            server.id.clone(),
+            SelectedServer {
+                server: server.clone(),
+                root,
+            },
+        ));
     }
     selected
+        .sort_by(|left, right| (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2)));
+    let result = selected
+        .into_iter()
         .map(|(_, _, _, selected)| selected)
-        .ok_or_else(|| format!("No LSP server configured for {}", file_path.display()))
+        .collect::<Vec<_>>();
+    if result.is_empty() {
+        return Err(format!(
+            "No LSP server configured for {}",
+            file_path.display()
+        ));
+    }
+    Ok(result)
+}
+
+fn available_selected_servers(
+    config: &LspConfig,
+    workspace: &Path,
+    file_path: &Path,
+) -> Result<Vec<SelectedServer>, String> {
+    let selected = select_servers(config, workspace, file_path)?;
+    let mut available = Vec::new();
+    let mut unavailable = Vec::new();
+    for selected in selected {
+        let program = selected
+            .server
+            .command
+            .first()
+            .map(String::as_str)
+            .unwrap_or("");
+        if command_available_for_root(program, &selected.root) {
+            available.push(selected);
+        } else {
+            unavailable.push(format!(
+                "{}: {}",
+                selected.server.id,
+                selected.server.command.join(" ")
+            ));
+        }
+    }
+    if available.is_empty() {
+        return Err(format!(
+            "No available LSP server for {}: {}",
+            file_path.display(),
+            unavailable.join("; ")
+        ));
+    }
+    Ok(available)
 }
 
 fn file_selectors(file_path: &Path) -> Vec<String> {
@@ -2130,7 +2255,10 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         let config = load_workspace_config(&temp)?;
-        let selected = select_server(&config, &temp, &temp.join("src/main.ts"))?;
+        let selected = select_servers(&config, &temp, &temp.join("src/main.ts"))?
+            .into_iter()
+            .next()
+            .ok_or("missing selected server")?;
         assert_eq!(selected.server.id, "deno");
         assert_eq!(selected.root, temp);
         let _ = fs::remove_dir_all(selected.root);
@@ -2172,7 +2300,10 @@ mod tests {
         let temp = unique_temp_dir("openagent-lsp-dockerfile")?;
         fs::write(temp.join("Dockerfile"), "FROM scratch\n").map_err(|error| error.to_string())?;
         let config = load_workspace_config(&temp)?;
-        let selected = select_server(&config, &temp, &temp.join("Dockerfile"))?;
+        let selected = select_servers(&config, &temp, &temp.join("Dockerfile"))?
+            .into_iter()
+            .next()
+            .ok_or("missing selected server")?;
         assert_eq!(selected.server.id, "dockerfile");
         let _ = fs::remove_dir_all(temp);
         Ok(())
