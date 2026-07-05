@@ -1686,7 +1686,13 @@ impl SessionRunnerFacade {
         call: &ToolCall,
         result: &ToolResult,
     ) -> Option<SettlementEventIntent> {
-        if call.name != LSP_TOOL_ID || result.error.is_some() {
+        if result.error.is_some() {
+            return None;
+        }
+        let explicit_lsp_tool = call.name == LSP_TOOL_ID;
+        let implicit_lsp_update = result.metadata.contains_key("lsp_server_id")
+            || result.metadata.contains_key("lsp_server_ids");
+        if !explicit_lsp_tool && !implicit_lsp_update {
             return None;
         }
         let mut attributes = BTreeMap::from([
@@ -1706,10 +1712,18 @@ impl SessionRunnerFacade {
             "server_count",
             "available_count",
             "diagnostics",
+            "lsp_server_id",
+            "lsp_server_ids",
+            "lsp_root",
+            "lsp_roots",
+            "lsp_error_count",
         ] {
             if let Some(value) = result.metadata.get(key) {
                 attributes.insert(key.to_string(), value.clone());
             }
+        }
+        if implicit_lsp_update && !attributes.contains_key("operation") {
+            attributes.insert("operation".to_string(), json!("diagnostics"));
         }
         Some(SettlementEventIntent {
             event_name: "lsp.updated".to_string(),

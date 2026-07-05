@@ -411,6 +411,40 @@ fn session_runner_facade_builds_shared_tool_result_session_projection() {
         lsp_settlement.event_intents[1].event_name,
         "tool.call.finished"
     );
+
+    let write_call = ToolCall {
+        name: "write".to_string(),
+        input: json!({"file_path": "src/main.rs"}),
+        call_id: "call_write".to_string(),
+    };
+    let write_result = ToolResult {
+        call_id: "call_write".to_string(),
+        output: "Wrote file".to_string(),
+        error: None,
+        metadata: BTreeMap::from([
+            ("file_path".to_string(), json!("/workspace/src/main.rs")),
+            ("diagnostics".to_string(), json!({})),
+            ("lsp_server_id".to_string(), json!("fake")),
+            ("lsp_server_ids".to_string(), json!(["fake"])),
+            ("lsp_error_count".to_string(), json!(0)),
+        ]),
+    };
+    let write_settlement = facade.tool_result_settlement(6, &write_call, &write_result, None, None);
+    assert_eq!(write_settlement.event_intents.len(), 2);
+    assert_eq!(write_settlement.event_intents[0].event_name, "lsp.updated");
+    assert_eq!(write_settlement.event_intents[0].kind, "lsp");
+    assert_eq!(
+        write_settlement.event_intents[0].attributes["operation"],
+        "diagnostics"
+    );
+    assert_eq!(
+        write_settlement.event_intents[0].attributes["lsp_server_ids"],
+        json!(["fake"])
+    );
+    assert_eq!(
+        write_settlement.event_intents[1].event_name,
+        "tool.call.finished"
+    );
 }
 
 #[test]
