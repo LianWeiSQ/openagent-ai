@@ -330,6 +330,91 @@ fn query_aggregates_multiple_matching_lsp_servers() -> Result<(), Box<dyn Error>
 }
 
 #[test]
+fn workspace_symbol_queries_all_running_workspace_clients() -> Result<(), Box<dyn Error>> {
+    if !command_available("python3") {
+        return Ok(());
+    }
+    let root = temp_dir("openagent-lsp-workspace-symbol")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"fake\"\n")?;
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+    fs::write(root.join("src/main.py"), "def main():\n    pass\n")?;
+    let fake = write_fake_lsp_server(&root)?;
+    fs::create_dir_all(root.join(".openagent"))?;
+    fs::write(
+        root.join(".openagent/lsp.json"),
+        serde_json::to_string_pretty(&json!({
+            "servers": {
+                "rust-analyzer": {"disabled": true},
+                "pyright": {"disabled": true},
+                "pylsp": {"disabled": true},
+                "ty": {"disabled": true},
+                "fake-rs": {
+                    "command": ["python3", fake],
+                    "extensions": [".rs"],
+                    "root_markers": ["Cargo.toml"],
+                    "env": {"FAKE_LSP_SYMBOL_NAME": "rust-symbol"}
+                },
+                "fake-py": {
+                    "command": ["python3", fake],
+                    "extensions": [".py"],
+                    "root_markers": ["Cargo.toml"],
+                    "env": {"FAKE_LSP_SYMBOL_NAME": "python-symbol"}
+                }
+            }
+        }))?,
+    )?;
+
+    let python_symbols = query_workspace(
+        &root,
+        LspQuery {
+            operation: LspOperation::DocumentSymbol,
+            file_path: PathBuf::from("src/main.py"),
+            line: None,
+            character: None,
+            query: None,
+            timeout_ms: Some(3_000),
+        },
+    )?;
+    assert_eq!(python_symbols.server_ids, vec!["fake-py"]);
+
+    let workspace_symbols = query_workspace(
+        &root,
+        LspQuery {
+            operation: LspOperation::WorkspaceSymbol,
+            file_path: PathBuf::from("src/main.rs"),
+            line: None,
+            character: None,
+            query: Some("symbol".to_string()),
+            timeout_ms: Some(3_000),
+        },
+    )?;
+    assert_eq!(workspace_symbols.server_ids.len(), 2);
+    assert!(
+        workspace_symbols
+            .server_ids
+            .iter()
+            .any(|id| id == "fake-py")
+    );
+    assert!(
+        workspace_symbols
+            .server_ids
+            .iter()
+            .any(|id| id == "fake-rs")
+    );
+    let result = workspace_symbols
+        .result
+        .as_array()
+        .ok_or("missing workspace symbols")?;
+    assert!(result.iter().any(|item| item["name"] == "python-symbol"));
+    assert!(result.iter().any(|item| item["name"] == "rust-symbol"));
+
+    assert_eq!(shutdown_workspace_clients(&root), 2);
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn startup_failure_marks_server_broken_and_skips_retry() -> Result<(), Box<dyn Error>> {
     if !command_available("python3") {
         return Ok(());
@@ -518,6 +603,16 @@ while True:
             "kind": 12,
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 1}},
             "selectionRange": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 7}}
+        }])
+    elif method == "workspace/symbol":
+        symbol_name = os.environ.get("FAKE_LSP_SYMBOL_NAME", "main")
+        result(id, [{
+            "name": symbol_name,
+            "kind": 12,
+            "location": {
+                "uri": uri,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 1}}
+            }
         }])
     elif method == "textDocument/definition":
         result(id, [{

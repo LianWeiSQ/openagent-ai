@@ -329,6 +329,24 @@ impl LspClientPool {
             .map(|client| client.root.clone())
     }
 
+    fn workspace_client_keys(&self, workspace: &Path) -> Vec<String> {
+        let mut keys = self
+            .clients
+            .iter()
+            .filter_map(|(key, client)| {
+                (client.workspace == workspace).then(|| {
+                    (
+                        client.server_id.clone(),
+                        path_to_string(&client.root),
+                        key.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        keys.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        keys.into_iter().map(|(_, _, key)| key).collect()
+    }
+
     fn remove_key(&mut self, key: &str) -> Option<PooledClient> {
         self.clients.remove(key)
     }
@@ -599,6 +617,17 @@ fn query_selected_servers(
     selected_servers: &[SelectedServer],
     timeout: Duration,
 ) -> Result<QueryAggregation, String> {
+    if request.operation == LspOperation::WorkspaceSymbol {
+        return query_workspace_symbol_clients(
+            workspace,
+            config,
+            file_path,
+            request,
+            selected_servers,
+            timeout,
+        );
+    }
+
     let mut pool = client_pool()
         .lock()
         .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
@@ -663,6 +692,117 @@ fn query_selected_servers(
     if server_ids.is_empty() {
         return Err(format!(
             "No LSP server completed query: {}",
+            errors.join("; ")
+        ));
+    }
+    let result = aggregate_lsp_result(&request.operation, results, &diagnostics);
+    Ok(QueryAggregation {
+        server_ids,
+        roots,
+        result,
+        diagnostics,
+    })
+}
+
+fn query_workspace_symbol_clients(
+    workspace: &Path,
+    config: &LspConfig,
+    file_path: &Path,
+    request: &LspQuery,
+    selected_servers: &[SelectedServer],
+    timeout: Duration,
+) -> Result<QueryAggregation, String> {
+    let mut pool = client_pool()
+        .lock()
+        .map_err(|_| "LSP client pool lock is poisoned".to_string())?;
+    let mut errors = Vec::new();
+
+    for selected in selected_servers {
+        let client_key = pooled_client_key(workspace, &selected.server.id, &selected.root);
+        let response = {
+            let client = pool.client_for(workspace, selected, timeout);
+            match client {
+                Ok(client) => {
+                    let opened = client.connection.open_document(file_path, timeout);
+                    if opened.is_ok() {
+                        client.connection.collect_for(Duration::from_millis(
+                            DEFAULT_DIAGNOSTIC_WAIT_MS.min(timeout.as_millis() as u64),
+                        ));
+                    }
+                    opened.map(|_| ())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = response {
+            if let Some(mut client) = pool.remove_key(&client_key) {
+                let _ = client.connection.shutdown(Duration::from_millis(500));
+            }
+            errors.push(format!("{}: {error}", selected.server.id));
+        }
+    }
+
+    let client_keys = pool.workspace_client_keys(workspace);
+    if client_keys.is_empty() {
+        return Err(format!(
+            "No LSP server completed workspaceSymbol: {}",
+            errors.join("; ")
+        ));
+    }
+
+    let mut server_ids = Vec::new();
+    let mut roots = Vec::new();
+    let mut results = Vec::new();
+    let mut diagnostics = BTreeMap::new();
+    for client_key in client_keys {
+        let response = {
+            let client = pool.clients.get_mut(&client_key);
+            match client {
+                Some(client) => {
+                    let outcome = run_lsp_operation(
+                        &mut client.connection,
+                        config,
+                        workspace,
+                        file_path,
+                        request,
+                        timeout,
+                    );
+                    if outcome.is_ok() {
+                        client.connection.collect_for(Duration::from_millis(
+                            DEFAULT_DIAGNOSTIC_WAIT_MS.min(timeout.as_millis() as u64),
+                        ));
+                    }
+                    outcome.map(|result| {
+                        (
+                            client.server_id.clone(),
+                            path_to_string(&client.root),
+                            result,
+                            client.connection.diagnostics.clone(),
+                        )
+                    })
+                }
+                None => Err("LSP client disappeared from pool".to_string()),
+            }
+        };
+        match response {
+            Ok((server_id, root, result, server_diagnostics)) => {
+                server_ids.push(server_id);
+                roots.push(root);
+                results.push(result);
+                merge_diagnostics(&mut diagnostics, server_diagnostics);
+            }
+            Err(error) => {
+                if let Some(mut client) = pool.remove_key(&client_key) {
+                    let _ = client.connection.shutdown(Duration::from_millis(500));
+                }
+                errors.push(error);
+            }
+        }
+    }
+
+    if server_ids.is_empty() {
+        return Err(format!(
+            "No LSP server completed workspaceSymbol: {}",
             errors.join("; ")
         ));
     }
