@@ -721,6 +721,40 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
     assert_eq!(symbols.metadata["server_id"], json!("fake"));
     assert!(symbols.output.contains("\"name\": \"main\""));
 
+    let read = toolkit.execute(
+        "read",
+        json!({"file_path": "src/main.rs"}),
+        "call_lsp_read_before_write",
+        &mut ctx,
+    );
+    assert!(read.error.is_none(), "{read:?}");
+    let write = toolkit.execute(
+        "write",
+        json!({"file_path": "src/main.rs", "content": "fn main() { broken(); }\n"}),
+        "call_lsp_write",
+        &mut ctx,
+    );
+    assert!(write.error.is_none(), "{write:?}");
+    assert!(write.output.contains("LSP errors detected in this file"));
+    assert!(write.output.contains("<diagnostics file="));
+    assert!(write.output.contains("fake diagnostic"));
+    assert_eq!(write.metadata["lsp_server_id"], json!("fake"));
+    assert_eq!(write.metadata["lsp_error_count"], json!(1));
+
+    let edit = toolkit.execute(
+        "edit",
+        json!({
+            "file_path": "src/main.rs",
+            "old_string": "broken()",
+            "new_string": "still_broken()"
+        }),
+        "call_lsp_edit",
+        &mut ctx,
+    );
+    assert!(edit.error.is_none(), "{edit:?}");
+    assert!(edit.output.contains("LSP errors detected in this file"));
+    assert_eq!(edit.metadata["lsp_error_count"], json!(1));
+
     let escaped = toolkit.execute(
         "lsp",
         json!({"operation": "documentSymbol", "file_path": "../main.rs"}),
@@ -1612,6 +1646,16 @@ while True:
                 "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 9}}
             }
         }])
+    elif method == "textDocument/diagnostic":
+        result(id, {"kind": "full", "items": [{
+            "range": {
+                "start": {"line": 0, "character": 12},
+                "end": {"line": 0, "character": 20}
+            },
+            "severity": 1,
+            "source": "fake",
+            "message": "fake diagnostic"
+        }]})
     elif id is not None:
         result(id, [])
 "#,

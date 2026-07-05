@@ -46,6 +46,9 @@ const CODE_SEARCH_MAX_LINE_CHARS: usize = 240;
 const WEB_FETCH_DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const WEB_FETCH_MAX_BYTES: usize = 128 * 1024;
 const BENCHMARK_MODE_ENV: &str = "OPENAGENT_BENCHMARK_MODE";
+const LSP_CHANGE_DIAGNOSTICS_TIMEOUT_MS: u64 = 5_000;
+const LSP_MAX_PROJECT_DIAGNOSTIC_FILES: usize = 5;
+const LSP_MAX_DIAGNOSTICS_PER_FILE: usize = 20;
 
 const SOURCE_ONLY_SCAN_IGNORE: &[&str] = &[
     ".git/",
@@ -2837,6 +2840,7 @@ fn write_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
         .metadata
         .insert("file_path".to_string(), json!(path_to_string(&target)));
     output.metadata.insert("exists".to_string(), json!(existed));
+    append_lsp_diagnostics_after_change(&root, &target, &mut output, false);
     Ok(output)
 }
 
@@ -2852,7 +2856,9 @@ fn edit_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput>
     if old_string.is_empty() {
         write_text(&target, &new_string)?;
         ctx.remember_read(&target);
-        return edited_output(&root, &target, replace_all);
+        let mut output = edited_output(&root, &target, replace_all)?;
+        append_lsp_diagnostics_after_change(&root, &target, &mut output, true);
+        return Ok(output);
     }
     if !target.exists() {
         return Err(format!("File not found: {}", target.display()));
@@ -2867,7 +2873,9 @@ fn edit_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput>
     let new_text = replace_text(&text, &old_string, &new_string, replace_all)?;
     write_text(&target, &new_text)?;
     ctx.remember_read(&target);
-    edited_output(&root, &target, replace_all)
+    let mut output = edited_output(&root, &target, replace_all)?;
+    append_lsp_diagnostics_after_change(&root, &target, &mut output, true);
+    Ok(output)
 }
 
 fn glob_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput> {
@@ -3708,6 +3716,146 @@ fn lsp_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput> 
         .metadata
         .insert("diagnostics".to_string(), json!(result.diagnostics));
     Ok(output)
+}
+
+fn append_lsp_diagnostics_after_change(
+    root: &Path,
+    target: &Path,
+    output: &mut ToolOutput,
+    current_file_only: bool,
+) {
+    let Ok(result) = query_workspace(
+        root,
+        LspQuery {
+            operation: LspOperation::Diagnostics,
+            file_path: target.to_path_buf(),
+            line: None,
+            character: None,
+            query: None,
+            timeout_ms: Some(LSP_CHANGE_DIAGNOSTICS_TIMEOUT_MS),
+        },
+    ) else {
+        return;
+    };
+    let error_count = lsp_error_count(&result.diagnostics);
+    output
+        .metadata
+        .insert("diagnostics".to_string(), json!(result.diagnostics.clone()));
+    output
+        .metadata
+        .insert("lsp_server_id".to_string(), json!(result.server_id));
+    output
+        .metadata
+        .insert("lsp_error_count".to_string(), json!(error_count));
+    if error_count == 0 {
+        return;
+    }
+    if let Some(rendered) =
+        render_lsp_change_diagnostics(root, target, &result.diagnostics, current_file_only)
+    {
+        output.output.push_str(&rendered);
+    }
+}
+
+fn render_lsp_change_diagnostics(
+    root: &Path,
+    target: &Path,
+    diagnostics: &BTreeMap<String, Vec<Value>>,
+    current_file_only: bool,
+) -> Option<String> {
+    let current = normalize_path(target);
+    let mut chunks = Vec::new();
+    let mut project_files = 0usize;
+    for (file, issues) in diagnostics {
+        let issue_path = normalize_path(Path::new(file));
+        let is_current = issue_path == current;
+        if current_file_only && !is_current {
+            continue;
+        }
+        if !is_current {
+            if project_files >= LSP_MAX_PROJECT_DIAGNOSTIC_FILES {
+                continue;
+            }
+            project_files += 1;
+        }
+        let file_label = if is_current {
+            path_to_string(target)
+        } else {
+            display_path(root, &issue_path)
+        };
+        let Some(block) = render_lsp_diagnostic_block(&file_label, issues) else {
+            continue;
+        };
+        if is_current {
+            chunks.push(format!(
+                "\n\nLSP errors detected in this file, please fix:\n{block}"
+            ));
+        } else {
+            chunks.push(format!("\n\nLSP errors detected in other files:\n{block}"));
+        }
+    }
+    (!chunks.is_empty()).then(|| chunks.join(""))
+}
+
+fn render_lsp_diagnostic_block(file: &str, issues: &[Value]) -> Option<String> {
+    let errors = issues
+        .iter()
+        .filter(|issue| lsp_diagnostic_is_error(issue))
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for issue in errors.iter().take(LSP_MAX_DIAGNOSTICS_PER_FILE) {
+        let (line, character) = lsp_diagnostic_position(issue);
+        let message = issue
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("diagnostic");
+        lines.push(format!(
+            "ERROR [{}:{}] {}",
+            line + 1,
+            character + 1,
+            message
+        ));
+    }
+    let omitted = errors.len().saturating_sub(LSP_MAX_DIAGNOSTICS_PER_FILE);
+    if omitted > 0 {
+        lines.push(format!("... and {omitted} more"));
+    }
+    Some(format!(
+        "<diagnostics file=\"{file}\">\n{}\n</diagnostics>",
+        lines.join("\n")
+    ))
+}
+
+fn lsp_error_count(diagnostics: &BTreeMap<String, Vec<Value>>) -> usize {
+    diagnostics
+        .values()
+        .map(|issues| {
+            issues
+                .iter()
+                .filter(|issue| lsp_diagnostic_is_error(issue))
+                .count()
+        })
+        .sum()
+}
+
+fn lsp_diagnostic_is_error(issue: &Value) -> bool {
+    issue.get("severity").and_then(Value::as_u64).unwrap_or(1) == 1
+}
+
+fn lsp_diagnostic_position(issue: &Value) -> (u64, u64) {
+    let start = issue.get("range").and_then(|range| range.get("start"));
+    let line = start
+        .and_then(|value| value.get("line"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let character = start
+        .and_then(|value| value.get("character"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    (line, character)
 }
 
 fn memory_read_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput> {
