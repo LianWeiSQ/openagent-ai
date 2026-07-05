@@ -155,13 +155,30 @@ struct RpcConnection {
     next_id: u64,
     root: PathBuf,
     initialization: Option<Value>,
+    capabilities: Value,
     diagnostics: BTreeMap<String, Vec<Value>>,
+    push_diagnostics: BTreeMap<String, Vec<Value>>,
+    pull_diagnostics: BTreeMap<String, Vec<Value>>,
+    diagnostic_registrations: BTreeMap<String, DiagnosticRegistration>,
     documents: BTreeMap<String, OpenDocument>,
 }
 
 #[derive(Clone, Debug)]
 struct OpenDocument {
     version: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DiagnosticRegistration {
+    identifier: Option<String>,
+    workspace_diagnostics: bool,
+}
+
+#[derive(Debug, Default)]
+struct DiagnosticRequestResult {
+    handled: bool,
+    matched: bool,
+    by_file: BTreeMap<String, Vec<Value>>,
 }
 
 #[derive(Debug, Default)]
@@ -901,7 +918,11 @@ impl RpcConnection {
             next_id: 1,
             root: root.to_path_buf(),
             initialization: server.initialization.clone(),
+            capabilities: Value::Null,
             diagnostics: BTreeMap::new(),
+            push_diagnostics: BTreeMap::new(),
+            pull_diagnostics: BTreeMap::new(),
+            diagnostic_registrations: BTreeMap::new(),
             documents: BTreeMap::new(),
         })
     }
@@ -942,7 +963,11 @@ impl RpcConnection {
                 }
             }),
         );
-        self.request("initialize", Value::Object(params), timeout)?;
+        let initialized = self.request("initialize", Value::Object(params), timeout)?;
+        self.capabilities = initialized
+            .get("capabilities")
+            .cloned()
+            .unwrap_or(Value::Null);
         self.notify("initialized", json!({}))?;
         if let Some(initialization) = self.initialization.clone() {
             self.notify(
@@ -1071,18 +1096,190 @@ impl RpcConnection {
     }
 
     fn collect_diagnostics(&mut self, file_path: &Path, timeout: Duration) {
-        let result = self.request(
-            "textDocument/diagnostic",
-            json!({"textDocument": {"uri": file_uri(file_path)}}),
-            timeout.min(Duration::from_millis(3_000)),
-        );
-        if let Ok(report) = result
-            && let Some(items) = report.get("items").and_then(Value::as_array)
-        {
-            self.diagnostics
-                .insert(path_to_string(file_path), items.clone());
+        let timeout = timeout.min(Duration::from_millis(3_000));
+        let mut results = Vec::new();
+        for identifier in self.document_diagnostic_identifiers() {
+            if let Some(result) =
+                self.request_document_diagnostic_report(file_path, identifier.as_deref(), timeout)
+            {
+                results.push(result);
+            }
         }
+        for identifier in self.workspace_diagnostic_identifiers() {
+            if let Some(result) =
+                self.request_workspace_diagnostic_report(file_path, identifier.as_deref(), timeout)
+            {
+                results.push(result);
+            }
+        }
+        self.merge_pull_diagnostic_results(file_path, results);
         self.collect_for(Duration::from_millis(DEFAULT_DIAGNOSTIC_WAIT_MS));
+    }
+
+    fn document_diagnostic_identifiers(&self) -> Vec<Option<String>> {
+        let document_registrations = self
+            .diagnostic_registrations
+            .values()
+            .filter(|registration| !registration.workspace_diagnostics)
+            .collect::<Vec<_>>();
+        let mut identifiers = Vec::new();
+        if self.has_static_pull_diagnostics()
+            || document_registrations.is_empty()
+            || document_registrations
+                .iter()
+                .any(|registration| registration.identifier.is_some())
+        {
+            identifiers.push(None);
+        }
+        for registration in document_registrations {
+            push_unique_identifier(&mut identifiers, registration.identifier.clone());
+        }
+        if identifiers.is_empty() {
+            identifiers.push(None);
+        }
+        identifiers
+    }
+
+    fn workspace_diagnostic_identifiers(&self) -> Vec<Option<String>> {
+        let workspace_registrations = self
+            .diagnostic_registrations
+            .values()
+            .filter(|registration| registration.workspace_diagnostics)
+            .collect::<Vec<_>>();
+        if workspace_registrations.is_empty() {
+            return Vec::new();
+        }
+        let mut identifiers = Vec::new();
+        for registration in workspace_registrations {
+            push_unique_identifier(&mut identifiers, registration.identifier.clone());
+        }
+        if identifiers.is_empty() {
+            identifiers.push(None);
+        }
+        identifiers
+    }
+
+    fn has_static_pull_diagnostics(&self) -> bool {
+        !self
+            .capabilities
+            .get("diagnosticProvider")
+            .is_none_or(Value::is_null)
+    }
+
+    fn request_document_diagnostic_report(
+        &mut self,
+        file_path: &Path,
+        identifier: Option<&str>,
+        timeout: Duration,
+    ) -> Option<DiagnosticRequestResult> {
+        let mut params = Map::new();
+        if let Some(identifier) = identifier {
+            params.insert("identifier".to_string(), json!(identifier));
+        }
+        params.insert(
+            "textDocument".to_string(),
+            json!({"uri": file_uri(file_path)}),
+        );
+        let report = self
+            .request("textDocument/diagnostic", Value::Object(params), timeout)
+            .ok()?;
+        let mut result = DiagnosticRequestResult::default();
+        let file_key = path_to_string(file_path);
+        if let Some(items) = report.get("items").and_then(Value::as_array) {
+            result.handled = true;
+            result.matched = true;
+            result
+                .by_file
+                .entry(file_key.clone())
+                .or_default()
+                .extend(items.clone());
+        }
+        if let Some(related) = report.get("relatedDocuments").and_then(Value::as_object) {
+            for (uri, document_report) in related {
+                let Some(path) = self.path_key_from_uri(uri) else {
+                    continue;
+                };
+                let Some(items) = document_report.get("items").and_then(Value::as_array) else {
+                    continue;
+                };
+                result.handled = true;
+                result.matched = result.matched || path == file_key;
+                result
+                    .by_file
+                    .entry(path)
+                    .or_default()
+                    .extend(items.clone());
+            }
+        }
+        result.handled.then_some(result)
+    }
+
+    fn request_workspace_diagnostic_report(
+        &mut self,
+        file_path: &Path,
+        identifier: Option<&str>,
+        timeout: Duration,
+    ) -> Option<DiagnosticRequestResult> {
+        let mut params = Map::new();
+        if let Some(identifier) = identifier {
+            params.insert("identifier".to_string(), json!(identifier));
+        }
+        params.insert("previousResultIds".to_string(), json!([]));
+        let report = self
+            .request("workspace/diagnostic", Value::Object(params), timeout)
+            .ok()?;
+        let file_key = path_to_string(file_path);
+        let mut result = DiagnosticRequestResult {
+            handled: true,
+            ..DiagnosticRequestResult::default()
+        };
+        for item in report
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(uri) = item.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(path) = self.path_key_from_uri(uri) else {
+                continue;
+            };
+            let Some(items) = item.get("items").and_then(Value::as_array) else {
+                continue;
+            };
+            result.matched = result.matched || path == file_key;
+            result
+                .by_file
+                .entry(path)
+                .or_default()
+                .extend(items.clone());
+        }
+        Some(result)
+    }
+
+    fn merge_pull_diagnostic_results(
+        &mut self,
+        file_path: &Path,
+        results: Vec<DiagnosticRequestResult>,
+    ) {
+        if results.is_empty() || !results.iter().any(|result| result.handled) {
+            return;
+        }
+        let file_key = path_to_string(file_path);
+        let matched = results.iter().any(|result| result.matched);
+        let mut merged: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for result in results {
+            for (path, items) in result.by_file {
+                merged.entry(path).or_default().extend(items);
+            }
+        }
+        if matched {
+            merged.entry(file_key).or_default();
+        }
+        for (path, items) in merged {
+            self.update_pull_diagnostics(path, items);
+        }
     }
 
     fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
@@ -1148,6 +1345,11 @@ impl RpcConnection {
             }
             if let Some(id) = message.get("id").cloned() {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
+                if method == "client/registerCapability" {
+                    self.record_capability_registrations(&params);
+                } else if method == "client/unregisterCapability" {
+                    self.remove_capability_registrations(&params);
+                }
                 let result = self.default_client_response(method, &params);
                 self.write(json!({"jsonrpc": "2.0", "id": id, "result": result}))?;
             }
@@ -1204,7 +1406,7 @@ impl RpcConnection {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return;
         };
-        let Some(path) = file_path_from_uri(uri) else {
+        let Some(path) = self.path_key_from_uri(uri) else {
             return;
         };
         let diagnostics = params
@@ -1212,7 +1414,100 @@ impl RpcConnection {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        self.diagnostics.insert(path, diagnostics);
+        self.update_push_diagnostics(path, diagnostics);
+    }
+
+    fn update_push_diagnostics(&mut self, path: String, diagnostics: Vec<Value>) {
+        self.push_diagnostics.insert(path.clone(), diagnostics);
+        self.refresh_merged_diagnostics(&path);
+    }
+
+    fn update_pull_diagnostics(&mut self, path: String, diagnostics: Vec<Value>) {
+        self.pull_diagnostics
+            .insert(path.clone(), dedupe_diagnostics(diagnostics));
+        self.refresh_merged_diagnostics(&path);
+    }
+
+    fn refresh_merged_diagnostics(&mut self, path: &str) {
+        let mut merged = Vec::new();
+        if let Some(items) = self.push_diagnostics.get(path) {
+            merged.extend(items.clone());
+        }
+        if let Some(items) = self.pull_diagnostics.get(path) {
+            merged.extend(items.clone());
+        }
+        self.diagnostics
+            .insert(path.to_string(), dedupe_diagnostics(merged));
+    }
+
+    fn record_capability_registrations(&mut self, params: &Value) {
+        let Some(registrations) = params.get("registrations").and_then(Value::as_array) else {
+            return;
+        };
+        for registration in registrations {
+            if registration.get("method").and_then(Value::as_str) != Some("textDocument/diagnostic")
+            {
+                continue;
+            }
+            let Some(id) = registration.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let options = registration
+                .get("registerOptions")
+                .and_then(Value::as_object);
+            self.diagnostic_registrations.insert(
+                id.to_string(),
+                DiagnosticRegistration {
+                    identifier: options
+                        .and_then(|options| options.get("identifier"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    workspace_diagnostics: options
+                        .and_then(|options| options.get("workspaceDiagnostics"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                },
+            );
+        }
+    }
+
+    fn remove_capability_registrations(&mut self, params: &Value) {
+        let registrations = params
+            .get("unregisterations")
+            .or_else(|| params.get("unregistrations"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for registration in registrations {
+            if registration.get("method").and_then(Value::as_str) != Some("textDocument/diagnostic")
+            {
+                continue;
+            }
+            if let Some(id) = registration.get("id").and_then(Value::as_str) {
+                self.diagnostic_registrations.remove(id);
+            }
+        }
+    }
+
+    fn path_key_from_uri(&self, uri: &str) -> Option<String> {
+        let raw_path = file_path_from_uri(uri)?;
+        let normalized = normalize_path(Path::new(&raw_path));
+        let root = normalize_path(&self.root);
+        if normalized.starts_with(&root) {
+            return Some(path_to_string(&normalized));
+        }
+        let root_canonical = fs::canonicalize(&root)
+            .ok()
+            .map(|path| normalize_path(&path));
+        let path_canonical = fs::canonicalize(&normalized)
+            .ok()
+            .map(|path| normalize_path(&path));
+        if let (Some(root_canonical), Some(path_canonical)) = (root_canonical, path_canonical)
+            && let Ok(relative) = path_canonical.strip_prefix(&root_canonical)
+        {
+            return Some(path_to_string(&normalize_path(&root.join(relative))));
+        }
+        Some(path_to_string(&normalized))
     }
 
     fn write(&mut self, message: Value) -> Result<(), String> {
@@ -1240,6 +1535,31 @@ fn zero_based_position(request: &LspQuery) -> Result<(u64, u64), String> {
         return Err("LSP line and character are 1-based and must be >= 1".to_string());
     }
     Ok((line - 1, character - 1))
+}
+
+fn push_unique_identifier(target: &mut Vec<Option<String>>, identifier: Option<String>) {
+    if !target.iter().any(|existing| existing == &identifier) {
+        target.push(identifier);
+    }
+}
+
+fn dedupe_diagnostics(items: Vec<Value>) -> Vec<Value> {
+    let mut seen = BTreeMap::new();
+    let mut result = Vec::new();
+    for item in items {
+        let key = serde_json::to_string(&json!({
+            "code": item.get("code").cloned().unwrap_or(Value::Null),
+            "severity": item.get("severity").cloned().unwrap_or(Value::Null),
+            "message": item.get("message").cloned().unwrap_or(Value::Null),
+            "source": item.get("source").cloned().unwrap_or(Value::Null),
+            "range": item.get("range").cloned().unwrap_or(Value::Null),
+        }))
+        .unwrap_or_else(|_| item.to_string());
+        if seen.insert(key, ()).is_none() {
+            result.push(item);
+        }
+    }
+    result
 }
 
 fn read_lsp_frame<R: BufRead + Read>(reader: &mut R) -> io::Result<Option<Value>> {
