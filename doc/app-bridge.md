@@ -149,7 +149,7 @@ The bridge reads:
 | `OPENAGENT_WORKSPACE` | current working directory | Session workspace |
 | `OPENAGENT_SESSION_ROOT` | `.openagent/sessions` | File session store root |
 | `OPENAGENT_APP_AGENT_NAME` | `openagent-app` | Agent name |
-| `OPENAGENT_APP_MAX_STEPS` | `OPENAGENT_MAX_STEPS` or `50` | Max AgentLoop steps |
+| `OPENAGENT_APP_MAX_STEPS` | `0` | Max AgentLoop steps; `0` means OpenCode-style unbounded unless an agent/profile/request sets `steps` |
 | `OPENAGENT_APP_PERMISSION` | `FULL` | Permission ruleset |
 | `OPENAGENT_APP_TOOLS` | `all` | Tool allowlist |
 | `OPENAGENT_TRACE_ROOT` | `.openagent/traces` | Local trace root |

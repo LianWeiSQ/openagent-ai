@@ -16,7 +16,7 @@ On 2026-06-11, a real `gpt-5.5` OpenAgent smoke task showed:
 
 ## Operating Rule
 
-For ordinary engineering work, use `max_steps=24` until adaptive budgeting lands. Treat a final answer that describes missing required work as a step-budget miss, not a successful completion.
+OpenAgent now follows OpenCode semantics by default: no step cap is applied unless the request or agent profile sets `max_steps`/`steps`. Use explicit step caps for constrained evals, demos, or agents that should stop early. Treat a final answer that describes missing required work as a step-budget miss, not a successful completion.
 
 ## Evolution Issues
 

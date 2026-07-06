@@ -181,7 +181,7 @@ Recommended defaults:
 | Multi-file feature, benchmark adapter, or cross-module debugging | 30-40 |
 | Terminal-Bench or long benchmark tasks | 80+ |
 
-For ordinary engineering work, prefer `max_steps=24` as the default. It gives roughly 20 useful tool-enabled rounds plus closeout space, while still making runaway loops visible in traces. Treat a final answer that says a required artifact could not be written as a step-budget miss, not as a successful completion.
+By default, OpenAgent now follows OpenCode semantics: no step cap is applied unless the request or agent profile sets `max_steps`/`steps`. Use explicit step caps for constrained evals, demos, or agents that should stop early. Treat a final answer that says a required artifact could not be written as a step-budget miss, not as a successful completion.
 
 ## Evaluation
 
