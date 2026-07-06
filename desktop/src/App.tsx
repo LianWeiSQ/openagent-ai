@@ -1,8 +1,6 @@
 import {
   Activity,
   AlertTriangle,
-  ArrowLeft,
-  ArrowRight,
   ArrowUp,
   Bot,
   CheckCircle2,
@@ -30,6 +28,7 @@ import {
   Sidebar,
   Square,
   Terminal,
+  Trash2,
   Undo2,
   Wrench,
   XCircle,
@@ -56,6 +55,21 @@ class ApiError extends Error {
   }
 }
 
+function isMissingSessionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const body = error instanceof ApiError ? error.body : undefined;
+  const code = typeof body?.code === "string" ? body.code : "";
+  const bodyError = typeof body?.error === "string" ? body.error : "";
+  const text = `${message}\n${code}\n${bodyError}`.toLowerCase();
+  return (
+    (error instanceof ApiError && error.status === 404) ||
+    code === "session_not_found" ||
+    text.includes("session not found") ||
+    text.includes("session state not found") ||
+    text.includes("no such file or directory")
+  );
+}
+
 type AppEvent = {
   event_id?: string;
   schema_version?: string;
@@ -75,6 +89,13 @@ type SessionSummary = {
   status?: string;
   updated_at_ms?: number;
   message_count?: number;
+  metadata?: JsonRecord;
+};
+
+type CreateSessionPayload = {
+  session_id?: string;
+  id?: string;
+  session?: SessionSummary;
 };
 
 type TurnJobSummary = {
@@ -229,6 +250,17 @@ type CheckpointsPayload = {
   checkpoints?: CheckpointSummary[];
 };
 
+type CheckpointRestoreRecord = {
+  checkpoint_id?: string;
+  run_id?: string;
+  restored_at_ms?: number;
+  checkpoint_kind?: string;
+  file_count?: number;
+  total_bytes?: number;
+  message_id?: string;
+  part_id?: string;
+};
+
 type FileEntry = {
   path?: string;
   name?: string;
@@ -309,6 +341,11 @@ type MessageWithParts = {
   parts?: MessagePart[];
 };
 
+type TimelineMessageItem = {
+  message: MessageWithParts;
+  index: number;
+};
+
 type SessionMessagesPayload = {
   session_id?: string;
   message_count?: number;
@@ -339,6 +376,12 @@ type StreamingDraft = {
   text: string;
   eventCount: number;
   completed: boolean;
+  terminalMethod?: string;
+};
+
+type LiveFinalAnswer = {
+  turnId: string;
+  text: string;
 };
 
 type TrustHistoryItem = {
@@ -453,10 +496,64 @@ const STORAGE_BRIDGE = "openagent.desktop.bridgeUrl";
 const STORAGE_TOKEN = "openagent.desktop.token";
 const STORAGE_PROJECTS = "openagent.desktop.projects";
 const STORAGE_ACTIVE_PROJECT = "openagent.desktop.activeProject";
+const STORAGE_PERMISSION_MODE = "openagent.desktop.permissionMode";
 
 function storedValue(key: string, fallback: string): string {
   if (typeof window === "undefined") return fallback;
   return window.localStorage.getItem(key) ?? fallback;
+}
+
+function normalizePermissionMode(value?: string | null): string {
+  switch ((value ?? "").trim()) {
+    case "FULL":
+    case "FULL_ACCESS":
+      return "FULL_ACCESS";
+    case "READONLY":
+    case "READ_ONLY":
+      return "READONLY";
+    case "AUTO":
+    case "AUTO_APPROVE":
+      return "AUTO_APPROVE";
+    case "PLAN_ONLY":
+    case "ASK":
+    case "REQUEST_APPROVAL":
+      return "REQUEST_APPROVAL";
+    default:
+      return "REQUEST_APPROVAL";
+  }
+}
+
+function permissionPayloadForMode(mode: string): JsonRecord {
+  switch (normalizePermissionMode(mode)) {
+    case "FULL_ACCESS":
+      return {
+        permission: "FULL",
+        dangerously_skip_permissions: true,
+        skip_permissions: true,
+        permission_mode: "full_access",
+      };
+    case "AUTO_APPROVE":
+      return {
+        permission: "PLAN_ONLY",
+        dangerously_skip_permissions: true,
+        skip_permissions: true,
+        permission_mode: "auto_approve",
+      };
+    case "READONLY":
+      return {
+        permission: "READONLY",
+        dangerously_skip_permissions: false,
+        skip_permissions: false,
+        permission_mode: "readonly",
+      };
+    default:
+      return {
+        permission: "PLAN_ONLY",
+        dangerously_skip_permissions: false,
+        skip_permissions: false,
+        permission_mode: "request_approval",
+      };
+  }
 }
 
 function storedProjects(): DesktopProject[] {
@@ -512,8 +609,13 @@ function projectFromPath(path: string, name?: string): DesktopProject {
   };
 }
 
+function isDisplayableProject(project: DesktopProject): boolean {
+  const path = normalizeProjectPath(project.path);
+  return Boolean(path && path !== "/" && path !== "\\");
+}
+
 function upsertProject(projects: DesktopProject[], project: DesktopProject): DesktopProject[] {
-  if (!project.path) return projects;
+  if (!isDisplayableProject(project)) return projects;
   const next = projects.filter((item) => normalizeProjectPath(item.path) !== normalizeProjectPath(project.path));
   return [project, ...next].slice(0, 12);
 }
@@ -524,6 +626,57 @@ function sameProjectPath(left?: string, right?: string): boolean {
 
 function sessionId(session: SessionSummary): string {
   return session.session_id ?? session.id ?? "";
+}
+
+function isSessionIdLike(value: string): boolean {
+  const text = value.trim();
+  if (!text) return false;
+  if (/^(session|new session)$/i.test(text)) return true;
+  if (/^session[-_][A-Za-z0-9-]+$/i.test(text)) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text)) return true;
+  return /^[0-9a-f]{24,}$/i.test(text);
+}
+
+function sessionDisplayTitle(session: SessionSummary): string {
+  const title = session.title?.trim() ?? "";
+  const id = sessionId(session);
+  if (title && title !== id && !isSessionIdLike(title)) return title;
+  return "新对话";
+}
+
+function sessionTimeLabel(session: SessionSummary, nowMs: number): string {
+  return formatElapsed(session.updated_at_ms, nowMs) || session.status || "";
+}
+
+function createdSessionSummary(payload: CreateSessionPayload, workspace: string): SessionSummary | null {
+  const nested = payload.session ?? {};
+  const id = payload.session_id ?? payload.id ?? sessionId(nested);
+  if (!id) return null;
+  return {
+    ...nested,
+    id: nested.id ?? id,
+    session_id: nested.session_id ?? id,
+    workspace: normalizeProjectPath(nested.workspace || workspace),
+    status: nested.status ?? "idle",
+    updated_at_ms: nested.updated_at_ms ?? Date.now(),
+    message_count: nested.message_count ?? 0,
+  };
+}
+
+function upsertSessionSummary(sessions: SessionSummary[], session: SessionSummary): SessionSummary[] {
+  const id = sessionId(session);
+  if (!id) return sessions;
+  const next = [session, ...sessions.filter((item) => sessionId(item) !== id)];
+  return next.sort((left, right) => (right.updated_at_ms ?? 0) - (left.updated_at_ms ?? 0));
+}
+
+function isImeKeyboardEvent(event: KeyboardEvent<HTMLElement>): boolean {
+  const nativeEvent = event.nativeEvent as typeof event.nativeEvent & {
+    isComposing?: boolean;
+    keyCode?: number;
+    which?: number;
+  };
+  return Boolean(nativeEvent.isComposing || nativeEvent.keyCode === 229 || nativeEvent.which === 229);
 }
 
 function turnJobId(job: TurnJobSummary): string {
@@ -675,6 +828,56 @@ function checkpointLabel(checkpoint: CheckpointSummary): string {
   return `${checkpoint.kind ?? "checkpoint"} · ${compactId(checkpoint.checkpoint_id)}`;
 }
 
+function checkpointRestoreHistoryFromSession(session?: SessionSummary): CheckpointRestoreRecord[] {
+  const metadata = session?.metadata;
+  const history = jsonArray(metadata?.checkpoint_restore_history).map((item) => ({
+    checkpoint_id: firstText(item.checkpoint_id),
+    run_id: firstText(item.run_id),
+    restored_at_ms: numberField(item, "restored_at_ms") || undefined,
+    checkpoint_kind: firstText(item.checkpoint_kind),
+    file_count: numberField(item, "file_count") || undefined,
+    total_bytes: numberField(item, "total_bytes") || undefined,
+    message_id: firstText(item.message_id),
+    part_id: firstText(item.part_id),
+  }));
+  if (history.length) return history;
+  const latest = nestedRecord(metadata, "latest_checkpoint_restore");
+  const checkpointId = firstText(latest?.checkpoint_id);
+  if (!checkpointId) return [];
+  return [
+    {
+      checkpoint_id: checkpointId,
+      run_id: firstText(latest?.run_id),
+      restored_at_ms: numberField(latest, "restored_at_ms") || undefined,
+      checkpoint_kind: firstText(latest?.checkpoint_kind),
+      file_count: numberField(latest, "file_count") || undefined,
+      total_bytes: numberField(latest, "total_bytes") || undefined,
+      message_id: firstText(latest?.message_id),
+      part_id: firstText(latest?.part_id),
+    },
+  ];
+}
+
+function restoredCheckpointIdFromSession(session?: SessionSummary): string {
+  return firstText(checkpointRestoreHistoryFromSession(session)[0]?.checkpoint_id);
+}
+
+function checkpointForRestore(record: CheckpointRestoreRecord, checkpoints?: CheckpointsPayload | null): CheckpointSummary | undefined {
+  const checkpointId = record.checkpoint_id;
+  if (!checkpointId) return undefined;
+  return (checkpoints?.checkpoints ?? []).find((checkpoint) => checkpoint.checkpoint_id === checkpointId);
+}
+
+function checkpointRestoreFileLabel(record: CheckpointRestoreRecord, checkpoint?: CheckpointSummary): string {
+  const fileCount = record.file_count ?? checkpoint?.file_count ?? 0;
+  const totalBytes = record.total_bytes ?? checkpoint?.total_bytes ?? 0;
+  return `${fileCount} files · ${formatBytes(totalBytes)}`;
+}
+
+function checkpointRestoreTimeLabel(record: CheckpointRestoreRecord): string {
+  return record.restored_at_ms ? formatTime(record.restored_at_ms) : "-";
+}
+
 function fileBadge(entry: FileEntry): string {
   if (entry.kind === "dir") return "dir";
   if (entry.text) return "txt";
@@ -692,6 +895,22 @@ function compactText(value: string, limit = 120): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length <= limit) return normalized;
   return `${normalized.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function compactJson(value: unknown, limit = 160): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return compactText(value, limit);
+  try {
+    return compactText(JSON.stringify(value), limit);
+  } catch {
+    return compactText(String(value), limit);
+  }
+}
+
+function lineCountLabel(value: string): string {
+  if (!value.trim()) return "no output";
+  const count = value.split(/\r?\n/).filter((line) => line.length > 0).length;
+  return count === 1 ? "1 line" : `${count} lines`;
 }
 
 function formatElapsed(startMs?: number, nowMs = Date.now()): string {
@@ -799,7 +1018,8 @@ function queueFullMessage(payload?: JsonRecord): string {
 }
 
 function messageKey(message: MessageWithParts, index: number): string {
-  return message.info?.id || `${message.info?.role ?? "message"}:${message.info?.created_at_ms ?? index}`;
+  const stable = message.info?.id || `${message.info?.role ?? "message"}:${message.info?.created_at_ms ?? index}`;
+  return `${stable}:${index}`;
 }
 
 function messageRoleLabel(message: MessageWithParts): string {
@@ -847,8 +1067,42 @@ function isSupersededPendingInteraction(part: MessagePart, resolvedKeys: Set<str
   return Boolean(key && item && isPendingInteractionStatus(item.status) && resolvedKeys.has(key));
 }
 
-function visibleMessageParts(message: MessageWithParts, resolvedKeys: Set<string> = new Set()): MessagePart[] {
-  return (message.parts ?? []).filter((part) => part.kind !== "text" && !isSupersededPendingInteraction(part, resolvedKeys));
+function messagePartCallId(part: MessagePart): string {
+  const content = jsonRecord(part.content);
+  return firstText(content?.call_id, content?.tool_call_id, part.attributes?.call_id, part.attributes?.tool_call_id);
+}
+
+function messagePartIdentity(part: MessagePart): string {
+  const callId = messagePartCallId(part);
+  if (callId && ["tool", "mcp_tool"].includes(part.kind ?? "")) return `${part.kind}:${callId}`;
+  return "";
+}
+
+function isPendingMessagePart(part: MessagePart): boolean {
+  return isPendingInteractionStatus(part.status ?? "");
+}
+
+function visibleMessageParts(
+  message: MessageWithParts,
+  resolvedKeys: Set<string> = new Set(),
+  terminalRunStatus = "",
+): MessagePart[] {
+  const parts = message.parts ?? [];
+  const latestPartIndexes = new Set<number>();
+  const seenIdentities = new Set<string>();
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const identity = messagePartIdentity(parts[index]);
+    if (!identity || seenIdentities.has(identity)) continue;
+    seenIdentities.add(identity);
+    latestPartIndexes.add(index);
+  }
+  return parts.filter((part, index) => {
+    if (part.kind === "text") return false;
+    if (isSupersededPendingInteraction(part, resolvedKeys)) return false;
+    if (terminalRunStatus && ["tool", "mcp_tool"].includes(part.kind ?? "") && isPendingMessagePart(part)) return false;
+    const identity = messagePartIdentity(part);
+    return !identity || latestPartIndexes.has(index);
+  });
 }
 
 function valueText(value: unknown): string {
@@ -867,7 +1121,7 @@ function valueText(value: unknown): string {
 }
 
 function renderInlineText(text: string, keyPrefix: string) {
-  return text.split(/(`[^`\n]+`)/g).map((part, index) => {
+  return text.split(/(`[^`\n]+`|\*\*[^*\n]+?\*\*|\[[^\]\n]+?\]\([^)]+\))/g).map((part, index) => {
     if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
       return (
         <code className="inline-code" key={`${keyPrefix}:code:${index}`}>
@@ -875,8 +1129,204 @@ function renderInlineText(text: string, keyPrefix: string) {
         </code>
       );
     }
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return (
+        <strong className="inline-strong" key={`${keyPrefix}:strong:${index}`}>
+          {renderInlineText(part.slice(2, -2), `${keyPrefix}:strong:${index}`)}
+        </strong>
+      );
+    }
+    const linkMatch = part.match(/^\[([^\]\n]+?)\]\(([^)]+)\)$/);
+    if (linkMatch) {
+      const [, label, target] = linkMatch;
+      const href = target.startsWith("http://") || target.startsWith("https://") ? target : undefined;
+      return href ? (
+        <a className="inline-link" href={href} key={`${keyPrefix}:link:${index}`} rel="noreferrer" target="_blank">
+          {label}
+        </a>
+      ) : (
+        <span className="inline-link" key={`${keyPrefix}:link:${index}`} title={target}>
+          {label}
+        </span>
+      );
+    }
     return <Fragment key={`${keyPrefix}:text:${index}`}>{part}</Fragment>;
   });
+}
+
+function markdownHeading(level: number, children: React.ReactNode, key: string) {
+  const className = `event-markdown-heading level-${level}`;
+  switch (level) {
+    case 1:
+      return <h1 className={className} key={key}>{children}</h1>;
+    case 2:
+      return <h2 className={className} key={key}>{children}</h2>;
+    case 3:
+      return <h3 className={className} key={key}>{children}</h3>;
+    case 4:
+      return <h4 className={className} key={key}>{children}</h4>;
+    case 5:
+      return <h5 className={className} key={key}>{children}</h5>;
+    default:
+      return <h6 className={className} key={key}>{children}</h6>;
+  }
+}
+
+function isMarkdownTableSeparator(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) return false;
+  const cells = trimmed.replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+  return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function isMarkdownTableStart(lines: string[], index: number): boolean {
+  return Boolean(lines[index]?.includes("|") && lines[index + 1] && isMarkdownTableSeparator(lines[index + 1]));
+}
+
+function isMarkdownListLine(line: string): boolean {
+  return /^\s*[-*+]\s+\S/.test(line) || /^\s*\d+[.)]\s+\S/.test(line);
+}
+
+function isMarkdownBlockStart(lines: string[], index: number): boolean {
+  const line = lines[index] ?? "";
+  return (
+    /^#{1,6}\s+\S/.test(line) ||
+    isMarkdownTableStart(lines, index) ||
+    isMarkdownListLine(line) ||
+    /^>\s?/.test(line) ||
+    /^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)
+  );
+}
+
+function renderMarkdownLineBreaks(lines: string[], keyPrefix: string) {
+  return lines.map((line, index) => (
+    <Fragment key={`${keyPrefix}:line:${index}`}>
+      {index > 0 ? <br /> : null}
+      {renderInlineText(line, `${keyPrefix}:inline:${index}`)}
+    </Fragment>
+  ));
+}
+
+function renderMarkdownTextBlock(text: string, blockIndex: number) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const nodes: React.ReactNode[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      nodes.push(markdownHeading(level, renderInlineText(heading[2].trim(), `${blockIndex}:heading:${index}`), `${blockIndex}:heading:${index}`));
+      index += 1;
+      continue;
+    }
+
+    if (isMarkdownTableStart(lines, index)) {
+      const header = splitMarkdownTableRow(lines[index]);
+      const align = splitMarkdownTableRow(lines[index + 1]).map((cell) => {
+        if (cell.startsWith(":") && cell.endsWith(":")) return "center";
+        if (cell.endsWith(":")) return "right";
+        return "left";
+      });
+      const rows: string[][] = [];
+      index += 2;
+      while (index < lines.length && lines[index].trim().includes("|")) {
+        rows.push(splitMarkdownTableRow(lines[index]));
+        index += 1;
+      }
+      nodes.push(
+        <div className="event-markdown-table-wrap" key={`${blockIndex}:table:${index}`}>
+          <table className="event-markdown-table">
+            <thead>
+              <tr>
+                {header.map((cell, cellIndex) => (
+                  <th key={`${blockIndex}:table:head:${cellIndex}`} style={{ textAlign: align[cellIndex] as "left" | "center" | "right" | undefined }}>
+                    {renderInlineText(cell, `${blockIndex}:table:head:${cellIndex}`)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={`${blockIndex}:table:row:${rowIndex}`}>
+                  {header.map((_, cellIndex) => (
+                    <td key={`${blockIndex}:table:row:${rowIndex}:${cellIndex}`} style={{ textAlign: align[cellIndex] as "left" | "center" | "right" | undefined }}>
+                      {renderInlineText(row[cellIndex] ?? "", `${blockIndex}:table:row:${rowIndex}:${cellIndex}`)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      );
+      continue;
+    }
+
+    if (isMarkdownListLine(line)) {
+      const ordered = /^\s*\d+[.)]\s+\S/.test(line);
+      const items: string[] = [];
+      while (index < lines.length) {
+        const current = lines[index];
+        const matchesType = ordered ? /^\s*\d+[.)]\s+\S/.test(current) : /^\s*[-*+]\s+\S/.test(current);
+        if (!matchesType) break;
+        items.push(current.replace(ordered ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/, ""));
+        index += 1;
+      }
+      const Tag = ordered ? "ol" : "ul";
+      nodes.push(
+        <Tag className="event-markdown-list" key={`${blockIndex}:list:${index}`}>
+          {items.map((item, itemIndex) => (
+            <li key={`${blockIndex}:list:${index}:${itemIndex}`}>{renderInlineText(item, `${blockIndex}:list:${index}:${itemIndex}`)}</li>
+          ))}
+        </Tag>,
+      );
+      continue;
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quoteLines: string[] = [];
+      while (index < lines.length && /^>\s?/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^>\s?/, ""));
+        index += 1;
+      }
+      nodes.push(
+        <blockquote className="event-markdown-quote" key={`${blockIndex}:quote:${index}`}>
+          {renderMarkdownLineBreaks(quoteLines, `${blockIndex}:quote:${index}`)}
+        </blockquote>,
+      );
+      continue;
+    }
+
+    if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+      nodes.push(<hr className="event-markdown-rule" key={`${blockIndex}:rule:${index}`} />);
+      index += 1;
+      continue;
+    }
+
+    const paragraphLines: string[] = [];
+    while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines, index)) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    nodes.push(
+      <p className="event-paragraph" key={`${blockIndex}:paragraph:${index}`}>
+        {renderMarkdownLineBreaks(paragraphLines, `${blockIndex}:paragraph:${index}`)}
+      </p>,
+    );
+  }
+
+  return nodes;
 }
 
 function TextContent({ text }: { text: string }) {
@@ -897,19 +1347,7 @@ function TextContent({ text }: { text: string }) {
             </pre>
           );
         }
-        return block.split(/\n{2,}/).map((paragraph, paragraphIndex) => {
-          const lines = paragraph.split("\n");
-          return (
-            <p className="event-paragraph" key={`paragraph:${blockIndex}:${paragraphIndex}`}>
-              {lines.map((line, lineIndex) => (
-                <Fragment key={`line:${blockIndex}:${paragraphIndex}:${lineIndex}`}>
-                  {lineIndex > 0 ? <br /> : null}
-                  {renderInlineText(line, `${blockIndex}:${paragraphIndex}:${lineIndex}`)}
-                </Fragment>
-              ))}
-            </p>
-          );
-        });
+        return renderMarkdownTextBlock(block, blockIndex);
       })}
     </div>
   );
@@ -1062,6 +1500,17 @@ function defaultMcpServerDraft(): McpServerDraft {
     env: "",
     headers: "",
     timeoutMs: "",
+  };
+}
+
+function mcpDraftFromServer(server: McpServerSummary): McpServerDraft {
+  const mode = server.type === "local" ? "local" : "remote";
+  return {
+    ...defaultMcpServerDraft(),
+    mode,
+    name: server.name ?? "",
+    transport: server.transport ?? server.selected_transport ?? "http",
+    timeoutMs: server.timeout_ms ? String(server.timeout_ms) : "",
   };
 }
 
@@ -1252,6 +1701,94 @@ function interactionResolutionText(kind: "approval" | "question", resolution: Js
       .join("; ");
   }
   return status;
+}
+
+function humanizeToken(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function approvalToolLabel(approval: JsonRecord): string {
+  const tool = stringField(approval, "tool_name").toLowerCase();
+  if (["write", "edit", "replace"].includes(tool)) return "File write";
+  if (["read", "list", "glob", "search"].includes(tool)) return "File read";
+  if (["bash", "shell", "command", "terminal"].some((name) => tool.includes(name))) return "Shell command";
+  if (tool.startsWith("mcp") || tool.includes("mcp_")) return "MCP tool";
+  return tool ? `${humanizeToken(tool)} tool` : "Approval needed";
+}
+
+function approvalReasonLabel(approval: JsonRecord): string {
+  const metadata = nestedRecord(approval, "metadata");
+  const reason = firstText(
+    approval.reason,
+    approval.permission_action,
+    metadata?.permission_action,
+    metadata?.error_kind,
+    "permission required",
+  );
+  switch (reason) {
+    case "permission_required":
+    case "ask":
+      return "Needs approval";
+    case "permission_denied":
+    case "deny":
+      return "Blocked";
+    case "allow":
+      return "Allowed";
+    default:
+      return humanizeToken(reason);
+  }
+}
+
+function approvalPermissionLabel(approval: JsonRecord): string {
+  const action = firstText(approval.permission_action, nestedRecord(approval, "metadata")?.permission_action, "ask");
+  switch (action) {
+    case "ask":
+      return "Permission: confirm before running";
+    case "deny":
+      return "Permission: blocked by policy";
+    case "allow":
+      return "Permission: allowed by policy";
+    default:
+      return `Permission: ${humanizeToken(action)}`;
+  }
+}
+
+function approvalRiskLabel(approval: JsonRecord): string {
+  const metadata = nestedRecord(approval, "metadata");
+  const tool = stringField(approval, "tool_name").toLowerCase();
+  const pattern = firstText(
+    approval.permission_pattern,
+    metadata?.permission_pattern,
+    metadata?.permission,
+    metadata?.sandbox,
+  );
+  if (["write", "edit", "replace"].includes(tool)) return "Risk: can edit files";
+  if (["bash", "shell", "command", "terminal"].some((name) => tool.includes(name))) return "Risk: can run shell";
+  if (tool.startsWith("mcp") || tool.includes("mcp_")) return "Risk: external tool";
+  if (pattern) return `Risk: ${humanizeToken(pattern)}`;
+  return "Risk: workspace action";
+}
+
+function approvalRiskTone(approval: JsonRecord): string {
+  const tool = stringField(approval, "tool_name").toLowerCase();
+  if (["write", "edit", "replace"].includes(tool)) return "write";
+  if (["bash", "shell", "command", "terminal"].some((name) => tool.includes(name))) return "command";
+  if (tool.startsWith("mcp") || tool.includes("mcp_")) return "external";
+  return "workspace";
+}
+
+function approvalInputSummary(approval: JsonRecord): string {
+  const preview = nestedRecord(approval, "preview");
+  const previewPath = firstText(preview?.path);
+  const diff = firstText(preview?.diff);
+  const toolInput = approval.tool_input ?? approval.input;
+  if (previewPath && diff) return `${previewPath} · ${compactText(diff, 120)}`;
+  if (previewPath) return previewPath;
+  return compactJson(toolInput, 150) || compactId(firstText(approval.request_id));
 }
 
 function interactionHistoryItem(part: MessagePart): TrustHistoryItem | null {
@@ -1616,11 +2153,29 @@ function activeTurnIdFromEvents(events: AppEvent[]): string {
   return activeTurnId;
 }
 
+function latestTerminalErrorTurnIdFromEvents(events: AppEvent[]): string {
+  for (const event of [...events].reverse()) {
+    const turnId = eventTurnId(event);
+    if (!turnId) continue;
+    if (event.method === "turn/failed" || event.method === "turn/interrupted") return turnId;
+    if (
+      event.method === "turn/completed" ||
+      event.method === "turn/started" ||
+      event.method === "item/agentMessage/delta" ||
+      event.method.includes("toolCall")
+    ) {
+      return "";
+    }
+  }
+  return "";
+}
+
 function activeStreamingDraftFromEvents(events: AppEvent[]): StreamingDraft | null {
   let currentTurnId = "";
   let text = "";
   let eventCount = 0;
   let completed = false;
+  let terminalMethod = "";
   for (const event of events) {
     const turnId = eventTurnId(event) || currentTurnId || "current";
     if (event.method === "turn/started") {
@@ -1628,6 +2183,7 @@ function activeStreamingDraftFromEvents(events: AppEvent[]): StreamingDraft | nu
       text = "";
       eventCount = 0;
       completed = false;
+      terminalMethod = "";
       continue;
     }
     if (event.method === "item/agentMessage/delta") {
@@ -1638,10 +2194,12 @@ function activeStreamingDraftFromEvents(events: AppEvent[]): StreamingDraft | nu
         text = "";
         eventCount = 0;
         completed = false;
+        terminalMethod = "";
       }
       text += delta;
       eventCount += 1;
       completed = false;
+      terminalMethod = "";
       continue;
     }
     if (
@@ -1652,6 +2210,7 @@ function activeStreamingDraftFromEvents(events: AppEvent[]): StreamingDraft | nu
       turnId === currentTurnId
     ) {
       completed = true;
+      terminalMethod = event.method;
     }
   }
   if (!text) return null;
@@ -1660,7 +2219,21 @@ function activeStreamingDraftFromEvents(events: AppEvent[]): StreamingDraft | nu
     text,
     eventCount,
     completed,
+    terminalMethod,
   };
+}
+
+function liveFinalAnswerFromEvents(events: AppEvent[]): LiveFinalAnswer | null {
+  for (const event of [...events].reverse()) {
+    if (event.method !== "turn/completed") continue;
+    const text = stringParam(event.params ?? {}, "final_answer");
+    if (!text.trim()) continue;
+    return {
+      turnId: eventTurnId(event) || "current",
+      text,
+    };
+  }
+  return null;
 }
 
 function hasPersistedAssistantForTurn(messages: MessageWithParts[], turnId: string): boolean {
@@ -1670,6 +2243,13 @@ function hasPersistedAssistantForTurn(messages: MessageWithParts[], turnId: stri
     const runId = message.info?.run_id;
     return !turnId || turnId === "current" || !runId || runId === turnId;
   });
+}
+
+function shouldDeferAssistantMessageAfterLiveEvents(message: MessageWithParts, turnId: string, hasLiveEvents: boolean): boolean {
+  if (!hasLiveEvents || !turnId || turnId === "current") return false;
+  if (message.info?.role !== "assistant") return false;
+  if (!messageContent(message)) return false;
+  return message.info?.run_id === turnId;
 }
 
 function interactionEventChanged(method: string): boolean {
@@ -1689,6 +2269,20 @@ function sessionEventChanged(method: string): boolean {
     method.includes("approval") ||
     method.includes("checkpoint") ||
     method.includes("patch")
+  );
+}
+
+function isVisibleProcessEvent(event: AppEvent): boolean {
+  const method = event.method;
+  if (method === "item/agentMessage/delta" || method === "turn/started" || method === "turn/completed") return false;
+  return (
+    method.includes("toolCall") ||
+    method.includes("approval") ||
+    method.includes("question") ||
+    method.includes("patch") ||
+    method.includes("checkpoint") ||
+    method === "turn/failed" ||
+    method === "turn/interrupted"
   );
 }
 
@@ -1727,15 +2321,24 @@ export function App() {
   const [mcp, setMcp] = useState<McpPayload | null>(null);
   const [mcpRefreshing, setMcpRefreshing] = useState(false);
   const [mcpServerDraft, setMcpServerDraft] = useState<McpServerDraft>(() => defaultMcpServerDraft());
+  const [mcpEditingServerName, setMcpEditingServerName] = useState("");
   const [mcpMutationBusy, setMcpMutationBusy] = useState("");
   const [mcpMutationError, setMcpMutationError] = useState("");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [renamingSessionId, setRenamingSessionId] = useState("");
+  const [sessionRenameDraft, setSessionRenameDraft] = useState("");
+  const [sessionRenameBusy, setSessionRenameBusy] = useState("");
+  const [sessionRenameError, setSessionRenameError] = useState("");
+  const [deleteConfirmationSessionId, setDeleteConfirmationSessionId] = useState("");
+  const [sessionDeleteBusy, setSessionDeleteBusy] = useState("");
+  const [sessionDeleteError, setSessionDeleteError] = useState("");
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
   const [questions, setQuestions] = useState<PendingQuestion[]>([]);
   const [interactionSync, setInteractionSync] = useState<InteractionSync>({});
   const [respondingInteractionId, setRespondingInteractionId] = useState("");
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, string[][]>>({});
   const [restoringCheckpointId, setRestoringCheckpointId] = useState("");
+  const [restoreConfirmationId, setRestoreConfirmationId] = useState("");
   const [restoredCheckpointId, setRestoredCheckpointId] = useState("");
   const [sessionDiff, setSessionDiff] = useState<SessionDiff | null>(null);
   const [checkpoints, setCheckpoints] = useState<CheckpointsPayload | null>(null);
@@ -1748,7 +2351,7 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState("");
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [prompt, setPrompt] = useState("");
-  const [permission, setPermission] = useState("PLAN_ONLY");
+  const [permission, setPermission] = useState(() => normalizePermissionMode(storedValue(STORAGE_PERMISSION_MODE, "REQUEST_APPROVAL")));
   const [model, setModel] = useState("");
   const [terminalCommand, setTerminalCommand] = useState("pwd");
   const [terminalResult, setTerminalResult] = useState<TerminalRunResult | null>(null);
@@ -1779,8 +2382,16 @@ export function App() {
   const [inspectorMode, setInspectorMode] = useState<"overview" | "review">("overview");
   const [error, setError] = useState("");
   const lastGlobalId = useRef(0);
+  const eventKeysRef = useRef<Set<string>>(new Set());
+  const refreshEffectKey = useRef("");
   const streamReconnectAttempts = useRef(0);
   const managedBridgeAutoSyncKey = useRef("");
+  const sessionRenameCancelledRef = useRef(false);
+  const composerComposingRef = useRef(false);
+  const composerCompositionEndAtRef = useRef(0);
+  const timelineRef = useRef<HTMLElement | null>(null);
+  const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const timelineAutoScrollFrameRef = useRef<number | null>(null);
   const activeProject = projects.find((project) => sameProjectPath(project.path, activeProjectPath));
   const selectedProjectPath = activeProject?.path || activeProjectPath || desktopDiagnostics?.workspace_default || managedBridge?.workspace || "";
   const managedBridgeBusyAny = Boolean(managedBridgeBusy);
@@ -1920,9 +2531,11 @@ export function App() {
     [api],
   );
 
-  const addMcpServer = useCallback(
+  const submitMcpServer = useCallback(
     async (event: FormEvent) => {
       event.preventDefault();
+      const editingName = mcpEditingServerName.trim();
+      const editing = Boolean(editingName);
       const name = mcpServerDraft.name.trim();
       const url = mcpServerDraft.url.trim();
       const command = mcpServerDraft.command.trim();
@@ -1935,11 +2548,11 @@ export function App() {
         setMcpMutationError("Name is required.");
         return;
       }
-      if (mcpServerDraft.mode === "remote" && !url) {
+      if (!editing && mcpServerDraft.mode === "remote" && !url) {
         setMcpMutationError("Remote MCP URL is required.");
         return;
       }
-      if (mcpServerDraft.mode === "local" && !command) {
+      if (!editing && mcpServerDraft.mode === "local" && !command) {
         setMcpMutationError("Local MCP command is required.");
         return;
       }
@@ -1985,14 +2598,56 @@ export function App() {
               timeout_ms: timeoutMs,
               enabled: true,
             };
+      if (editing) {
+        const patchBody: JsonRecord = { type: mcpServerDraft.mode };
+        if (timeoutMs) patchBody.timeout_ms = timeoutMs;
+        if (Object.keys(env).length) patchBody.env = env;
+        if (Object.keys(headers).length) patchBody.headers = headers;
+        if (mcpServerDraft.mode === "local") {
+          if (command) {
+            patchBody.command = command;
+            patchBody.args = parseMcpList(mcpServerDraft.args);
+          }
+          if (mcpServerDraft.cwd.trim()) patchBody.cwd = mcpServerDraft.cwd.trim();
+        } else {
+          if (url) patchBody.url = url;
+          if (transport) patchBody.transport = transport;
+        }
+        const payload = await commitMcpMutation(`edit:${editingName}`, `/api/mcp/servers/${encodeURIComponent(editingName)}`, {
+          method: "PATCH",
+          body: JSON.stringify(patchBody),
+        });
+        if (payload) {
+          setMcpServerDraft(defaultMcpServerDraft());
+          setMcpEditingServerName("");
+        }
+        return;
+      }
       const payload = await commitMcpMutation("add", "/api/mcp/servers", {
         method: "POST",
         body: JSON.stringify(body),
       });
-      if (payload) setMcpServerDraft(defaultMcpServerDraft());
+      if (payload) {
+        setMcpServerDraft(defaultMcpServerDraft());
+        setMcpEditingServerName("");
+      }
     },
-    [commitMcpMutation, mcp?.writable, mcpServerDraft],
+    [commitMcpMutation, mcp?.writable, mcpEditingServerName, mcpServerDraft],
   );
+
+  const editMcpServer = useCallback((server: McpServerSummary) => {
+    const name = server.name?.trim();
+    if (!name) return;
+    setMcpMutationError("");
+    setMcpEditingServerName(name);
+    setMcpServerDraft(mcpDraftFromServer(server));
+  }, []);
+
+  const cancelMcpEdit = useCallback(() => {
+    setMcpMutationError("");
+    setMcpEditingServerName("");
+    setMcpServerDraft(defaultMcpServerDraft());
+  }, []);
 
   const toggleMcpServer = useCallback(
     async (server: McpServerSummary) => {
@@ -2039,23 +2694,29 @@ export function App() {
     [commitMcpMutation],
   );
 
-  const addEvents = useCallback((incoming: AppEvent[]) => {
-    if (!incoming.length) return;
+  const addEvents = useCallback((incoming: AppEvent[]): AppEvent[] => {
+    if (!incoming.length) return [];
     lastGlobalId.current = incoming.reduce((cursor, event) => {
       return Math.max(cursor, event.global_sequence ?? 0);
     }, lastGlobalId.current);
 
+    const seen = new Set(eventKeysRef.current);
+    const accepted: AppEvent[] = [];
+    for (const event of incoming) {
+      const key = eventKey(event);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      accepted.push(event);
+    }
+    eventKeysRef.current = seen;
+    if (!accepted.length) return [];
+
     setEvents((current) => {
-      const seen = new Set(current.map(eventKey));
-      const next = [...current];
-      for (const event of incoming) {
-        const key = eventKey(event);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        next.push(event);
-      }
-      return next.slice(-300);
+      const next = [...current, ...accepted].slice(-300);
+      eventKeysRef.current = new Set(next.map(eventKey));
+      return next;
     });
+    return accepted;
   }, []);
 
   const refreshWorkspaceContext = useCallback(
@@ -2074,16 +2735,39 @@ export function App() {
     [api],
   );
 
+  const clearMissingSession = useCallback(
+    (session: string) => {
+      if (!session) return;
+      setSessions((current) => current.filter((record) => sessionId(record) !== session));
+      if (activeSessionId !== session) return;
+      setActiveSessionId("");
+      setSelectedTurnJobId("");
+      setSessionMessages(null);
+      setSessionDiff(null);
+      setCheckpoints(null);
+      setRestoredCheckpointId("");
+    },
+    [activeSessionId],
+  );
+
   const refreshSessionMessages = useCallback(
     async (session: string) => {
       if (!session) {
         setSessionMessages(null);
         return;
       }
-      const payload = await api<SessionMessagesPayload>(`/api/sessions/${session}/messages?limit=100`);
-      setSessionMessages(payload);
+      try {
+        const payload = await api<SessionMessagesPayload>(`/api/sessions/${session}/messages?limit=100`);
+        setSessionMessages(payload);
+      } catch (err) {
+        if (isMissingSessionError(err)) {
+          clearMissingSession(session);
+          return;
+        }
+        throw err;
+      }
     },
-    [api],
+    [api, clearMissingSession],
   );
 
   const refreshInteractions = useCallback(
@@ -2124,15 +2808,24 @@ export function App() {
         await refreshWorkspaceContext();
         return;
       }
-      const [diffPayload, checkpointsPayload] = await Promise.all([
-        api<SessionDiff>(`/api/sessions/${session}/diff`),
-        api<CheckpointsPayload>(`/api/sessions/${session}/checkpoints`),
-      ]);
-      setSessionDiff(diffPayload);
-      setCheckpoints(checkpointsPayload);
-      await refreshWorkspaceContext(stringField(diffPayload.latest ?? undefined, "path"));
+      try {
+        const [diffPayload, checkpointsPayload] = await Promise.all([
+          api<SessionDiff>(`/api/sessions/${session}/diff`),
+          api<CheckpointsPayload>(`/api/sessions/${session}/checkpoints`),
+        ]);
+        setSessionDiff(diffPayload);
+        setCheckpoints(checkpointsPayload);
+        await refreshWorkspaceContext(stringField(diffPayload.latest ?? undefined, "path"));
+      } catch (err) {
+        if (isMissingSessionError(err)) {
+          clearMissingSession(session);
+          await refreshWorkspaceContext();
+          return;
+        }
+        throw err;
+      }
     },
-    [api, refreshWorkspaceContext],
+    [api, clearMissingSession, refreshWorkspaceContext],
   );
 
   const refresh = useCallback(async () => {
@@ -2143,7 +2836,7 @@ export function App() {
         healthy: false,
         model_endpoint_ok: false,
         provider: "openai",
-        model: model || undefined,
+        model: undefined,
         error: err instanceof Error ? err.message : String(err),
         models: [],
       })),
@@ -2194,24 +2887,164 @@ export function App() {
     });
     await refreshWorkspaceContext();
     setConnection("online");
-  }, [api, model, refreshWorkspaceContext, selectedProjectPath]);
+  }, [api, refreshWorkspaceContext, selectedProjectPath]);
 
   const createSession = useCallback(async () => {
     if (bridgeSwitchInProgress) {
       throw new Error("App Bridge is switching to the selected project. Try again in a moment.");
     }
-    const payload = await api<{ session_id?: string; id?: string }>("/api/sessions", {
+    const workspace = selectedProjectPath || undefined;
+    const payload = await api<CreateSessionPayload>("/api/sessions", {
       method: "POST",
       body: JSON.stringify({
-        cwd: selectedProjectPath || undefined,
-        title: activeProject?.name ? `${activeProject.name} session` : undefined,
+        cwd: workspace,
       }),
     });
-    const id = payload.session_id ?? payload.id ?? "";
+    const id = payload.session_id ?? payload.id ?? sessionId(payload.session ?? {});
+    const session = createdSessionSummary(payload, workspace ?? selectedProjectPath);
+    if (session) setSessions((current) => upsertSessionSummary(current, session));
+    setSelectedTurnJobId("");
+    setSessionMessages(null);
+    setSessionDiff(null);
+    setCheckpoints(null);
+    setRestoredCheckpointId("");
     await refresh();
     setActiveSessionId(id);
     return id;
-  }, [activeProject?.name, api, bridgeSwitchInProgress, refresh, selectedProjectPath]);
+  }, [api, bridgeSwitchInProgress, refresh, selectedProjectPath]);
+
+	  const beginRenameSession = useCallback((session: SessionSummary) => {
+	    const id = sessionId(session);
+	    if (!id) return;
+	    sessionRenameCancelledRef.current = false;
+	    setDeleteConfirmationSessionId("");
+	    setSessionDeleteError("");
+	    setRenamingSessionId(id);
+	    setSessionRenameDraft(sessionDisplayTitle(session));
+	    setSessionRenameError("");
+	  }, []);
+
+  const cancelRenameSession = useCallback(() => {
+    sessionRenameCancelledRef.current = true;
+    setRenamingSessionId("");
+    setSessionRenameDraft("");
+    setSessionRenameError("");
+  }, []);
+
+  const saveSessionRename = useCallback(
+    async (session: SessionSummary) => {
+      const id = sessionId(session);
+      if (!id) return;
+      const title = sessionRenameDraft.trim();
+      const currentTitle = sessionDisplayTitle(session);
+      if (!title || title === currentTitle) {
+        setRenamingSessionId("");
+        setSessionRenameDraft("");
+        return;
+      }
+
+      setSessionRenameBusy(id);
+      setSessionRenameError("");
+      try {
+        const payload = await api<{ session?: SessionSummary }>(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ title }),
+        });
+        const updated = payload.session;
+        if (updated) {
+          setSessions((current) => current.map((record) => (sessionId(record) === id ? updated : record)));
+        } else {
+          await refresh();
+        }
+        setRenamingSessionId("");
+        setSessionRenameDraft("");
+      } catch (err) {
+        if (isMissingSessionError(err)) {
+          setSessions((current) => current.filter((record) => sessionId(record) !== id));
+          setRenamingSessionId("");
+          setSessionRenameDraft("");
+          setSessionRenameError("这个会话已经不存在，已从列表移除。");
+          if (activeSessionId === id) {
+            setActiveSessionId("");
+            setSelectedTurnJobId("");
+            setSessionMessages(null);
+            setSessionDiff(null);
+            setCheckpoints(null);
+            setRestoredCheckpointId("");
+          }
+          refresh().catch(() => undefined);
+        } else {
+          setSessionRenameError("重命名失败，请刷新后重试。");
+        }
+      } finally {
+        setSessionRenameBusy("");
+      }
+    },
+    [activeSessionId, api, refresh, sessionRenameDraft],
+  );
+
+  const deleteSession = useCallback(
+    async (session: SessionSummary) => {
+      const id = sessionId(session);
+      if (!id || sessionDeleteBusy) return;
+      if (deleteConfirmationSessionId !== id) {
+        setDeleteConfirmationSessionId(id);
+        setSessionDeleteError("");
+        return;
+      }
+
+      setSessionDeleteBusy(id);
+      setSessionDeleteError("");
+      try {
+        await api(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+        });
+        setSessions((current) => current.filter((record) => sessionId(record) !== id));
+        setDeleteConfirmationSessionId("");
+        if (renamingSessionId === id) {
+          setRenamingSessionId("");
+          setSessionRenameDraft("");
+        }
+        if (activeSessionId === id) {
+          setActiveSessionId("");
+          setSelectedTurnJobId("");
+          setSessionMessages(null);
+          setSessionDiff(null);
+          setCheckpoints(null);
+          setRestoredCheckpointId("");
+          setEvents((current) => current.filter((event) => eventSessionId(event) !== id));
+        }
+        await refresh();
+      } catch (err) {
+        if (isMissingSessionError(err)) {
+          setSessions((current) => current.filter((record) => sessionId(record) !== id));
+          setDeleteConfirmationSessionId("");
+          if (activeSessionId === id) {
+            setActiveSessionId("");
+            setSelectedTurnJobId("");
+            setSessionMessages(null);
+            setSessionDiff(null);
+            setCheckpoints(null);
+            setRestoredCheckpointId("");
+            setEvents((current) => current.filter((event) => eventSessionId(event) !== id));
+          }
+          refresh().catch(() => undefined);
+          return;
+        }
+        setSessionDeleteError("删除失败，请刷新后重试。");
+      } finally {
+        setSessionDeleteBusy("");
+      }
+    },
+    [
+      activeSessionId,
+      api,
+      deleteConfirmationSessionId,
+      refresh,
+      renamingSessionId,
+      sessionDeleteBusy,
+    ],
+  );
 
   const refreshFromEvents = useCallback(
     async (incoming: AppEvent[]) => {
@@ -2267,6 +3100,10 @@ export function App() {
       refreshTurnJobs,
     ],
   );
+  const refreshFromEventsRef = useRef(refreshFromEvents);
+  useEffect(() => {
+    refreshFromEventsRef.current = refreshFromEvents;
+  }, [refreshFromEvents]);
 
   const respondApproval = useCallback(
     async (approval: PendingApproval, action: "allow" | "deny") => {
@@ -2280,9 +3117,9 @@ export function App() {
           body: JSON.stringify({ action, scope: "once" }),
         });
         const incoming = payload.events ?? [];
-        addEvents(incoming);
-        if (incoming.length) {
-          await refreshFromEvents(incoming);
+        const accepted = addEvents(incoming);
+        if (accepted.length) {
+          await refreshFromEvents(accepted);
         } else {
           await refreshInteractions("turn/approval_resolved");
           await refreshSessionMessages(approval.session_id || activeSessionId);
@@ -2339,9 +3176,9 @@ export function App() {
           ),
         });
         const incoming = payload.events ?? [];
-        addEvents(incoming);
-        if (incoming.length) {
-          await refreshFromEvents(incoming);
+        const accepted = addEvents(incoming);
+        if (accepted.length) {
+          await refreshFromEvents(accepted);
         } else {
           await refreshInteractions("item/question/resolved");
           await refreshSessionMessages(question.session_id || activeSessionId);
@@ -2399,14 +3236,15 @@ export function App() {
           { method: "POST" },
         );
         const incoming = payload.events ?? [];
-        addEvents(incoming);
-        if (incoming.length) {
-          await refreshFromEvents(incoming);
+        const accepted = addEvents(incoming);
+        if (accepted.length) {
+          await refreshFromEvents(accepted);
         } else {
           setRestoredCheckpointId(checkpointId);
           await refreshSessionMessages(activeSessionId);
           await refreshSessionTrust(activeSessionId);
         }
+        setRestoreConfirmationId("");
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
@@ -2415,6 +3253,22 @@ export function App() {
     },
     [activeSessionId, addEvents, api, refreshFromEvents, refreshSessionMessages, refreshSessionTrust],
   );
+
+  const requestCheckpointRestore = useCallback((checkpointId?: string) => {
+    if (!checkpointId) return;
+    setError("");
+    setRestoreConfirmationId(checkpointId);
+    setInspectorMode("review");
+    setInspectorOpen(true);
+  }, []);
+
+  const cancelCheckpointRestore = useCallback(() => {
+    setRestoreConfirmationId("");
+  }, []);
+
+  const confirmCheckpointRestore = useCallback(() => {
+    void restoreCheckpoint(restoreConfirmationId);
+  }, [restoreCheckpoint, restoreConfirmationId]);
 
   const runTerminalCommand = useCallback(
     async (event: FormEvent) => {
@@ -2450,8 +3304,7 @@ export function App() {
       setError("");
       setStreamState("running");
       try {
-        const session = activeSessionId || (await createSession());
-        const payload = await api<{
+        type TurnSubmitPayload = {
           events?: AppEvent[];
           status?: string;
           turn_id?: string;
@@ -2459,53 +3312,66 @@ export function App() {
           queue_position?: number;
           queue_reason?: string;
           scheduler?: TurnSchedulerSummary;
-        }>(`/api/sessions/${session}/turns`, {
-          method: "POST",
-          body: JSON.stringify({
-            input: text,
-            model: model || undefined,
-            permission,
-            stream: true,
-            async: true,
-          }),
-        });
-        const incoming = payload.events ?? [];
-        const hasStreamedDeltas = incoming.some((event) => event.method === "item/agentMessage/delta");
-        if (payload.turn_id) {
-          setActiveTurnId(payload.turn_id);
-          setTurnJobs((current) =>
-            upsertTurnJob(current, {
-              session_id: session,
-              turn_id: payload.turn_id,
-              status: payload.status ?? (payload.queued ? "queued" : "running"),
-              queue_position: payload.queue_position,
-              queue_reason: payload.queue_reason,
-              started_at_ms: Date.now(),
-              updated_at_ms: Date.now(),
+        };
+        const startTurn = (session: string) =>
+          api<TurnSubmitPayload>(`/api/sessions/${session}/turns`, {
+            method: "POST",
+            body: JSON.stringify({
+              input: text,
+              model: model || undefined,
+              ...permissionPayloadForMode(permission),
+              stream: true,
+              async: true,
             }),
-          );
+          });
+        const acceptTurnPayload = async (session: string, payload: TurnSubmitPayload) => {
+          const incoming = payload.events ?? [];
+          const hasStreamedDeltas = incoming.some((event) => event.method === "item/agentMessage/delta");
+          if (payload.turn_id) {
+            setActiveTurnId(payload.turn_id);
+            setTurnJobs((current) =>
+              upsertTurnJob(current, {
+                session_id: session,
+                turn_id: payload.turn_id,
+                status: payload.status ?? (payload.queued ? "queued" : "running"),
+                queue_position: payload.queue_position,
+                queue_reason: payload.queue_reason,
+                started_at_ms: Date.now(),
+                updated_at_ms: Date.now(),
+              }),
+            );
+          }
+          const accepted = addEvents(incoming);
+          setStreamState(streamStateAfterEvents(accepted.length ? accepted : incoming, turnSubmitState(payload.status, payload.queued)));
+          setPrompt("");
+          if (hasStreamedDeltas) {
+            await nextPaint();
+            await sleepMs(320);
+          }
+          window.setTimeout(() => {
+            refresh().catch((err: unknown) => {
+              if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
+            });
+            refreshTurnJobs().catch((err: unknown) => {
+              if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
+            });
+            refreshSessionMessages(session).catch((err: unknown) => {
+              if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
+            });
+            refreshSessionTrust(session).catch((err: unknown) => {
+              if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
+            });
+          }, 250);
+        };
+        let session = activeSessionId || (await createSession());
+        try {
+          await acceptTurnPayload(session, await startTurn(session));
+        } catch (err) {
+          if (!isMissingSessionError(err)) throw err;
+          clearMissingSession(session);
+          session = await createSession();
+          await acceptTurnPayload(session, await startTurn(session));
         }
-        addEvents(incoming);
-        setStreamState(streamStateAfterEvents(incoming, turnSubmitState(payload.status, payload.queued)));
-        setPrompt("");
-        if (hasStreamedDeltas) {
-          await nextPaint();
-          await sleepMs(320);
-        }
-        window.setTimeout(() => {
-          refresh().catch((err: unknown) => {
-            if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
-          });
-          refreshTurnJobs().catch((err: unknown) => {
-            if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
-          });
-          refreshSessionMessages(session).catch((err: unknown) => {
-            if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
-          });
-          refreshSessionTrust(session).catch((err: unknown) => {
-            if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
-          });
-        }, 250);
       } catch (err) {
         if (err instanceof ApiError && err.body?.error_code === "turn_queue_full") {
           setStreamState("idle");
@@ -2522,6 +3388,7 @@ export function App() {
       addEvents,
       api,
       bridgeSwitchInProgress,
+      clearMissingSession,
       createSession,
       model,
       permission,
@@ -2551,9 +3418,9 @@ export function App() {
         method: "POST",
       });
       const incoming = payload.events ?? [];
-      addEvents(incoming);
-      setStreamState(streamStateAfterEvents(incoming, payload.status ?? "interrupted"));
-      await refreshFromEvents(incoming);
+      const accepted = addEvents(incoming);
+      setStreamState(streamStateAfterEvents(accepted.length ? accepted : incoming, payload.status ?? "interrupted"));
+      if (accepted.length) await refreshFromEvents(accepted);
       setTurnJobs((current) =>
         upsertTurnJob(current, {
           ...(payload.job ?? {}),
@@ -2600,6 +3467,10 @@ export function App() {
   }, [activeProjectPath]);
 
   useEffect(() => {
+    window.localStorage.setItem(STORAGE_PERMISSION_MODE, normalizePermissionMode(permission));
+  }, [permission]);
+
+  useEffect(() => {
     if (!bridgeApiReady) return;
     refreshSessionMessages(activeSessionId).catch((err: unknown) => {
       if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
@@ -2615,11 +3486,14 @@ export function App() {
 
   useEffect(() => {
     if (!bridgeApiReady) return;
+    const key = `${bridgeUrl}\n${token}\n${selectedProjectPath}`;
+    if (refreshEffectKey.current === key) return;
+    refreshEffectKey.current = key;
     refresh().catch((err: unknown) => {
       setConnection("offline");
       if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
     });
-  }, [bridgeApiReady, refresh]);
+  }, [bridgeApiReady, bridgeUrl, refresh, selectedProjectPath, token]);
 
   useEffect(() => {
     if (!bridgeApiReady) return;
@@ -2645,15 +3519,16 @@ export function App() {
           if (!response.ok) throw new Error(`events ${response.status}`);
           const parsed = await readSse(response, async (incoming) => {
             if (cancelled) return;
-            addEvents(incoming);
-            setStreamState((current) => streamStateAfterEvents(incoming, current));
+            const accepted = addEvents(incoming);
+            if (!accepted.length) return;
+            setStreamState((current) => streamStateAfterEvents(accepted, current));
             setStreamHealth((current) => ({
               ...current,
               status: "receiving",
               resume_cursor: lastGlobalId.current,
-              last_batch_count: incoming.length,
+              last_batch_count: accepted.length,
             }));
-            await refreshFromEvents(incoming);
+            await refreshFromEventsRef.current(accepted);
           });
           const recovered = streamReconnectAttempts.current > 0;
           streamReconnectAttempts.current = 0;
@@ -2694,7 +3569,7 @@ export function App() {
       cancelled = true;
       controller?.abort();
     };
-  }, [addEvents, bridgeApiReady, bridgeUrl, refreshFromEvents, token]);
+  }, [addEvents, bridgeApiReady, bridgeUrl, token]);
 
   const activeEvents = useMemo(() => {
     if (!activeSessionId) return events;
@@ -2705,44 +3580,67 @@ export function App() {
     return filtered.length ? filtered : events;
   }, [activeSessionId, events]);
   const eventActiveTurnId = useMemo(() => activeTurnIdFromEvents(activeEvents), [activeEvents]);
-  const activeTurnTerminalSeen = useMemo(
-    () =>
-      Boolean(
-        activeTurnId &&
-          activeEvents.some((event) => {
-            const method = event.method;
-            return (
-              eventTurnId(event) === activeTurnId &&
-              (method === "turn/completed" || method === "turn/failed" || method === "turn/interrupted")
-            );
-          }),
-      ),
-    [activeEvents, activeTurnId],
-  );
   useEffect(() => {
-    if (eventActiveTurnId && eventActiveTurnId !== activeTurnId) {
-      setActiveTurnId(eventActiveTurnId);
-      return;
-    }
-    if (activeTurnTerminalSeen) {
-      setActiveTurnId("");
-      setInterruptingTurnId("");
-    }
-  }, [activeTurnId, activeTurnTerminalSeen, eventActiveTurnId]);
+    if (!activeEvents.length) return;
+    setActiveTurnId((current) => (current === eventActiveTurnId ? current : eventActiveTurnId));
+    if (!eventActiveTurnId) setInterruptingTurnId("");
+  }, [activeEvents.length, eventActiveTurnId]);
   const rawStreamingDraft = useMemo(() => activeStreamingDraftFromEvents(activeEvents), [activeEvents]);
-  const visibleLiveEvents = useMemo(
-    () => activeEvents.filter((event) => event.method !== "item/agentMessage/delta"),
-    [activeEvents],
-  );
-
   const activeMessages = sessionMessages?.messages_v2 ?? [];
   const activeStreamingDraft = useMemo(() => {
     if (!rawStreamingDraft) return null;
-    if (rawStreamingDraft.completed && hasPersistedAssistantForTurn(activeMessages, rawStreamingDraft.turnId)) {
+    if (rawStreamingDraft.completed) return null;
+    if (hasPersistedAssistantForTurn(activeMessages, rawStreamingDraft.turnId)) {
       return null;
     }
     return rawStreamingDraft;
   }, [activeMessages, rawStreamingDraft]);
+  const liveFinalAnswer = useMemo(() => {
+    if (activeStreamingDraft) return null;
+    const finalAnswer = liveFinalAnswerFromEvents(activeEvents);
+    if (finalAnswer && !hasPersistedAssistantForTurn(activeMessages, finalAnswer.turnId)) return finalAnswer;
+    if (
+      rawStreamingDraft?.completed &&
+      rawStreamingDraft.terminalMethod === "turn/completed" &&
+      rawStreamingDraft.text.trim() &&
+      !hasPersistedAssistantForTurn(activeMessages, rawStreamingDraft.turnId)
+    ) {
+      return {
+        turnId: rawStreamingDraft.turnId,
+        text: rawStreamingDraft.text,
+      };
+    }
+    return null;
+  }, [activeEvents, activeMessages, activeStreamingDraft, rawStreamingDraft]);
+  const latestTerminalErrorTurnId = useMemo(() => latestTerminalErrorTurnIdFromEvents(activeEvents), [activeEvents]);
+  const visibleLiveTurnId =
+    eventActiveTurnId || activeTurnId || liveFinalAnswer?.turnId || rawStreamingDraft?.turnId || latestTerminalErrorTurnId || "";
+  const visibleLiveEvents = useMemo(() => {
+    if (!visibleLiveTurnId) return [];
+    return activeEvents
+      .filter((event) => {
+        if (!isVisibleProcessEvent(event)) return false;
+        const turnId = eventTurnId(event);
+        return !turnId || turnId === visibleLiveTurnId;
+      })
+      .slice(-10);
+  }, [activeEvents, visibleLiveTurnId]);
+  const timelineMessageItems = useMemo(
+    () => activeMessages.map((message, index) => ({ message, index })),
+    [activeMessages],
+  );
+  const deferredAssistantMessages = useMemo(
+    () =>
+      timelineMessageItems.filter(({ message }) =>
+        shouldDeferAssistantMessageAfterLiveEvents(message, visibleLiveTurnId, visibleLiveEvents.length > 0),
+      ),
+    [timelineMessageItems, visibleLiveEvents.length, visibleLiveTurnId],
+  );
+  const inlineTimelineMessages = useMemo(() => {
+    if (!deferredAssistantMessages.length) return timelineMessageItems;
+    const deferred = new Set(deferredAssistantMessages.map(({ index }) => index));
+    return timelineMessageItems.filter(({ index }) => !deferred.has(index));
+  }, [deferredAssistantMessages, timelineMessageItems]);
   const activeResolvedInteractionKeys = useMemo(() => resolvedInteractionKeys(activeMessages), [activeMessages]);
   const trustHistory = useMemo(() => trustHistoryFromMessages(activeMessages), [activeMessages]);
   const modelOptions = provider?.models?.map((item) => item.id).filter(Boolean) as string[] | undefined;
@@ -2753,10 +3651,66 @@ export function App() {
   const mcpStatusClass = mcp?.error ? "bad" : mcp?.enabled ? "ok" : mcp?.configured ? "neutral" : "missing";
   const mcpWritable = Boolean(mcp?.writable);
   const mcpConfigPath = mcp?.config_path ?? "";
+  const mcpEditing = Boolean(mcpEditingServerName);
+  useEffect(() => {
+    const shouldStickToBottom =
+      streamState !== "idle" ||
+      Boolean(activeStreamingDraft) ||
+      Boolean(liveFinalAnswer) ||
+      visibleLiveEvents.length > 0;
+    if (!shouldStickToBottom) return;
+    const timeline = timelineRef.current;
+    if (!timeline) return;
+    if (timelineAutoScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(timelineAutoScrollFrameRef.current);
+    }
+    timelineAutoScrollFrameRef.current = window.requestAnimationFrame(() => {
+      timeline.scrollTop = timeline.scrollHeight;
+      timelineAutoScrollFrameRef.current = null;
+    });
+    return () => {
+      if (timelineAutoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(timelineAutoScrollFrameRef.current);
+        timelineAutoScrollFrameRef.current = null;
+      }
+    };
+  }, [
+    activeMessages.length,
+    activeStreamingDraft?.text,
+    deferredAssistantMessages.length,
+    inlineTimelineMessages.length,
+    liveFinalAnswer?.text,
+    streamState,
+    visibleLiveEvents.length,
+  ]);
   const activeSession = sessions.find((session) => sessionId(session) === activeSessionId);
-  const visibleSessions = selectedProjectPath
-    ? sessions.filter((session) => sameProjectPath(session.workspace, selectedProjectPath))
-    : sessions;
+  const checkpointRestoreHistory = useMemo(() => checkpointRestoreHistoryFromSession(activeSession), [activeSession]);
+  const latestCheckpointRestore = checkpointRestoreHistory[0];
+  const restoredCheckpointIdFromActiveSession = restoredCheckpointIdFromSession(activeSession);
+  useEffect(() => {
+    setRestoredCheckpointId((current) => {
+      if (current === restoredCheckpointIdFromActiveSession) return current;
+      return restoredCheckpointIdFromActiveSession;
+    });
+  }, [restoredCheckpointIdFromActiveSession]);
+  const sessionsByProjectPath = useMemo(() => {
+    const grouped = new Map<string, SessionSummary[]>();
+    for (const session of sessions) {
+      const workspace = normalizeProjectPath(session.workspace);
+      if (!workspace) continue;
+      const records = grouped.get(workspace) ?? [];
+      records.push(session);
+      grouped.set(workspace, records);
+    }
+    for (const records of grouped.values()) {
+      records.sort((left, right) => {
+        const rightTime = right.updated_at_ms ?? 0;
+        const leftTime = left.updated_at_ms ?? 0;
+        return rightTime - leftTime;
+      });
+    }
+    return grouped;
+  }, [sessions]);
   const sessionById = useMemo(() => {
     const records = new Map<string, SessionSummary>();
     for (const session of sessions) {
@@ -2769,6 +3723,8 @@ export function App() {
     const jobs = turnJobs.turns ?? [];
     return jobs
       .filter((job) => {
+        const jobSessionId = turnJobSessionId(job);
+        if (activeSessionId) return jobSessionId === activeSessionId;
         if (!selectedProjectPath) return true;
         const session = sessionById.get(turnJobSessionId(job));
         return !session?.workspace || sameProjectPath(session.workspace, selectedProjectPath);
@@ -2778,8 +3734,16 @@ export function App() {
         const leftTime = left.updated_at_ms ?? left.started_at_ms ?? 0;
         return rightTime - leftTime;
       });
-  }, [selectedProjectPath, sessionById, turnJobs.turns]);
+  }, [activeSessionId, selectedProjectPath, sessionById, turnJobs.turns]);
   const activeTurnJobs = visibleTurnJobs.filter((job) => !isTurnJobTerminal(job));
+  const terminalTurnStatusById = useMemo(() => {
+    const records = new Map<string, string>();
+    for (const job of turnJobs.turns ?? []) {
+      const id = turnJobId(job);
+      if (id && isTurnJobTerminal(job)) records.set(id, job.status ?? "completed");
+    }
+    return records;
+  }, [turnJobs.turns]);
   const queuedTurnJobs = activeTurnJobs
     .filter(isTurnJobQueued)
     .sort((left, right) => {
@@ -2788,8 +3752,6 @@ export function App() {
       return leftTime - rightTime;
     });
   const runningTurnJobs = activeTurnJobs.filter((job) => !isTurnJobQueued(job));
-  const recentTerminalTurnJobs = visibleTurnJobs.filter(isTurnJobTerminal).slice(0, 3);
-  const sidebarTurnJobs = (activeTurnJobs.length ? [...runningTurnJobs, ...queuedTurnJobs] : recentTerminalTurnJobs).slice(0, 5);
   const selectedTurnJob =
     visibleTurnJobs.find((job) => turnJobId(job) === selectedTurnJobId) ??
     runningTurnJobs[0] ??
@@ -2828,31 +3790,17 @@ export function App() {
     stringField(latestPatch, "status") ||
     (latestPatch ? `${sessionDiff?.undo_count ?? 0} undo · ${sessionDiff?.redo_count ?? 0} redo` : "");
   const latestCheckpoint = checkpoints?.latest ?? (checkpoints?.checkpoints ?? [])[0];
+  const restoreConfirmationCheckpoint = restoreConfirmationId
+    ? (checkpoints?.checkpoints ?? []).find((checkpoint) => checkpoint.checkpoint_id === restoreConfirmationId)
+    : undefined;
   const showWorkspaceDock =
     pendingInteractionCount > 0 ||
     Boolean(latestPatch) ||
     Boolean(latestCheckpoint) ||
     Boolean(restoredCheckpointId);
-  const showComposerContext =
-    showWorkspaceDock ||
-    streamState !== "idle" ||
-    Boolean(activeStreamingDraft) ||
-    Boolean(activeSessionId) ||
-    Boolean(selectedProjectPath);
+  const showComposerContext = false;
   const timelineEmpty =
-    activeMessages.length === 0 && visibleLiveEvents.length === 0 && !activeStreamingDraft;
-  const projectBridgeStatusLabel = bridgeSwitchInProgress
-    ? "syncing"
-    : connection === "online"
-      ? "online"
-      : connection;
-  const jobSectionLabel = turnJobs.error
-    ? "offline"
-    : runningTurnJobs.length || queuedTurnJobs.length
-      ? `${runningTurnJobs.length} running · ${queuedTurnJobs.length} queued`
-      : visibleTurnJobs.length
-        ? "recent"
-        : "idle";
+    activeMessages.length === 0 && visibleLiveEvents.length === 0 && !activeStreamingDraft && !liveFinalAnswer;
   const latestUserActivity = useMemo(() => {
     for (const message of [...activeMessages].reverse()) {
       if (message.info?.role !== "user") continue;
@@ -2893,9 +3841,9 @@ export function App() {
   const activityElapsedLabel = activeSessionId ? formatElapsed(activityStartedAtMs, nowMs) : "";
   const activityTitle = latestUserActivity
     ? streamState === "queued"
-      ? "排队中的目标"
+      ? "排队中的任务"
       : streamState === "running" || streamState === "streaming"
-      ? "进行中的目标"
+      ? "进行中的任务"
       : streamState === "waiting_approval" || streamState === "waiting_question"
         ? "等待处理"
         : "最近任务"
@@ -3047,25 +3995,146 @@ export function App() {
     setProjects((current) => upsertProject(current, nextProject));
     setActiveProjectPath(nextProject.path);
     setProjectPathInput(nextProject.path);
-    setProjectError("");
-    setActiveSessionId("");
-    setSessionMessages(null);
-    setSessionDiff(null);
-    setCheckpoints(null);
-    setFileTree(null);
-    setFilePreview(null);
-    setGitStatus(null);
+      setProjectError("");
+      setActiveSessionId("");
+      setSelectedTurnJobId("");
+      setSessionMessages(null);
+      setSessionDiff(null);
+      setCheckpoints(null);
+      setRestoredCheckpointId("");
+      setFileTree(null);
+      setFilePreview(null);
+      setGitStatus(null);
     syncManagedBridgeToWorkspace(nextProject.path);
   }, [syncManagedBridgeToWorkspace]);
+
+  const selectProjectSession = useCallback(
+    (project: DesktopProject, session: SessionSummary) => {
+      const id = sessionId(session);
+      if (!id) return;
+      const workspace = normalizeProjectPath(session.workspace || project.path);
+      const nextProject = {
+        ...project,
+        path: workspace || project.path,
+        id: workspace || project.id,
+        last_opened_at_ms: Date.now(),
+      };
+      setProjects((current) => upsertProject(current, nextProject));
+      setActiveProjectPath(nextProject.path);
+      setProjectPathInput(nextProject.path);
+      setProjectError("");
+      setSelectedTurnJobId("");
+      setSessionMessages(null);
+      setSessionDiff(null);
+      setCheckpoints(null);
+      setRestoredCheckpointId("");
+      setActiveSessionId(id);
+      syncManagedBridgeToWorkspace(nextProject.path);
+      refreshSessionMessages(id).catch((err: unknown) => {
+        if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
+      });
+      refreshSessionTrust(id).catch((err: unknown) => {
+        if (!isInitialBridgeFetchError(err)) setError(err instanceof Error ? err.message : String(err));
+      });
+    },
+    [refreshSessionMessages, refreshSessionTrust, syncManagedBridgeToWorkspace],
+  );
+
+  const createProjectSession = useCallback(
+    async (project: DesktopProject) => {
+      const nextProject = { ...project, last_opened_at_ms: Date.now() };
+      const busyKey = `session:${normalizeProjectPath(nextProject.path)}`;
+      setProjectBusy(busyKey);
+      setProjectError("");
+      setProjects((current) => upsertProject(current, nextProject));
+      setActiveProjectPath(nextProject.path);
+      setProjectPathInput(nextProject.path);
+      setActiveSessionId("");
+      setSelectedTurnJobId("");
+      setSessionMessages(null);
+      setSessionDiff(null);
+      setCheckpoints(null);
+      setRestoredCheckpointId("");
+      setFileTree(null);
+      setFilePreview(null);
+      setGitStatus(null);
+      syncManagedBridgeToWorkspace(nextProject.path);
+      try {
+        const payload = await api<CreateSessionPayload>("/api/sessions", {
+          method: "POST",
+          body: JSON.stringify({
+            cwd: nextProject.path || undefined,
+          }),
+        });
+        const id = payload.session_id ?? payload.id ?? sessionId(payload.session ?? {});
+        const session = createdSessionSummary(payload, nextProject.path);
+        if (session) setSessions((current) => upsertSessionSummary(current, session));
+        setSelectedTurnJobId("");
+        setSessionMessages(null);
+        setSessionDiff(null);
+        setCheckpoints(null);
+        setRestoredCheckpointId("");
+        await refresh();
+        setActiveSessionId(id);
+      } catch (err) {
+        setProjectError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setProjectBusy("");
+      }
+    },
+    [api, refresh, syncManagedBridgeToWorkspace],
+  );
+
+  const removeProject = useCallback(
+    (project: DesktopProject) => {
+      const removedPath = normalizeProjectPath(project.path);
+      if (!removedPath) return;
+      const remainingProjects = projects.filter((item) => !sameProjectPath(item.path, removedPath));
+      const removingActiveProject =
+        sameProjectPath(activeProjectPath, removedPath) || sameProjectPath(selectedProjectPath, removedPath);
+      const fallbackProject = remainingProjects[0];
+      const fallbackPath = fallbackProject?.path ?? "";
+
+      setProjects(remainingProjects);
+      setProjectError("");
+      if (sameProjectPath(projectPathInput, removedPath)) {
+        setProjectPathInput(removingActiveProject ? fallbackPath : activeProjectPath || selectedProjectPath || "");
+      }
+      if (!removingActiveProject) return;
+
+      setActiveProjectPath(fallbackPath);
+      setProjectPathInput(fallbackPath);
+      if (!fallbackPath) window.localStorage.removeItem(STORAGE_ACTIVE_PROJECT);
+      setActiveSessionId("");
+      setSelectedTurnJobId("");
+      setSessionMessages(null);
+      setSessionDiff(null);
+      setCheckpoints(null);
+      setRestoredCheckpointId("");
+      setFileTree(null);
+      setFilePreview(null);
+      setGitStatus(null);
+      if (fallbackPath) syncManagedBridgeToWorkspace(fallbackPath);
+    },
+    [
+      activeProjectPath,
+      projectPathInput,
+      projects,
+      selectedProjectPath,
+      syncManagedBridgeToWorkspace,
+    ],
+  );
 
   const registerProject = useCallback((project: DesktopProject) => {
     setProjects((current) => upsertProject(current, project));
     setActiveProjectPath(project.path);
     setProjectPathInput(project.path);
     setActiveSessionId("");
+    setSelectedTurnJobId("");
     setSessionMessages(null);
     setSessionDiff(null);
     setCheckpoints(null);
+    setRestoredCheckpointId("");
     setFileTree(null);
     setFilePreview(null);
     setGitStatus(null);
@@ -3143,31 +4212,60 @@ export function App() {
     [openReviewPanel],
   );
 
+  const handleComposerKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (event.key !== "Enter" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+      if (
+        composerComposingRef.current ||
+        isImeKeyboardEvent(event) ||
+        Date.now() - composerCompositionEndAtRef.current < 120
+      ) {
+        return;
+      }
+      event.preventDefault();
+      if (bridgeSwitchInProgress || interruptBusy) return;
+      if (!prompt.trim()) return;
+      event.currentTarget.form?.requestSubmit();
+    },
+    [bridgeSwitchInProgress, interruptBusy, prompt],
+  );
+
+  const renderTimelineMessage = ({ message, index }: TimelineMessageItem) => {
+    const role = messageRoleLabel(message);
+    const content = messageContent(message);
+    const terminalRunStatus = terminalTurnStatusById.get(message.info?.run_id ?? "") ?? "";
+    const parts = visibleMessageParts(message, activeResolvedInteractionKeys, terminalRunStatus);
+    const showPartsBeforeContent = role === "assistant";
+    return (
+      <article
+        className={`event-row message-row role-${role}`}
+        key={messageKey(message, index)}
+      >
+        <div className="event-glyph">{messageIcon(message.info?.role)}</div>
+        <div className="event-body">
+          <div className="event-heading">
+            <strong>{role}</strong>
+            <span>{message.info?.status ?? "completed"}</span>
+          </div>
+          {showPartsBeforeContent ? <MessagePartCards parts={parts} /> : null}
+          {content ? (
+            <TextContent text={content} />
+          ) : parts.length === 0 ? (
+            <pre>{JSON.stringify(message.parts ?? [], null, 2)}</pre>
+          ) : null}
+          {!showPartsBeforeContent ? <MessagePartCards parts={parts} /> : null}
+          <div className="message-meta">
+            <span>{compactId(message.info?.id)}</span>
+            <span>{message.parts?.length ?? 0} parts</span>
+          </div>
+        </div>
+      </article>
+    );
+  };
+
   return (
     <main className={`app-shell ${inspectorOpen ? "inspector-visible" : ""}`}>
       <aside className="rail">
-        <div className="brand-row">
-          <div className="traffic-lights" aria-hidden="true">
-            <span className="traffic-close" />
-            <span className="traffic-minimize" />
-            <span className="traffic-zoom" />
-          </div>
-          <div className="brand-nav-actions">
-            <button className="chrome-button ghost" type="button" title="Toggle sidebar">
-              <Sidebar size={15} />
-            </button>
-            <button className="chrome-button ghost" type="button" title="Back">
-              <ArrowLeft size={15} />
-            </button>
-            <button className="chrome-button ghost" type="button" title="Forward">
-              <ArrowRight size={15} />
-            </button>
-          </div>
-          <button className="chrome-button ghost brand-refresh" onClick={refresh} type="button" title="Refresh">
-            <RefreshCw size={14} />
-          </button>
-        </div>
-
         <nav className="primary-nav" aria-label="OpenAgent navigation">
           <button
             className="nav-action"
@@ -3193,75 +4291,6 @@ export function App() {
             <span>插件</span>
           </button>
         </nav>
-
-        <section className="rail-section pinned">
-          <div className="section-title">置顶</div>
-          <button className="topic-row selected" type="button" title={activeProjectDisplayPath}>
-            <span>{activeProjectLabel}</span>
-            <small>{projectBridgeStatusLabel}</small>
-          </button>
-          <button className="topic-row" type="button" title={provider?.model ?? "model"}>
-            <span>{provider?.model ?? "模型未连接"}</span>
-            <small>{streamState}</small>
-          </button>
-        </section>
-
-        <section className="rail-section jobs" data-testid="turn-jobs-section">
-          <div className="section-title section-title-row">
-            <span>任务</span>
-            <small>{jobSectionLabel}</small>
-          </div>
-          <div className="job-list">
-            {sidebarTurnJobs.map((job) => {
-              const id = turnJobId(job);
-              const session = sessionById.get(turnJobSessionId(job));
-              const sessionLabel = session?.title || compactId(turnJobSessionId(job));
-              const status = job.status ?? "idle";
-              return (
-                <div className={`job-row ${isTurnJobTerminal(job) ? "terminal" : "active"}`} data-turn-id={id} key={id}>
-                  <button
-                    className={`job-main ${id === selectedTurnJobIdResolved ? "selected" : ""}`}
-                    onClick={() => {
-                      const sessionIdForJob = turnJobSessionId(job);
-                      if (sessionIdForJob) setActiveSessionId(sessionIdForJob);
-                      setSelectedTurnJobId(id);
-                      setInspectorMode("overview");
-                      setInspectorOpen(true);
-                    }}
-                    title={`${id} · ${sessionLabel}${job.queue_reason ? ` · ${queueReasonLabel(job.queue_reason)}` : ""}`}
-                    type="button"
-                  >
-                    <Activity size={14} />
-                    <span>{sessionLabel || "turn"}</span>
-                    <small>
-                      {isTurnJobQueued(job)
-                        ? `Queue #${queuePositionForJob(job, queuedTurnJobs)} · ${queueReasonLabel(job.queue_reason)}`
-                        : isTurnJobTerminal(job)
-                          ? `${turnJobStatusLabel(job)} · ${turnJobLabel(job)}`
-                          : turnJobLabel(job)}
-                    </small>
-                  </button>
-                  {isTurnJobInterruptible(job) ? (
-                    <button
-                      aria-label={`Interrupt ${id}`}
-                      className="job-stop-button"
-                      disabled={interruptingTurnId === id}
-                      onClick={() => interruptTurn(id)}
-                      title={interruptingTurnId === id ? "Interrupting" : `Interrupt ${compactId(id)}`}
-                      type="button"
-                    >
-                      <Square size={11} />
-                    </button>
-                  ) : (
-                    <small className={`job-status ${statusClass(status)}`}>{turnJobStatusLabel(job)}</small>
-                  )}
-                </div>
-              );
-            })}
-            {sidebarTurnJobs.length === 0 ? <p className="muted-line">暂无任务</p> : null}
-            {turnJobs.error ? <p className="muted-line job-error">{turnJobs.error}</p> : null}
-          </div>
-        </section>
 
         <section className="rail-section projects">
           <div className="section-title section-title-row">
@@ -3289,46 +4318,123 @@ export function App() {
           </form>
           {projectError ? <p className="project-error">{projectError}</p> : null}
           <div className="project-list">
-            {projects.map((project) => (
-              <button
-                className={`project-row ${sameProjectPath(project.path, selectedProjectPath) ? "selected" : ""}`}
-                disabled={managedBridgeBusyAny}
-                key={project.id}
-                onClick={() => selectProject(project)}
-                title={project.path}
-                type="button"
-              >
-                <Folder size={15} />
-                <span>{project.name}</span>
-                <small>{compactPath(project.path)}</small>
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section className="rail-section sessions">
-          <div className="section-title section-title-row">
-            <span>会话</span>
-            <button className="icon-button" onClick={refresh} type="button" title="Refresh">
-              <RefreshCw size={14} />
-            </button>
-          </div>
-          <div className="session-list">
-            {visibleSessions.map((session) => {
-              const id = sessionId(session);
+            {projects.filter(isDisplayableProject).map((project) => {
+              const isSelectedProject = sameProjectPath(project.path, selectedProjectPath);
+              const projectPath = normalizeProjectPath(project.path);
+              const projectSessions = sessionsByProjectPath.get(projectPath) ?? [];
+              const showProjectSessions =
+                isSelectedProject || projectSessions.some((session) => sessionId(session) === activeSessionId);
               return (
-                <button
-                  className={`session-row ${id === activeSessionId ? "selected" : ""}`}
-                  key={id}
-                  onClick={() => setActiveSessionId(id)}
-                  type="button"
-                >
-                  <span>{session.title || id || "session"}</span>
-                  <small>{session.status ?? "idle"}</small>
-                </button>
+                <div className="project-group" key={project.id}>
+                  <div
+                    className={`project-row ${isSelectedProject ? "selected" : ""}`}
+                    title={project.path}
+                  >
+                    <button
+                      className="project-open-button"
+                      disabled={managedBridgeBusyAny}
+                      onClick={() => selectProject(project)}
+                      type="button"
+                    >
+                      <Folder size={15} />
+                      <span>{project.name}</span>
+                    </button>
+                    <button
+                      aria-label={`New session in ${project.name}`}
+                      className="project-new-session-button"
+                      disabled={managedBridgeBusyAny || projectBusy === `session:${normalizeProjectPath(project.path)}`}
+                      onClick={() => createProjectSession(project)}
+                      title="New session in project"
+                      type="button"
+                    >
+                      <PencilLine size={14} />
+                    </button>
+                    <button
+                      aria-label={`Remove project ${project.name}`}
+                      className="project-remove-button"
+                      disabled={managedBridgeBusyAny}
+                      onClick={() => removeProject(project)}
+                      title="Remove project from workspace list"
+                      type="button"
+                    >
+                      <XCircle size={13} />
+                    </button>
+                  </div>
+                  {showProjectSessions && projectSessions.length ? (
+                    <div className="project-session-list">
+	                      {projectSessions.map((session) => {
+	                        const id = sessionId(session);
+	                        const isActiveSession = id === activeSessionId;
+	                        const isRenaming = renamingSessionId === id;
+	                        const isDeleteConfirming = deleteConfirmationSessionId === id;
+	                        const isDeleting = sessionDeleteBusy === id;
+	                        return (
+	                          <div className="project-session-row" key={id || `${project.id}:session`}>
+	                            {isRenaming ? (
+	                              <input
+                                aria-label="Session title"
+                                autoFocus
+                                className="session-rename-input"
+                                disabled={sessionRenameBusy === id}
+                                onBlur={() => {
+                                  if (sessionRenameCancelledRef.current) {
+                                    sessionRenameCancelledRef.current = false;
+                                    return;
+                                  }
+                                  void saveSessionRename(session);
+                                }}
+                                onChange={(event) => setSessionRenameDraft(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                    void saveSessionRename(session);
+                                  } else if (event.key === "Escape") {
+                                    event.preventDefault();
+                                    cancelRenameSession();
+                                  }
+                                }}
+                                value={sessionRenameDraft}
+                              />
+	                            ) : (
+	                              <>
+	                                <button
+	                                  className={`project-session-button ${isActiveSession ? "selected" : ""}`}
+	                                  disabled={!id}
+	                                  onClick={() => {
+	                                    setDeleteConfirmationSessionId("");
+	                                    selectProjectSession(project, session);
+	                                  }}
+	                                  onDoubleClick={() => beginRenameSession(session)}
+	                                  title={id ? `Session ${id}` : "Session"}
+	                                  type="button"
+	                                >
+	                                  <span>{sessionDisplayTitle(session)}</span>
+	                                  <small>{sessionTimeLabel(session, nowMs)}</small>
+	                                </button>
+	                                <button
+	                                  aria-label={`Delete session ${sessionDisplayTitle(session)}`}
+	                                  className={`project-session-delete-button ${isDeleteConfirming ? "confirm" : ""}`}
+	                                  disabled={!id || Boolean(sessionDeleteBusy && !isDeleting)}
+	                                  onClick={() => {
+	                                    void deleteSession(session);
+	                                  }}
+	                                  title={isDeleteConfirming ? "再次点击确认删除" : "删除会话"}
+	                                  type="button"
+	                                >
+	                                  {isDeleting ? <RefreshCw className="spin" size={12} /> : <Trash2 size={12} />}
+	                                </button>
+	                              </>
+	                            )}
+	                          </div>
+	                        );
+	                      })}
+	                      {sessionRenameError ? <p className="project-session-error">{sessionRenameError}</p> : null}
+	                      {sessionDeleteError ? <p className="project-session-error">{sessionDeleteError}</p> : null}
+	                    </div>
+	                  ) : null}
+                </div>
               );
             })}
-            {visibleSessions.length === 0 ? <p className="muted-line">暂无会话</p> : null}
           </div>
         </section>
 
@@ -3412,7 +4518,7 @@ export function App() {
           </div>
         </header>
 
-        <section className={`timeline ${timelineEmpty ? "empty" : ""}`} aria-live="polite">
+        <section className={`timeline ${timelineEmpty ? "empty" : ""}`} aria-live="polite" ref={timelineRef}>
           {timelineEmpty ? (
             <div className="empty-state">
               <span>开始一个任务</span>
@@ -3420,30 +4526,14 @@ export function App() {
             </div>
           ) : (
             <>
-              {activeMessages.map((message, index) => (
-                <article
-                  className={`event-row message-row role-${messageRoleLabel(message)}`}
-                  key={messageKey(message, index)}
-                >
-                  <div className="event-glyph">{messageIcon(message.info?.role)}</div>
-                  <div className="event-body">
-                    <div className="event-heading">
-                      <strong>{messageRoleLabel(message)}</strong>
-                      <span>{message.info?.status ?? "completed"}</span>
-                    </div>
-                    {messageContent(message) ? (
-                      <TextContent text={messageContent(message)} />
-                    ) : visibleMessageParts(message, activeResolvedInteractionKeys).length === 0 ? (
-                      <pre>{JSON.stringify(message.parts ?? [], null, 2)}</pre>
-                    ) : null}
-                    <MessagePartCards parts={visibleMessageParts(message, activeResolvedInteractionKeys)} />
-                    <div className="message-meta">
-                      <span>{compactId(message.info?.id)}</span>
-                      <span>{message.parts?.length ?? 0} parts</span>
-                    </div>
-                  </div>
-                </article>
-              ))}
+              {inlineTimelineMessages.map(renderTimelineMessage)}
+              {visibleLiveEvents.length ? (
+                <LiveTurnProcessCard
+                  events={visibleLiveEvents}
+                  isStreaming={Boolean(activeStreamingDraft)}
+                  key={`live-process:${visibleLiveTurnId}`}
+                />
+              ) : null}
               {activeStreamingDraft ? (
                 <article
                   className="event-row message-row role-assistant streaming-draft"
@@ -3460,69 +4550,118 @@ export function App() {
                   </div>
                 </article>
               ) : null}
-              {visibleLiveEvents.map((event, index) => (
-                <article className="event-row live-event-row" key={`${eventKey(event)}:${index}`}>
-                  <div className="event-glyph">{eventIcon(event.method)}</div>
+              {liveFinalAnswer ? (
+                <article
+                  className="event-row message-row role-assistant live-final-answer"
+                  data-testid="live-final-answer"
+                  key={`live-final-answer:${liveFinalAnswer.turnId}`}
+                >
+                  <div className="event-glyph">{messageIcon("assistant")}</div>
                   <div className="event-body">
-                    <div className="event-heading">
-                      <strong>{methodLabel(event.method)}</strong>
-                      <span>#{event.global_sequence ?? event.sequence ?? index + 1}</span>
-                    </div>
-                    <EventContent event={event} />
+                    <TextContent text={liveFinalAnswer.text} />
                   </div>
                 </article>
+              ) : null}
+              {deferredAssistantMessages.map(renderTimelineMessage)}
+              {checkpointRestoreHistory.slice(0, 3).map((record, index) => (
+                <CheckpointRestoreCard
+                  checkpoint={checkpointForRestore(record, checkpoints)}
+                  key={`${record.run_id || record.checkpoint_id || "restore"}:${index}`}
+                  record={record}
+                  variant="timeline"
+                />
               ))}
+              <div className="timeline-end" ref={timelineEndRef} />
             </>
           )}
         </section>
 
         <div className={`composer-dock ${showComposerContext ? "with-context" : "bare"}`}>
           {showWorkspaceDock ? (
-            <section className="workspace-dock" aria-label="Workspace activity">
+            <section className="workspace-dock" aria-label="Workspace activity" data-testid="approval-dock">
               {approvals.slice(0, 2).map((item) => {
                 const approval = item.approval ?? {};
-                const preview = approval.preview as JsonRecord | undefined;
                 const isResponding = respondingInteractionId === item.request_id;
+                const toolName = stringField(approval, "tool_name");
+                const riskTone = approvalRiskTone(approval);
                 return (
-                  <article className="dock-item dock-item-attention" key={item.request_id}>
-                    <ShieldCheck size={15} />
-                    <div>
-                      <strong>{stringField(approval, "tool_name") || "Approval needed"}</strong>
-                      <span>{stringField(preview, "path") || compactId(item.request_id)}</span>
+                  <article
+                    className="dock-item approval-dock-item dock-item-attention"
+                    data-testid="approval-dock-approval"
+                    data-approval-risk={riskTone}
+                    key={item.request_id}
+                  >
+                    <span className={`approval-dock-icon approval-risk-${riskTone}`}>
+                      <ShieldCheck size={15} />
+                    </span>
+                    <div className="approval-dock-body">
+                      <div className="approval-dock-heading">
+                        <div className="approval-dock-title">
+                          <strong>{approvalToolLabel(approval)}</strong>
+                          {toolName ? <small>{toolName}</small> : null}
+                        </div>
+                        <span className="approval-dock-status" data-testid="approval-dock-reason">{approvalReasonLabel(approval)}</span>
+                      </div>
+                      <p data-testid="approval-dock-input">{approvalInputSummary(approval)}</p>
+                      <div className="approval-dock-meta" data-testid="approval-dock-meta">
+                        <span className="approval-chip permission" data-testid="approval-dock-permission">
+                          {approvalPermissionLabel(approval)}
+                        </span>
+                        <span className={`approval-chip risk risk-${riskTone}`} data-testid="approval-dock-risk">
+                          {approvalRiskLabel(approval)}
+                        </span>
+                        <span>call {compactId(firstText(approval.call_id, item.request_id))}</span>
+                      </div>
                     </div>
-                    <button type="button" disabled={isResponding} onClick={() => respondApproval(item, "allow")}>
-                      {isResponding ? "Working" : "Allow"}
-                    </button>
-                    <button type="button" disabled={isResponding} onClick={() => respondApproval(item, "deny")}>
-                      Deny
-                    </button>
+                    <div className="approval-dock-actions">
+                      <button type="button" disabled={isResponding} onClick={() => respondApproval(item, "allow")}>
+                        {isResponding ? "Working" : "Allow"}
+                      </button>
+                      <button type="button" disabled={isResponding} onClick={() => respondApproval(item, "deny")}>
+                        Deny
+                      </button>
+                    </div>
                   </article>
                 );
               })}
               {questions.slice(0, 2).map((item) => {
                 const question = item.question ?? {};
                 const fields = questionElicitationFields(question, item.request_id ?? "", questionDrafts);
-                const hasErrors = fields.some((field) => field.error);
                 const isResponding = respondingInteractionId === item.request_id;
                 return (
-                  <article className="dock-item dock-item-attention" key={item.request_id}>
-                    <Bot size={15} />
-                    <div>
-                      <strong>{fields[0]?.label || "Question"}</strong>
-                      <span>{hasErrors ? "Open details to answer required fields" : fields[0]?.description || compactId(item.request_id)}</span>
+                  <article className="dock-item approval-dock-item approval-dock-question dock-item-attention" data-testid="approval-dock-question" key={item.request_id}>
+                    <span className="approval-dock-icon approval-risk-question">
+                      <Bot size={15} />
+                    </span>
+                    <div className="approval-dock-body">
+                      <div className="approval-dock-heading">
+                        <div className="approval-dock-title">
+                          <strong>{fields[0]?.label || "Question"}</strong>
+                          <small>{stringField(question, "tool_name") || "question"}</small>
+                        </div>
+                        <span className="approval-dock-status question" data-testid="approval-dock-question-status">Needs answer</span>
+                      </div>
+                      <p>{fields.length > 1 ? `${fields.length} required fields` : fields[0]?.description || compactId(item.request_id)}</p>
+                      <div className="approval-dock-meta">
+                        <span className="approval-chip permission">Question: reply to resume</span>
+                        <span>call {compactId(firstText(question.call_id, item.request_id))}</span>
+                      </div>
+                      <QuestionElicitationForm
+                        fields={fields}
+                        isResponding={isResponding}
+                        onChange={(index, value) => updateQuestionDraft(item.request_id, index, value)}
+                        onSubmit={() => respondQuestion(item)}
+                        onDismiss={() => respondQuestion(item, true)}
+                        compact
+                      />
                     </div>
-                    <button type="button" disabled={isResponding || hasErrors} onClick={() => respondQuestion(item)}>
-                      {isResponding ? "Working" : "Reply"}
-                    </button>
-                    <button type="button" disabled={isResponding} onClick={() => respondQuestion(item, true)}>
-                      Dismiss
-                    </button>
                   </article>
                 );
               })}
-              {latestPatch ? (
+              {pendingInteractionCount === 0 && latestPatch ? (
                 <article
                   className="dock-item dock-item-clickable"
+                  data-testid="diff-dock-item"
                   onClick={openReviewPanel}
                   onKeyDown={handleReviewKeyDown}
                   role="button"
@@ -3555,9 +4694,11 @@ export function App() {
                   </button>
                 </article>
               ) : null}
-              {latestCheckpoint ? (
+              {pendingInteractionCount === 0 && latestCheckpoint ? (
                 <article
                   className="dock-item dock-item-clickable"
+                  data-restored-checkpoint-id={restoredCheckpointId || undefined}
+                  data-testid="checkpoint-dock-item"
                   onClick={openReviewPanel}
                   onKeyDown={handleReviewKeyDown}
                   role="button"
@@ -3565,7 +4706,7 @@ export function App() {
                 >
                   <History size={15} />
                   <div>
-                    <strong>
+                    <strong data-testid="checkpoint-dock-title">
                       {restoredCheckpointId ? `Restored ${compactId(restoredCheckpointId)}` : checkpointLabel(latestCheckpoint)}
                     </strong>
                     <span>
@@ -3575,6 +4716,7 @@ export function App() {
                   </div>
                   <button
                     data-checkpoint-id={latestCheckpoint.checkpoint_id}
+                    data-testid="checkpoint-dock-restore"
                     disabled={Boolean(restoringCheckpointId)}
                     onClick={(event) => {
                       event.stopPropagation();
@@ -3585,11 +4727,11 @@ export function App() {
                     {restoringCheckpointId === latestCheckpoint.checkpoint_id ? "Restoring" : "Restore"}
                   </button>
                 </article>
-              ) : restoredCheckpointId ? (
-                <article className="dock-item">
+              ) : pendingInteractionCount === 0 && restoredCheckpointId ? (
+                <article className="dock-item" data-restored-checkpoint-id={restoredCheckpointId || undefined} data-testid="checkpoint-dock-item">
                   <History size={15} />
                   <div>
-                    <strong>Restored {compactId(restoredCheckpointId)}</strong>
+                    <strong data-testid="checkpoint-dock-title">Restored {compactId(restoredCheckpointId)}</strong>
                     <span>checkpoint restored</span>
                   </div>
                 </article>
@@ -3619,6 +4761,14 @@ export function App() {
             <textarea
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
+              onCompositionEnd={() => {
+                composerComposingRef.current = false;
+                composerCompositionEndAtRef.current = Date.now();
+              }}
+              onCompositionStart={() => {
+                composerComposingRef.current = true;
+              }}
+              onKeyDown={handleComposerKeyDown}
               placeholder="要求后续变更"
               rows={2}
             />
@@ -3629,12 +4779,13 @@ export function App() {
               <div className="composer-controls">
                 <select
                   value={permission}
-                  onChange={(event) => setPermission(event.target.value)}
+                  onChange={(event) => setPermission(normalizePermissionMode(event.target.value))}
                   title="Permission"
                 >
-                  <option value="PLAN_ONLY">计划模式</option>
+                  <option value="REQUEST_APPROVAL">请求批准</option>
+                  <option value="AUTO_APPROVE">替我审批</option>
+                  <option value="FULL_ACCESS">完全访问</option>
                   <option value="READONLY">只读</option>
-                  <option value="FULL">完全访问</option>
                 </select>
                 <select value={model} onChange={(event) => setModel(event.target.value)} title="Model">
                   {(modelOptions?.length ? modelOptions : [model || "server-local"]).map((item) => (
@@ -3643,10 +4794,6 @@ export function App() {
                     </option>
                   ))}
                 </select>
-                <button className="composer-goal-button" type="button" title="Goal">
-                  <Activity size={14} />
-                  目标
-                </button>
               </div>
               <button
                 aria-label={isTurnInterruptible ? "Interrupt active turn" : "Run prompt"}
@@ -3718,7 +4865,7 @@ export function App() {
           </button>
         </div>
         {inspectorMode === "review" ? (
-          <section className="review-panel" aria-label="Diff and checkpoint review">
+          <section className="review-panel" aria-label="Diff and checkpoint review" data-testid="review-panel">
             <div className="review-summary">
               <div>
                 <span>Pending</span>
@@ -3734,7 +4881,7 @@ export function App() {
               </div>
             </div>
 
-            <div className="inspector-card review-card review-primary">
+            <div className="inspector-card review-card review-primary" data-testid="change-review-card">
               <div className="inspector-title">
                 <GitCompare size={15} />
                 Change Review
@@ -3749,7 +4896,7 @@ export function App() {
                     <span>{latestPatchStatus || "workspace changed"}</span>
                   </div>
                   {sideBySideRows(latestPatch).length ? (
-                    <div className="review-split-diff" role="table" aria-label="Side-by-side file diff">
+                    <div className="review-split-diff" role="table" aria-label="Side-by-side file diff" data-testid="review-split-diff">
                       <div className="review-split-header" role="row">
                         <span>Before</span>
                         <span>After</span>
@@ -3776,7 +4923,7 @@ export function App() {
                       ) : null}
                     </div>
                   ) : stringField(latestPatch, "diff") ? (
-                    <pre className="review-diff-code">{stringField(latestPatch, "diff")}</pre>
+                    <pre className="review-diff-code" data-testid="review-diff-code">{stringField(latestPatch, "diff")}</pre>
                   ) : (
                     <p className="muted-line">No diff payload for this patch.</p>
                   )}
@@ -3811,7 +4958,9 @@ export function App() {
                 {restoredCheckpointId ? <span className="checkpoint-restored">restored</span> : null}
               </div>
               {restoredCheckpointId ? (
-                <p className="restore-state">Restored {compactId(restoredCheckpointId)}</p>
+                <p className="restore-state" data-checkpoint-id={restoredCheckpointId} data-testid="checkpoint-restore-state">
+                  Restored {compactId(restoredCheckpointId)}
+                </p>
               ) : null}
               <div className="review-checkpoint-list">
                 {(checkpoints?.checkpoints ?? []).slice(0, 8).map((checkpoint) => {
@@ -3820,6 +4969,9 @@ export function App() {
                   return (
                     <div
                       className={`review-checkpoint-row ${isRestored ? "restored" : ""}`}
+                      data-checkpoint-id={checkpoint.checkpoint_id}
+                      data-checkpoint-restored={isRestored ? "true" : "false"}
+                      data-testid="review-checkpoint-row"
                       key={checkpoint.checkpoint_id}
                     >
                       <History size={14} />
@@ -3832,6 +4984,7 @@ export function App() {
                       </div>
                       <button
                         data-checkpoint-id={checkpoint.checkpoint_id}
+                        data-testid="review-checkpoint-restore"
                         disabled={Boolean(restoringCheckpointId)}
                         onClick={() => restoreCheckpoint(checkpoint.checkpoint_id)}
                         type="button"
@@ -3845,6 +4998,27 @@ export function App() {
                   <p className="muted-line">No checkpoints for this session yet.</p>
                 ) : null}
               </div>
+            </div>
+
+            <div className="inspector-card review-card" data-testid="restore-history-card">
+              <div className="inspector-title">
+                <RotateCcw size={15} />
+                Restore History
+                {checkpointRestoreHistory.length ? <span className="checkpoint-restored">restored</span> : null}
+              </div>
+              {checkpointRestoreHistory.length ? (
+                <div className="checkpoint-restore-list">
+                  {checkpointRestoreHistory.slice(0, 5).map((record, index) => (
+                    <CheckpointRestoreCard
+                      checkpoint={checkpointForRestore(record, checkpoints)}
+                      key={`${record.run_id || record.checkpoint_id || "restore"}:${index}`}
+                      record={record}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <p className="muted-line">No restore history for this session yet.</p>
+              )}
             </div>
 
             <div className="inspector-card review-card">
@@ -4177,7 +5351,7 @@ export function App() {
           </dl>
         </div>
 
-        <div className="inspector-card" data-testid="mcp-card">
+        <div className="inspector-card mcp-inspector-card" data-testid="mcp-card">
           <div className="inspector-title">
             <PlugZap size={15} />
             MCP
@@ -4211,12 +5385,20 @@ export function App() {
             <dd title={mcpConfigPath}>{mcpConfigPath ? compactText(mcpConfigPath, 34) : "-"}</dd>
           </dl>
           {mcp?.error ? <p className="stream-error">{mcp.error}</p> : null}
-          <form className="mcp-config-form" data-testid="mcp-server-form" onSubmit={addMcpServer}>
+          <form className="mcp-config-form" data-testid="mcp-server-form" onSubmit={submitMcpServer}>
+            {mcpEditing ? (
+              <div className="mcp-edit-banner" data-testid="mcp-edit-banner">
+                <span>Editing {mcpEditingServerName}</span>
+                <button type="button" onClick={cancelMcpEdit} disabled={Boolean(mcpMutationBusy)}>
+                  Cancel
+                </button>
+              </div>
+            ) : null}
             <label>
               <span>Mode</span>
               <select
                 value={mcpServerDraft.mode}
-                disabled={!mcpWritable || Boolean(mcpMutationBusy)}
+                disabled={!mcpWritable || Boolean(mcpMutationBusy) || mcpEditing}
                 onChange={(event) =>
                   setMcpServerDraft((draft) => ({ ...draft, mode: event.target.value === "local" ? "local" : "remote" }))
                 }
@@ -4229,7 +5411,7 @@ export function App() {
               <span>Name</span>
               <input
                 value={mcpServerDraft.name}
-                disabled={!mcpWritable || Boolean(mcpMutationBusy)}
+                disabled={!mcpWritable || Boolean(mcpMutationBusy) || mcpEditing}
                 onChange={(event) => setMcpServerDraft((draft) => ({ ...draft, name: event.target.value }))}
                 placeholder={mcpServerDraft.mode === "local" ? "local-tools" : "remote-tools"}
               />
@@ -4242,7 +5424,7 @@ export function App() {
                     value={mcpServerDraft.url}
                     disabled={!mcpWritable || Boolean(mcpMutationBusy)}
                     onChange={(event) => setMcpServerDraft((draft) => ({ ...draft, url: event.target.value }))}
-                    placeholder="http://127.0.0.1:3000/mcp"
+                    placeholder={mcpEditing ? "leave blank to keep current remote URL" : "http://127.0.0.1:3000/mcp"}
                   />
                 </label>
                 <label>
@@ -4266,7 +5448,7 @@ export function App() {
                     value={mcpServerDraft.command}
                     disabled={!mcpWritable || Boolean(mcpMutationBusy)}
                     onChange={(event) => setMcpServerDraft((draft) => ({ ...draft, command: event.target.value }))}
-                    placeholder="npx"
+                    placeholder={mcpEditing ? "leave blank to keep current command" : "npx"}
                   />
                 </label>
                 <label className="full">
@@ -4276,7 +5458,7 @@ export function App() {
                     value={mcpServerDraft.args}
                     disabled={!mcpWritable || Boolean(mcpMutationBusy)}
                     onChange={(event) => setMcpServerDraft((draft) => ({ ...draft, args: event.target.value }))}
-                    placeholder="@modelcontextprotocol/server-filesystem&#10;/Users/william/project"
+                    placeholder={mcpEditing ? "only used when replacing command" : "@modelcontextprotocol/server-filesystem\n/Users/william/project"}
                   />
                 </label>
                 <label className="full">
@@ -4285,7 +5467,7 @@ export function App() {
                     value={mcpServerDraft.cwd}
                     disabled={!mcpWritable || Boolean(mcpMutationBusy)}
                     onChange={(event) => setMcpServerDraft((draft) => ({ ...draft, cwd: event.target.value }))}
-                    placeholder="optional working directory"
+                    placeholder={mcpEditing ? "leave blank to keep current cwd" : "optional working directory"}
                   />
                 </label>
               </>
@@ -4307,7 +5489,7 @@ export function App() {
                 value={mcpServerDraft.env}
                 disabled={!mcpWritable || Boolean(mcpMutationBusy)}
                 onChange={(event) => setMcpServerDraft((draft) => ({ ...draft, env: event.target.value }))}
-                placeholder="API_KEY=..."
+                placeholder={mcpEditing ? "leave blank to keep current env" : "API_KEY=..."}
               />
             </label>
             <label className="full">
@@ -4317,7 +5499,7 @@ export function App() {
                 value={mcpServerDraft.headers}
                 disabled={!mcpWritable || Boolean(mcpMutationBusy)}
                 onChange={(event) => setMcpServerDraft((draft) => ({ ...draft, headers: event.target.value }))}
-                placeholder="Authorization: Bearer ..."
+                placeholder={mcpEditing ? "leave blank to keep current headers" : "Authorization: Bearer ..."}
               />
             </label>
             <button
@@ -4327,12 +5509,12 @@ export function App() {
                 !mcpWritable ||
                 Boolean(mcpMutationBusy) ||
                 !mcpServerDraft.name.trim() ||
-                (mcpServerDraft.mode === "remote" ? !mcpServerDraft.url.trim() : !mcpServerDraft.command.trim())
+                (!mcpEditing && (mcpServerDraft.mode === "remote" ? !mcpServerDraft.url.trim() : !mcpServerDraft.command.trim()))
               }
-              title={mcpWritable ? "Add MCP server" : "MCP config is read-only"}
+              title={mcpWritable ? (mcpEditing ? "Save MCP server" : "Add MCP server") : "MCP config is read-only"}
             >
-              <Plus size={13} />
-              Add
+              {mcpEditing ? <PencilLine size={13} /> : <Plus size={13} />}
+              {mcpEditing ? "Save" : "Add"}
             </button>
           </form>
           {mcp?.readonly_reason && !mcpWritable ? <p className="muted-line">{mcp.readonly_reason}</p> : null}
@@ -4437,6 +5619,18 @@ export function App() {
                           }}
                         >
                           <RefreshCw size={12} className={mcpMutationBusy === `test:${serverName}` ? "spin" : ""} />
+                        </button>
+                        <button
+                          className="icon-button mini"
+                          type="button"
+                          aria-label={`Edit MCP server ${server.name ?? ""}`}
+                          title="Edit MCP server"
+                          disabled={!mcpWritable || Boolean(mcpMutationBusy) || !server.name}
+                          onClick={() => {
+                            editMcpServer(server);
+                          }}
+                        >
+                          <PencilLine size={12} />
                         </button>
                         <button
                           className="icon-button mini"
@@ -4835,19 +6029,141 @@ export function App() {
   );
 }
 
-function EventContent({ event }: { event: AppEvent }) {
-  const params = event.params ?? {};
-  const text =
-    stringParam(params, "delta") ||
-    stringParam(params, "final_answer") ||
-    stringParam(params, "output") ||
-    stringParam(params, "error") ||
-    stringParam(params, "status");
+function isToolCallEvent(event: AppEvent): boolean {
+  return event.method.includes("toolCall");
+}
 
-  if (text) {
-    return <TextContent text={text} />;
+function toolCallStatus(event: AppEvent): string {
+  if (event.method.includes("failed")) return "failed";
+  if (event.method.includes("completed")) return "completed";
+  if (event.method.includes("started")) return "started";
+  return stringParam(event.params ?? {}, "status") || "tool call";
+}
+
+function toolCallStatusLabel(status: string): string {
+  if (status === "started" || status === "running") return "正在运行";
+  if (status === "completed") return "已完成";
+  if (status === "failed") return "失败";
+  return status;
+}
+
+function processEventTitle(event: AppEvent): string {
+  const method = event.method;
+  if (method.includes("toolCall")) return "工具调用";
+  if (method.includes("approval")) return "权限确认";
+  if (method.includes("question")) return "需要回复";
+  if (method.includes("patch")) return "文件变更";
+  if (method.includes("checkpoint")) return "检查点";
+  if (method === "turn/failed") return "运行失败";
+  if (method === "turn/interrupted") return "已停止";
+  return "运行详情";
+}
+
+function processEventStatus(event: AppEvent): string {
+  if (event.method.includes("toolCall")) return toolCallStatusLabel(toolCallStatus(event));
+  const status = stringParam(event.params ?? {}, "status");
+  if (status === "completed") return "已完成";
+  if (status === "failed") return "失败";
+  if (status === "running") return "正在运行";
+  if (status === "pending") return "待处理";
+  return status;
+}
+
+function processEventSummary(event: AppEvent): string {
+  const params = event.params ?? {};
+  if (event.method.includes("toolCall")) {
+    return firstText(params.name, params.tool_name, params.tool, params.command, "工具");
   }
-  return <pre>{JSON.stringify(params, null, 2)}</pre>;
+  return (
+    stringParam(params, "error") ||
+    stringParam(params, "output") ||
+    stringParam(params, "message") ||
+    stringParam(params, "reason") ||
+    processEventTitle(event)
+  );
+}
+
+function ToolCallEventContent({ event }: { event: AppEvent }) {
+  const params = event.params ?? {};
+  const status = toolCallStatus(event);
+  return (
+    <details className={`live-tool-event-details ${statusClass(status)}`} data-testid="live-tool-event-details">
+      <summary className="live-tool-event-summary">
+        <strong>{processEventTitle(event)}</strong>
+        <span>{processEventSummary(event)}</span>
+        <small>{toolCallStatusLabel(status)}</small>
+        <b className="live-tool-event-action" />
+      </summary>
+      <pre>{JSON.stringify(params, null, 2)}</pre>
+    </details>
+  );
+}
+
+function EventContent({ event }: { event: AppEvent }) {
+  if (isToolCallEvent(event)) return <ToolCallEventContent event={event} />;
+
+  const params = event.params ?? {};
+  const status = processEventStatus(event);
+  return (
+    <details className={`live-tool-event-details ${statusClass(status)}`} data-testid="process-event-details">
+      <summary className="live-tool-event-summary">
+        <strong>{processEventTitle(event)}</strong>
+        <span>{processEventSummary(event)}</span>
+        {status ? <small>{status}</small> : null}
+        <b className="live-tool-event-action" />
+      </summary>
+      <pre>{JSON.stringify(params, null, 2)}</pre>
+    </details>
+  );
+}
+
+function liveTurnProcessState(events: AppEvent[], isStreaming: boolean): { label: string; tone: string } {
+  const hasFailure = events.some((event) => {
+    const status = processEventStatus(event);
+    return event.method === "turn/failed" || event.method === "turn/interrupted" || status === "失败" || status === "failed";
+  });
+  if (hasFailure) return { label: "已停止", tone: "failed" };
+
+  const hasPending = events.some((event) => {
+    const status = processEventStatus(event);
+    return status === "正在运行" || status === "待处理" || status === "started" || status === "running" || status === "pending";
+  });
+  if (isStreaming || hasPending) return { label: "正在执行", tone: "running" };
+  return { label: "执行完成", tone: "completed" };
+}
+
+function LiveTurnProcessCard({ events, isStreaming }: { events: AppEvent[]; isStreaming: boolean }) {
+  const state = liveTurnProcessState(events, isStreaming);
+  const visibleEvents = events.slice(-6);
+  const hiddenCount = Math.max(0, events.length - visibleEvents.length);
+  const latestEvent = [...events].reverse().find((event) => isVisibleProcessEvent(event));
+  const latestSummary = latestEvent ? processEventSummary(latestEvent) : "正在整理执行状态";
+  const toolCount = events.filter(isToolCallEvent).length;
+  const label = toolCount > 0 ? `${toolCount} 个工具调用` : `${events.length} 条执行状态`;
+
+  return (
+    <article className="event-row live-turn-process-row" data-testid="live-turn-process-card">
+      <div className="event-glyph">
+        <Activity size={16} />
+      </div>
+      <div className="event-body">
+        <details className={`live-turn-process-card ${state.tone}`}>
+          <summary className="live-turn-process-summary">
+            <strong>{state.label}</strong>
+            <span>{latestSummary}</span>
+            <small>{label}</small>
+            <b className="live-tool-event-action" />
+          </summary>
+          <div className="live-turn-process-events">
+            {hiddenCount > 0 ? <small className="live-turn-process-hidden">已折叠较早的 {hiddenCount} 条状态</small> : null}
+            {visibleEvents.map((event, index) => (
+              <EventContent event={event} key={`${eventKey(event)}:${index}`} />
+            ))}
+          </div>
+        </details>
+      </div>
+    </article>
+  );
 }
 
 function MessagePartCards({ parts }: { parts: MessagePart[] }) {
@@ -4861,6 +6177,52 @@ function MessagePartCards({ parts }: { parts: MessagePart[] }) {
   );
 }
 
+function CheckpointRestoreCard({
+  record,
+  checkpoint,
+  variant = "review",
+}: {
+  record: CheckpointRestoreRecord;
+  checkpoint?: CheckpointSummary;
+  variant?: "review" | "timeline";
+}) {
+  const checkpointId = record.checkpoint_id || checkpoint?.checkpoint_id || "";
+  const kind = record.checkpoint_kind || checkpoint?.kind || "checkpoint";
+  const restoredAt = checkpointRestoreTimeLabel(record);
+  return (
+    <section
+      className={`checkpoint-restore-card ${variant}`}
+      data-checkpoint-id={checkpointId}
+      data-run-id={record.run_id || ""}
+      data-testid="checkpoint-restore-history"
+    >
+      <div className="checkpoint-restore-heading">
+        <strong>
+          <RotateCcw size={14} />
+          Workspace restored
+        </strong>
+        <span className="part-status ok">restored</span>
+      </div>
+      <p>
+        Restored {kind} {compactId(checkpointId)} into the workspace.
+      </p>
+      <dl className="part-grid">
+        {nonEmptyRows([
+          ["Checkpoint", compactId(checkpointId)],
+          ["Restore run", compactId(record.run_id)],
+          ["Files", checkpointRestoreFileLabel(record, checkpoint)],
+          ["Restored", restoredAt],
+        ]).map(([label, value]) => (
+          <div key={`${checkpointId}:${label}`}>
+            <dt>{label}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}
+
 function MessagePartCard({ part }: { part: MessagePart }) {
   const kind = part.kind ?? "part";
   const interaction = interactionHistoryItem(part);
@@ -4869,6 +6231,39 @@ function MessagePartCard({ part }: { part: MessagePart }) {
   const entries = patchEntries(part);
   const rows = partRows(part);
   const preText = partPreText(part);
+  const summary = partSummary(part);
+
+  if (kind === "tool" && !mcpTrace) {
+    const failed = statusClass(part.status) === "bad";
+    return (
+      <details
+        className={`message-part-card part-tool tool-result-details ${failed ? "failed" : ""}`}
+        data-part-kind={kind}
+        data-testid="tool-result-details"
+      >
+        <summary className="tool-result-summary">
+          <strong>
+            {partIcon(kind)}
+            {partTitle(part).replace(/^Tool:\s*/i, "")}
+          </strong>
+          <span className={`part-status ${statusClass(part.status)}`}>{part.status ?? "completed"}</span>
+          <small>{failed ? compactText(summary, 72) : lineCountLabel(summary)}</small>
+          <b className="tool-result-action" />
+        </summary>
+        {rows.length > 0 ? (
+          <dl className="part-grid tool-result-grid">
+            {rows.map(([label, value]) => (
+              <div key={`${label}:${value}`}>
+                <dt>{label}</dt>
+                <dd>{value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+        {summary ? <pre className="tool-result-output">{summary}</pre> : null}
+      </details>
+    );
+  }
 
   return (
     <section
@@ -4892,7 +6287,7 @@ function MessagePartCard({ part }: { part: MessagePart }) {
           {mcpTrace.lifecyclePid ? <span>pid {mcpTrace.lifecyclePid}</span> : null}
         </div>
       ) : null}
-      <p className="part-summary">{partSummary(part)}</p>
+      <p className="part-summary">{summary}</p>
       {rows.length > 0 ? (
         <dl className="part-grid">
           {rows.map(([label, value]) => (
@@ -4929,16 +6324,18 @@ function QuestionElicitationForm({
   onChange,
   onSubmit,
   onDismiss,
+  compact = false,
 }: {
   fields: ElicitationField[];
   isResponding: boolean;
   onChange: (index: number, values: string[]) => void;
   onSubmit: () => void;
   onDismiss: () => void;
+  compact?: boolean;
 }) {
   const hasErrors = fields.some((field) => field.error);
   return (
-    <div className="elicitation-form" data-testid="elicitation-form">
+    <div className={`elicitation-form ${compact ? "compact" : ""}`} data-testid="elicitation-form">
       {fields.map((field) => {
         const inputId = `elicitation-${field.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
         return (
@@ -5040,6 +6437,31 @@ function QuestionElicitationForm({
   );
 }
 
+function trustHistoryTerminalLabel(item: TrustHistoryItem): string {
+  if (item.kind === "approval") {
+    if (item.status === "allowed" || item.status === "allow") return "Allowed";
+    if (item.status === "denied" || item.status === "deny") return "Denied";
+    if (item.status === "pending") return "Waiting";
+    return humanizeToken(item.status || "Resolved");
+  }
+  if (item.status === "answered") return "Answered";
+  if (item.status === "dismissed") return "Dismissed";
+  if (item.status === "pending") return "Waiting";
+  return humanizeToken(item.status || "Resolved");
+}
+
+function trustHistoryFlowLabel(item: TrustHistoryItem): string {
+  const requested = item.kind === "approval" ? "Requested" : "Asked";
+  return `${requested} -> ${trustHistoryTerminalLabel(item)}`;
+}
+
+function trustHistoryFlowState(item: TrustHistoryItem): string {
+  if (item.status === "pending") return "pending";
+  if (item.status === "allowed" || item.status === "answered" || item.status === "allow") return "ok";
+  if (item.status === "denied" || item.status === "dismissed" || item.status === "deny") return "blocked";
+  return "resolved";
+}
+
 function TrustHistoryCard({
   item,
   compact = false,
@@ -5052,8 +6474,12 @@ function TrustHistoryCard({
   return (
     <section
       className={`trust-history-item ${item.tone} ${compact ? "compact" : ""} ${variant}`}
+      data-testid="trust-history-item"
       data-part-kind={item.kind}
       data-interaction-status={item.status}
+      data-flow-state={trustHistoryFlowState(item)}
+      data-request-id={item.requestId}
+      data-call-id={item.callId}
     >
       <div className="trust-history-heading">
         <strong>
@@ -5061,6 +6487,11 @@ function TrustHistoryCard({
           {item.title}
         </strong>
         <span className={`part-status ${statusClass(item.status)}`}>{item.status}</span>
+      </div>
+      <div className="trust-history-flow" data-testid="trust-history-flow" aria-label={trustHistoryFlowLabel(item)}>
+        <span>{item.kind === "approval" ? "Requested" : "Asked"}</span>
+        <span className="trust-history-flow-line" aria-hidden="true" />
+        <span>{trustHistoryTerminalLabel(item)}</span>
       </div>
       <p>{item.summary}</p>
       {item.detail ? <span className="trust-history-detail">{item.detail}</span> : null}
@@ -5120,7 +6551,7 @@ async function readSse(response: Response, onEvents?: SseEventHandler): Promise<
 }
 
 function shouldYieldStreamPaint(event: AppEvent | null): boolean {
-  return event?.method === "item/agentMessage/delta";
+  return event?.method === "turn/completed" || event?.method === "turn/failed" || event?.method === "turn/interrupted";
 }
 
 function nextPaint(): Promise<void> {
