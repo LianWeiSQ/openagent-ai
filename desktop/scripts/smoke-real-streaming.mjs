@@ -14,7 +14,7 @@ const desktopDir = path.resolve(scriptDir, "..");
 const repoRoot = path.resolve(desktopDir, "..");
 const chromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const token = "desktop-stream-smoke-token";
-const DEFAULT_REAL_MODEL = "gpt-5.4-mini";
+const DEFAULT_REAL_MODEL = "gpt-5.5";
 
 function parseArgs(argv) {
   const options = {
@@ -152,11 +152,12 @@ function realProviderEnv(options) {
   const envFileValues = parseEnvFile(options.envFile);
   const merged = { ...envFileValues, ...process.env };
   const apiKey = merged.OPENAI_API_KEY;
-  const baseUrl = options.baseUrl || merged.OPENAI_BASE_URL || "http://47.116.192.3/v1";
+  const baseUrl = options.baseUrl || merged.OPENAI_BASE_URL;
   const model = options.model || DEFAULT_REAL_MODEL;
   const wireApi = merged.OPENAI_WIRE_API || "responses";
 
   if (!apiKey) throw new Error(`OPENAI_API_KEY is missing; checked env and ${options.envFile}`);
+  if (!baseUrl) throw new Error(`OPENAI_BASE_URL is missing; checked env and ${options.envFile}`);
 
   return {
     env: {
