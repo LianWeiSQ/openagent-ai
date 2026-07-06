@@ -843,7 +843,7 @@ pub(super) fn route_dynamic_request(
     {
         return match session_messages_payload(config, parts[2], &request.path) {
             Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
+            Err(error) => session_error_response(error),
         };
     }
     if parts.len() == 2 && parts[0] == "api" && parts[1] == "skills" && request.method == "GET" {
@@ -951,7 +951,7 @@ pub(super) fn route_dynamic_request(
         return match request.method.as_str() {
             "GET" => match session_diff_payload(config, parts[2]) {
                 Ok(payload) => json_response(200, payload),
-                Err(error) => json_response(400, json!({"error": error})),
+                Err(error) => session_error_response(error),
             },
             _ => route_unknown(),
         };
@@ -964,7 +964,7 @@ pub(super) fn route_dynamic_request(
     {
         return match session_checkpoints_payload(config, parts[2]) {
             Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
+            Err(error) => session_error_response(error),
         };
     }
     if parts.len() == 6
@@ -976,7 +976,7 @@ pub(super) fn route_dynamic_request(
     {
         return match restore_session_checkpoint_payload(config, parts[2], parts[4]) {
             Ok(payload) => json_response(200, payload),
-            Err(error) => json_response(400, json!({"error": error})),
+            Err(error) => session_error_response(error),
         };
     }
     if parts.len() == 4
@@ -1084,6 +1084,10 @@ pub(super) fn route_dynamic_request(
 }
 
 fn session_mutation_error_response(error: String) -> HttpResponseSpec {
+    session_error_response(error)
+}
+
+pub(super) fn session_error_response(error: String) -> HttpResponseSpec {
     let normalized = error.to_lowercase();
     if normalized == "session_not_found"
         || normalized.contains("session state not found")

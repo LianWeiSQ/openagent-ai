@@ -968,6 +968,7 @@ impl FileSessionStore {
             json!(ended.saturating_sub(started)),
         );
         write_json(&run_path, &Value::Object(run_record))?;
+        self.write_run_summary(&session.id, run_id)?;
         self.save_state(session, Some(run_id))
     }
 

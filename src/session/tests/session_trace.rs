@@ -182,6 +182,36 @@ fn file_session_store_writes_summary_and_restores_state() {
         .expect("parts load");
     assert_eq!(parts[0].part_type, "usage");
 
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_interrupted".to_string(),
+                trace_id: "trace_interrupted".to_string(),
+                agent_name: "default".to_string(),
+                model_id: Some("gpt-test".to_string()),
+                provider_id: Some("test".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1_000),
+            },
+        )
+        .expect("interrupted run starts");
+    session.status = SessionStatus::Stop;
+    store
+        .finish_run(
+            &session,
+            "run_interrupted",
+            "interrupted",
+            1,
+            Some("interrupted"),
+            Some("interrupt requested"),
+        )
+        .expect("interrupted run finishes");
+    let interrupted_summary =
+        read_json(root.join("sessions/session_test/runs/run_interrupted/summary.json"));
+    assert_eq!(interrupted_summary["status"], "interrupted");
+
     fs::remove_dir_all(root).expect("temporary session store is removed");
 }
 
