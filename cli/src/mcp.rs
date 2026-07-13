@@ -12,7 +12,7 @@ pub(super) fn mcp_command(args: &[String]) -> CliRunResult {
         return err_text(2, mcp_remote_ignores_local_config_message(&args[0]));
     }
     if mcp_lifecycle_command(&args[0]) && mcp_local_config_requested(&args[1..]) {
-        return err_text(2, mcp_lifecycle_requires_app_bridge_message(&args[0]));
+        return err_text(2, mcp_lifecycle_requires_bridge_message(&args[0]));
     }
     if mcp_remote_requested(args) || mcp_remote_only_command(&args[0]) {
         return mcp_remote_command(args);
@@ -49,10 +49,10 @@ fn mcp_remote_only_command(command: &str) -> bool {
     )
 }
 
-fn mcp_lifecycle_requires_app_bridge_message(command: &str) -> String {
+fn mcp_lifecycle_requires_bridge_message(command: &str) -> String {
     format!(
-        "mcp {command} uses the App Bridge lifecycle registry and cannot run directly from --mcp-config/--config.\n\
-         Start the Rust App Bridge with the desired workspace/config, then run:\n\
+        "mcp {command} uses the Bridge lifecycle registry and cannot run directly from --mcp-config/--config.\n\
+         Start the Rust Bridge API service with the desired workspace/config, then run:\n\
          openagent mcp {command} <server> --server-url <url> --server-token <token>\n\
          For one-shot local connectivity, use: openagent mcp test <server> --mcp-config <file>"
     )
@@ -60,8 +60,8 @@ fn mcp_lifecycle_requires_app_bridge_message(command: &str) -> String {
 
 fn mcp_remote_ignores_local_config_message(command: &str) -> String {
     format!(
-        "mcp {command} with --server-url/--attach uses the App Bridge server workspace/config; local --mcp-config/--config/--workspace/--dir cannot be applied client-side.\n\
-         Start the Rust App Bridge with the desired workspace/config, then retry without the local config flag."
+        "mcp {command} with --server-url/--attach uses the Bridge server workspace/config; local --mcp-config/--config/--workspace/--dir cannot be applied client-side.\n\
+         Start the Rust Bridge API service with the desired workspace/config, then retry without the local config flag."
     )
 }
 
@@ -71,7 +71,7 @@ fn mcp_remote_command(args: &[String]) -> CliRunResult {
     let server_url = value_for(rest, &["--server-url", "--attach"])
         .or_else(|| value_for(args, &["--server-url", "--attach"]))
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
-    let client = remote::app_bridge_client(&server_url, &remote_auth_from_args(rest));
+    let client = remote::bridge_client(&server_url, &remote_auth_from_args(rest));
     let refresh = has_flag(rest, &["--refresh", "--check"]) || command == "doctor";
     let result = match command {
         "list" | "ls" | "doctor" => client.mcp_status(refresh),

@@ -11,12 +11,11 @@ use mcp_runtime::{McpRuntime, execute_mcp_tool, load_mcp_runtime};
 pub(crate) use openagent_mcp::discover_mcp_server_tools;
 use openagent_tools::SessionRunnerFacade;
 use profile::{
-    RunAgentProfile, agent_tool_options, bind_agent_profile_system_prompt, child_task_depth,
-    child_task_lineage, filter_tools_for_agent, is_subagent_mode, load_agent_profile_from_args,
-    max_subagent_depth_cli, parent_task_lineage, permission_manager_for_agent,
-    permission_ruleset_for_profile, permission_ruleset_from_args, provider_and_model_for_subagent,
-    provider_and_model_from_args, subagent_task_governance_error, task_root_session_id,
-    task_subagent_descriptors,
+    RunAgentProfile, agent_tool_options, child_task_depth, child_task_lineage,
+    filter_tools_for_agent, is_subagent_mode, load_agent_profile_from_args, max_subagent_depth_cli,
+    parent_task_lineage, permission_manager_for_agent, permission_ruleset_for_profile,
+    permission_ruleset_from_args, provider_and_model_for_subagent, provider_and_model_from_args,
+    subagent_task_governance_error, task_root_session_id, task_subagent_descriptors,
 };
 pub(crate) use profile::{
     agent_profile_public_value, available_agent_profiles, load_agent_profile_by_name,
@@ -150,11 +149,6 @@ pub(super) fn run_prompt_command_with_events(
         },
     ) {
         return err_text(1, format!("failed to start session run: {error}"));
-    }
-    if let Err(error) =
-        bind_agent_profile_system_prompt(&mut session, &store, &run_id, agent_profile.as_ref())
-    {
-        return err_text(1, error);
     }
     if has_user_prompt {
         let user_message = chat_message(Role::User, prompt.clone());
@@ -373,7 +367,7 @@ fn run_attached_command(
         return CliRunResult::ok_json(&payload);
     }
     if !events.is_empty() {
-        ok_text(text_from_app_events(&events))
+        ok_text(text_from_bridge_events(&events))
     } else {
         ok_text(stable_json_dumps(&payload))
     }

@@ -34,6 +34,21 @@ pub enum ProviderStreamEvent {
     TextDelta {
         text: String,
     },
+    ReasoningDelta {
+        text: String,
+    },
+    Retry {
+        attempt: u64,
+        max_attempts: u64,
+        delay_ms: u64,
+        model: String,
+        reason: String,
+    },
+    Fallback {
+        from_model: String,
+        to_model: String,
+        reason: String,
+    },
     ToolCall {
         call_id: String,
         name: String,

@@ -65,7 +65,7 @@ pub(super) fn client_command(args: &[String]) -> CliRunResult {
         return CliRunResult::ok_json(&payload);
     }
     if let Some(events) = payload.get("events").and_then(Value::as_array) {
-        ok_text(text_from_app_events(events))
+        ok_text(text_from_bridge_events(events))
     } else {
         ok_text(stable_json_dumps(&payload))
     }

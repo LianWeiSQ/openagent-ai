@@ -229,14 +229,13 @@ pub(super) fn root_help() -> String {
     let core = [
         ("run", "run an agent prompt without opening the TUI"),
         ("tui", "start the terminal UI"),
-        ("attach", "attach to a running App Bridge server"),
+        ("attach", "attach to a running Bridge server"),
         (
             "terminal",
-            "run a workspace-scoped command through App Bridge",
+            "run a workspace-scoped command through Bridge API",
         ),
-        ("serve", "start the local App Bridge HTTP server"),
-        ("web", "start the browser console server"),
-        ("client", "send a prompt to a running App Bridge server"),
+        ("serve", "start the local Bridge API HTTP server"),
+        ("client", "send a prompt to a running Bridge server"),
     ];
     let workspace = [
         (
@@ -339,7 +338,7 @@ pub(super) fn run_help() -> String {
         ("--skip-doctor", "skip local gateway preflight"),
     ];
     let remote = [
-        ("--attach <url>", "run through a remote App Bridge server"),
+        ("--attach <url>", "run through a remote Bridge server"),
         ("--server-token <token>", "bearer token for --attach"),
         ("-u, --username <name>", "basic auth username"),
         ("-p, --password <password>", "basic auth password"),
@@ -385,11 +384,6 @@ pub(super) fn tui_help() -> &'static str {
 
 pub(super) fn serve_help() -> &'static str {
     "Usage: openagent serve [options]\n\n\
-     Options: --host <host>, --port <port>, --workspace <path>, --session-root <path>, --headless, --auth-token <token>"
-}
-
-pub(super) fn web_help() -> &'static str {
-    "Usage: openagent web [options]\n\n\
      Options: --host <host>, --port <port>, --workspace <path>, --session-root <path>, --auth-token <token>"
 }
 
@@ -407,7 +401,7 @@ pub(super) fn attach_help() -> &'static str {
 pub(super) fn terminal_help() -> &'static str {
     "Usage: openagent terminal [options] -- <command...>\n\n\
      Options: --server-url <url>, --attach <url>, --server-token <token>, --server-token-env <name>, -u/--username <name>, -p/--password <password>, --cwd <path>, --timeout-ms <n>, --command <text>, --format <text|json>\n\
-     Runs through the App Bridge /api/terminal/run endpoint and is scoped to the server workspace."
+     Runs through the Bridge API /api/terminal/run endpoint and is scoped to the server workspace."
 }
 
 pub(super) fn doctor_help() -> &'static str {
@@ -462,7 +456,7 @@ pub(super) fn mcp_help() -> &'static str {
      add remote: name --url <url> --transport <auto|http|sse> --header KEY=VALUE --timeout-ms <n> --disabled --mcp-config <file>\n\
      add local:  name --command <program> --arg <value> --env KEY=VALUE --cwd <dir> --timeout-ms <n> --disabled --mcp-config <file>\n\
      local one-shot test: test <name> --mcp-config <file> --workspace <dir>\n\
-     App Bridge lifecycle: list|show|doctor|test|start|stop|restart|enable|disable --server-url <url> --server-token <token>\n\
+     Bridge lifecycle: list|show|doctor|test|start|stop|restart|enable|disable --server-url <url> --server-token <token>\n\
      auth: list|status|login|set-token|callback\n\
      doctor/debug: --refresh --format <table|json>"
 }

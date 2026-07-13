@@ -328,7 +328,6 @@ fn binary_help_smoke_covers_legacy_command_surface() -> Result<(), Box<dyn Error
         "tui",
         "run",
         "serve",
-        "web",
         "client",
         "attach",
         "terminal",
@@ -353,6 +352,11 @@ fn binary_help_smoke_covers_legacy_command_surface() -> Result<(), Box<dyn Error
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    let web = run_openagent(["web", "--help"], None)?;
+    assert!(!web.status.success());
+    let web_stderr = String::from_utf8(web.stderr)?;
+    assert!(web_stderr.contains("unsupported Rust CLI command: web"));
 
     let run_help = run_openagent(["run", "--help"], None)?;
     let run_stdout = String::from_utf8(run_help.stdout)?;
@@ -438,7 +442,7 @@ fn binary_terminal_runs_remote_bridge_command() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn binary_mcp_remote_lifecycle_controls_app_bridge() -> Result<(), Box<dyn Error>> {
+fn binary_mcp_remote_lifecycle_controls_bridge() -> Result<(), Box<dyn Error>> {
     let port = free_port()?;
     let temp = temp_dir("openagent-cli-remote-mcp")?;
     let workspace = temp.join("workspace");
@@ -627,7 +631,7 @@ fn binary_mcp_test_uses_local_mcp_config_alias_once() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn binary_mcp_lifecycle_rejects_local_config_without_app_bridge() -> Result<(), Box<dyn Error>> {
+fn binary_mcp_lifecycle_rejects_local_config_without_bridge() -> Result<(), Box<dyn Error>> {
     let temp = temp_dir("openagent-cli-mcp-lifecycle-local-config")?;
     let mcp_config = temp.join("mcp.json");
     fs::write(
@@ -644,7 +648,7 @@ fn binary_mcp_lifecycle_rejects_local_config_without_app_bridge() -> Result<(), 
     ])?;
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("App Bridge lifecycle registry"), "{stderr}");
+    assert!(stderr.contains("Bridge lifecycle registry"), "{stderr}");
     assert!(stderr.contains("--server-url <url>"), "{stderr}");
     assert!(!stderr.contains("Connection refused"), "{stderr}");
 
@@ -1520,7 +1524,7 @@ Disabled prompt.
             .join("state.latest.json"),
     )?)?;
     assert!(child_state["messages"].as_array().is_some_and(|messages| {
-        messages.iter().any(|message| {
+        !messages.iter().any(|message| {
             message["role"] == "system"
                 && message["content"].as_str().is_some_and(|content| {
                     content.contains("You are the CLI Markdown research subagent.")
@@ -1624,7 +1628,7 @@ fn binary_run_executes_task_subagent_tool() -> Result<(), Box<dyn Error>> {
     assert_eq!(child_state["metadata"]["parent_tool_call_id"], "call_task");
     assert_eq!(child_state["metadata"]["agent_profile"]["id"], "explore");
     assert!(child_state["messages"].as_array().is_some_and(|messages| {
-        messages.iter().any(|message| {
+        !messages.iter().any(|message| {
             message["role"] == "system" && message["metadata"]["agent_profile"] == "explore"
         }) && messages.iter().any(|message| {
             message["role"] == "user"
@@ -2497,6 +2501,111 @@ You cannot load skills.
 }
 
 #[test]
+fn binary_agent_system_prompt_refreshes_instructions_on_continue() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-dynamic-system-prompt")?;
+    let session_root = temp.join("sessions");
+    let agent_dir = temp.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("dynamic.md"),
+        r#"---
+id: dynamic
+name: Dynamic
+mode: primary
+tools: ["read", "skill"]
+model: gpt-dynamic
+---
+You are the dynamic profile.
+"#,
+    )?;
+    fs::write(temp.join("OPENAGENT.md"), "FIRST_TURN_INSTRUCTION")?;
+    let (port, server, requests) = serve_http_capture_responses_on_free_port(
+        "application/json",
+        vec![
+            json!({
+                "id": "resp_dynamic_first",
+                "output_text": "first answer",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+            .to_string(),
+            json!({
+                "id": "resp_dynamic_second",
+                "output_text": "second answer",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+            .to_string(),
+        ],
+    )?;
+
+    let first = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--agent",
+            "dynamic",
+            "--format",
+            "json",
+            "first",
+            "turn",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
+        .env("OPENAI_WIRE_API", "responses")
+        .output()?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    fs::write(temp.join("OPENAGENT.md"), "SECOND_TURN_INSTRUCTION")?;
+    let second = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--continue",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--agent",
+            "dynamic",
+            "--format",
+            "json",
+            "second",
+            "turn",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
+        .env("OPENAI_WIRE_API", "responses")
+        .output()?;
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    server
+        .join()
+        .expect("provider server thread")
+        .expect("provider responses");
+    let requests = requests.lock().expect("captured provider requests");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("FIRST_TURN_INSTRUCTION"));
+    assert!(!requests[0].contains("SECOND_TURN_INSTRUCTION"));
+    assert!(requests[1].contains("SECOND_TURN_INSTRUCTION"));
+    assert!(!requests[1].contains("FIRST_TURN_INSTRUCTION"));
+    assert!(requests[1].contains("You are the dynamic profile."));
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn binary_run_command_and_agent_profile_affect_real_run_state() -> Result<(), Box<dyn Error>> {
     let temp = temp_dir("openagent-cli-command-agent")?;
     let command_dir = temp.join(".openagent/commands");
@@ -2580,7 +2689,7 @@ fn binary_run_command_and_agent_profile_affect_real_run_state() -> Result<(), Bo
     assert_eq!(state["metadata"]["permission"], "READONLY");
     assert_eq!(state["metadata"]["agent_profile"]["id"], "reviewer");
     assert!(state["messages"].as_array().is_some_and(|messages| {
-        messages.iter().any(|message| {
+        !messages.iter().any(|message| {
             message["role"] == "system"
                 && message["content"] == "You are a careful reviewer."
                 && message["metadata"]["agent_profile"] == "reviewer"
@@ -3132,6 +3241,37 @@ fn serve_http_capture_once_on_free_port(
         stream
             .write_all(response.as_bytes())
             .map_err(|error| error.to_string())
+    });
+    Ok((port, server, requests))
+}
+
+fn serve_http_capture_responses_on_free_port(
+    content_type: &str,
+    bodies: Vec<String>,
+) -> Result<(u16, MockServer, Arc<Mutex<Vec<String>>>), Box<dyn Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let content_type = content_type.to_string();
+    let server = thread::spawn(move || {
+        for body in bodies {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request = read_http_request_body(&mut stream)?;
+            captured
+                .lock()
+                .map_err(|error| error.to_string())?
+                .push(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     });
     Ok((port, server, requests))
 }

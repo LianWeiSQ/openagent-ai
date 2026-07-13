@@ -83,11 +83,10 @@
       "CMD [\"--host\", \"0.0.0.0\", \"--port\", \"8787\", \"--headless\"]"
     ],
     "expected_stdout_json": {
-      "app_bridge": "openagent-app-server",
       "auth_required": false,
+      "bridge_server": "openagent-bridge-server",
       "ok": true,
-      "service": "openagent-http-runtime",
-      "ui_enabled": false
+      "service": "openagent-http-runtime"
     },
     "smoke_command": [
       "docker",
@@ -107,24 +106,22 @@
     "config": {
       "auth_basic_enabled": false,
       "auth_required": true,
-      "cors_origin": "*",
+      "cors_origin": "tauri://localhost,http://tauri.localhost,http://127.0.0.1:5173,http://localhost:5173",
       "host": "0.0.0.0",
       "max_queued_turns_per_session": 8,
       "max_running_turn_workers": 4,
       "mdns_name": "openagent",
       "port": 8787,
-      "serve_static": false,
       "session_store_root": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace/.openagent/sessions",
       "turn_queue_lease_stale_ms": 30000,
       "turn_queue_timeout_ms": 1800000,
       "workspace": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace"
     },
     "health": {
-      "app_bridge": "openagent-app-server",
       "auth_required": true,
+      "bridge_server": "openagent-bridge-server",
       "ok": true,
-      "service": "openagent-http-runtime",
-      "ui_enabled": false
+      "service": "openagent-http-runtime"
     },
     "routes": {
       "health": {
@@ -144,7 +141,7 @@
           "error": "unauthorized"
         },
         "headers": {
-          "WWW-Authenticate": "Bearer realm=\"openagent-app-bridge\", Basic realm=\"openagent-app-bridge\""
+          "WWW-Authenticate": "Bearer realm=\"openagent-bridge\", Basic realm=\"openagent-bridge\""
         },
         "status": 401
       },
@@ -205,7 +202,6 @@
   },
   "serve": {
     "args": {
-      "headless": true,
       "host": "0.0.0.0",
       "port": 8787,
       "session_root": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace/.openagent/sessions",
@@ -215,7 +211,6 @@
       "auth_token": "server-secret",
       "host": "0.0.0.0",
       "port": 8787,
-      "serve_static": false,
       "session_store_root": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace/.openagent/sessions",
       "workspace": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace"
     }

@@ -303,7 +303,8 @@ pub(super) fn run_agent_loop(
         let assistant_index = session.messages.len() as u64;
         let assistant_message_id = cli_message_id(assistant_index);
         record_step_started(store, &session.id, run_id, step, None);
-        let provider_messages = session.messages.clone();
+        let provider_messages =
+            super::profile::materialized_provider_messages_for_agent(session, agent_profile);
         let mut on_provider_stream = |event: &ProviderStreamEvent| {
             if let ProviderStreamEvent::TextDelta { text } = event
                 && !text.is_empty()
@@ -1227,14 +1228,6 @@ fn execute_task_tool_call(
             &format!("failed to start subagent session: {error}"),
             BTreeMap::from([("subagent_type".to_string(), json!(subagent_type))]),
         );
-    }
-    if let Err(error) = bind_agent_profile_system_prompt(
-        &mut child_session,
-        task_context.store,
-        &child_run_id,
-        Some(&child_profile),
-    ) {
-        return task_tool_error(tool_call, &error, BTreeMap::new());
     }
     let user_message = chat_message(Role::User, prompt.clone());
     let user_index = child_session.messages.len() as u64;

@@ -41,7 +41,7 @@ fn config_init(args: &[String]) -> CliRunResult {
             value_for(args, &["--wire-api"]).unwrap_or_else(|| DEFAULT_WIRE_API.to_string())
         )),
         Some(format!(
-            "OPENAGENT_APP_MAX_STEPS={}",
+            "OPENAGENT_BRIDGE_MAX_STEPS={}",
             value_for(args, &["--max-steps"]).unwrap_or_else(|| DEFAULT_MAX_STEPS.to_string())
         )),
         server_token.map(|token| format!("{DEFAULT_SERVER_TOKEN_ENV}={token}")),
@@ -91,9 +91,9 @@ fn config_show(args: &[String]) -> CliRunResult {
             "wire_api_source": openai.as_ref().map(|config| config.wire_api_source.as_str()).unwrap_or("default"),
             "api_key": if openai.as_ref().is_some_and(|config| config.api_key.is_some()) {"set"} else {"missing"},
             "api_key_source": openai.as_ref().and_then(|config| config.api_key_source.as_deref()),
-            "max_steps": env::var("OPENAGENT_APP_MAX_STEPS").unwrap_or_else(|_| DEFAULT_MAX_STEPS.to_string()),
+            "max_steps": env::var("OPENAGENT_BRIDGE_MAX_STEPS").unwrap_or_else(|_| DEFAULT_MAX_STEPS.to_string()),
         },
-        "app_bridge": {
+        "bridge": {
             "server_url": value_for(args, &["--server-url"]).unwrap_or_else(|| DEFAULT_SERVER_URL.to_string()),
             "server_token": if env::var(DEFAULT_SERVER_TOKEN_ENV).is_ok_and(|value| !value.is_empty()) {"set"} else {"missing"},
             "server_token_env": DEFAULT_SERVER_TOKEN_ENV,

@@ -80,7 +80,6 @@ const SOURCE_ONLY_SCAN_IGNORE: &[&str] = &[
     "tests/workdir/",
     "openagent/tests/workdir/",
     "examples/workdir*",
-    "desktop/src-tauri/gen/",
 ];
 
 const BINARY_EXTENSIONS: &[&str] = &[

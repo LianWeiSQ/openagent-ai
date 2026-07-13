@@ -1,0 +1,766 @@
+{
+  "client": {
+    "event_ids": {
+      "key": [
+        "event_id",
+        "bridge_evt:session_existing:turn_remote:4"
+      ],
+      "session": "session_existing",
+      "turn": "turn_remote"
+    },
+    "helpers": {
+      "auth_header": "Bearer secret",
+      "join": "http://127.0.0.1:8787/api/sessions",
+      "normalize": "http://127.0.0.1:8787",
+      "quote": "turn%2Fa%20b"
+    },
+    "parsed_event": {
+      "created_at_ms": 1781842000304,
+      "event_id": "bridge_evt:session_existing:turn_remote:4",
+      "global_sequence": 12,
+      "method": "turn/completed",
+      "params": {
+        "final_answer": "hello remote",
+        "status": "completed",
+        "thread_id": "session_existing",
+        "trace": {
+          "id": "trace_1"
+        },
+        "turn_id": "turn_remote"
+      },
+      "sequence": 4
+    },
+    "remote_turn": {
+      "append_results": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "duplicate_result": false,
+      "events": [
+        {
+          "created_at_ms": 1781842000301,
+          "event_id": "bridge_evt:session_existing:turn_remote:1",
+          "global_sequence": 10,
+          "method": "turn/started",
+          "params": {
+            "status": "running",
+            "thread_id": "session_existing",
+            "turn_id": "turn_remote"
+          },
+          "sequence": 1
+        },
+        {
+          "created_at_ms": 1781842000302,
+          "event_id": "bridge_evt:session_existing:turn_remote:2",
+          "global_sequence": 11,
+          "method": "turn/approval_requested",
+          "params": {
+            "approval": {
+              "request_id": "approval_1",
+              "tool_name": "write",
+              "turn_id": "turn_remote"
+            },
+            "status": "waiting_approval",
+            "thread_id": "session_existing",
+            "turn_id": "turn_remote"
+          },
+          "sequence": 2
+        },
+        {
+          "created_at_ms": 1781842000303,
+          "event_id": "bridge_evt:session_existing:turn_remote:3",
+          "method": "turn/approval_resolved",
+          "params": {
+            "approval": {
+              "action": "deny",
+              "request_id": "approval_1",
+              "turn_id": "turn_remote"
+            },
+            "status": "running",
+            "thread_id": "session_existing",
+            "turn_id": "turn_remote"
+          },
+          "sequence": 3
+        },
+        {
+          "created_at_ms": 1781842000304,
+          "event_id": "bridge_evt:session_existing:turn_remote:4",
+          "global_sequence": 12,
+          "method": "turn/completed",
+          "params": {
+            "final_answer": "hello remote",
+            "status": "completed",
+            "thread_id": "session_existing",
+            "trace": {
+              "id": "trace_1"
+            },
+            "turn_id": "turn_remote"
+          },
+          "sequence": 4
+        }
+      ],
+      "final_answer": "hello remote",
+      "status": "completed",
+      "trace": {
+        "id": "trace_1"
+      }
+    },
+    "request_shapes": {
+      "approval": {
+        "method": "POST",
+        "path": "/api/turns/turn_remote/approvals/approval_1",
+        "payload": {
+          "action": "deny"
+        }
+      },
+      "control_next": {
+        "method": "GET",
+        "path": "/tui/control/next?timeout=0.25"
+      },
+      "control_response": {
+        "method": "POST",
+        "path": "/tui/control/response",
+        "payload": {
+          "ok": true,
+          "result": {
+            "applied": true
+          }
+        }
+      },
+      "interrupt": {
+        "method": "POST",
+        "path": "/api/turns/turn_remote/interrupt",
+        "payload": {}
+      },
+      "mcp_enable": {
+        "method": "PATCH",
+        "path": "/api/mcp/servers/local-tools",
+        "payload": {
+          "enabled": true
+        }
+      },
+      "mcp_start": {
+        "method": "POST",
+        "path": "/api/mcp/servers/local-tools/start"
+      },
+      "mcp_status": {
+        "method": "GET",
+        "path": "/api/mcp?refresh=true"
+      },
+      "mcp_test": {
+        "method": "POST",
+        "path": "/api/mcp/servers/local-tools/test"
+      },
+      "start_session": {
+        "method": "POST",
+        "path": "/api/sessions",
+        "payload": {
+          "cwd": "/tmp/openagent-rust-rewrite-fixture-goal11/workspace"
+        }
+      },
+      "start_turn": {
+        "method": "POST",
+        "path": "/api/sessions/session_existing/turns",
+        "payload": {
+          "input": "hello"
+        }
+      },
+      "turns": {
+        "method": "GET",
+        "path": "/api/turns?session_id=session_existing"
+      },
+      "terminal_run": {
+        "method": "POST",
+        "path": "/api/terminal/run",
+        "payload": {
+          "command": "printf terminal-ok",
+          "cwd": "/tmp/openagent-rust-rewrite-fixture-goal11/workspace",
+          "timeout_ms": 1000
+        }
+      }
+    }
+  },
+  "protocol": {
+    "lifecycle_started": {
+      "created_at_ms": 1781842000001,
+      "method": "turn/started",
+      "params": {
+        "input": "hello",
+        "status": "running",
+        "thread_id": "session_1",
+        "turn_id": "turn_1"
+      },
+      "sequence": 1
+    },
+    "method_map": {
+      "error": "turn/error",
+      "patch": "item/patch/detected",
+      "question-request": "item/question/requested",
+      "runtime-warning": "runtime/warning",
+      "step-finish": "item/step/completed",
+      "step-start": "item/step/started",
+      "text-delta": "item/agentMessage/delta",
+      "text-end": "item/agentMessage/completed",
+      "text-start": "item/agentMessage/started",
+      "tool-call": "item/toolCall/started",
+      "tool-result": "item/toolCall/completed",
+      "unknown": "item/event"
+    },
+    "tui_control_request": {
+      "body": {
+        "text": "hello"
+      },
+      "path": "/tui/append-prompt"
+    },
+    "wrapped_tool_call": {
+      "created_at_ms": 1781842000003,
+      "method": "item/toolCall/started",
+      "params": {
+        "event": {
+          "call_id": "call_1",
+          "input": {
+            "path": "."
+          },
+          "name": "ls",
+          "type": "tool-call"
+        },
+        "event_type": "tool-call",
+        "source": "openagent",
+        "thread_id": "session_1",
+        "turn_id": "turn_1"
+      },
+      "sequence": 3
+    }
+  },
+  "schema_version": 1,
+  "server": {
+    "approval_path": {
+      "invalid_error": "approval path must be /api/turns/{turn_id}/approvals/{request_id}",
+      "valid": [
+        "turn_123",
+        "approval_456"
+      ]
+    },
+    "auth": {
+      "authenticated_paths": {
+        "/": false,
+        "/api/health": true,
+        "/tui/append-prompt": true
+      },
+      "expected_header": "Bearer server-secret",
+      "unauthorized": {
+        "headers": {
+          "WWW-Authenticate": "Bearer realm=\"openagent-bridge\""
+        },
+        "json": {
+          "error": "unauthorized"
+        },
+        "status": 401
+      }
+    },
+    "control_routes": {
+      "cases": [
+        {
+          "path": "/tui/append-prompt",
+          "payload": {
+            "text": "hello"
+          },
+          "queued": {
+            "body": {
+              "text": "hello"
+            },
+            "path": "/tui/append-prompt"
+          }
+        },
+        {
+          "path": "/tui/submit-prompt",
+          "payload": {},
+          "queued": {
+            "body": {},
+            "path": "/tui/submit-prompt"
+          }
+        },
+        {
+          "path": "/tui/clear-prompt",
+          "payload": {},
+          "queued": {
+            "body": {},
+            "path": "/tui/clear-prompt"
+          }
+        },
+        {
+          "path": "/tui/open-help",
+          "payload": {},
+          "queued": {
+            "body": {},
+            "path": "/tui/open-help"
+          }
+        },
+        {
+          "path": "/tui/open-sessions",
+          "payload": {},
+          "queued": {
+            "body": {},
+            "path": "/tui/open-sessions"
+          }
+        },
+        {
+          "path": "/tui/open-themes",
+          "payload": {},
+          "queued": {
+            "body": {},
+            "path": "/tui/open-themes"
+          }
+        },
+        {
+          "path": "/tui/open-models",
+          "payload": {},
+          "queued": {
+            "body": {},
+            "path": "/tui/open-models"
+          }
+        },
+        {
+          "path": "/tui/execute-command",
+          "payload": {
+            "command": "status"
+          },
+          "queued": {
+            "body": {
+              "command": "status"
+            },
+            "path": "/tui/execute-command"
+          }
+        },
+        {
+          "path": "/tui/show-toast",
+          "payload": {
+            "duration": 1.5,
+            "message": "Saved",
+            "title": "Hi",
+            "variant": "success"
+          },
+          "queued": {
+            "body": {
+              "duration": 1.5,
+              "message": "Saved",
+              "title": "Hi",
+              "variant": "success"
+            },
+            "path": "/tui/show-toast"
+          }
+        },
+        {
+          "path": "/tui/publish",
+          "payload": {
+            "properties": {
+              "command": "help"
+            },
+            "type": "tui.command.execute"
+          },
+          "queued": {
+            "body": {
+              "properties": {
+                "command": "help"
+              },
+              "type": "tui.command.execute"
+            },
+            "path": "/tui/publish"
+          }
+        },
+        {
+          "path": "/tui/select-session",
+          "payload": {
+            "sessionID": "session_existing"
+          },
+          "queued": {
+            "body": {
+              "sessionID": "session_existing"
+            },
+            "path": "/tui/select-session"
+          }
+        }
+      ],
+      "empty_next": {
+        "body": null,
+        "path": ""
+      },
+      "publish_samples": {
+        "append": {
+          "action": "prompt.append",
+          "params": {
+            "text": "hello"
+          }
+        },
+        "command": {
+          "action": "command.execute",
+          "params": {
+            "command": "status"
+          }
+        },
+        "session": {
+          "action": "session.select",
+          "params": {
+            "sessionID": "session_existing"
+          }
+        },
+        "toast": {
+          "action": "toast.show",
+          "params": {
+            "duration": 1.25,
+            "message": "Done",
+            "title": "Saved",
+            "variant": "success"
+          }
+        }
+      },
+      "record_response": {
+        "ok": true,
+        "response": [
+          "ok",
+          {
+            "applied": true
+          }
+        ]
+      },
+      "unsupported_publish_error": "unsupported publish type: tui.unknown"
+    },
+    "health": {
+      "auth_required": true,
+      "ok": true,
+      "service": "openagent-bridge-server"
+    },
+    "runtime": {
+      "approval_requested": {
+        "created_at_ms": 1781842000202,
+        "method": "turn/approval_requested",
+        "params": {
+          "approval": {
+            "call_id": "call_1",
+            "created_at_ms": 1781842000202,
+            "request_id": "approval_1",
+            "session_id": "session_1",
+            "tool_input": {
+              "file_path": "blocked.txt"
+            },
+            "tool_name": "write",
+            "turn_id": "turn_1"
+          },
+          "status": "waiting_approval",
+          "thread_id": "session_1",
+          "turn_id": "turn_1"
+        },
+        "sequence": 2
+      },
+      "approval_resolved": {
+        "created_at_ms": 1781842000203,
+        "method": "turn/approval_resolved",
+        "params": {
+          "approval": {
+            "action": "deny",
+            "call_id": "call_1",
+            "created_at_ms": 1781842000202,
+            "request_id": "approval_1",
+            "session_id": "session_1",
+            "tool_input": {
+              "file_path": "blocked.txt"
+            },
+            "tool_name": "write",
+            "turn_id": "turn_1"
+          },
+          "status": "running",
+          "thread_id": "session_1",
+          "turn_id": "turn_1"
+        },
+        "sequence": 3
+      },
+      "interrupt_event": {
+        "created_at_ms": 1781842000201,
+        "method": "turn/interrupt_requested",
+        "params": {
+          "status": "interrupting",
+          "thread_id": "session_1",
+          "turn_id": "turn_1"
+        },
+        "sequence": 1
+      },
+      "turn_after_interrupt": {
+        "created_at_ms": 1781842000200,
+        "error": null,
+        "event_count": 1,
+        "final_answer": "",
+        "id": "turn_1",
+        "interrupt_requested": true,
+        "pending_approval_count": 0,
+        "session_id": "session_1",
+        "status": "interrupting",
+        "trace": null
+      }
+    },
+    "sse": {
+      "ping_comment": ": ping\n\n",
+      "replay_after_last_event_id_2": [
+        {
+          "data": {
+            "created_at_ms": 1781842000103,
+            "global_sequence": 3,
+            "method": "turn/started",
+            "params": {
+              "status": "running",
+              "thread_id": "session_1",
+              "turn_id": "turn_2"
+            },
+            "sequence": 1
+          },
+          "event": "turn/started",
+          "id": "3"
+        }
+      ],
+      "replay_after_query_sequence_1": [
+        {
+          "data": {
+            "created_at_ms": 1781842000102,
+            "global_sequence": 2,
+            "method": "turn/completed",
+            "params": {
+              "final_answer": "done",
+              "status": "completed",
+              "thread_id": "session_1",
+              "turn_id": "turn_1"
+            },
+            "sequence": 2
+          },
+          "event": "turn/completed",
+          "id": "2"
+        },
+        {
+          "data": {
+            "created_at_ms": 1781842000103,
+            "global_sequence": 3,
+            "method": "turn/started",
+            "params": {
+              "status": "running",
+              "thread_id": "session_1",
+              "turn_id": "turn_2"
+            },
+            "sequence": 1
+          },
+          "event": "turn/started",
+          "id": "3"
+        }
+      ]
+    }
+  },
+  "tui": {
+    "action_map": {
+      "append-prompt": "prompt.append",
+      "archive-session": "session.archive",
+      "attach-file": "file.select",
+      "clear-prompt": "prompt.clear",
+      "compact-session": "session.compact",
+      "custom.action": "custom.action",
+      "delete-session": "session.delete",
+      "execute-command": "command.execute",
+      "execute-palette": "palette.execute",
+      "fork-session": "session.fork",
+      "open-agents": "agent.open",
+      "open-files": "file.open",
+      "open-help": "help.open",
+      "open-models": "model.open",
+      "open-palette": "palette.open",
+      "open-sessions": "sessions.open",
+      "open-themes": "theme.open",
+      "open-thinking": "thinking.open",
+      "open-variants": "variant.open",
+      "parent-session": "session.parent",
+      "redo-session": "session.redo",
+      "rename-session": "session.rename",
+      "select-agent": "agent.select",
+      "select-file": "file.select",
+      "select-model": "model.select",
+      "select-session": "session.select",
+      "select-theme": "theme.select",
+      "select-thinking": "thinking.select",
+      "select-variant": "variant.select",
+      "session-children": "session.children",
+      "session-details": "session.details",
+      "share-session": "session.share",
+      "show-toast": "toast.show",
+      "submit-prompt": "prompt.submit",
+      "unarchive-session": "session.unarchive",
+      "undo-session": "session.undo",
+      "unshare-session": "session.unshare",
+      "open-theme-schemes": "theme.scheme.open",
+      "open-color-schemes": "theme.scheme.open",
+      "select-theme-scheme": "theme.scheme.select",
+      "select-color-scheme": "theme.scheme.select",
+      "cycle-theme-scheme": "theme.scheme.cycle",
+      "cycle-color-scheme": "theme.scheme.cycle"
+    },
+    "invalid_select": {
+      "result": {
+        "action": "session.select",
+        "applied": false,
+        "error": "sessionID is required"
+      },
+      "status": "control invalid",
+      "timeline": [
+        {
+          "important": true,
+          "kind": "error",
+          "text": "control request missing sessionID"
+        }
+      ]
+    },
+    "steps": [
+      {
+        "input_buffer": "hello",
+        "request": {
+          "body": {
+            "text": "hello"
+          },
+          "path": "/tui/append-prompt"
+        },
+        "result": {
+          "action": "prompt.append",
+          "applied": true
+        },
+        "status": "prompt updated",
+        "timeline": []
+      },
+      {
+        "input_buffer": "hello next",
+        "request": {
+          "body": {
+            "properties": {
+              "text": " next"
+            },
+            "type": "tui.prompt.append"
+          },
+          "path": "/tui/publish"
+        },
+        "result": {
+          "action": "prompt.append",
+          "applied": true
+        },
+        "status": "prompt updated",
+        "timeline": []
+      },
+      {
+        "input_buffer": "hello next",
+        "request": {
+          "body": {
+            "message": "Session selected",
+            "title": "Saved",
+            "variant": "success"
+          },
+          "path": "/tui/show-toast"
+        },
+        "result": {
+          "action": "toast.show",
+          "applied": true
+        },
+        "status": "Saved",
+        "timeline": [
+          {
+            "important": true,
+            "kind": "status",
+            "text": "Saved: Session selected"
+          }
+        ]
+      },
+      {
+        "input_buffer": "",
+        "request": {
+          "body": {
+            "command": "help"
+          },
+          "path": "/tui/execute-command"
+        },
+        "result": {
+          "action": "command.execute",
+          "applied": false
+        },
+        "status": "help listed",
+        "timeline": [
+          {
+            "important": true,
+            "kind": "status",
+            "text": "Saved: Session selected"
+          },
+          {
+            "important": true,
+            "kind": "status",
+            "text": "built-in commands:\n/help - show TUI commands\n/connect <url> - connect to a Bridge server\n/sessions [query] - open/search recent session picker\n/resume <id> - resume a session by id or unique prefix\n/rename <title> - rename the current session\n/archive - archive the current session\n/unarchive - unarchive the current session\n/delete - delete the current session\n/transcript [limit] - show recent messages from the current session\n/new - start a new session\n/fork - fork the current session\n/children - list child sessions\n/parent - navigate to the parent session\n/share - share the current session\n/unshare - remove the current shared session link\n/compact - compact the current session context\n/details - show current turn and trace details\n/models [id] - list models or set the current model\n/agents - list available agent profiles\n/agent <id> - set the current agent profile\n/variant <name> - set the current model variant\n/themes - open theme picker\n/theme-scheme [system|light|dark] - open or set color scheme\n/thinking <level> - set reasoning effort or visibility\n/config - show loaded TUI configuration\n/keybinds - show active key bindings\n/usage - show token and cost totals\n/warnings - show aggregated runtime warnings\n/tool-details [on|off] - toggle tool metadata details\n/mcp [list|show|doctor|test|start|stop|restart|enable|disable] - inspect and control Bridge MCP servers\n/editor - edit prompt in an external editor\n/stash <draft> - stash a draft prompt\n/unstash - restore the latest stashed prompt\n/stashes - list stashed prompt drafts\n/files [query] - search workspace files for @ attachments\n/attach <path[:range]> - insert a file/image reference into the prompt\n/export - export the current session\n/init - initialize OpenAgent project files\n/undo - undo the last reversible change\n/redo - redo the last undone change\n/clear - clear the visible timeline\n/status - show current session, turn, and model status\n/allow [once|always] - approve the active tool request\n/deny [note] - deny the active tool request with an optional note\n/answer <text> - answer the active question request\n/dismiss [note] - dismiss the active question request\n/commands - list project/global custom commands"
+          }
+        ]
+      },
+      {
+        "input_buffer": "",
+        "request": {
+          "body": {},
+          "path": "/tui/open-themes"
+        },
+        "result": {
+          "action": "theme.open",
+          "applied": true,
+          "themes": [
+            "default",
+            "light",
+            "high-contrast",
+            "midnight"
+          ]
+        },
+        "status": "theme picker",
+        "timeline": [
+          {
+            "important": true,
+            "kind": "status",
+            "text": "Saved: Session selected"
+          },
+          {
+            "important": true,
+            "kind": "status",
+            "text": "built-in commands:\n/help - show TUI commands\n/connect <url> - connect to a Bridge server\n/sessions [query] - open/search recent session picker\n/resume <id> - resume a session by id or unique prefix\n/rename <title> - rename the current session\n/archive - archive the current session\n/unarchive - unarchive the current session\n/delete - delete the current session\n/transcript [limit] - show recent messages from the current session\n/new - start a new session\n/fork - fork the current session\n/children - list child sessions\n/parent - navigate to the parent session\n/share - share the current session\n/unshare - remove the current shared session link\n/compact - compact the current session context\n/details - show current turn and trace details\n/models [id] - list models or set the current model\n/agents - list available agent profiles\n/agent <id> - set the current agent profile\n/variant <name> - set the current model variant\n/themes - open theme picker\n/theme-scheme [system|light|dark] - open or set color scheme\n/thinking <level> - set reasoning effort or visibility\n/config - show loaded TUI configuration\n/keybinds - show active key bindings\n/usage - show token and cost totals\n/warnings - show aggregated runtime warnings\n/tool-details [on|off] - toggle tool metadata details\n/mcp [list|show|doctor|test|start|stop|restart|enable|disable] - inspect and control Bridge MCP servers\n/editor - edit prompt in an external editor\n/stash <draft> - stash a draft prompt\n/unstash - restore the latest stashed prompt\n/stashes - list stashed prompt drafts\n/files [query] - search workspace files for @ attachments\n/attach <path[:range]> - insert a file/image reference into the prompt\n/export - export the current session\n/init - initialize OpenAgent project files\n/undo - undo the last reversible change\n/redo - redo the last undone change\n/clear - clear the visible timeline\n/status - show current session, turn, and model status\n/allow [once|always] - approve the active tool request\n/deny [note] - deny the active tool request with an optional note\n/answer <text> - answer the active question request\n/dismiss [note] - dismiss the active question request\n/commands - list project/global custom commands"
+          },
+          {
+            "important": true,
+            "kind": "status",
+            "text": "themes: default, light, high-contrast, midnight (current: default)"
+          }
+        ]
+      },
+      {
+        "input_buffer": "",
+        "request": {
+          "body": {},
+          "path": "/tui/clear-prompt"
+        },
+        "result": {
+          "action": "prompt.clear",
+          "applied": true
+        },
+        "status": "prompt cleared",
+        "timeline": [
+          {
+            "important": true,
+            "kind": "status",
+            "text": "Saved: Session selected"
+          },
+          {
+            "important": true,
+            "kind": "status",
+            "text": "built-in commands:\n/help - show TUI commands\n/connect <url> - connect to a Bridge server\n/sessions [query] - open/search recent session picker\n/resume <id> - resume a session by id or unique prefix\n/rename <title> - rename the current session\n/archive - archive the current session\n/unarchive - unarchive the current session\n/delete - delete the current session\n/transcript [limit] - show recent messages from the current session\n/new - start a new session\n/fork - fork the current session\n/children - list child sessions\n/parent - navigate to the parent session\n/share - share the current session\n/unshare - remove the current shared session link\n/compact - compact the current session context\n/details - show current turn and trace details\n/models [id] - list models or set the current model\n/agents - list available agent profiles\n/agent <id> - set the current agent profile\n/variant <name> - set the current model variant\n/themes - open theme picker\n/theme-scheme [system|light|dark] - open or set color scheme\n/thinking <level> - set reasoning effort or visibility\n/config - show loaded TUI configuration\n/keybinds - show active key bindings\n/usage - show token and cost totals\n/warnings - show aggregated runtime warnings\n/tool-details [on|off] - toggle tool metadata details\n/mcp [list|show|doctor|test|start|stop|restart|enable|disable] - inspect and control Bridge MCP servers\n/editor - edit prompt in an external editor\n/stash <draft> - stash a draft prompt\n/unstash - restore the latest stashed prompt\n/stashes - list stashed prompt drafts\n/files [query] - search workspace files for @ attachments\n/attach <path[:range]> - insert a file/image reference into the prompt\n/export - export the current session\n/init - initialize OpenAgent project files\n/undo - undo the last reversible change\n/redo - redo the last undone change\n/clear - clear the visible timeline\n/status - show current session, turn, and model status\n/allow [once|always] - approve the active tool request\n/deny [note] - deny the active tool request with an optional note\n/answer <text> - answer the active question request\n/dismiss [note] - dismiss the active question request\n/commands - list project/global custom commands"
+          },
+          {
+            "important": true,
+            "kind": "status",
+            "text": "themes: default, light, high-contrast, midnight (current: default)"
+          }
+        ]
+      }
+    ]
+  }
+}

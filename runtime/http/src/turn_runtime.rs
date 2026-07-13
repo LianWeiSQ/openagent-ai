@@ -646,7 +646,43 @@ pub(super) fn mark_turn_job_status_at_root(root: &Path, turn_id: &str, status: &
     if turn_job_status_terminal(status) {
         remove_queued_turn_payload(root, turn_id);
         remove_queued_turn_from_memory(turn_id);
+        if status != "failed" {
+            remove_turn_retry_payload(root, turn_id);
+        }
     }
+}
+
+pub(super) fn turn_retry_payload_path(root: &Path, turn_id: &str) -> PathBuf {
+    root.join(TURN_RETRY_PAYLOAD_DIR)
+        .join(format!("{turn_id}.json"))
+}
+
+pub(super) fn persist_turn_retry_payload(
+    root: &Path,
+    session_id: &str,
+    turn_id: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    write_json_value(
+        &turn_retry_payload_path(root, turn_id),
+        &json!({
+            "schema_version": TURN_RETRY_PAYLOAD_SCHEMA_VERSION,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "created_at_ms": now_ms(),
+            "payload": payload,
+        }),
+    )
+}
+
+pub(super) fn read_turn_retry_payload(root: &Path, turn_id: &str) -> Option<Value> {
+    let value = read_json_file(&turn_retry_payload_path(root, turn_id));
+    (value.get("schema_version").and_then(Value::as_u64) == Some(TURN_RETRY_PAYLOAD_SCHEMA_VERSION))
+        .then_some(value)
+}
+
+pub(super) fn remove_turn_retry_payload(root: &Path, turn_id: &str) {
+    let _ = fs::remove_file(turn_retry_payload_path(root, turn_id));
 }
 
 pub(super) fn request_turn_job_cancel(config: &HttpRuntimeConfig, turn_id: &str) -> Option<Value> {

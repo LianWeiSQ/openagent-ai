@@ -149,8 +149,7 @@ pub(super) fn acp_command(args: &[String]) -> CliRunResult {
     if runtime_args.first().map(String::as_str) == Some("serve") {
         runtime_args.remove(0);
     }
-    runtime_args.push("--headless".to_string());
-    http_runtime_command(&runtime_args, false, "Usage: openagent acp")
+    http_runtime_command(&runtime_args, "Usage: openagent acp")
 }
 
 pub(super) fn generate_command(args: &[String]) -> CliRunResult {
@@ -160,7 +159,7 @@ pub(super) fn generate_command(args: &[String]) -> CliRunResult {
     if args.first().map(String::as_str) == Some("commands") {
         return CliRunResult::ok_json(&json!({
             "schema_version": "openagent.commands.v1",
-            "commands": ["run", "tui", "serve", "web", "models", "agent", "plugin", "github", "pr", "debug", "db", "acp", "generate", "console"],
+            "commands": ["run", "tui", "serve", "models", "agent", "plugin", "github", "pr", "debug", "db", "acp", "generate", "console"],
         }));
     }
     if args.first().map(String::as_str) == Some("acp") {
@@ -168,7 +167,7 @@ pub(super) fn generate_command(args: &[String]) -> CliRunResult {
     }
     CliRunResult::ok_json(&json!({
         "openapi": "3.1.0",
-        "info": {"title": "OpenAgent App Bridge", "version": env!("CARGO_PKG_VERSION")},
+        "info": {"title": "OpenAgent Bridge API", "version": env!("CARGO_PKG_VERSION")},
         "paths": {
             "/api/health": {"get": {"operationId": "health"}},
             "/api/events": {"get": {"operationId": "globalEvents"}},

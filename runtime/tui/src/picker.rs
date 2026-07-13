@@ -1,4 +1,4 @@
-use openagent_app_server_client::session_id_from_payload;
+use openagent_bridge_server_client::session_id_from_payload;
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},

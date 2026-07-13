@@ -1,6 +1,6 @@
 use std::{io::IsTerminal, path::PathBuf};
 
-use openagent_app_server_client::RemoteAuth;
+use openagent_bridge_server_client::RemoteAuth;
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -29,7 +29,7 @@ fn main() {
     let workspace = value_for(&args, &["--workspace", "--dir"])
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let options = openagent_tui::AppBridgeTerminalOptions {
+    let options = openagent_tui::BridgeTerminalOptions {
         server_url: server_url.clone(),
         auth,
         workspace,
@@ -39,18 +39,18 @@ fn main() {
         permission: value_for(&args, &["--permission"]),
         dangerously_skip_permissions: has_flag(&args, &["--dangerously-skip-permissions"]),
     };
-    let handler = match openagent_tui::AppBridgeTerminalHandler::connect(options) {
+    let handler = match openagent_tui::BridgeTerminalHandler::connect(options) {
         Ok(handler) => handler,
         Err(error) => {
             eprintln!(
-                "failed to connect to App Bridge at {server_url}: {error}\nstart one with: openagent serve --host 127.0.0.1 --port 8787"
+                "failed to connect to Bridge API at {server_url}: {error}\nstart one with: openagent serve --host 127.0.0.1 --port 8787"
             );
             std::process::exit(1);
         }
     };
     if let Err(error) = openagent_tui::run_terminal_ui(
         openagent_tui::TerminalUiOptions {
-            title: format!("OpenAgent App Bridge: {server_url}"),
+            title: format!("OpenAgent Bridge: {server_url}"),
             status: "connected".to_string(),
         },
         handler,

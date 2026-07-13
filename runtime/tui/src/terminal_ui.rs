@@ -5,9 +5,9 @@ use std::path::PathBuf;
 #[cfg(test)]
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[cfg(test)]
-use openagent_app_server_client::RemoteAuth;
+use openagent_bridge_server_client::RemoteAuth;
 #[cfg(test)]
-use openagent_app_server_client::session_id_from_payload;
+use openagent_bridge_server_client::session_id_from_payload;
 #[cfg(test)]
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
@@ -52,12 +52,12 @@ use picker::file_picker_lines;
 pub use provider::ModelPickerState;
 #[cfg(test)]
 use render::draw_terminal_frame;
-pub use server::{AppBridgeTerminalHandler, AppBridgeTerminalOptions};
+pub use server::{BridgeTerminalHandler, BridgeTerminalOptions};
 #[cfg(test)]
 use session::open_session_picker_from_handler;
 pub use session::{SessionPickerAction, SessionPickerMode, SessionPickerState};
 #[cfg(test)]
-pub(crate) use terminal::apply_app_event_values;
+pub(crate) use terminal::apply_bridge_event_values;
 pub(crate) use terminal::apply_handler_output;
 pub use terminal::{TerminalEventHandler, TerminalUiOptions, run_terminal_ui};
 #[cfg(test)]
@@ -80,12 +80,12 @@ pub fn command_name() -> &'static str {
 
 #[must_use]
 pub fn client_crate_name() -> &'static str {
-    openagent_app_server_client::crate_name()
+    openagent_bridge_server_client::crate_name()
 }
 
 #[must_use]
 pub fn server_crate_name() -> &'static str {
-    openagent_app_server::crate_name()
+    openagent_bridge_server::crate_name()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

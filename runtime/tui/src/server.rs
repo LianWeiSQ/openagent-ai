@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, path::PathBuf, time::Duration};
 
-use openagent_app_server_client::{
+use openagent_bridge_server_client::{
     RemoteAuth, RemoteRuntimeClient, event_sequence, events_from_payload, turn_id_from_payload,
 };
 use serde_json::{Map, Value, json};
@@ -18,7 +18,7 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AppBridgeTerminalOptions {
+pub struct BridgeTerminalOptions {
     pub server_url: String,
     pub auth: RemoteAuth,
     pub workspace: PathBuf,
@@ -29,7 +29,7 @@ pub struct AppBridgeTerminalOptions {
     pub dangerously_skip_permissions: bool,
 }
 
-impl Default for AppBridgeTerminalOptions {
+impl Default for BridgeTerminalOptions {
     fn default() -> Self {
         Self {
             server_url: "http://127.0.0.1:8787".to_string(),
@@ -44,7 +44,7 @@ impl Default for AppBridgeTerminalOptions {
     }
 }
 
-pub struct AppBridgeTerminalHandler {
+pub struct BridgeTerminalHandler {
     client: RemoteRuntimeClient,
     workspace: PathBuf,
     current_session: Option<String>,
@@ -58,8 +58,8 @@ pub struct AppBridgeTerminalHandler {
     seen_events: BTreeSet<String>,
 }
 
-impl AppBridgeTerminalHandler {
-    pub fn connect(options: AppBridgeTerminalOptions) -> Result<Self, String> {
+impl BridgeTerminalHandler {
+    pub fn connect(options: BridgeTerminalOptions) -> Result<Self, String> {
         let client = RemoteRuntimeClient::new(options.server_url.clone())
             .with_auth(options.auth)
             .with_timeout(Duration::from_secs(3));
@@ -413,7 +413,7 @@ fn mcp_endpoint_label(server: &Value) -> String {
     }
 }
 
-impl TerminalEventHandler for AppBridgeTerminalHandler {
+impl TerminalEventHandler for BridgeTerminalHandler {
     fn initial_lines(&mut self) -> Vec<TimelineLine> {
         let mut lines = vec![TimelineLine::new(
             "status",
@@ -437,7 +437,7 @@ impl TerminalEventHandler for AppBridgeTerminalHandler {
         lines
     }
 
-    fn poll_app_events(&mut self) -> Result<Vec<Value>, String> {
+    fn poll_bridge_events(&mut self) -> Result<Vec<Value>, String> {
         let events = self.client.global_events(self.last_global_event_id)?;
         Ok(self.filter_new_events(events))
     }
@@ -458,7 +458,7 @@ impl TerminalEventHandler for AppBridgeTerminalHandler {
         self.client.record_tui_control_response(payload).map(|_| ())
     }
 
-    fn drain_app_events(&mut self) -> Vec<Value> {
+    fn drain_bridge_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.pending_events)
     }
 

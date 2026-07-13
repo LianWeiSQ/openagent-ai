@@ -499,6 +499,7 @@ fn provider_events_to_run_result(
     for event in events {
         match event {
             ProviderStreamEvent::TextDelta { text } => answer.push_str(text),
+            ProviderStreamEvent::ReasoningDelta { .. } => {}
             ProviderStreamEvent::Finish {
                 usage: item,
                 finish_reason: reason,
@@ -628,23 +629,36 @@ fn parse_sse_frame_json(frame: &str) -> Result<Option<Value>, String> {
 }
 
 fn openai_stream_text_delta(wire_api: &str, chunk: &Value) -> Option<ProviderStreamEvent> {
-    let text = if wire_api == "chat" {
-        chunk
+    if wire_api == "chat" {
+        let choice = chunk
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|choice| choice.get("delta"))
+            .and_then(|items| items.first());
+        let delta = choice.and_then(|choice| choice.get("delta"));
+        let text = delta
             .and_then(|delta| delta.get("content"))
-            .or_else(|| {
-                chunk
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|items| items.first())
-                    .and_then(|choice| choice.get("text"))
+            .or_else(|| choice.and_then(|choice| choice.get("text")))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !text.is_empty() {
+            return Some(ProviderStreamEvent::TextDelta {
+                text: text.to_string(),
+            });
+        }
+        let reasoning = delta
+            .and_then(|delta| {
+                delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .or_else(|| delta.get("thinking"))
             })
             .and_then(Value::as_str)
-            .unwrap_or_default()
-    } else if matches!(
+            .unwrap_or_default();
+        return (!reasoning.is_empty()).then(|| ProviderStreamEvent::ReasoningDelta {
+            text: reasoning.to_string(),
+        });
+    }
+    let text = if matches!(
         chunk.get("type").and_then(Value::as_str),
         Some("response.output_text.delta" | "response.refusal.delta")
     ) {

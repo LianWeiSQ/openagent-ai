@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 openagent-core.workspace = true
-openagent-app-server-client.workspace = true
+openagent-bridge-server-client.workspace = true
 openagent-http-runtime = { path = "../runtime/http" }
 openagent-lsp.workspace = true
 openagent-mcp.workspace = true

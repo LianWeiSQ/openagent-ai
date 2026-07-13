@@ -1,7 +1,7 @@
 use super::*;
 
-use openagent_app_server_client::{
-    RemoteAuth as AppBridgeRemoteAuth, RemoteRuntimeClient as AppBridgeRuntimeClient,
+use openagent_bridge_server_client::{
+    RemoteAuth as BridgeRemoteAuth, RemoteRuntimeClient as BridgeRuntimeClient,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -23,21 +23,18 @@ pub(super) fn remote_auth_from_args(args: &[String]) -> RemoteAuth {
     }
 }
 
-fn app_bridge_auth(auth: &RemoteAuth) -> AppBridgeRemoteAuth {
+fn bridge_auth(auth: &RemoteAuth) -> BridgeRemoteAuth {
     if let Some(token) = auth.token.as_deref().filter(|value| !value.is_empty()) {
-        return AppBridgeRemoteAuth::bearer(token);
+        return BridgeRemoteAuth::bearer(token);
     }
     if let Some(password) = auth.password.as_deref().filter(|value| !value.is_empty()) {
-        return AppBridgeRemoteAuth::basic(
-            auth.username.as_deref().unwrap_or("openagent"),
-            password,
-        );
+        return BridgeRemoteAuth::basic(auth.username.as_deref().unwrap_or("openagent"), password);
     }
-    AppBridgeRemoteAuth::default()
+    BridgeRemoteAuth::default()
 }
 
-pub(super) fn app_bridge_client(server_url: &str, auth: &RemoteAuth) -> AppBridgeRuntimeClient {
-    AppBridgeRuntimeClient::new(server_url).with_auth(app_bridge_auth(auth))
+pub(super) fn bridge_client(server_url: &str, auth: &RemoteAuth) -> BridgeRuntimeClient {
+    BridgeRuntimeClient::new(server_url).with_auth(bridge_auth(auth))
 }
 
 pub(super) fn remote_select_session(
@@ -156,7 +153,7 @@ fn remote_turn_events(
     last_event_id: u64,
 ) -> Result<Vec<Value>, String> {
     let mut events = Vec::new();
-    app_bridge_client(server_url, auth).turn_events_live_stream(
+    bridge_client(server_url, auth).turn_events_live_stream(
         turn_id,
         last_event_id,
         remote_attach_poll_duration(),
@@ -185,8 +182,8 @@ pub(super) fn remote_events_for_payload(
     let mut seen = BTreeSet::new();
     let mut last_id = 0_u64;
     for event in fallback {
-        last_id = last_id.max(app_event_sequence(&event));
-        if let Some(key) = app_event_dedupe_key(&event)
+        last_id = last_id.max(bridge_event_sequence(&event));
+        if let Some(key) = bridge_event_dedupe_key(&event)
             && !seen.insert(key)
         {
             continue;
@@ -199,11 +196,11 @@ pub(super) fn remote_events_for_payload(
             Ok(next) => {
                 let mut advanced = false;
                 for event in next {
-                    let seq = app_event_sequence(&event);
+                    let seq = bridge_event_sequence(&event);
                     if seq > last_id {
                         last_id = seq;
                     }
-                    if let Some(key) = app_event_dedupe_key(&event)
+                    if let Some(key) = bridge_event_dedupe_key(&event)
                         && !seen.insert(key)
                     {
                         continue;
@@ -211,7 +208,7 @@ pub(super) fn remote_events_for_payload(
                     advanced = true;
                     events.push(event);
                 }
-                if events.iter().any(is_terminal_app_event) {
+                if events.iter().any(is_terminal_bridge_event) {
                     return Ok(events);
                 }
                 if !advanced && SystemTime::now() >= deadline {
@@ -241,7 +238,7 @@ fn remote_attach_poll_duration() -> Duration {
     Duration::from_millis(millis)
 }
 
-fn app_event_sequence(event: &Value) -> u64 {
+fn bridge_event_sequence(event: &Value) -> u64 {
     event
         .get("sequence")
         .or_else(|| event.get("global_sequence"))
@@ -249,7 +246,7 @@ fn app_event_sequence(event: &Value) -> u64 {
         .unwrap_or_default()
 }
 
-fn app_event_global_sequence(event: &Value) -> u64 {
+fn bridge_event_global_sequence(event: &Value) -> u64 {
     event
         .get("global_sequence")
         .or_else(|| event.get("sequence"))
@@ -257,7 +254,7 @@ fn app_event_global_sequence(event: &Value) -> u64 {
         .unwrap_or_default()
 }
 
-fn app_event_dedupe_key(event: &Value) -> Option<String> {
+fn bridge_event_dedupe_key(event: &Value) -> Option<String> {
     if let Some(event_id) = event.get("event_id").and_then(Value::as_str)
         && !event_id.is_empty()
     {
@@ -265,13 +262,13 @@ fn app_event_dedupe_key(event: &Value) -> Option<String> {
     }
     Some(format!(
         "{}:{}:{}",
-        app_event_sequence(event),
+        bridge_event_sequence(event),
         event.get("method").and_then(Value::as_str).unwrap_or(""),
         stable_json_dumps(event.get("params").unwrap_or(&Value::Null))
     ))
 }
 
-fn is_terminal_app_event(event: &Value) -> bool {
+fn is_terminal_bridge_event(event: &Value) -> bool {
     matches!(
         event.get("method").and_then(Value::as_str),
         Some("turn/completed" | "turn/failed" | "turn/interrupted")
@@ -490,7 +487,7 @@ fn http_text_with_auth(
     Ok(raw)
 }
 
-pub(super) fn text_from_app_events(events: &[Value]) -> String {
+pub(super) fn text_from_bridge_events(events: &[Value]) -> String {
     let mut text = String::new();
     let mut final_answer = String::new();
     for event in events {
@@ -531,15 +528,11 @@ pub(super) fn text_from_app_events(events: &[Value]) -> String {
     if text.is_empty() { final_answer } else { text }
 }
 
-pub(super) fn http_runtime_command(args: &[String], web: bool, help: &'static str) -> CliRunResult {
+pub(super) fn http_runtime_command(args: &[String], help: &'static str) -> CliRunResult {
     if args.iter().any(|arg| is_help_flag(arg)) {
         return ok_text(help);
     }
-    let mut runtime_args = args.to_vec();
-    if !web && !has_flag(args, &["--headless"]) {
-        runtime_args.push("--headless".to_string());
-    }
-    let result = openagent_http_runtime::run_cli(&runtime_args);
+    let result = openagent_http_runtime::run_cli(args);
     CliRunResult {
         exit_code: result.exit_code,
         stdout: result.stdout,
@@ -596,8 +589,8 @@ pub(super) fn terminal_command(args: &[String]) -> CliRunResult {
             .saturating_add(1_000)
             .max(5_000),
     );
-    let client = AppBridgeRuntimeClient::new(server_url)
-        .with_auth(app_bridge_auth(&remote_auth_from_args(args)))
+    let client = BridgeRuntimeClient::new(server_url)
+        .with_auth(bridge_auth(&remote_auth_from_args(args)))
         .with_timeout(client_timeout);
     let payload = match client.terminal_run(&command, cwd.as_deref(), timeout_ms) {
         Ok(payload) => payload,
@@ -674,8 +667,8 @@ fn remote_terminal_run_text(
     command: &str,
     cwd: Option<&Path>,
 ) -> Result<String, String> {
-    let client = AppBridgeRuntimeClient::new(url)
-        .with_auth(app_bridge_auth(auth))
+    let client = BridgeRuntimeClient::new(url)
+        .with_auth(bridge_auth(auth))
         .with_timeout(Duration::from_secs(31));
     let payload = client.terminal_run(command, cwd, None)?;
     Ok(terminal_payload_text(&payload))
@@ -963,7 +956,7 @@ fn interactive_remote_loop(args: &[String], url: &str, auth: &RemoteAuth) -> Cli
             ) {
                 Ok(payload) => {
                     if let Some(events) = payload.get("events").and_then(Value::as_array) {
-                        stdout.push_str(&text_from_app_events(events));
+                        stdout.push_str(&text_from_bridge_events(events));
                         stdout.push('\n');
                     } else {
                         stdout.push_str(&stable_json_dumps(&payload));
@@ -992,7 +985,7 @@ fn interactive_remote_loop(args: &[String], url: &str, auth: &RemoteAuth) -> Cli
                 last_turn_id = remote_turn_id(&payload).or(last_turn_id);
                 match remote_events_for_payload(url, auth, &payload) {
                     Ok(events) if !events.is_empty() => {
-                        stdout.push_str(&text_from_app_events(&events));
+                        stdout.push_str(&text_from_bridge_events(&events));
                         stdout.push('\n');
                     }
                     Ok(_) => {
@@ -1049,11 +1042,11 @@ impl RemoteTerminalHandler {
     fn filter_new_events(&mut self, events: Vec<Value>) -> Vec<Value> {
         let mut output = Vec::new();
         for event in events {
-            let sequence = app_event_global_sequence(&event);
+            let sequence = bridge_event_global_sequence(&event);
             if sequence > self.last_global_event_id {
                 self.last_global_event_id = sequence;
             }
-            if let Some(key) = app_event_dedupe_key(&event)
+            if let Some(key) = bridge_event_dedupe_key(&event)
                 && !self.seen_events.insert(key)
             {
                 continue;
@@ -1083,9 +1076,9 @@ impl openagent_tui::TerminalEventHandler for RemoteTerminalHandler {
         lines
     }
 
-    fn poll_app_events(&mut self) -> Result<Vec<Value>, String> {
+    fn poll_bridge_events(&mut self) -> Result<Vec<Value>, String> {
         let mut events = Vec::new();
-        app_bridge_client(&self.url, &self.auth).global_events_live_stream(
+        bridge_client(&self.url, &self.auth).global_events_live_stream(
             self.last_global_event_id,
             remote_attach_poll_duration(),
             |event| {
@@ -1119,7 +1112,7 @@ impl openagent_tui::TerminalEventHandler for RemoteTerminalHandler {
         .map(|_| ())
     }
 
-    fn drain_app_events(&mut self) -> Vec<Value> {
+    fn drain_bridge_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.pending_events)
     }
 
@@ -1372,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_terminal_command_runs_through_app_bridge_client() {
+    fn remote_terminal_command_runs_through_bridge_client() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
         let port = listener.local_addr().expect("mock server addr").port();
         let server = thread::spawn(move || {
@@ -1431,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_terminal_poll_app_events_uses_app_bridge_live_stream() {
+    fn remote_terminal_poll_bridge_events_uses_bridge_live_stream() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
         let port = listener.local_addr().expect("mock server addr").port();
         let server = thread::spawn(move || {
@@ -1478,7 +1471,7 @@ mod tests {
             seen_events: BTreeSet::new(),
         };
 
-        let events = TerminalEventHandler::poll_app_events(&mut handler)
+        let events = TerminalEventHandler::poll_bridge_events(&mut handler)
             .expect("poll should use live SSE client");
 
         assert_eq!(events.len(), 1);

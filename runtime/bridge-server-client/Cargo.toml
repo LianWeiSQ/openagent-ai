@@ -1,5 +1,5 @@
 [package]
-name = "openagent-tui"
+name = "openagent-bridge-server-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,20 +7,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-crossterm = "0.28.1"
+openagent-protocol.workspace = true
 openagent-bridge-server.workspace = true
-openagent-bridge-server-client.workspace = true
-openagent-core.workspace = true
-ratatui = "0.29.0"
+reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
 
 [lib]
-path = "src/terminal_ui.rs"
+path = "src/bridge_client.rs"
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "openagent-tui"
-path = "src/main.rs"

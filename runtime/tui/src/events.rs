@@ -87,7 +87,7 @@ impl TuiState {
         self.usage_totals = usage_totals_value(input, output, total, cost);
     }
 
-    pub fn apply_app_event(&mut self, event: &Value) -> Value {
+    pub fn apply_bridge_event(&mut self, event: &Value) -> Value {
         let method = event
             .get("method")
             .and_then(Value::as_str)

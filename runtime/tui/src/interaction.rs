@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent};
-use openagent_app_server::{
+use openagent_bridge_server::{
     approval_response_payload, question_dismiss_payload, question_reply_payload,
 };
 use serde_json::{Map, Value, json};

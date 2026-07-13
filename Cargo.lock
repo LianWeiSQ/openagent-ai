@@ -713,7 +713,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "openagent-app-server"
+name = "openagent-bridge-server"
 version = "0.1.0"
 dependencies = [
  "openagent-core",
@@ -724,10 +724,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "openagent-app-server-client"
+name = "openagent-bridge-server-client"
 version = "0.1.0"
 dependencies = [
- "openagent-app-server",
+ "openagent-bridge-server",
  "openagent-protocol",
  "reqwest",
  "serde",
@@ -738,7 +738,7 @@ dependencies = [
 name = "openagent-cli"
 version = "0.1.0"
 dependencies = [
- "openagent-app-server-client",
+ "openagent-bridge-server-client",
  "openagent-core",
  "openagent-http-runtime",
  "openagent-lsp",
@@ -783,8 +783,8 @@ dependencies = [
 name = "openagent-http-runtime"
 version = "0.1.0"
 dependencies = [
- "openagent-app-server",
- "openagent-app-server-client",
+ "openagent-bridge-server",
+ "openagent-bridge-server-client",
  "openagent-core",
  "openagent-lsp",
  "openagent-mcp",
@@ -875,8 +875,8 @@ name = "openagent-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
- "openagent-app-server",
- "openagent-app-server-client",
+ "openagent-bridge-server",
+ "openagent-bridge-server-client",
  "openagent-core",
  "ratatui",
  "serde",

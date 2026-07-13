@@ -2,8 +2,8 @@
 members = [
     "cli",
     "eval",
-    "runtime/app-server",
-    "runtime/app-server-client",
+    "runtime/bridge-server",
+    "runtime/bridge-server-client",
     "runtime/http",
     "runtime/tui",
     "src",
@@ -25,8 +25,8 @@ repository = "https://github.com/LianWeiSQ/openagent-ai"
 rust-version = "1.85"
 
 [workspace.dependencies]
-openagent-app-server = { path = "runtime/app-server" }
-openagent-app-server-client = { path = "runtime/app-server-client" }
+openagent-bridge-server = { path = "runtime/bridge-server" }
+openagent-bridge-server-client = { path = "runtime/bridge-server-client" }
 openagent-core = { path = "src" }
 openagent-lsp = { path = "src/lsp" }
 openagent-mcp = { path = "src/mcp" }

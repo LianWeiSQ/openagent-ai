@@ -51,13 +51,13 @@ pub fn model_env_fixture() -> Value {
             "OPENAI_BASE_URL": DEFAULT_BASE_URL,
             "OPENAI_MODEL": DEFAULT_MODEL,
             "OPENAI_WIRE_API": DEFAULT_WIRE_API,
-            "OPENAGENT_APP_MAX_STEPS": DEFAULT_MAX_STEPS,
+            "OPENAGENT_BRIDGE_MAX_STEPS": DEFAULT_MAX_STEPS,
         },
         "override": {
             "OPENAI_BASE_URL": "http://127.0.0.1:9999",
             "OPENAI_MODEL": "gpt-test",
             "OPENAI_WIRE_API": "chat",
-            "OPENAGENT_APP_MAX_STEPS": "8",
+            "OPENAGENT_BRIDGE_MAX_STEPS": "8",
         },
     })
 }
@@ -241,7 +241,7 @@ pub fn config_show_payload() -> Value {
             "api_key": "set",
             "max_steps": "12",
         },
-        "app_bridge": {
+        "bridge": {
             "server_url": DEFAULT_SERVER_URL,
             "server_token": "set",
             "server_token_env": DEFAULT_SERVER_TOKEN_ENV,

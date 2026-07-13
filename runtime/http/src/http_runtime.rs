@@ -11,14 +11,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use openagent_app_server::{
+use openagent_bridge_server::{
     approval_response_payload, control_next_payload, parse_turn_approval_path,
     parse_turn_question_reply_path, question_dismiss_payload, question_reply_payload,
     record_control_response_payload, tui_control_request_for_path,
 };
 use openagent_core::{
-    PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions, permission_rule,
-    render_available_skills, render_preloaded_skills, skill_document_model_invocable,
+    AgentSystemPromptInput, PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
+    build_agent_system_prompt, permission_rule, skill_document_model_invocable,
     skill_info_model_invocable,
 };
 use openagent_lsp::{
@@ -55,14 +55,14 @@ use openagent_tools::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-mod app_bridge_routes;
+mod bridge_routes;
 mod mcp_runtime;
 mod turn_runtime;
 
-use app_bridge_routes::*;
-pub use app_bridge_routes::{
+use bridge_routes::*;
+pub use bridge_routes::{
     CliRunResult, HttpResponseSpec, build_run_prompt, command_text_from_args, docker_smoke_command,
-    dockerfile_lines, emit_app_bridge_events, format_http_error, health_payload, parse_cli_args,
+    dockerfile_lines, emit_bridge_events, format_http_error, health_payload, parse_cli_args,
     parse_sse_data, parse_sse_response_lines, route_health, route_options, route_unauthorized,
     route_unknown, run_cli,
 };
@@ -72,12 +72,12 @@ use turn_runtime::*;
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8787;
-const INDEX_HTML: &str = include_str!("../../static/app-server/static/index.html");
-const APP_JS: &str = include_str!("../../static/app-server/static/app.js");
-const APP_CSS: &str = include_str!("../../static/app-server/static/app.css");
-const APP_EVENTS_FILE: &str = "app_events.jsonl";
-const APP_BRIDGE_PROTOCOL_VERSION: u64 = 1;
-const APP_BRIDGE_EVENT_SCHEMA_VERSION: &str = "openagent.app_event.v1";
+pub const DEFAULT_CORS_ORIGINS: &str =
+    "tauri://localhost,http://tauri.localhost,http://127.0.0.1:5173,http://localhost:5173";
+const BRIDGE_EVENTS_FILE: &str = "bridge_events.jsonl";
+const LEGACY_APP_EVENTS_FILE: &str = "app_events.jsonl";
+const BRIDGE_PROTOCOL_VERSION: u64 = 1;
+const BRIDGE_EVENT_SCHEMA_VERSION: &str = "openagent.bridge_event.v1";
 const TUI_CONTROL_QUEUE_FILE: &str = "tui_control_queue.json";
 const TUI_CONTROL_RESPONSES_FILE: &str = "tui_control_responses.jsonl";
 const FILE_CHANGE_UNDO_STACK_KEY: &str = "file_change_undo_stack";
@@ -102,9 +102,11 @@ const TURN_INTERRUPTED_ERROR: &str = "turn interrupted";
 const TURN_JOB_INDEX_FILE: &str = ".openagent-runtime/turn_jobs.json";
 const TURN_QUEUE_DIR: &str = ".openagent-runtime/turn_queue";
 const TURN_QUEUE_LEASE_DIR: &str = ".openagent-runtime/turn_queue_leases";
+const TURN_RETRY_PAYLOAD_DIR: &str = ".openagent-runtime/turn_retry";
 const TURN_JOB_INDEX_SCHEMA_VERSION: u64 = 1;
 const TURN_QUEUE_PAYLOAD_SCHEMA_VERSION: u64 = 1;
 const TURN_QUEUE_LEASE_SCHEMA_VERSION: u64 = 1;
+const TURN_RETRY_PAYLOAD_SCHEMA_VERSION: u64 = 1;
 const TURN_JOB_TERMINAL_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_TURN_JOB_INDEX_ENTRIES: usize = 200;
 const DEFAULT_MAX_QUEUED_TURNS_PER_SESSION: usize = 8;
@@ -124,15 +126,14 @@ pub fn command_name() -> &'static str {
 }
 
 #[must_use]
-pub fn app_server_crate_name() -> &'static str {
-    openagent_app_server::crate_name()
+pub fn bridge_server_crate_name() -> &'static str {
+    openagent_bridge_server::crate_name()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct HttpRuntimeConfig {
     pub host: String,
     pub port: u16,
-    pub serve_static: bool,
     pub workspace: Option<String>,
     pub session_store_root: Option<String>,
     pub mcp_config: Option<String>,
@@ -153,14 +154,13 @@ impl Default for HttpRuntimeConfig {
         Self {
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
-            serve_static: true,
             workspace: None,
             session_store_root: None,
             mcp_config: None,
             auth_token: None,
             auth_username: None,
             auth_password: None,
-            cors_origin: "*".to_string(),
+            cors_origin: DEFAULT_CORS_ORIGINS.to_string(),
             mdns_name: Some("openagent".to_string()),
             max_queued_turns_per_session: configured_max_queued_turns_per_session(),
             max_running_turn_workers: configured_max_running_turn_workers(),
@@ -187,7 +187,6 @@ impl HttpRuntimeConfig {
         json!({
             "host": self.host,
             "port": self.port,
-            "serve_static": self.serve_static,
             "workspace": self.workspace,
             "session_store_root": self.session_store_root,
             "auth_required": self.auth_required(),
@@ -202,7 +201,7 @@ impl HttpRuntimeConfig {
     }
 }
 
-// app_bridge_routes implementation lives in `app_bridge_routes.rs`.
+// bridge_routes implementation lives in `bridge_routes.rs`.
 fn list_sessions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Value {
     let root = session_root(config);
     let query = query_param(request_path, "query").unwrap_or_default();
@@ -1070,21 +1069,26 @@ fn runtime_task_subagent_descriptors(
 }
 
 fn runtime_agent_profile_for_session(session: &Session) -> Option<RuntimeSubagentProfile> {
+    let profile_id = session
+        .metadata
+        .get("agent_profile")
+        .and_then(|profile| profile.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| session.metadata.get("agent").and_then(Value::as_str));
+    if let Some(profile) = profile_id.and_then(|id| runtime_agent_profile(id, &session.directory)) {
+        return Some(profile);
+    }
     if let Some(profile_value) = session.metadata.get("agent_profile") {
         let fallback_id = profile_value
             .get("id")
             .and_then(Value::as_str)
-            .or_else(|| session.metadata.get("agent").and_then(Value::as_str))
+            .or(profile_id)
             .unwrap_or("agent");
         if let Some(profile) = runtime_agent_profile_from_value(profile_value, fallback_id, None) {
             return Some(profile);
         }
     }
-    session
-        .metadata
-        .get("agent")
-        .and_then(Value::as_str)
-        .and_then(|id| runtime_agent_profile(id, &session.directory))
+    None
 }
 
 fn skills_payload(config: &HttpRuntimeConfig) -> Value {
@@ -2948,7 +2952,7 @@ fn restore_session_checkpoint_payload(
         }
     });
     let mut events = vec![event];
-    append_app_events(&store.root, session_id, &run_id, &mut events);
+    append_bridge_events(&store.root, session_id, &run_id, &mut events);
     Ok(json!({
         "session_id": session_id,
         "run_id": run_id,
@@ -3199,7 +3203,7 @@ fn append_patch_stack_event(
         }
     });
     let mut events = vec![event];
-    append_app_events(&store.root, &session.id, turn_id, &mut events);
+    append_bridge_events(&store.root, &session.id, turn_id, &mut events);
     let event = events.into_iter().next().unwrap_or_else(|| json!({}));
     let _ = store.record_event(
         &session.id,
@@ -4070,9 +4074,10 @@ struct RuntimeProviderLoopInput<'a> {
 
 fn provider_turn_result(
     store: &FileSessionStore,
-    session: &Session,
+    session: &mut Session,
     payload: &Value,
     tools: &[ToolSchema],
+    agent_profile: Option<&RuntimeSubagentProfile>,
     stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
     should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<RuntimeProviderResult, String> {
@@ -4099,9 +4104,8 @@ fn provider_turn_result(
         .and_then(Value::as_u64)
         .unwrap_or(60);
     let stream = provider_streaming_enabled_for_turn(payload);
-    let provider_messages = store
-        .materialized_chat_messages(session)
-        .unwrap_or_else(|_| session.messages.clone());
+    let provider_messages =
+        runtime_materialized_provider_messages_for_agent(store, session, agent_profile);
     let model_options = runtime_provider_model_options(session, payload);
     call_openai_compatible_provider_for_runtime(
         OpenAiRuntimeProviderRequest {
@@ -4274,6 +4278,13 @@ fn call_openai_compatible_provider_for_runtime(
             }
             Err(error) => {
                 let can_try_next = error.retryable && index + 1 < models.len();
+                if can_try_next && let Some(sink) = stream_sink.as_deref_mut() {
+                    sink(&ProviderStreamEvent::Fallback {
+                        from_model: candidate_model.clone(),
+                        to_model: models[index + 1].clone(),
+                        reason: error.message.clone(),
+                    });
+                }
                 last_error = Some(error);
                 if can_try_next {
                     continue;
@@ -4329,6 +4340,8 @@ fn call_openai_compatible_provider_model(
         &payload,
         stream,
         runtime_provider_request_retries(),
+        model,
+        stream_sink,
     )?;
     let status = response.status();
     let content_type = response
@@ -4481,6 +4494,8 @@ fn send_runtime_provider_request(
     payload: &Value,
     stream: bool,
     max_retries: u64,
+    model: &str,
+    stream_sink: &mut Option<&mut dyn FnMut(&ProviderStreamEvent)>,
 ) -> Result<reqwest::blocking::Response, RuntimeProviderCallError> {
     let mut attempt = 0_u64;
     loop {
@@ -4496,14 +4511,34 @@ fn send_runtime_provider_request(
                 let status = response.status().as_u16();
                 if runtime_provider_status_retryable(status) && attempt < max_retries {
                     attempt += 1;
-                    thread::sleep(runtime_provider_retry_delay(attempt));
+                    let delay = runtime_provider_retry_delay(attempt);
+                    if let Some(sink) = stream_sink.as_deref_mut() {
+                        sink(&ProviderStreamEvent::Retry {
+                            attempt: attempt + 1,
+                            max_attempts: max_retries + 1,
+                            delay_ms: delay.as_millis() as u64,
+                            model: model.to_string(),
+                            reason: format!("provider returned HTTP {status}"),
+                        });
+                    }
+                    thread::sleep(delay);
                     continue;
                 }
                 return Ok(response);
             }
-            Err(_error) if attempt < max_retries => {
+            Err(error) if attempt < max_retries => {
                 attempt += 1;
-                thread::sleep(runtime_provider_retry_delay(attempt));
+                let delay = runtime_provider_retry_delay(attempt);
+                if let Some(sink) = stream_sink.as_deref_mut() {
+                    sink(&ProviderStreamEvent::Retry {
+                        attempt: attempt + 1,
+                        max_attempts: max_retries + 1,
+                        delay_ms: delay.as_millis() as u64,
+                        model: model.to_string(),
+                        reason: format!("provider request failed: {error}"),
+                    });
+                }
+                thread::sleep(delay);
             }
             Err(error) => {
                 return Err(RuntimeProviderCallError {
@@ -4527,7 +4562,7 @@ fn runtime_provider_request_retries() -> u64 {
     std::env::var("OPENAGENT_PROVIDER_RETRIES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(4)
+        .unwrap_or(6)
 }
 
 fn read_sse_json_values_stream<R, F>(mut reader: R, mut on_value: F) -> Result<(), String>
@@ -4632,23 +4667,36 @@ fn parse_sse_frame_json(frame: &str) -> Result<Option<Value>, String> {
 }
 
 fn openai_stream_text_delta(wire_api: &str, chunk: &Value) -> Option<ProviderStreamEvent> {
-    let text = if wire_api == "chat" {
-        chunk
+    if wire_api == "chat" {
+        let choice = chunk
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(|choice| choice.get("delta"))
+            .and_then(|items| items.first());
+        let delta = choice.and_then(|choice| choice.get("delta"));
+        let text = delta
             .and_then(|delta| delta.get("content"))
-            .or_else(|| {
-                chunk
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|items| items.first())
-                    .and_then(|choice| choice.get("text"))
+            .or_else(|| choice.and_then(|choice| choice.get("text")))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !text.is_empty() {
+            return Some(ProviderStreamEvent::TextDelta {
+                text: text.to_string(),
+            });
+        }
+        let reasoning = delta
+            .and_then(|delta| {
+                delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .or_else(|| delta.get("thinking"))
             })
             .and_then(Value::as_str)
-            .unwrap_or_default()
-    } else if matches!(
+            .unwrap_or_default();
+        return (!reasoning.is_empty()).then(|| ProviderStreamEvent::ReasoningDelta {
+            text: reasoning.to_string(),
+        });
+    }
+    let text = if matches!(
         chunk.get("type").and_then(Value::as_str),
         Some("response.output_text.delta" | "response.refusal.delta")
     ) {
@@ -4662,6 +4710,30 @@ fn openai_stream_text_delta(wire_api: &str, chunk: &Value) -> Option<ProviderStr
     (!text.is_empty()).then(|| ProviderStreamEvent::TextDelta {
         text: text.to_string(),
     })
+}
+
+fn provider_reasoning_heartbeat_event(
+    session_id: &str,
+    run_id: &str,
+    step: u64,
+    reasoning_chars: u64,
+) -> Value {
+    json!({
+        "method": "item/agentMessage/thinking",
+        "params": {
+            "thread_id": session_id,
+            "session_id": session_id,
+            "turn_id": run_id,
+            "run_id": run_id,
+            "step": step,
+            "status": "thinking",
+            "reasoning_chars": reasoning_chars,
+        }
+    })
+}
+
+fn should_emit_reasoning_heartbeat(reasoning_chars: u64, last_emitted_chars: u64) -> bool {
+    last_emitted_chars == 0 || reasoning_chars.saturating_sub(last_emitted_chars) >= 80
 }
 
 fn openai_chat_response_to_runtime_result(value: &Value, source: String) -> RuntimeProviderResult {
@@ -4738,6 +4810,8 @@ fn provider_events_to_runtime_result(
     for event in events {
         match event {
             ProviderStreamEvent::TextDelta { text } => answer.push_str(text),
+            ProviderStreamEvent::ReasoningDelta { .. } => {}
+            ProviderStreamEvent::Retry { .. } | ProviderStreamEvent::Fallback { .. } => {}
             ProviderStreamEvent::ToolCall {
                 call_id,
                 name,
@@ -4772,11 +4846,21 @@ fn provider_events_to_runtime_result(
 }
 
 fn provider_max_steps(payload: &Value) -> u64 {
+    let env_max_steps = std::env::var("OPENAGENT_BRIDGE_MAX_STEPS").ok();
+    provider_max_steps_with_env(payload, env_max_steps.as_deref())
+}
+
+fn provider_max_steps_with_env(payload: &Value, env_max_steps: Option<&str>) -> u64 {
     payload
         .get("max_steps")
         .or_else(|| payload.get("maxSteps"))
         .and_then(Value::as_u64)
         .filter(|value| *value > 0)
+        .or_else(|| {
+            env_max_steps
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+        })
         .unwrap_or(UNBOUNDED_MAX_STEPS)
 }
 
@@ -5017,15 +5101,8 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         runner_facade = runner_facade.with_question_answers_value(value);
     }
     let mut ctx = runner_facade.tool_context();
-    if let Some(profile) = agent_profile.as_ref()
-        && let Some((system, system_index)) =
-            bind_runtime_agent_system_prompt(session, profile, &profile.mode)
-    {
-        let _ = store.append_message(session, &system, run_id, system_index);
-    }
-
     let mut persisted_events = 0;
-    append_unpersisted_app_events(
+    append_unpersisted_bridge_events(
         &store.root,
         &session.id,
         run_id,
@@ -5048,12 +5125,12 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         let assistant_message_id = runtime_message_id(assistant_index);
         runtime_record_step_started(store, &session.id, run_id, step, None);
         let mut streamed_text = false;
+        let mut reasoning_chars = 0_u64;
+        let mut last_reasoning_heartbeat_chars = 0_u64;
         let session_id = session.id.clone();
         let root = store.root.clone();
-        let mut on_provider_stream = |event: &ProviderStreamEvent| {
-            if let ProviderStreamEvent::TextDelta { text } = event
-                && !text.is_empty()
-            {
+        let mut on_provider_stream = |event: &ProviderStreamEvent| match event {
+            ProviderStreamEvent::TextDelta { text } if !text.is_empty() => {
                 streamed_text = true;
                 events.push(json!({
                     "method": "item/agentMessage/delta",
@@ -5067,7 +5144,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                         "delta": text.clone(),
                     }
                 }));
-                append_unpersisted_app_events(
+                append_unpersisted_bridge_events(
                     &root,
                     &session_id,
                     run_id,
@@ -5075,6 +5152,87 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                     &mut persisted_events,
                 );
             }
+            ProviderStreamEvent::ReasoningDelta { text } if !text.is_empty() => {
+                reasoning_chars = reasoning_chars.saturating_add(text.chars().count() as u64);
+                if should_emit_reasoning_heartbeat(reasoning_chars, last_reasoning_heartbeat_chars)
+                {
+                    last_reasoning_heartbeat_chars = reasoning_chars;
+                    events.push(provider_reasoning_heartbeat_event(
+                        &session_id,
+                        run_id,
+                        step,
+                        reasoning_chars,
+                    ));
+                    append_unpersisted_bridge_events(
+                        &root,
+                        &session_id,
+                        run_id,
+                        &mut events,
+                        &mut persisted_events,
+                    );
+                }
+            }
+            ProviderStreamEvent::Retry {
+                attempt,
+                max_attempts,
+                delay_ms,
+                model,
+                reason,
+            } => {
+                events.push(json!({
+                    "method": "turn/retrying",
+                    "params": {
+                        "thread_id": session_id.clone(),
+                        "session_id": session_id.clone(),
+                        "turn_id": run_id,
+                        "run_id": run_id,
+                        "step": step,
+                        "status": "retrying",
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "delay_ms": delay_ms,
+                        "model": model,
+                        "reason": reason,
+                        "retryable": true,
+                    }
+                }));
+                append_unpersisted_bridge_events(
+                    &root,
+                    &session_id,
+                    run_id,
+                    &mut events,
+                    &mut persisted_events,
+                );
+            }
+            ProviderStreamEvent::Fallback {
+                from_model,
+                to_model,
+                reason,
+            } => {
+                events.push(json!({
+                    "method": "turn/fallback",
+                    "params": {
+                        "thread_id": session_id.clone(),
+                        "session_id": session_id.clone(),
+                        "turn_id": run_id,
+                        "run_id": run_id,
+                        "step": step,
+                        "status": "running",
+                        "from_model": from_model,
+                        "to_model": to_model,
+                        "reason": reason,
+                        "retryable": true,
+                    }
+                }));
+                append_unpersisted_bridge_events(
+                    &root,
+                    &session_id,
+                    run_id,
+                    &mut events,
+                    &mut persisted_events,
+                );
+            }
+            _ => {}
         };
         let should_cancel = || turn_cancel_requested(run_id);
         let provider_result = match provider_turn_result(
@@ -5082,6 +5240,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             session,
             payload,
             &visible_tools,
+            agent_profile.as_ref(),
             Some(&mut on_provider_stream),
             Some(&should_cancel),
         ) {
@@ -5265,7 +5424,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                 ]),
             ),
     );
-    append_unpersisted_app_events(
+    append_unpersisted_bridge_events(
         &store.root,
         &session.id,
         run_id,
@@ -5771,7 +5930,6 @@ fn execute_runtime_task_tool_call(
         "agent_profile".to_string(),
         runtime_subagent_public_value(&profile),
     );
-    let system_message = bind_runtime_subagent_system_prompt(&mut child_session, &profile);
     let user = runtime_chat_message(Role::User, prompt.clone());
     let user_index = child_session.messages.len() as u64;
     child_session.add(user.clone());
@@ -5859,12 +6017,6 @@ fn execute_runtime_task_tool_call(
             &format!("failed to start subagent session: {error}"),
             BTreeMap::from([("subagent_type".to_string(), json!(profile.id.clone()))]),
         );
-    }
-    if let Some((system, system_index)) = system_message {
-        let _ =
-            task_context
-                .store
-                .append_message(&child_session, &system, &child_run_id, system_index);
     }
     let _ = task_context
         .store
@@ -6081,89 +6233,88 @@ fn validate_runtime_task_resume_session(
     Ok(())
 }
 
-fn bind_runtime_subagent_system_prompt(
+fn runtime_materialized_provider_messages_for_agent(
+    store: &FileSessionStore,
     session: &mut Session,
-    profile: &RuntimeSubagentProfile,
-) -> Option<(ChatMessage, u64)> {
-    bind_runtime_agent_system_prompt(session, profile, "subagent")
+    profile: Option<&RuntimeSubagentProfile>,
+) -> Vec<ChatMessage> {
+    let mut messages = store
+        .materialized_chat_messages(session)
+        .unwrap_or_else(|_| session.messages.clone())
+        .into_iter()
+        .filter(|message| !runtime_is_agent_profile_system_message(message))
+        .collect::<Vec<_>>();
+    if let Some(system) = runtime_materialized_agent_system_message(
+        session,
+        profile,
+        profile.map_or("", |item| item.mode.as_str()),
+    ) {
+        messages.insert(0, system);
+    }
+    messages
 }
 
-fn bind_runtime_agent_system_prompt(
+fn runtime_is_agent_profile_system_message(message: &ChatMessage) -> bool {
+    message.role == Role::System && message.metadata.get("agent_profile").is_some()
+}
+
+fn runtime_materialized_agent_system_message(
     session: &mut Session,
-    profile: &RuntimeSubagentProfile,
+    profile: Option<&RuntimeSubagentProfile>,
     agent_mode: &str,
-) -> Option<(ChatMessage, u64)> {
-    let already_bound = session.messages.iter().any(|message| {
-        message.role == Role::System
-            && message
-                .metadata
-                .get("agent_profile")
-                .and_then(Value::as_str)
-                == Some(profile.id.as_str())
-    });
-    if already_bound {
-        return None;
-    }
-    let mut prompt_parts = Vec::new();
-    let prompt = profile.prompt.trim_start_matches('\u{feff}').trim();
-    if !prompt.is_empty() {
-        prompt_parts.push(prompt.to_string());
-    }
+) -> Option<ChatMessage> {
+    let profile = profile?;
     let preloaded_skills = runtime_preloaded_skill_documents(profile, &session.directory);
-    let preloaded_skill_names = preloaded_skills
-        .iter()
-        .map(|skill| skill.name.clone())
-        .collect::<Vec<_>>();
-    if let Some(skills) = render_preloaded_skills(&preloaded_skills) {
-        prompt_parts.push(skills);
-    }
-    if runtime_agent_allows_tool(profile, "skill") {
-        let registry = SkillRegistry::new_with_options(
-            Some(session.directory.clone()),
-            (!profile.skill_roots.is_empty()).then_some(profile.skill_roots.clone()),
-            Option::<PathBuf>::None,
-            SkillRegistryOptions {
-                include_builtin_skills: true,
-            },
-        );
-        let skills = registry
-            .all()
-            .into_iter()
-            .filter(|skill| skill_is_visible(&profile.skill_permissions, &skill.name))
-            .collect::<Vec<_>>();
-        if let Some(skills) = render_available_skills(&skills) {
-            prompt_parts.push(skills);
-        }
-    }
-    if prompt_parts.is_empty() {
-        return None;
-    }
+    let available_skills = runtime_available_skill_infos(profile, &session.directory);
+    let system_prompt = build_agent_system_prompt(AgentSystemPromptInput {
+        profile_prompt: Some(profile.prompt.as_str()),
+        workspace_root: &session.directory,
+        preloaded_skills: &preloaded_skills,
+        available_skills: &available_skills,
+        include_instructions: true,
+    })?;
     if !profile.skills.is_empty() {
         session
             .metadata
             .insert("skills".to_string(), json!(profile.skills.clone()));
+    } else {
+        session.metadata.remove("skills");
     }
-    if !preloaded_skill_names.is_empty() {
+    if !system_prompt.preloaded_skill_names.is_empty() {
         session.metadata.insert(
             "preloaded_skills".to_string(),
-            json!(preloaded_skill_names.clone()),
+            json!(system_prompt.preloaded_skill_names.clone()),
         );
+    } else {
+        session.metadata.remove("preloaded_skills");
     }
-    let mut system = runtime_chat_message(Role::System, prompt_parts.join("\n\n"));
+    session.metadata.insert(
+        "dynamic_system_prompt".to_string(),
+        json!({
+            "hash": system_prompt.content_hash,
+            "instruction_count": system_prompt.instruction_count,
+            "instruction_total_bytes": system_prompt.instruction_total_bytes,
+            "instructions_truncated": system_prompt.instructions_truncated,
+            "instruction_issues": system_prompt.instruction_issues,
+            "preloaded_skills": system_prompt.preloaded_skill_names,
+        }),
+    );
+    let mut system = runtime_chat_message(Role::System, system_prompt.content);
     system
         .metadata
         .insert("agent_profile".to_string(), json!(profile.id.clone()));
     system
         .metadata
         .insert("agent_mode".to_string(), json!(agent_mode));
-    if !preloaded_skill_names.is_empty() {
+    system
+        .metadata
+        .insert("dynamic_system_prompt".to_string(), json!(true));
+    if let Some(dynamic) = session.metadata.get("dynamic_system_prompt") {
         system
             .metadata
-            .insert("preloaded_skills".to_string(), json!(preloaded_skill_names));
+            .insert("dynamic_system_prompt_info".to_string(), dynamic.clone());
     }
-    let system_index = session.messages.len() as u64;
-    session.add(system.clone());
-    Some((system, system_index))
+    Some(system)
 }
 
 fn runtime_preloaded_skill_documents(
@@ -6195,6 +6346,28 @@ fn runtime_preloaded_skill_documents(
             }
             registry.get(name).filter(skill_document_model_invocable)
         })
+        .collect()
+}
+
+fn runtime_available_skill_infos(
+    profile: &RuntimeSubagentProfile,
+    session_root: &Path,
+) -> Vec<openagent_core::SkillInfo> {
+    if !runtime_agent_allows_tool(profile, "skill") {
+        return Vec::new();
+    }
+    let registry = SkillRegistry::new_with_options(
+        Some(session_root.to_path_buf()),
+        (!profile.skill_roots.is_empty()).then_some(profile.skill_roots.clone()),
+        Option::<PathBuf>::None,
+        SkillRegistryOptions {
+            include_builtin_skills: true,
+        },
+    );
+    registry
+        .all()
+        .into_iter()
+        .filter(|skill| skill_is_visible(&profile.skill_permissions, &skill.name))
         .collect()
 }
 
@@ -6300,7 +6473,7 @@ fn execute_provider_tool_call(
         SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
             .tool_call_started_event(run_id, step, tool_call, Some(run_id), BTreeMap::new()),
     );
-    append_unpersisted_app_events(&store.root, &session.id, run_id, events, persisted_events);
+    append_unpersisted_bridge_events(&store.root, &session.id, run_id, events, persisted_events);
     let _ = store.record_event(
         &session.id,
         run_id,
@@ -6340,7 +6513,13 @@ fn execute_provider_tool_call(
             &mut tool_result,
             events,
         )?;
-        append_unpersisted_app_events(&store.root, &session.id, run_id, events, persisted_events);
+        append_unpersisted_bridge_events(
+            &store.root,
+            &session.id,
+            run_id,
+            events,
+            persisted_events,
+        );
         return Ok(None);
     }
 
@@ -6413,7 +6592,13 @@ fn execute_provider_tool_call(
                 "event": question,
             }
         }));
-        append_unpersisted_app_events(&store.root, &session.id, run_id, events, persisted_events);
+        append_unpersisted_bridge_events(
+            &store.root,
+            &session.id,
+            run_id,
+            events,
+            persisted_events,
+        );
         return Ok(Some(json!({
             "session_id": session.id,
             "turn_id": run_id,
@@ -6517,7 +6702,13 @@ fn execute_provider_tool_call(
                 "approval": approval,
             }
         }));
-        append_unpersisted_app_events(&store.root, &session.id, run_id, events, persisted_events);
+        append_unpersisted_bridge_events(
+            &store.root,
+            &session.id,
+            run_id,
+            events,
+            persisted_events,
+        );
         return Ok(Some(json!({
             "session_id": session.id,
             "turn_id": run_id,
@@ -6536,7 +6727,7 @@ fn execute_provider_tool_call(
         &mut tool_result,
         events,
     )?;
-    append_unpersisted_app_events(&store.root, &session.id, run_id, events, persisted_events);
+    append_unpersisted_bridge_events(&store.root, &session.id, run_id, events, persisted_events);
     Ok(None)
 }
 
@@ -6952,7 +7143,7 @@ fn finish_provider_loop(
                 ]),
             ),
     );
-    append_unpersisted_app_events(
+    append_unpersisted_bridge_events(
         &store.root,
         &session.id,
         run_id,
@@ -7051,12 +7242,16 @@ fn start_turn_async_payload(
         return Err("session_not_found".to_string());
     }
     let run_id = new_id("turn");
+    let root = session_root(config);
+    persist_turn_retry_payload(&root, session_id, &run_id, &payload)?;
     let registration = match register_turn_job(config, session_id, &run_id, payload.clone()) {
         Ok(registration) => registration,
         Err(TurnJobRegisterError::Unavailable) => {
+            remove_turn_retry_payload(&root, &run_id);
             return Err("turn job registry unavailable".to_string());
         }
         Err(TurnJobRegisterError::QueuePersistFailed(error)) => {
+            remove_turn_retry_payload(&root, &run_id);
             return Ok((
                 500,
                 json!({
@@ -7074,6 +7269,7 @@ fn start_turn_async_payload(
             queued_count,
             max_queued_turns_per_session,
         }) => {
+            remove_turn_retry_payload(&root, &run_id);
             return Ok((
                 429,
                 json!({
@@ -7225,6 +7421,8 @@ fn start_turn_payload_inner(
         .or_else(|| payload.get("message"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let attachments = turn_attachments_from_payload(&payload)?;
+    let model_input = build_turn_input_with_attachments(input, &attachments);
     let permission_ruleset = permission_ruleset_for_turn(&payload)?;
     let skip_permissions = skip_permissions_for_turn(&payload);
     let store = FileSessionStore::new(session_root(config));
@@ -7255,12 +7453,29 @@ fn start_turn_payload_inner(
             started_at_ms: None,
         },
     );
+    let mut user_metadata = BTreeMap::new();
+    if !attachments.is_empty() {
+        user_metadata.insert(
+            "display_content".to_string(),
+            json!(input.trim().to_string()),
+        );
+        user_metadata.insert(
+            "attachments".to_string(),
+            Value::Array(
+                attachments
+                    .iter()
+                    .map(|attachment| attachment.metadata.clone())
+                    .collect(),
+            ),
+        );
+        user_metadata.insert("attachment_count".to_string(), json!(attachments.len()));
+    }
     let user = ChatMessage {
         role: Role::User,
-        content: input.to_string(),
+        content: model_input,
         name: None,
         tool_call_id: None,
-        metadata: BTreeMap::new(),
+        metadata: user_metadata,
     };
     let user_index = session.messages.len() as u64;
     session.add(user.clone());
@@ -7321,8 +7536,115 @@ fn validate_start_turn_payload(payload: &Value) -> Result<(), String> {
     if input.trim().is_empty() {
         return Err("turn input is required".to_string());
     }
+    let _ = turn_attachments_from_payload(payload)?;
     let _ = permission_ruleset_for_turn(payload)?;
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct TurnAttachment {
+    prompt_path: String,
+    content: String,
+    metadata: Value,
+}
+
+fn build_turn_input_with_attachments(input: &str, attachments: &[TurnAttachment]) -> String {
+    if attachments.is_empty() {
+        return input.to_string();
+    }
+    let files = attachments
+        .iter()
+        .map(|attachment| (attachment.prompt_path.as_str(), attachment.content.as_str()))
+        .collect::<Vec<_>>();
+    build_run_prompt(input, &files)
+}
+
+fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>, String> {
+    const MAX_ATTACHMENTS: usize = 12;
+    const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
+    let Some(raw) = payload.get("attachments") else {
+        return Ok(Vec::new());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| "attachments must be an array".to_string())?;
+    if items.len() > MAX_ATTACHMENTS {
+        return Err(format!(
+            "attachments must contain at most {MAX_ATTACHMENTS} files"
+        ));
+    }
+
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let object = item
+                .as_object()
+                .ok_or_else(|| format!("attachment {index} must be an object"))?;
+            let kind = object
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("file")
+                .trim();
+            if kind != "file" {
+                return Err(format!("attachment {index} has unsupported kind {kind}"));
+            }
+            let content = object
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if content.len() > MAX_ATTACHMENT_BYTES {
+                return Err(format!(
+                    "attachment {index} content is larger than {MAX_ATTACHMENT_BYTES} bytes"
+                ));
+            }
+            let path = object
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let prompt_path = if !path.is_empty() {
+                path.clone()
+            } else if !name.is_empty() {
+                name.clone()
+            } else {
+                format!("attachment-{index}.txt")
+            };
+            let size_bytes = object
+                .get("size_bytes")
+                .or_else(|| object.get("sizeBytes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(content.len() as u64);
+            let content_type = object
+                .get("content_type")
+                .or_else(|| object.get("contentType"))
+                .and_then(Value::as_str)
+                .unwrap_or("text/plain");
+            let content_chars = content.chars().count();
+            let content_lines = content.lines().count();
+            Ok(TurnAttachment {
+                prompt_path,
+                content,
+                metadata: json!({
+                    "kind": "file",
+                    "path": path,
+                    "name": name,
+                    "size_bytes": size_bytes,
+                    "content_type": content_type,
+                    "content_chars": content_chars,
+                    "content_lines": content_lines,
+                }),
+            })
+        })
+        .collect()
 }
 
 fn turn_async_requested(request_path: &str, payload: &Value) -> bool {
@@ -7354,7 +7676,7 @@ fn is_turn_interrupted_error(error: &str) -> bool {
 }
 
 fn turn_event_recorded(root: &Path, session_id: &str, turn_id: &str, method: &str) -> bool {
-    read_jsonl_values(&app_events_path(root, session_id, turn_id))
+    read_bridge_event_values(root, session_id, turn_id)
         .iter()
         .any(|event| event.get("method").and_then(Value::as_str) == Some(method))
 }
@@ -7422,6 +7744,8 @@ fn record_async_turn_failure(
     session.status = SessionStatus::Idle;
     session.metadata.remove("pending_provider_turn");
     let outcome = SessionRunnerFacade::failed_turn_outcome(1, "async_turn_error", error);
+    let retryable = runtime_provider_error_retryable(error);
+    let resumable = read_turn_retry_payload(&store.root, run_id).is_some();
     let _ = store.finish_run(
         &session,
         run_id,
@@ -7440,10 +7764,80 @@ fn record_async_turn_failure(
                 false,
                 true,
                 false,
-                BTreeMap::from([("error".to_string(), json!(error))]),
+                BTreeMap::from([
+                    ("error".to_string(), json!(error)),
+                    ("retryable".to_string(), json!(retryable)),
+                    ("resumable".to_string(), json!(resumable)),
+                    (
+                        "retry_url".to_string(),
+                        json!(format!("/api/turns/{run_id}/retry")),
+                    ),
+                ]),
             ),
     ];
-    append_app_events(&store.root, session_id, run_id, &mut events);
+    append_bridge_events(&store.root, session_id, run_id, &mut events);
+}
+
+fn runtime_provider_error_retryable(error: &str) -> bool {
+    let text = error.to_ascii_lowercase();
+    text.contains("provider returned http 429")
+        || (500..=599).any(|status| text.contains(&format!("provider returned http {status}")))
+        || text.contains("provider request failed")
+        || text.contains("timed out")
+        || text.contains("connection")
+        || text.contains("reset")
+}
+
+fn retry_turn_response(config: &HttpRuntimeConfig, turn_id: &str) -> HttpResponseSpec {
+    let root = session_root(config);
+    let Some(saved) = read_turn_retry_payload(&root, turn_id) else {
+        return json_response(
+            404,
+            json!({
+                "error": "turn retry payload not found",
+                "error_code": "turn_not_resumable",
+                "turn_id": turn_id,
+            }),
+        );
+    };
+    let status = turn_status_payload(config, turn_id)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default();
+    if status != "failed" {
+        return json_response(
+            409,
+            json!({
+                "error": "only failed turns can be retried",
+                "error_code": "turn_not_failed",
+                "turn_id": turn_id,
+                "status": status,
+            }),
+        );
+    }
+    let Some(session_id) = saved.get("session_id").and_then(Value::as_str) else {
+        return json_response(500, json!({"error": "turn retry payload is invalid"}));
+    };
+    let mut payload = saved.get("payload").cloned().unwrap_or_else(|| json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("async".to_string(), json!(true));
+        object.insert("retry_of_turn_id".to_string(), json!(turn_id));
+    }
+    match start_turn_async_payload(config, session_id, payload) {
+        Ok((status, mut response)) => {
+            remove_turn_retry_payload(&root, turn_id);
+            if let Some(object) = response.as_object_mut() {
+                object.insert("retry_of_turn_id".to_string(), json!(turn_id));
+            }
+            json_response(status, response)
+        }
+        Err(error) => session_error_response(error),
+    }
 }
 
 fn record_turn_interrupted(
@@ -7477,7 +7871,7 @@ fn record_turn_interrupted(
         );
     let mut events = vec![event];
     if !turn_event_recorded(&store.root, &session.id, turn_id, "turn/interrupted") {
-        append_app_events(&store.root, &session.id, turn_id, &mut events);
+        append_bridge_events(&store.root, &session.id, turn_id, &mut events);
     }
     events
 }
@@ -7590,7 +7984,7 @@ fn run_http_tool_turn(
                     "approval": approval,
                 }
             }));
-            append_app_events(&store.root, &session.id, run_id, &mut events);
+            append_bridge_events(&store.root, &session.id, run_id, &mut events);
             return Ok(json!({
                 "session_id": session.id,
                 "turn_id": run_id,
@@ -7647,7 +8041,7 @@ fn run_http_tool_turn(
                 ]),
             ),
     );
-    append_app_events(&store.root, &session.id, run_id, &mut events);
+    append_bridge_events(&store.root, &session.id, run_id, &mut events);
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
@@ -7893,7 +8287,7 @@ fn respond_approval_payload(
         );
     }
     let _ = store.save_state(&session, Some(&run_id));
-    append_app_events(&store.root, &session.id, &run_id, &mut events);
+    append_bridge_events(&store.root, &session.id, &run_id, &mut events);
     mark_turn_job_status(config, &run_id, response_status);
     Ok(json!({
         "session_id": session.id,
@@ -7997,7 +8391,7 @@ fn respond_question_payload(
                 ),
         );
         let _ = store.save_state(&session, Some(&run_id));
-        append_app_events(&store.root, &session.id, &run_id, &mut events);
+        append_bridge_events(&store.root, &session.id, &run_id, &mut events);
         mark_turn_job_status(config, &run_id, "failed");
         return Ok(json!({
             "session_id": session.id,
@@ -8078,7 +8472,7 @@ fn respond_question_payload(
                 ]),
             ),
     );
-    append_app_events(&store.root, &session.id, &run_id, &mut events);
+    append_bridge_events(&store.root, &session.id, &run_id, &mut events);
     mark_turn_job_status(config, &run_id, "completed");
     Ok(json!({
         "session_id": session.id,
@@ -8139,7 +8533,7 @@ fn pop_tui_control_payload(config: &HttpRuntimeConfig) -> Value {
     let next = queue.remove(0);
     let _ = write_json_value(&path, &Value::Array(queue));
     let request = next.as_object().map(|_| {
-        openagent_app_server::TuiControlRequest::new(
+        openagent_bridge_server::TuiControlRequest::new(
             next.get("path").and_then(Value::as_str).unwrap_or_default(),
             next.get("body").cloned().unwrap_or(Value::Null),
         )
@@ -8432,7 +8826,7 @@ fn permission_ruleset_for_turn(payload: &Value) -> Result<PermissionRuleset, Str
         .or_else(|| payload.get("permissions"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .or_else(|| std::env::var("OPENAGENT_APP_PERMISSION").ok())
+        .or_else(|| std::env::var("OPENAGENT_BRIDGE_PERMISSION").ok())
         .unwrap_or_else(|| "FULL".to_string());
     parse_permission_ruleset(&raw)
 }
@@ -8453,7 +8847,7 @@ fn skip_permissions_for_turn(payload: &Value) -> bool {
         .or_else(|| payload.get("skip_permissions"))
         .and_then(Value::as_bool)
         .unwrap_or_else(|| {
-            std::env::var("OPENAGENT_APP_DANGEROUSLY_SKIP_PERMISSIONS")
+            std::env::var("OPENAGENT_BRIDGE_DANGEROUSLY_SKIP_PERMISSIONS")
                 .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
         })
 }
@@ -8471,16 +8865,16 @@ fn provider_streaming_enabled_for_turn(payload: &Value) -> bool {
         })
 }
 
-fn append_app_events(root: &Path, session_id: &str, turn_id: &str, events: &mut [Value]) {
-    let path = app_events_path(root, session_id, turn_id);
+fn append_bridge_events(root: &Path, session_id: &str, turn_id: &str, events: &mut [Value]) {
+    let path = bridge_events_path(root, session_id, turn_id);
     let existing = read_jsonl_values(&path).len() as u64;
     for (index, event) in events.iter_mut().enumerate() {
-        normalize_app_event(event, session_id, turn_id, existing + index as u64 + 1);
+        normalize_bridge_event(event, session_id, turn_id, existing + index as u64 + 1);
         append_json_line(&path, event);
     }
 }
 
-fn append_unpersisted_app_events(
+fn append_unpersisted_bridge_events(
     root: &Path,
     session_id: &str,
     turn_id: &str,
@@ -8490,20 +8884,25 @@ fn append_unpersisted_app_events(
     if *persisted_events >= events.len() {
         return;
     }
-    append_app_events(root, session_id, turn_id, &mut events[*persisted_events..]);
+    append_bridge_events(root, session_id, turn_id, &mut events[*persisted_events..]);
     *persisted_events = events.len();
 }
 
-fn normalize_app_event(event: &mut Value, session_id: &str, turn_id: &str, fallback_sequence: u64) {
+fn normalize_bridge_event(
+    event: &mut Value,
+    session_id: &str,
+    turn_id: &str,
+    fallback_sequence: u64,
+) {
     let Some(object) = event.as_object_mut() else {
         return;
     };
     object
         .entry("schema_version".to_string())
-        .or_insert_with(|| json!(APP_BRIDGE_EVENT_SCHEMA_VERSION));
+        .or_insert_with(|| json!(BRIDGE_EVENT_SCHEMA_VERSION));
     object
         .entry("protocol_version".to_string())
-        .or_insert_with(|| json!(APP_BRIDGE_PROTOCOL_VERSION));
+        .or_insert_with(|| json!(BRIDGE_PROTOCOL_VERSION));
     let sequence = object
         .get("sequence")
         .and_then(Value::as_u64)
@@ -8519,17 +8918,17 @@ fn normalize_app_event(event: &mut Value, session_id: &str, turn_id: &str, fallb
         .or_insert_with(|| json!(sequence));
     object
         .entry("event_id".to_string())
-        .or_insert_with(|| json!(app_event_id(session_id, turn_id, sequence)));
+        .or_insert_with(|| json!(bridge_event_id(session_id, turn_id, sequence)));
 }
 
-fn app_event_id(session_id: &str, turn_id: &str, sequence: u64) -> String {
-    format!("app_evt:{session_id}:{turn_id}:{sequence}")
+fn bridge_event_id(session_id: &str, turn_id: &str, sequence: u64) -> String {
+    format!("bridge_evt:{session_id}:{turn_id}:{sequence}")
 }
 
 fn global_sse_frames(config: &HttpRuntimeConfig, request_path: &str) -> String {
     let last_id = last_event_id_from_path(request_path);
     let mut frames = String::new();
-    for (index, event) in all_app_events(config).into_iter().enumerate() {
+    for (index, event) in all_bridge_events(config).into_iter().enumerate() {
         let id = event
             .get("global_sequence")
             .or_else(|| event.get("sequence"))
@@ -8549,7 +8948,7 @@ fn global_sse_frames(config: &HttpRuntimeConfig, request_path: &str) -> String {
 fn turn_sse_frames(config: &HttpRuntimeConfig, turn_id: &str, request_path: &str) -> String {
     let last_id = last_event_id_from_path(request_path);
     let mut frames = String::new();
-    for event in turn_app_events(config, turn_id) {
+    for event in turn_bridge_events(config, turn_id) {
         let id = event
             .get("sequence")
             .and_then(Value::as_u64)
@@ -8576,7 +8975,7 @@ fn sse_frame(id: u64, event: &Value) -> String {
     )
 }
 
-fn all_app_events(config: &HttpRuntimeConfig) -> Vec<Value> {
+fn all_bridge_events(config: &HttpRuntimeConfig) -> Vec<Value> {
     let root = session_root(config);
     let mut events = Vec::new();
     if let Ok(sessions) = fs::read_dir(&root) {
@@ -8584,7 +8983,8 @@ fn all_app_events(config: &HttpRuntimeConfig) -> Vec<Value> {
             let runs_dir = session.path().join("runs");
             if let Ok(runs) = fs::read_dir(runs_dir) {
                 for run in runs.flatten() {
-                    events.extend(read_jsonl_values(&run.path().join(APP_EVENTS_FILE)));
+                    events.extend(read_jsonl_values(&run.path().join(BRIDGE_EVENTS_FILE)));
+                    events.extend(read_jsonl_values(&run.path().join(LEGACY_APP_EVENTS_FILE)));
                 }
             }
         }
@@ -8603,24 +9003,40 @@ fn all_app_events(config: &HttpRuntimeConfig) -> Vec<Value> {
     events
 }
 
-fn turn_app_events(config: &HttpRuntimeConfig, turn_id: &str) -> Vec<Value> {
+fn turn_bridge_events(config: &HttpRuntimeConfig, turn_id: &str) -> Vec<Value> {
     let root = session_root(config);
     if let Ok(sessions) = fs::read_dir(&root) {
         for session in sessions.flatten() {
-            let path = app_events_path(&root, &session.file_name().to_string_lossy(), turn_id);
-            if path.exists() {
-                return read_jsonl_values(&path);
+            let session_id = session.file_name().to_string_lossy().to_string();
+            let events = read_bridge_event_values(&root, &session_id, turn_id);
+            if !events.is_empty() {
+                return events;
             }
         }
     }
     Vec::new()
 }
 
-fn app_events_path(root: &Path, session_id: &str, turn_id: &str) -> PathBuf {
+fn read_bridge_event_values(root: &Path, session_id: &str, turn_id: &str) -> Vec<Value> {
+    let mut events = read_jsonl_values(&bridge_events_path(root, session_id, turn_id));
+    events.extend(read_jsonl_values(&legacy_app_events_path(
+        root, session_id, turn_id,
+    )));
+    events
+}
+
+fn bridge_events_path(root: &Path, session_id: &str, turn_id: &str) -> PathBuf {
     root.join(session_id)
         .join("runs")
         .join(turn_id)
-        .join(APP_EVENTS_FILE)
+        .join(BRIDGE_EVENTS_FILE)
+}
+
+fn legacy_app_events_path(root: &Path, session_id: &str, turn_id: &str) -> PathBuf {
+    root.join(session_id)
+        .join("runs")
+        .join(turn_id)
+        .join(LEGACY_APP_EVENTS_FILE)
 }
 
 fn last_event_id_from_path(path: &str) -> u64 {
@@ -8753,15 +9169,14 @@ pub fn http_runtime_fixture() -> Value {
     let config = HttpRuntimeConfig {
         host: "0.0.0.0".to_string(),
         port: 8787,
-        serve_static: false,
         workspace: Some(workspace.to_string()),
         session_store_root: Some(session_root.to_string()),
         auth_token: Some("server-secret".to_string()),
         ..HttpRuntimeConfig::default()
     };
     let events = fixture_events();
-    let text = emit_app_bridge_events(&events, "text", true);
-    let emitted_json = emit_app_bridge_events(&events, "json", false);
+    let text = emit_bridge_events(&events, "text", true);
+    let emitted_json = emit_bridge_events(&events, "json", false);
     let sse_lines = [
         ": ping\n",
         "\n",
@@ -8784,14 +9199,12 @@ pub fn http_runtime_fixture() -> Value {
                 "port": 8787,
                 "workspace": workspace,
                 "session_root": session_root,
-                "headless": true,
             },
             "call": {
                 "host": "0.0.0.0",
                 "port": 8787,
                 "workspace": workspace,
                 "session_store_root": session_root,
-                "serve_static": false,
                 "auth_token": "server-secret",
             },
         },
@@ -8842,10 +9255,7 @@ pub fn http_runtime_fixture() -> Value {
         "docker": {
             "dockerfile": dockerfile_lines(),
             "smoke_command": docker_smoke_command(),
-            "expected_stdout_json": health_payload(&HttpRuntimeConfig {
-                serve_static: false,
-                ..HttpRuntimeConfig::default()
-            }),
+            "expected_stdout_json": health_payload(&HttpRuntimeConfig::default()),
             "daemon_required": true,
         },
     })
@@ -9026,11 +9436,34 @@ mod tests {
     fn exposes_command_boundary() {
         assert_eq!(crate_name(), "openagent-http-runtime");
         assert_eq!(command_name(), "openagent-http-runtime");
-        assert_eq!(app_server_crate_name(), "openagent-app-server");
+        assert_eq!(bridge_server_crate_name(), "openagent-bridge-server");
     }
 
     #[test]
-    fn app_bridge_lsp_routes_report_status_and_query_symbols() {
+    fn security_defaults_are_fail_closed() {
+        let config = HttpRuntimeConfig::default();
+        assert_ne!(config.cors_origin, "*");
+        assert!(config.cors_origin.contains("tauri://localhost"));
+        assert!(config.cors_origin.contains("http://tauri.localhost"));
+    }
+
+    #[test]
+    fn bridge_auth_token_can_be_loaded_from_file_without_cli_secret() {
+        let path = std::env::temp_dir().join(format!(
+            "openagent-bridge-auth-{}-{}.token",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, "file-only-secret\n").expect("write auth file");
+        let args = vec!["--auth-token-file".to_string(), path.display().to_string()];
+        let (config, _, _) = parse_cli_args(&args);
+        assert_eq!(config.auth_token.as_deref(), Some("file-only-secret"));
+        assert!(!args.iter().any(|arg| arg.contains("file-only-secret")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bridge_lsp_routes_report_status_and_query_symbols() {
         if !openagent_lsp::command_available("python3") {
             return;
         }
@@ -9191,6 +9624,15 @@ while True:
         );
         assert_eq!(provider_max_steps(&json!({"max_steps": 25})), 25);
         assert_eq!(provider_max_steps(&json!({"maxSteps": 100})), 100);
+        assert_eq!(provider_max_steps_with_env(&json!({}), Some("8")), 8);
+        assert_eq!(
+            provider_max_steps_with_env(&json!({}), Some("0")),
+            UNBOUNDED_MAX_STEPS
+        );
+        assert_eq!(
+            provider_max_steps_with_env(&json!({"max_steps": 25}), Some("8")),
+            25
+        );
     }
 
     #[test]
@@ -9256,13 +9698,12 @@ while True:
     }
 
     #[test]
-    fn app_bridge_terminal_run_is_workspace_scoped() {
+    fn bridge_terminal_run_is_workspace_scoped() {
         let root = std::env::temp_dir().join(format!("openagent-http-terminal-{}", now_ms()));
         let workspace = root.join("workspace");
         let nested = workspace.join("nested");
         fs::create_dir_all(&nested).expect("workspace");
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             session_store_root: Some(root.join("sessions").to_string_lossy().to_string()),
             ..HttpRuntimeConfig::default()
@@ -9311,9 +9752,8 @@ while True:
     }
 
     #[test]
-    fn app_bridge_mcp_status_sanitizes_config() {
+    fn bridge_mcp_status_sanitizes_config() {
         let config = HttpRuntimeConfig {
-            serve_static: false,
             mcp_config: Some(stable_json_dumps(&json!({
                 "mcp": {
                     "servers": {
@@ -9334,7 +9774,7 @@ while True:
             }))),
             ..HttpRuntimeConfig::default()
         };
-        let protocol = app_bridge_protocol_payload();
+        let protocol = bridge_protocol_payload();
         assert_eq!(
             protocol["endpoints"]["mcp"],
             "GET /api/mcp; POST /api/mcp/servers; PATCH|DELETE /api/mcp/servers/{name}; POST /api/mcp/servers/{name}/test|start|stop|restart"
@@ -9393,12 +9833,11 @@ while True:
     }
 
     #[test]
-    fn app_bridge_mcp_server_config_crud_writes_default_file() {
+    fn bridge_mcp_server_config_crud_writes_default_file() {
         let root = std::env::temp_dir().join(format!("openagent-mcp-crud-{}", now_ms()));
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             session_store_root: Some(root.join("sessions").to_string_lossy().to_string()),
             ..HttpRuntimeConfig::default()
@@ -9489,12 +9928,11 @@ while True:
     }
 
     #[test]
-    fn app_bridge_mcp_server_config_crud_writes_local_stdio_fields() {
+    fn bridge_mcp_server_config_crud_writes_local_stdio_fields() {
         let root = std::env::temp_dir().join(format!("openagent-mcp-local-crud-{}", now_ms()));
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             session_store_root: Some(root.join("sessions").to_string_lossy().to_string()),
             ..HttpRuntimeConfig::default()
@@ -9555,14 +9993,13 @@ while True:
     }
 
     #[test]
-    fn app_bridge_mcp_refresh_and_test_discover_local_stdio_tools() {
+    fn bridge_mcp_refresh_and_test_discover_local_stdio_tools() {
         let root = std::env::temp_dir().join(format!("openagent-mcp-stdio-{}", now_ms()));
         let workspace = root.join("workspace");
         let tools_dir = workspace.join("tools");
         fs::create_dir_all(&tools_dir).expect("workspace tools dir");
         let fake_server = compile_fake_stdio_mcp_server(&root);
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             mcp_config: Some(stable_json_dumps(&json!({
                 "mcp": {
@@ -9616,14 +10053,13 @@ while True:
     }
 
     #[test]
-    fn app_bridge_mcp_local_stdio_lifecycle_start_stop_restart() {
+    fn bridge_mcp_local_stdio_lifecycle_start_stop_restart() {
         let root = std::env::temp_dir().join(format!("openagent-mcp-lifecycle-{}", now_ms()));
         let workspace = root.join("workspace");
         let tools_dir = workspace.join("tools");
         fs::create_dir_all(&tools_dir).expect("workspace tools dir");
         let fake_server = compile_fake_stdio_mcp_server(&root);
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             mcp_config: Some(stable_json_dumps(&json!({
                 "mcp": {
@@ -9740,7 +10176,7 @@ while True:
     }
 
     #[test]
-    fn app_bridge_mcp_tool_call_reuses_local_stdio_lifecycle_session() {
+    fn bridge_mcp_tool_call_reuses_local_stdio_lifecycle_session() {
         let root = std::env::temp_dir().join(format!("openagent-mcp-lifecycle-call-{}", now_ms()));
         let workspace = root.join("workspace");
         let session_root = root.join("sessions");
@@ -9749,7 +10185,6 @@ while True:
         let request_log = root.join("stdio-requests.log");
         let fake_server = compile_fake_stdio_mcp_server(&root);
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             session_store_root: Some(session_root.to_string_lossy().to_string()),
             mcp_config: Some(stable_json_dumps(&json!({
@@ -9898,7 +10333,7 @@ while True:
     }
 
     #[test]
-    fn app_bridge_mcp_lifecycle_survives_enable_toggle() {
+    fn bridge_mcp_lifecycle_survives_enable_toggle() {
         let root =
             std::env::temp_dir().join(format!("openagent-mcp-lifecycle-toggle-{}", now_ms()));
         let workspace = root.join("workspace");
@@ -9931,7 +10366,6 @@ while True:
         )
         .expect("write mcp config");
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             session_store_root: Some(session_root.to_string_lossy().to_string()),
             ..HttpRuntimeConfig::default()
@@ -10084,7 +10518,7 @@ while True:
     }
 
     #[test]
-    fn app_bridge_mcp_refresh_discovers_tools_without_leaking_endpoint_secret() {
+    fn bridge_mcp_refresh_discovers_tools_without_leaking_endpoint_secret() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock mcp bind");
         let port = listener.local_addr().expect("mock mcp addr").port();
         let server = thread::spawn(move || {
@@ -10132,7 +10566,6 @@ while True:
         let workspace = std::env::temp_dir().join(format!("openagent-mcp-refresh-{}", now_ms()));
         fs::create_dir_all(&workspace).expect("workspace");
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             mcp_config: Some(stable_json_dumps(&json!({
                 "mcp": {
@@ -10389,7 +10822,7 @@ fn escape_json_string(value: &str) -> String {
 "#;
 
     #[test]
-    fn app_bridge_mcp_server_test_discovers_disabled_server_tools() {
+    fn bridge_mcp_server_test_discovers_disabled_server_tools() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock mcp bind");
         let port = listener.local_addr().expect("mock mcp addr").port();
         let server = thread::spawn(move || {
@@ -10432,7 +10865,6 @@ fn escape_json_string(value: &str) -> String {
         let workspace = std::env::temp_dir().join(format!("openagent-mcp-test-{}", now_ms()));
         fs::create_dir_all(&workspace).expect("workspace");
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             mcp_config: Some(stable_json_dumps(&json!({
                 "mcp": {
@@ -10481,7 +10913,7 @@ fn escape_json_string(value: &str) -> String {
     }
 
     #[test]
-    fn app_bridge_permission_approval_round_trip_executes_allowed_tool() {
+    fn bridge_permission_approval_round_trip_executes_allowed_tool() {
         let root = std::env::temp_dir().join(format!("openagent-http-permission-{}", now_ms()));
         let workspace = root.join("workspace");
         let session_root = root.join("sessions");
@@ -10492,7 +10924,6 @@ fn escape_json_string(value: &str) -> String {
             .arg("init")
             .output();
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             session_store_root: Some(session_root.to_string_lossy().to_string()),
             ..HttpRuntimeConfig::default()
@@ -10554,13 +10985,86 @@ fn escape_json_string(value: &str) -> String {
     }
 
     #[test]
-    fn app_bridge_trust_boundary_routes_list_approve_diff_and_restore_checkpoint() {
+    fn bridge_turn_persists_text_attachment_metadata() {
+        let root = std::env::temp_dir().join(format!("openagent-http-attachment-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session id");
+        let started = start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "review attachment",
+                "permission": "FULL",
+                "attachments": [
+                    {
+                        "kind": "file",
+                        "path": "/tmp/openagent-note.md",
+                        "name": "openagent-note.md",
+                        "size_bytes": 13,
+                        "content_type": "text/markdown",
+                        "content": "hello attached\n"
+                    }
+                ],
+                "tool_call": {
+                    "call_id": "call_bash",
+                    "name": "bash",
+                    "input": {"command": "printf ok"}
+                }
+            })),
+        )
+        .expect("start turn");
+        assert_eq!(started["status"], "completed");
+
+        let messages = session_messages_payload(
+            &config,
+            session_id,
+            &format!("/api/sessions/{session_id}/messages?limit=20"),
+        )
+        .expect("messages");
+        let messages_v2 = messages["messages_v2"].as_array().expect("messages v2");
+        let user = messages_v2
+            .iter()
+            .find(|message| message["info"]["role"] == "user")
+            .expect("user message");
+        assert_eq!(
+            user["info"]["metadata"]["display_content"],
+            json!("review attachment")
+        );
+        assert_eq!(
+            user["info"]["metadata"]["attachments"][0]["name"],
+            json!("openagent-note.md")
+        );
+        let text = user["parts"][0]["content"]
+            .as_str()
+            .expect("user text part");
+        assert!(text.contains("review attachment"));
+        assert!(text.contains("Attached file: /tmp/openagent-note.md"));
+        assert!(text.contains("hello attached"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bridge_trust_boundary_routes_list_approve_diff_and_restore_checkpoint() {
         let root = std::env::temp_dir().join(format!("openagent-http-trust-{}", now_ms()));
         let workspace = root.join("workspace");
         let session_root = root.join("sessions");
         fs::create_dir_all(&workspace).expect("workspace");
         let config = HttpRuntimeConfig {
-            serve_static: false,
             workspace: Some(workspace.to_string_lossy().to_string()),
             session_store_root: Some(session_root.to_string_lossy().to_string()),
             ..HttpRuntimeConfig::default()

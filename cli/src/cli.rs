@@ -10,8 +10,8 @@ use std::{
 };
 
 use openagent_core::{
-    PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions, permission_rule,
-    render_available_skills, render_preloaded_skills, skill_document_model_invocable,
+    AgentSystemPromptInput, PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
+    build_agent_system_prompt, permission_rule, skill_document_model_invocable,
 };
 use openagent_mcp::{
     McpTransport, RemoteMcpManager, RemoteMcpToolDescriptor, bridge_tool_output,
@@ -79,7 +79,7 @@ use prompt::{run_prompt_command, run_prompt_command_with_events, split_answer_it
 use remote::{
     attach_command, http_runtime_command, remote_auth_from_args, remote_events_for_payload,
     remote_select_session, remote_select_session_with_auth, remote_start_turn,
-    remote_start_turn_with_auth, terminal_command, text_from_app_events, tui_command,
+    remote_start_turn_with_auth, terminal_command, text_from_bridge_events, tui_command,
 };
 use sessions::{
     latest_session_id, session_command, session_export, session_import, session_list, share_session,
@@ -190,8 +190,7 @@ pub fn run_cli_command(argv: &[String]) -> CliRunResult {
     }
     match argv[0].as_str() {
         "tui" => tui_command(&argv[1..]),
-        "serve" => http_runtime_command(&argv[1..], false, serve_help()),
-        "web" => http_runtime_command(&argv[1..], true, web_help()),
+        "serve" => http_runtime_command(&argv[1..], serve_help()),
         "attach" => attach_command(&argv[1..]),
         "terminal" => terminal_command(&argv[1..]),
         "run" => run_prompt_command(&argv[1..]),

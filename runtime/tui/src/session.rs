@@ -517,7 +517,7 @@ impl TuiState {
         self.session_picker
             .as_ref()
             .and_then(|picker| picker.candidates.get(picker.selected))
-            .and_then(openagent_app_server_client::session_id_from_payload)
+            .and_then(openagent_bridge_server_client::session_id_from_payload)
     }
 
     pub fn selected_session_picker_payload(&self) -> Option<&Value> {

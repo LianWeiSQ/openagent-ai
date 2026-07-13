@@ -44,7 +44,7 @@ pub trait TerminalEventHandler {
         Vec::new()
     }
 
-    fn poll_app_events(&mut self) -> Result<Vec<Value>, String> {
+    fn poll_bridge_events(&mut self) -> Result<Vec<Value>, String> {
         Ok(Vec::new())
     }
 
@@ -56,7 +56,7 @@ pub trait TerminalEventHandler {
         Ok(())
     }
 
-    fn drain_app_events(&mut self) -> Vec<Value> {
+    fn drain_bridge_events(&mut self) -> Vec<Value> {
         Vec::new()
     }
 
@@ -136,8 +136,8 @@ fn terminal_ui_loop<H: TerminalEventHandler>(
                 state.status = "control poll failed".to_string();
             }
         }
-        match handler.poll_app_events() {
-            Ok(events) => apply_app_event_values(&mut state, events),
+        match handler.poll_bridge_events() {
+            Ok(events) => apply_bridge_event_values(&mut state, events),
             Err(error) => {
                 if state.status != "remote poll failed" {
                     state
@@ -356,12 +356,12 @@ pub(crate) fn apply_handler_output<H: TerminalEventHandler>(
     lines: Vec<TimelineLine>,
 ) {
     state.timeline.extend(lines);
-    apply_app_event_values(state, handler.drain_app_events());
+    apply_bridge_event_values(state, handler.drain_bridge_events());
 }
 
-pub(crate) fn apply_app_event_values(state: &mut TuiState, events: Vec<Value>) {
+pub(crate) fn apply_bridge_event_values(state: &mut TuiState, events: Vec<Value>) {
     for event in events {
-        let result = state.apply_app_event(&event);
+        let result = state.apply_bridge_event(&event);
         if !result
             .get("applied")
             .and_then(Value::as_bool)

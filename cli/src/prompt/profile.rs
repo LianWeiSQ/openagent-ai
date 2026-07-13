@@ -560,92 +560,89 @@ pub(crate) fn agent_profile_public_value(profile: &RunAgentProfile) -> Value {
     })
 }
 
-pub(super) fn bind_agent_profile_system_prompt(
+pub(super) fn materialized_provider_messages_for_agent(
     session: &mut Session,
-    store: &FileSessionStore,
-    run_id: &str,
     profile: Option<&RunAgentProfile>,
-) -> Result<(), String> {
-    let Some(profile) = profile else {
-        return Ok(());
-    };
-    let already_bound = session.messages.iter().any(|message| {
-        message.role == Role::System
-            && message
-                .metadata
-                .get("agent_profile")
-                .and_then(Value::as_str)
-                == Some(profile.id.as_str())
-    });
-    if already_bound {
-        return Ok(());
-    }
-    let mut prompt_parts = Vec::new();
-    if let Some(prompt) = profile
-        .prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        prompt_parts.push(prompt.to_string());
-    }
-    let preloaded_skills = profile_preloaded_skill_documents(profile, &session.directory);
-    let preloaded_skill_names = preloaded_skills
+) -> Vec<ChatMessage> {
+    let mut messages = session
+        .messages
         .iter()
-        .map(|skill| skill.name.clone())
+        .filter(|message| !is_agent_profile_system_message(message))
+        .cloned()
         .collect::<Vec<_>>();
-    if let Some(skills) = render_preloaded_skills(&preloaded_skills) {
-        prompt_parts.push(skills);
+    if let Some(system) = materialized_agent_profile_system_message(
+        session,
+        profile,
+        profile.map_or("", |item| item.mode.as_str()),
+    ) {
+        messages.insert(0, system);
     }
-    if agent_allows_tool(profile, "skill") {
-        let registry = SkillRegistry::new_with_options(
-            Some(session.directory.clone()),
-            (!profile.skill_roots.is_empty()).then_some(profile.skill_roots.clone()),
-            Option::<PathBuf>::None,
-            SkillRegistryOptions {
-                include_builtin_skills: true,
-            },
-        );
-        let skills = registry
-            .all()
-            .into_iter()
-            .filter(|skill| skill_is_visible(&profile.skill_permissions, &skill.name))
-            .collect::<Vec<_>>();
-        if let Some(skills) = render_available_skills(&skills) {
-            prompt_parts.push(skills);
-        }
-    }
-    if prompt_parts.is_empty() {
-        return Ok(());
-    }
+    messages
+}
+
+fn is_agent_profile_system_message(message: &ChatMessage) -> bool {
+    message.role == Role::System && message.metadata.get("agent_profile").is_some()
+}
+
+fn materialized_agent_profile_system_message(
+    session: &mut Session,
+    profile: Option<&RunAgentProfile>,
+    agent_mode: &str,
+) -> Option<ChatMessage> {
+    let Some(profile) = profile else {
+        return None;
+    };
+    let preloaded_skills = profile_preloaded_skill_documents(profile, &session.directory);
+    let available_skills = profile_available_skill_infos(profile, &session.directory);
+    let system_prompt = build_agent_system_prompt(AgentSystemPromptInput {
+        profile_prompt: profile.prompt.as_deref(),
+        workspace_root: &session.directory,
+        preloaded_skills: &preloaded_skills,
+        available_skills: &available_skills,
+        include_instructions: true,
+    })?;
     if !profile.skills.is_empty() {
         session
             .metadata
             .insert("skills".to_string(), json!(profile.skills.clone()));
+    } else {
+        session.metadata.remove("skills");
     }
-    if !preloaded_skill_names.is_empty() {
+    if !system_prompt.preloaded_skill_names.is_empty() {
         session.metadata.insert(
             "preloaded_skills".to_string(),
-            json!(preloaded_skill_names.clone()),
+            json!(system_prompt.preloaded_skill_names.clone()),
         );
+    } else {
+        session.metadata.remove("preloaded_skills");
     }
-    let mut message = chat_message(Role::System, prompt_parts.join("\n\n"));
+    session.metadata.insert(
+        "dynamic_system_prompt".to_string(),
+        json!({
+            "hash": system_prompt.content_hash,
+            "instruction_count": system_prompt.instruction_count,
+            "instruction_total_bytes": system_prompt.instruction_total_bytes,
+            "instructions_truncated": system_prompt.instructions_truncated,
+            "instruction_issues": system_prompt.instruction_issues,
+            "preloaded_skills": system_prompt.preloaded_skill_names,
+        }),
+    );
+    let mut message = chat_message(Role::System, system_prompt.content);
     message
         .metadata
         .insert("agent_profile".to_string(), json!(profile.id.clone()));
     message
         .metadata
-        .insert("agent_mode".to_string(), json!(profile.mode.clone()));
-    if !preloaded_skill_names.is_empty() {
+        .insert("agent_mode".to_string(), json!(agent_mode));
+    message
+        .metadata
+        .insert("dynamic_system_prompt".to_string(), json!(true));
+    if let Some(dynamic) = session.metadata.get("dynamic_system_prompt") {
         message
             .metadata
-            .insert("preloaded_skills".to_string(), json!(preloaded_skill_names));
+            .insert("dynamic_system_prompt_info".to_string(), dynamic.clone());
     }
-    let index = session.messages.len() as u64;
-    session.add(message.clone());
-    store
-        .append_message(session, &message, run_id, index)
-        .map_err(|error| format!("failed to record agent system prompt: {error}"))
+    Some(message)
 }
 
 pub(super) fn filter_tools_for_agent(
@@ -698,6 +695,28 @@ fn profile_preloaded_skill_documents(
             }
             registry.get(name).filter(skill_document_model_invocable)
         })
+        .collect()
+}
+
+fn profile_available_skill_infos(
+    profile: &RunAgentProfile,
+    session_root: &Path,
+) -> Vec<openagent_core::SkillInfo> {
+    if !agent_allows_tool(profile, "skill") {
+        return Vec::new();
+    }
+    let registry = SkillRegistry::new_with_options(
+        Some(session_root.to_path_buf()),
+        (!profile.skill_roots.is_empty()).then_some(profile.skill_roots.clone()),
+        Option::<PathBuf>::None,
+        SkillRegistryOptions {
+            include_builtin_skills: true,
+        },
+    );
+    registry
+        .all()
+        .into_iter()
+        .filter(|skill| skill_is_visible(&profile.skill_permissions, &skill.name))
         .collect()
 }
 

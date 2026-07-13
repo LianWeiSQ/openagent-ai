@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use openagent_app_server_client::{RemoteAuth, RemoteRuntimeClient};
+use openagent_bridge_server_client::{RemoteAuth, RemoteRuntimeClient};
 use openagent_http_runtime::http_runtime_fixture;
 use serde_json::Value;
 
@@ -61,7 +61,8 @@ fn dockerfile_matches_smoke_contract() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn app_bridge_http_routes_cover_static_sse_auth_and_tui_control() -> Result<(), Box<dyn Error>> {
+fn bridge_http_routes_are_api_only_and_cover_sse_auth_and_tui_control() -> Result<(), Box<dyn Error>>
+{
     let port = free_port()?;
     let temp = temp_dir("openagent-http-runtime-routes")?;
     let workspace = temp.join("workspace");
@@ -84,13 +85,9 @@ fn app_bridge_http_routes_cover_static_sse_auth_and_tui_control() -> Result<(), 
     assert_eq!(json_body(&basic)?["ok"], true);
 
     let index = authorized_request(port, "GET", "/", "", true)?;
-    assert!(index.contains("content-type: text/html"));
-    assert!(index.contains("OpenAgent"));
-    assert!(index.contains("task-list"));
-    let app_js = authorized_request(port, "GET", "/app.js", "", true)?;
-    assert!(app_js.contains("refreshTasks"));
-    assert!(app_js.contains("/tasks"));
-    assert!(app_js.contains("runBackgroundTask"));
+    assert!(index.starts_with("HTTP/1.1 404"));
+    let unknown = authorized_request(port, "GET", "/bridge-console.js", "", true)?;
+    assert!(unknown.starts_with("HTTP/1.1 404"));
 
     let created = json_body(&authorized_request(
         port,
@@ -149,6 +146,72 @@ fn app_bridge_http_routes_cover_static_sse_auth_and_tui_control() -> Result<(), 
     )?)?;
     assert_eq!(next["path"], "/tui/append-prompt");
     assert_eq!(next["body"]["text"], "queued prompt");
+
+    let _ = server.kill();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn cors_allowlist_reflects_allowed_origin_and_rejects_unknown_origin() -> Result<(), Box<dyn Error>>
+{
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-cors-allowlist")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let mut server = spawn_runtime(port, &workspace, &session_root)?;
+    wait_for_server(port)?;
+
+    let allowed = http_request(
+        port,
+        "GET",
+        "/api/health",
+        &[
+            ("Authorization", "Bearer secret"),
+            ("Origin", "http://client.test"),
+        ],
+        "",
+    )?;
+    assert!(allowed.starts_with("HTTP/1.1 200"));
+    assert!(allowed.contains("Access-Control-Allow-Origin: http://client.test"));
+    assert!(allowed.contains("Vary: Origin"));
+
+    let denied = http_request(
+        port,
+        "GET",
+        "/api/health",
+        &[
+            ("Authorization", "Bearer secret"),
+            ("Origin", "https://evil.example"),
+        ],
+        "",
+    )?;
+    assert!(denied.starts_with("HTTP/1.1 403"));
+    assert!(denied.contains("cors_origin_denied"));
+    assert!(!denied.contains("Access-Control-Allow-Origin"));
+
+    let denied_preflight = http_request(
+        port,
+        "OPTIONS",
+        "/api/health",
+        &[("Origin", "https://evil.example")],
+        "",
+    )?;
+    assert!(denied_preflight.starts_with("HTTP/1.1 403"));
+
+    let denied_sse = http_request(
+        port,
+        "GET",
+        "/api/events?live_timeout_ms=250",
+        &[
+            ("Authorization", "Bearer secret"),
+            ("Accept", "text/event-stream"),
+            ("Origin", "https://evil.example"),
+        ],
+        "",
+    )?;
+    assert!(denied_sse.starts_with("HTTP/1.1 403"));
 
     let _ = server.kill();
     let _ = fs::remove_dir_all(temp);
@@ -291,7 +354,7 @@ fn remote_runtime_client_round_trips_tui_approval() -> Result<(), Box<dyn Error>
 }
 
 #[test]
-fn app_bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box<dyn Error>> {
+fn bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box<dyn Error>> {
     let port = free_port()?;
     let temp = temp_dir("openagent-http-runtime-protocol-contract")?;
     let workspace = temp.join("workspace");
@@ -303,9 +366,12 @@ fn app_bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box
     let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
         .with_auth(RemoteAuth::bearer("secret"));
     let protocol = client.protocol()?;
-    assert_eq!(protocol["protocol"], "openagent.app_bridge");
+    assert_eq!(protocol["protocol"], "openagent.bridge");
     assert_eq!(protocol["protocol_version"], 1);
-    assert_eq!(protocol["event_schema_version"], "openagent.app_event.v1");
+    assert_eq!(
+        protocol["event_schema_version"],
+        "openagent.bridge_event.v1"
+    );
     assert!(
         protocol["compatibility"]["required_event_fields"]
             .as_array()
@@ -321,10 +387,24 @@ fn app_bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box
         "event_id"
     );
     assert_eq!(protocol["endpoints"]["global_events"], "GET /api/events");
+    assert_eq!(
+        protocol["endpoints"]["retry"],
+        "POST /api/turns/{turn_id}/retry"
+    );
     assert!(
         protocol["event_methods"]
             .as_array()
             .is_some_and(|methods| methods.iter().any(|method| method == "turn/completed"))
+    );
+    assert!(
+        protocol["event_methods"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|method| method == "turn/retrying"))
+    );
+    assert!(
+        protocol["event_methods"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|method| method == "turn/fallback"))
     );
 
     let session_id = client.create_session(&workspace, None)?;
@@ -358,14 +438,16 @@ fn app_bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box
         .and_then(|event| event["event_id"].as_str())
         .expect("returned completed event_id")
         .to_string();
-    assert!(returned_completed_event_id.starts_with(&format!("app_evt:{session_id}:{turn_id}:")));
+    assert!(
+        returned_completed_event_id.starts_with(&format!("bridge_evt:{session_id}:{turn_id}:"))
+    );
 
     let live_events = live
         .join()
         .map_err(|_| "live subscription thread panicked".to_string())?
         .map_err(|error| format!("live subscription failed: {error}"))?;
     assert!(live_events.iter().any(|event| {
-        event["schema_version"] == "openagent.app_event.v1"
+        event["schema_version"] == "openagent.bridge_event.v1"
             && event["protocol_version"] == 1
             && event["method"] == "item/toolCall/completed"
             && event["params"]["call_id"] == "call_protocol_write"
@@ -382,11 +464,40 @@ fn app_bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box
 
     let turn_events = client.turn_events_live(turn_id, 0, Duration::from_millis(500))?;
     assert!(turn_events.iter().any(|event| {
-        event["schema_version"] == "openagent.app_event.v1"
+        event["schema_version"] == "openagent.bridge_event.v1"
             && event["protocol_version"] == 1
             && event["method"] == "turn/completed"
             && event["event_id"] == returned_completed_event_id
     }));
+
+    let legacy_run_dir = session_root
+        .join("session_legacy")
+        .join("runs")
+        .join("turn_legacy");
+    fs::create_dir_all(&legacy_run_dir)?;
+    fs::write(
+        legacy_run_dir.join("app_events.jsonl"),
+        serde_json::to_string(&serde_json::json!({
+            "sequence": 1,
+            "method": "turn/completed",
+            "params": {
+                "thread_id": "session_legacy",
+                "turn_id": "turn_legacy",
+                "status": "completed",
+                "final_answer": "legacy ok"
+            },
+            "created_at_ms": 1781842000400u64
+        }))? + "\n",
+    )?;
+    let legacy_events = authorized_request(
+        port,
+        "GET",
+        "/api/turns/turn_legacy/events?last_event_id=0",
+        "",
+        true,
+    )?;
+    assert!(legacy_events.contains("event: turn/completed"));
+    assert!(legacy_events.contains("legacy ok"));
 
     let _ = server.kill();
     let _ = fs::remove_dir_all(temp);
@@ -704,7 +815,90 @@ fn remote_runtime_client_controls_model_agent_variant_and_thinking() -> Result<(
 }
 
 #[test]
-fn app_bridge_provider_health_uses_runtime_provider_config_without_leaking_key()
+fn runtime_agent_system_prompt_refreshes_instructions_each_turn() -> Result<(), Box<dyn Error>> {
+    let first = serde_json::json!({
+        "id": "resp_dynamic_http_first",
+        "output_text": "first http answer",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    let second = serde_json::json!({
+        "id": "resp_dynamic_http_second",
+        "output_text": "second http answer",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![first, second])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-dynamic-system-prompt")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(workspace.join(".openagent/agents"))?;
+    fs::write(
+        workspace.join(".openagent/agents/dynamic.md"),
+        r#"---
+id: dynamic
+name: Dynamic
+mode: primary
+tools: ["read", "skill"]
+model: gpt-dynamic-http
+---
+You are the HTTP dynamic profile.
+"#,
+    )?;
+    fs::write(
+        workspace.join("OPENAGENT.md"),
+        "HTTP_FIRST_TURN_INSTRUCTION",
+    )?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "fake-model"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let first_turn = client.start_turn(
+        &session_id,
+        "first http turn",
+        serde_json::json!({"agent": "dynamic"}),
+    )?;
+    assert_eq!(first_turn["status"], "completed");
+    fs::write(
+        workspace.join("OPENAGENT.md"),
+        "HTTP_SECOND_TURN_INSTRUCTION",
+    )?;
+    let second_turn = client.start_turn(
+        &session_id,
+        "second http turn",
+        serde_json::json!({"agent": "dynamic"}),
+    )?;
+    assert_eq!(second_turn["status"], "completed");
+
+    let _ = server.kill();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("HTTP_FIRST_TURN_INSTRUCTION"));
+    assert!(!requests[0].contains("HTTP_SECOND_TURN_INSTRUCTION"));
+    assert!(requests[1].contains("HTTP_SECOND_TURN_INSTRUCTION"));
+    assert!(!requests[1].contains("HTTP_FIRST_TURN_INSTRUCTION"));
+    assert!(requests[1].contains("You are the HTTP dynamic profile."));
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn bridge_provider_health_uses_runtime_provider_config_without_leaking_key()
 -> Result<(), Box<dyn Error>> {
     let (provider_port, provider_thread, _provider_requests) =
         spawn_fake_openai_responses_provider_sequence(vec![serde_json::json!({
@@ -814,6 +1008,78 @@ fn remote_runtime_client_uses_real_provider_endpoint_for_plain_turn() -> Result<
 }
 
 #[test]
+fn remote_runtime_client_retries_retryable_provider_502_same_model() -> Result<(), Box<dyn Error>> {
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_http_sequence(vec![
+            (
+                502,
+                serde_json::json!({
+                    "error": {
+                        "message": "Upstream service temporarily unavailable",
+                        "type": "upstream_error"
+                    }
+                }),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "resp_retry",
+                    "output_text": "retried provider answer",
+                    "usage": {"input_tokens": 3, "output_tokens": 2}
+                }),
+            ),
+        ])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-provider-retry")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "fake-model"),
+            ("OPENAGENT_PROVIDER_RETRIES", "1"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let started = client.start_turn(&session_id, "ask provider", serde_json::json!({}))?;
+
+    assert_eq!(started["status"], "completed");
+    assert_eq!(started["turn"]["final_answer"], "retried provider answer");
+    assert!(
+        started["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|event| {
+                event["method"] == "turn/retrying"
+                    && event["params"]["attempt"] == 2
+                    && event["params"]["max_attempts"] == 2
+                    && event["params"]["model"] == "fake-model"
+            }))
+    );
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 2);
+    let first: Value = serde_json::from_str(&requests[0])?;
+    let second: Value = serde_json::from_str(&requests[1])?;
+    assert_eq!(first["model"], "fake-model");
+    assert_eq!(second["model"], "fake-model");
+
+    let _ = server.kill();
+    let _ = provider_thread.join();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn remote_runtime_client_falls_back_from_retryable_provider_502() -> Result<(), Box<dyn Error>> {
     let (provider_port, provider_thread, provider_requests) =
         spawn_fake_openai_responses_provider_http_sequence(vec![
@@ -863,6 +1129,15 @@ fn remote_runtime_client_falls_back_from_retryable_provider_502() -> Result<(), 
 
     assert_eq!(started["status"], "completed");
     assert_eq!(started["turn"]["final_answer"], "fallback provider answer");
+    assert!(
+        started["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|event| {
+                event["method"] == "turn/fallback"
+                    && event["params"]["from_model"] == "gpt-5.5"
+                    && event["params"]["to_model"] == "gpt-5.4"
+            }))
+    );
     let requests = provider_requests.lock().expect("provider requests");
     assert_eq!(requests.len(), 2);
     let first: Value = serde_json::from_str(&requests[0])?;
@@ -870,6 +1145,118 @@ fn remote_runtime_client_falls_back_from_retryable_provider_502() -> Result<(), 
     assert_eq!(first["model"], "gpt-5.5");
     assert_eq!(second["model"], "gpt-5.4");
     assert!(!requests.iter().any(|request| request.contains("gpt-5.3")));
+
+    let _ = server.kill();
+    let _ = provider_thread.join();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn failed_async_provider_turn_can_be_retried_from_persisted_payload() -> Result<(), Box<dyn Error>>
+{
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_http_sequence(vec![
+            (
+                502,
+                serde_json::json!({
+                    "error": {
+                        "message": "Upstream service temporarily unavailable",
+                        "type": "upstream_error"
+                    }
+                }),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "resp_manual_retry",
+                    "output_text": "manual retry answer",
+                    "usage": {"input_tokens": 3, "output_tokens": 2}
+                }),
+            ),
+        ])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-provider-manual-retry")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "manual-retry-model"),
+            ("OPENAGENT_PROVIDER_RETRIES", "0"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let accepted = json_body(&authorized_request(
+        port,
+        "POST",
+        &format!("/api/sessions/{session_id}/turns"),
+        &serde_json::json!({
+            "input": "retry this provider request",
+            "async": true,
+            "stream": true,
+        })
+        .to_string(),
+        false,
+    )?)?;
+    let failed_turn_id = accepted["turn_id"].as_str().expect("failed turn id");
+    let mut failed = false;
+    for _ in 0..40 {
+        if client.turn_status(failed_turn_id)?["status"] == "failed" {
+            failed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(failed, "original async turn should fail");
+    let failed_events = client.turn_events_live(failed_turn_id, 0, Duration::from_millis(50))?;
+    assert!(failed_events.iter().any(|event| {
+        event["method"] == "turn/failed"
+            && event["params"]["retryable"] == true
+            && event["params"]["resumable"] == true
+    }));
+
+    let retried = json_body(&authorized_request(
+        port,
+        "POST",
+        &format!("/api/turns/{failed_turn_id}/retry"),
+        "",
+        false,
+    )?)?;
+    assert_eq!(retried["accepted"], true);
+    assert_eq!(retried["retry_of_turn_id"], failed_turn_id);
+    let retried_turn_id = retried["turn_id"].as_str().expect("retried turn id");
+    assert_ne!(retried_turn_id, failed_turn_id);
+
+    let mut completed = false;
+    for _ in 0..40 {
+        if client.turn_status(retried_turn_id)?["status"] == "completed" {
+            completed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(completed, "retried async turn should complete");
+    let retried_events = client.turn_events_live(retried_turn_id, 0, Duration::from_millis(50))?;
+    assert!(retried_events.iter().any(|event| {
+        event["method"] == "turn/completed"
+            && event["params"]["final_answer"] == "manual retry answer"
+    }));
+    assert_eq!(
+        provider_requests.lock().expect("provider requests").len(),
+        2
+    );
 
     let _ = server.kill();
     let _ = provider_thread.join();
@@ -1332,7 +1719,7 @@ Use runtime preloaded guidance.
     assert_eq!(task["agent_profile"]["id"], "deep-research");
     assert_eq!(task["run"]["status"], "completed");
     assert!(child_state["messages"].as_array().is_some_and(|messages| {
-        messages.iter().any(|message| {
+        !messages.iter().any(|message| {
             message["role"] == "system"
                 && message["content"].as_str().is_some_and(|content| {
                     content.contains("Custom runtime researcher")
@@ -1884,7 +2271,7 @@ fn task_subagent_task_id_resumes_existing_child_session() -> Result<(), Box<dyn 
             message["role"] == "system" && message["metadata"]["agent_profile"] == "resume-worker"
         })
         .count();
-    assert_eq!(system_count, 1);
+    assert_eq!(system_count, 0);
     assert!(messages.iter().any(|message| {
         message["role"] == "user" && message["content"] == "First prompt for the resumable worker."
     }));
@@ -2289,10 +2676,14 @@ Disabled prompt.
             .join(child_session_id)
             .join("state.latest.json"),
     )?)?;
-    assert_eq!(
-        child_state["messages"][0]["content"],
-        "You are the Markdown research subagent."
-    );
+    assert!(child_state["messages"].as_array().is_some_and(|messages| {
+        !messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["metadata"]["agent_profile"] == "markdown-research"
+        }) && messages.iter().any(|message| {
+            message["role"] == "user" && message["content"] == "Use the markdown agent prompt."
+        })
+    }));
     assert_eq!(child_state["metadata"]["temperature"], 0.21);
     assert_eq!(child_state["metadata"]["top_p"], 0.82);
     assert_eq!(child_state["metadata"]["color"], "cyan");
@@ -2307,6 +2698,8 @@ Disabled prompt.
     assert_eq!(provider_request["top_p"], 0.82);
     assert_eq!(provider_request["reasoning_effort"], "medium");
     let provider_request_text = requests[0].as_str();
+    assert!(provider_request_text.contains("You are the Markdown research subagent."));
+    assert!(provider_request_text.contains("Use the markdown agent prompt."));
     assert!(!provider_request_text.contains("skill_roots"));
     assert!(!provider_request_text.contains("skill_permissions"));
     assert!(!provider_request_text.contains("must-not-leak"));
@@ -3003,7 +3396,7 @@ fn start_turn_auto_routes_prompt_to_matching_subagent_description() -> Result<()
         "Auto-routed to scout"
     );
     assert!(child_state["messages"].as_array().is_some_and(|messages| {
-        messages.iter().any(|message| {
+        !messages.iter().any(|message| {
             message["role"] == "system"
                 && message["content"]
                     .as_str()
@@ -3022,6 +3415,7 @@ fn start_turn_auto_routes_prompt_to_matching_subagent_description() -> Result<()
     let _ = provider_thread.join();
     let requests = provider_requests.lock().expect("provider requests");
     assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("OpenAgent ScoutAgent"));
     assert!(requests[0].contains("Research external dependency docs before coding."));
     let _ = fs::remove_dir_all(temp);
     Ok(())
@@ -6032,7 +6426,7 @@ fn spawn_fake_openai_responses_streaming_tool_then_delayed_final_provider()
 }
 
 fn wait_for_server(port: u16) -> Result<(), Box<dyn Error>> {
-    for _ in 0..100 {
+    for _ in 0..300 {
         if authorized_request(port, "GET", "/api/health", "", false).is_ok() {
             return Ok(());
         }

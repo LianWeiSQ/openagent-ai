@@ -1,12 +1,12 @@
 use std::{error::Error, fs, path::PathBuf};
 
-use openagent_tui::tui_control_fixture;
+use openagent_bridge_server_client::bridge_client_fixture;
 use serde_json::Value;
 
 #[test]
-fn tui_control_matches_legacy_oracle() -> Result<(), Box<dyn Error>> {
+fn bridge_client_matches_legacy_oracle() -> Result<(), Box<dyn Error>> {
     let fixture = read_fixture()?;
-    assert_eq!(tui_control_fixture(), section(&fixture, "tui"));
+    assert_eq!(bridge_client_fixture(), section(&fixture, "client"));
     Ok(())
 }
 

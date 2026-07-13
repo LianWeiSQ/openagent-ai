@@ -54,7 +54,7 @@ pub struct ChoicePickerState {
 
 pub(crate) const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show TUI commands"),
-    ("/connect <url>", "connect to an App Bridge server"),
+    ("/connect <url>", "connect to a Bridge server"),
     ("/sessions [query]", "open/search recent session picker"),
     ("/resume <id>", "resume a session by id or unique prefix"),
     ("/rename <title>", "rename the current session"),
@@ -90,7 +90,7 @@ pub(crate) const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/tool-details [on|off]", "toggle tool metadata details"),
     (
         "/mcp [list|show|doctor|test|start|stop|restart|enable|disable]",
-        "inspect and control App Bridge MCP servers",
+        "inspect and control Bridge MCP servers",
     ),
     ("/editor", "edit prompt in an external editor"),
     ("/stash <draft>", "stash a draft prompt"),

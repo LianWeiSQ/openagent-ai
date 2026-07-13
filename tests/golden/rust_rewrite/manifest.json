@@ -2,7 +2,7 @@
   "fixture_count": 15,
   "fixtures": [
     "agent_loop.json",
-    "app_bridge_tui.json",
+    "bridge_tui.json",
     "cli_commands.json",
     "context_state.json",
     "core_context_policy.json",

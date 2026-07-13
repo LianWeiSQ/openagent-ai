@@ -18,14 +18,14 @@ use std::{
 fn exposes_command_boundary() {
     assert_eq!(crate_name(), "openagent-tui");
     assert_eq!(command_name(), "openagent-tui");
-    assert_eq!(client_crate_name(), "openagent-app-server-client");
-    assert_eq!(server_crate_name(), "openagent-app-server");
+    assert_eq!(client_crate_name(), "openagent-bridge-server-client");
+    assert_eq!(server_crate_name(), "openagent-bridge-server");
 }
 
 #[test]
 fn approval_events_render_diff_preview_and_support_allow_always() {
     let mut state = TuiState::new();
-    let applied = state.apply_app_event(&json!({
+    let applied = state.apply_bridge_event(&json!({
         "method": "turn/approval_requested",
         "params": {
             "approval": {
@@ -68,7 +68,7 @@ fn approval_events_render_diff_preview_and_support_allow_always() {
 #[test]
 fn patch_events_render_structured_diff_and_undo_redo_markers() {
     let mut state = TuiState::new();
-    let applied = state.apply_app_event(&json!({
+    let applied = state.apply_bridge_event(&json!({
         "method": "patch/detected",
         "params": {
             "session_id": "session_1",
@@ -120,7 +120,7 @@ fn patch_events_render_structured_diff_and_undo_redo_markers() {
 #[test]
 fn approval_can_be_denied_with_note_from_command() {
     let mut state = TuiState::new();
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "turn/approval_requested",
         "params": {
             "approval": {
@@ -166,7 +166,7 @@ fn question_events_support_answer_and_dismiss() {
     });
 
     assert_eq!(
-        state.apply_app_event(&question_event)["applied"],
+        state.apply_bridge_event(&question_event)["applied"],
         json!(true)
     );
     assert_eq!(state.status, "question pending");
@@ -185,7 +185,7 @@ fn question_events_support_answer_and_dismiss() {
     assert_eq!(response["request_id"], json!("question_1"));
     assert!(state.active_question.is_none());
 
-    state.apply_app_event(&question_event);
+    state.apply_bridge_event(&question_event);
     let dismissed = state.dismiss_active_question(Some("not needed"));
     assert_eq!(dismissed["payload"]["dismissed"], json!(true));
     assert_eq!(dismissed["payload"]["note"], json!("not needed"));
@@ -194,7 +194,7 @@ fn question_events_support_answer_and_dismiss() {
 #[test]
 fn control_requests_can_respond_to_active_interactions() {
     let mut state = TuiState::new();
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "turn/approval_requested",
         "params": {"approval": {"request_id": "approval_3", "tool_name": "write"}}
     }));
@@ -207,7 +207,7 @@ fn control_requests_can_respond_to_active_interactions() {
     assert_eq!(approval["applied"], json!(true));
     assert_eq!(approval["payload"]["scope"], json!("always"));
 
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "item/question/requested",
         "params": {"event": {"request_id": "question_2", "questions": [{"question": "Mode?"}]}}
     }));
@@ -875,7 +875,7 @@ fn local_interaction_commands_are_forwarded_to_terminal_handler() {
 
     let mut state = TuiState::new();
     let mut handler = CaptureHandler::default();
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "turn/approval_requested",
         "params": {
             "session_id": "session_1",
@@ -900,7 +900,7 @@ fn local_interaction_commands_are_forwarded_to_terminal_handler() {
     assert_eq!(handler.approvals[0]["action"], json!("allow"));
     assert_eq!(handler.approvals[0]["scope"], json!("always"));
 
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "item/question/requested",
         "params": {
             "event": {
@@ -1077,7 +1077,7 @@ fn tui_config_loads_jsonc_and_theme_command_updates_state() {
 #[test]
 fn observability_usage_warnings_and_tool_details_render() {
     let mut state = TuiState::new();
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "turn/completed",
         "params": {
             "status": "completed",
@@ -1085,7 +1085,7 @@ fn observability_usage_warnings_and_tool_details_render() {
             "trace": {"run_id": "turn_1", "model": "server-local"}
         }
     }));
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "turn/completed",
         "params": {
             "status": "completed",
@@ -1096,7 +1096,7 @@ fn observability_usage_warnings_and_tool_details_render() {
     assert_eq!(state.usage_totals["output_tokens"], json!(8));
     assert_eq!(state.usage_totals["total_tokens"], json!(20));
 
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "runtime/warning",
         "params": {"message": "provider throttled"}
     }));
@@ -1108,7 +1108,7 @@ fn observability_usage_warnings_and_tool_details_render() {
     state.input_buffer = "/tool-details on".to_string();
     assert!(!state.submit());
     assert!(state.show_tool_details);
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "item/toolCall/completed",
         "params": {
             "name": "bash",
@@ -1962,15 +1962,15 @@ fn key_event_flow_at_opens_file_picker_without_touching_commands() {
 }
 
 #[test]
-fn app_bridge_terminal_keyflow_smoke_uses_real_remote_handler() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_keyflow_smoke_uses_real_remote_handler() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-keyflow")?;
     fs::write(workspace.join("notes.txt"), "hello from workspace\n")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
     let mut state = TuiState::new();
@@ -2007,8 +2007,10 @@ fn app_bridge_terminal_keyflow_smoke_uses_real_remote_handler() -> Result<(), Bo
             .any(|line| line.kind == "assistant" && line.text.contains("bridge answer"))
     );
 
-    let polled = handler.poll_app_events().map_err(std::io::Error::other)?;
-    apply_app_event_values(&mut state, polled);
+    let polled = handler
+        .poll_bridge_events()
+        .map_err(std::io::Error::other)?;
+    apply_bridge_event_values(&mut state, polled);
     assert!(
         state
             .runtime_warnings
@@ -2051,14 +2053,14 @@ fn app_bridge_terminal_keyflow_smoke_uses_real_remote_handler() -> Result<(), Bo
 }
 
 #[test]
-fn app_bridge_terminal_mcp_lifecycle_controls_remote_bridge() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_mcp_lifecycle_controls_remote_bridge() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-mcp")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
     let mut state = TuiState::new();
@@ -2120,15 +2122,15 @@ fn app_bridge_terminal_mcp_lifecycle_controls_remote_bridge() -> Result<(), Box<
 }
 
 #[test]
-fn app_bridge_terminal_transcript_reads_real_session_messages() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_transcript_reads_real_session_messages() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-transcript")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
         session_id: Some("session_smoke".to_string()),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
 
@@ -2164,14 +2166,14 @@ fn app_bridge_terminal_transcript_reads_real_session_messages() -> Result<(), Bo
 }
 
 #[test]
-fn app_bridge_terminal_session_picker_searches_and_resumes() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_session_picker_searches_and_resumes() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-session-picker")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
     let mut state = TuiState::new();
@@ -2215,14 +2217,14 @@ fn app_bridge_terminal_session_picker_searches_and_resumes() -> Result<(), Box<d
 }
 
 #[test]
-fn app_bridge_terminal_session_picker_manages_real_session_actions() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_session_picker_manages_real_session_actions() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-session-actions")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
     let mut state = TuiState::new();
@@ -2278,15 +2280,15 @@ fn app_bridge_terminal_session_picker_manages_real_session_actions() -> Result<(
 }
 
 #[test]
-fn app_bridge_terminal_model_picker_fetches_and_sets_model() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_model_picker_fetches_and_sets_model() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-model-picker")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
         session_id: Some("session_smoke".to_string()),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
     let mut state = TuiState::new();
@@ -2340,15 +2342,15 @@ fn app_bridge_terminal_model_picker_fetches_and_sets_model() -> Result<(), Box<d
 }
 
 #[test]
-fn app_bridge_terminal_agent_picker_fetches_and_sets_agent() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_agent_picker_fetches_and_sets_agent() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-agent-picker")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
         session_id: Some("session_smoke".to_string()),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
     let mut state = TuiState::new();
@@ -2402,15 +2404,15 @@ fn app_bridge_terminal_agent_picker_fetches_and_sets_agent() -> Result<(), Box<d
 }
 
 #[test]
-fn app_bridge_terminal_variant_and_thinking_pickers_fetch_and_set() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_variant_and_thinking_pickers_fetch_and_set() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-choice-picker")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
         session_id: Some("session_smoke".to_string()),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
     let mut state = TuiState::new();
@@ -2482,19 +2484,19 @@ fn app_bridge_terminal_variant_and_thinking_pickers_fetch_and_set() -> Result<()
 }
 
 #[test]
-fn app_bridge_terminal_interaction_keyflow_posts_real_responses() -> Result<(), Box<dyn Error>> {
-    let bridge = FakeAppBridge::start()?;
+fn bridge_terminal_interaction_keyflow_posts_real_responses() -> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-interactions")?;
-    let mut handler = AppBridgeTerminalHandler::connect(AppBridgeTerminalOptions {
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
         server_url: bridge.server_url.clone(),
         auth: RemoteAuth::bearer("secret"),
         workspace: workspace.clone(),
-        ..AppBridgeTerminalOptions::default()
+        ..BridgeTerminalOptions::default()
     })
     .map_err(std::io::Error::other)?;
     let mut state = TuiState::new();
 
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "turn/approval_requested",
         "params": {
             "session_id": "session_smoke",
@@ -2526,7 +2528,7 @@ fn app_bridge_terminal_interaction_keyflow_posts_real_responses() -> Result<(), 
     assert_eq!(approvals[0]["scope"], json!("once"));
     assert_eq!(approvals[0]["request_id"], json!("approval_smoke"));
 
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "item/question/requested",
         "params": {
             "session_id": "session_smoke",
@@ -2582,7 +2584,7 @@ fn terminal_render_snapshot_contains_permission_overlay() {
     let backend = TestBackend::new(96, 24);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let mut state = TuiState::new();
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "turn/approval_requested",
         "params": {
             "approval": {
@@ -2884,7 +2886,7 @@ fn key_event_flow_answers_question_option_from_dock() {
 
     let mut state = TuiState::new();
     let mut handler = CaptureHandler::default();
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "item/question/requested",
         "params": {
             "event": {
@@ -2950,7 +2952,7 @@ fn key_event_flow_approves_from_dock() {
 
     let mut state = TuiState::new();
     let mut handler = CaptureHandler::default();
-    state.apply_app_event(&json!({
+    state.apply_bridge_event(&json!({
         "method": "turn/approval_requested",
         "params": {
             "approval": {
@@ -2994,7 +2996,7 @@ fn terminal_render_snapshot_contains_core_regions() {
         .expect("draw frame");
     let rendered = format!("{:?}", terminal.backend().buffer());
 
-    assert!(rendered.contains("App Bridge"));
+    assert!(rendered.contains("Bridge"));
     assert!(rendered.contains("Timeline"));
     assert!(rendered.contains("Prompt"));
     assert!(rendered.contains("OpenAgent"));
@@ -3058,14 +3060,14 @@ struct FakeBridgeState {
     mcp_pid: u64,
 }
 
-struct FakeAppBridge {
+struct FakeBridgeServer {
     server_url: String,
     state: Arc<Mutex<FakeBridgeState>>,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
-impl FakeAppBridge {
+impl FakeBridgeServer {
     fn start() -> Result<Self, Box<dyn Error>> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;

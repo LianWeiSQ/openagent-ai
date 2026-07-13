@@ -834,6 +834,105 @@ impl InstructionContext {
 }
 
 #[derive(Clone, Debug)]
+pub struct AgentSystemPromptInput<'a> {
+    pub profile_prompt: Option<&'a str>,
+    pub workspace_root: &'a Path,
+    pub preloaded_skills: &'a [SkillDocument],
+    pub available_skills: &'a [SkillInfo],
+    pub include_instructions: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentSystemPrompt {
+    pub content: String,
+    pub content_hash: String,
+    pub preloaded_skill_names: Vec<String>,
+    pub instruction_count: u64,
+    pub instruction_total_bytes: usize,
+    pub instructions_truncated: bool,
+    pub instruction_issues: Vec<String>,
+}
+
+#[must_use]
+pub fn build_agent_system_prompt(input: AgentSystemPromptInput<'_>) -> Option<AgentSystemPrompt> {
+    let mut prompt_parts = Vec::new();
+    if let Some(prompt) = input
+        .profile_prompt
+        .map(|value| value.trim_start_matches('\u{feff}').trim())
+        .filter(|value| !value.is_empty())
+    {
+        prompt_parts.push(prompt.to_string());
+    }
+
+    let mut instruction_count = 0;
+    let mut instruction_total_bytes = 0;
+    let mut instructions_truncated = false;
+    let mut instruction_issues = Vec::new();
+    if input.include_instructions {
+        let instructions = InstructionContextLoader::new(input.workspace_root, None).load();
+        instruction_count = instructions.items.len() as u64;
+        instruction_total_bytes = instructions.total_bytes;
+        instructions_truncated = instructions.truncated;
+        instruction_issues = instructions.issues.clone();
+        if let Some(rendered) = render_instruction_context_for_system_prompt(&instructions) {
+            prompt_parts.push(rendered);
+        }
+    }
+
+    let preloaded_skill_names = input
+        .preloaded_skills
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect::<Vec<_>>();
+    if let Some(skills) = render_preloaded_skills(input.preloaded_skills) {
+        prompt_parts.push(skills);
+    }
+    if let Some(skills) = render_available_skills(input.available_skills) {
+        prompt_parts.push(skills);
+    }
+
+    let content = prompt_parts
+        .into_iter()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if content.is_empty() {
+        return None;
+    }
+    Some(AgentSystemPrompt {
+        content_hash: sha1_hex_12(&content),
+        content,
+        preloaded_skill_names,
+        instruction_count,
+        instruction_total_bytes,
+        instructions_truncated,
+        instruction_issues,
+    })
+}
+
+fn render_instruction_context_for_system_prompt(context: &InstructionContext) -> Option<String> {
+    if context.items.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        "Workspace and user instructions loaded for this turn.".to_string(),
+        "<instructions>".to_string(),
+    ];
+    for item in &context.items {
+        lines.push(format!(
+            "  <instruction scope=\"{}\" path=\"{}\">",
+            xml_escape(&item.scope),
+            xml_escape(&item.display_path)
+        ));
+        lines.push(item.content.trim().to_string());
+        lines.push("  </instruction>".to_string());
+    }
+    lines.push("</instructions>".to_string());
+    Some(lines.join("\n"))
+}
+
+#[derive(Clone, Debug)]
 pub struct InstructionContextLoader {
     workspace_root: PathBuf,
     options: InstructionLoadOptions,
