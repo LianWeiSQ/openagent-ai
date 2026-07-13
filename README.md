@@ -1,40 +1,54 @@
 # OpenHarness
 
-OpenHarness is now a Rust-only agent harness workspace. The legacy runtime,
-package metadata, examples, and old unittest tree have been removed as part of
-the Goal 0-14 rewrite.
+OpenHarness is the Rust agent runtime behind OpenAgent. It owns provider
+streaming, the multi-step agent loop, tools, permissions, sessions, MCP, the
+Bridge HTTP/SSE API, CLI, TUI, swarm orchestration, and eval contracts.
 
-The repository keeps the Python golden JSON files captured during the rewrite
-as stable compatibility artifacts. Runtime code, CLIs, protocol models, tools,
-session/trace handling, provider adapters, swarm orchestration, App Bridge,
-TUI state, HTTP runtime contracts, and eval/benchmark contracts now live as
-top-level Rust workspace modules.
+The Desktop product is a separate repository at `../app`. It consumes the
+Bridge API and bundles the HTTP runtime as a Tauri sidecar; UI code and desktop
+packaging do not belong in this core workspace.
 
-## Binaries
+## Run
 
 ```bash
-cargo run -p openagent-cli --bin openagent
+# Inspect local configuration and provider health.
 cargo run -p openagent-cli --bin openagent -- doctor --format json
-cargo run -p openagent-swarm --bin openagent-swarm -- --help
-cargo run -p openagent-tui --bin openagent-tui -- --help
-cargo run -p openagent-http-runtime --bin openagent-http-runtime -- --health-json
+
+# Run one agent turn from the CLI.
+cargo run -p openagent-cli --bin openagent -- run "summarize this repository"
+
+# Start the Bridge API.
+cargo run -p openagent-cli --bin openagent -- serve --host 127.0.0.1 --port 8787
+
+# Attach the terminal UI to a running Bridge.
+cargo run -p openagent-tui --bin openagent-tui -- --attach http://127.0.0.1:8787
 ```
 
-## Workspace Layout
+Provider credentials must stay in environment variables or ignored local env
+files. Never commit API keys, Bridge tokens, or private provider endpoints.
+
+## Workspace
 
 ```text
-src/              Core agent engine crate plus internal Rust libraries
-  protocol/      Shared serde protocol types
-  provider/      Provider metadata and stream normalization
-  session/       Session store, trace, observability
-  tools/         Tool registry and built-in workspace tools
-  mcp/           MCP config/runtime contracts
-cli/             OpenAgent CLI command layer
-runtime/         App Bridge, HTTP runtime, TUI, and bundled web static assets
-swarm/           Swarm runner orchestration
-eval/            Eval, CI gate, benchmark integrations
-skill/           Built-in prompts, tool descriptions, and skill libraries
+src/                         Core runtime and internal Rust crates
+  protocol/                  Shared protocol types
+  provider/                  Provider catalog and stream normalization
+  session/                   Durable session, message, part, and trace state
+  tools/                     Built-in tools and tool execution
+  mcp/                       MCP configuration and lifecycle
+  lsp/                       Language-server integration
+cli/                         `openagent` command-line surface
+runtime/bridge-server/       Bridge protocol and server state
+runtime/bridge-server-client/ Bridge client helpers
+runtime/http/                HTTP/SSE runtime
+runtime/tui/                 Terminal UI
+swarm/                       Agent-runner orchestration
+eval/                        Eval and benchmark contracts
+skill/                       Runtime prompts, tools, and skills
 ```
+
+See [MODULES.md](MODULES.md) for crate ownership and [doc/README.md](doc/README.md)
+for implementation documentation.
 
 ## Verify
 
@@ -44,30 +58,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Additional legacy runtime check:
+The Desktop P0 acceptance gate lives in the app repository:
 
 ```bash
-git ls-files '*.py' pyproject.toml
+npm --prefix ../app run ci:p0
 ```
-
-The command above should print nothing.
-
-## Docker Smoke
-
-The HTTP runtime has a dedicated Dockerfile contract:
-
-```bash
-docker build -f Dockerfile.openagent-http-runtime -t openagent-http-runtime .
-docker run --rm openagent-http-runtime --health-json
-```
-
-Local Docker must be running for the image smoke test.
-
-## Rewrite Receipts
-
-- [Rust rewrite plan](doc/rust-rewrite-plan.md)
-- [Rust rewrite parity matrix](doc/rust-rewrite-parity-matrix.md)
-- [Rust rewrite progress](doc/rust-rewrite-progress.md)
 
 ## License
 

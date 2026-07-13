@@ -4,7 +4,7 @@ OpenAgent is a Rust-only agent harness workspace for tool-using and coding
 agents. The runtime is organized around a small set of durable concepts:
 protocol types, an agent loop, context assembly, tool execution, permission
 policy, session storage, trace/eval evidence, MCP integration, and product
-surfaces such as CLI, TUI, App Bridge, and the HTTP runtime.
+surfaces such as CLI, TUI, Bridge API, and the HTTP runtime.
 
 ```text
 User task
@@ -15,7 +15,7 @@ User task
   -> Permission policy
   -> Workspace / MCP / skill tools
   -> Session ledger / trace / parts
-  -> CLI / TUI / HTTP runtime / App Bridge
+  -> CLI / TUI / HTTP runtime / Bridge API
 ```
 
 ## Workspace Modules
@@ -33,8 +33,8 @@ User task
 | `cli` | `openagent` command-line binary |
 | `skill` | Built-in prompts, tool descriptions, and skill libraries |
 | `runtime/tui` | Local and remote terminal UI state |
-| `runtime/app-server` | App Bridge server protocol and state |
-| `runtime/app-server-client` | App Bridge client helpers |
+| `runtime/bridge-server` | Bridge API server protocol and state |
+| `runtime/bridge-server-client` | Bridge API client helpers |
 | `runtime/http` | HTTP runtime binary and API contracts |
 
 ## Tool Flow
@@ -61,7 +61,7 @@ to make context selection recoverable and debuggable: the runtime should be
 able to explain which items were included, which were dropped under budget
 pressure, and which assets changed before a resumed turn.
 
-See [`context.md`](context.md) for the context persistence stages.
+See [`context.md`](context.md) for the current context and persistence model.
 
 ## Session And Trace
 
@@ -80,8 +80,8 @@ The loop consumes normalized model text, tool calls, usage, and stream events.
 This keeps provider changes from leaking into tool execution, context
 assembly, permission policy, and session persistence.
 
-## Public Scope
+## Repository Boundary
 
-The repository is the Rust harness workspace. Legacy Python runtime code and
-package metadata were removed during the Rust rewrite; compatibility fixtures
-remain only as golden artifacts where they are useful for regression checks.
+This repository owns the Rust harness and Bridge contracts. The React/Tauri
+Desktop product lives in `../../app`; product UI state must not become an
+alternate source of truth for runtime behavior.

@@ -1,6 +1,8 @@
-# OpenAgent App Bridge
+# OpenAgent Bridge API
 
-OpenAgent App Bridge is the first thin UI integration layer for OpenAgent. It follows the shape of Codex app-server without copying the whole Codex runtime or UI. The first version keeps the interface small: a local HTTP server, an SSE event stream, and a static console bundled inside the OpenAgent package.
+OpenAgent Bridge API is the local API/SSE contract used by the Desktop app,
+CLI, TUI, and future IDE clients. The Rust core workspace owns this runtime
+contract; product UI assets live outside the core workspace in `../../app`.
 
 ## Goal
 
@@ -11,19 +13,21 @@ The goal is to let a UI, CLI, desktop shell, or IDE client drive OpenAgent throu
 - stream model text, tool calls, tool results, patches, runtime warnings, and completion state;
 - expose trace/session identifiers for later inspection.
 
-This is intentionally not a UI rewrite. The UI is a minimal console for validating the bridge.
+This is intentionally not a UI rewrite. The core runtime exposes API/SSE routes only; product clients live outside this workspace.
 
 ## Reference Shape
 
-Codex app-server uses three core primitives:
+Codex runtime services use three core primitives:
 
-| Codex app-server | OpenAgent mapping |
+| Codex runtime | OpenAgent mapping |
 | --- | --- |
 | Thread | `Session` |
 | Turn | one `AgentLoop.run(...)` invocation |
 | Item | `StreamEvent` projected into UI events |
 
-OpenAgent keeps the existing Python runtime as the source of truth. The bridge only adapts the runtime for clients.
+OpenAgent keeps the Rust runtime as the source of truth. The bridge adapts
+runtime sessions, turns, events, approvals, questions, MCP, diff, and
+checkpoint APIs for clients.
 
 ## First Version Scope
 
@@ -31,7 +35,6 @@ Implemented endpoints:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /` | Static OpenAgent console |
 | `GET /api/health` | Service health |
 | `GET /api/models` | Current OpenAI-compatible model catalog |
 | `GET /api/sessions` | List known sessions |
@@ -60,7 +63,7 @@ The event stream uses Codex-like method names:
 
 Interrupt is cooperative: the running turn is marked as interrupting immediately, and the background OpenAgent loop stops at the next model/tool event boundary. A blocking provider request or tool process may still need to return control before the final `turn/interrupted` event is emitted.
 
-Approvals are driven by the existing permission system. When `OPENAGENT_APP_PERMISSION=PLAN_ONLY` or a custom ask rule requires confirmation, the loop pauses and emits `turn/approval_requested` with:
+Approvals are driven by the existing permission system. When `OPENAGENT_BRIDGE_PERMISSION=PLAN_ONLY` or a custom ask rule requires confirmation, the loop pauses and emits `turn/approval_requested` with:
 
 ```json
 {
@@ -78,54 +81,51 @@ Clients resume the loop by posting `allow` or `deny` to the approval endpoint. I
 
 ## Run Locally
 
-Install the package in editable mode:
+Build the Rust command surfaces:
 
 ```bash
-python -m pip install -e .
+cargo build -p openagent-cli -p openagent-http-runtime
 ```
 
 Configure the OpenAI-compatible provider:
 
 ```bash
-openagent config init \
+cargo run -p openagent-cli --bin openagent -- config init \
   --api-key "$OPENAI_API_KEY" \
   --base-url http://localhost:8080/v1 \
   --model gpt-5.5 \
   --wire-api responses
 
-openagent config show
+cargo run -p openagent-cli --bin openagent -- config show
 ```
 
-Start the app bridge:
+Start the bridge API:
 
 ```bash
-openagent serve --host 127.0.0.1 --port 8787 --workspace .
+cargo run -p openagent-cli --bin openagent -- \
+  serve --host 127.0.0.1 --port 8787 --workspace .
 ```
 
-Then open:
-
-```text
-http://127.0.0.1:8787
-```
-
-Equivalent module form:
+For Desktop, IDE, CLI, TUI, or other clients, run the Bridge API service:
 
 ```bash
-PYTHONPATH=src python -m openagent.app_server.server --host 127.0.0.1 --port 8787
-```
-
-For Desktop, IDE, or other non-browser clients, run the same App Bridge as a headless API/SSE service:
-
-```bash
-export OPENAGENT_SERVER_TOKEN="replace-with-a-local-secret"
-openagent serve --host 127.0.0.1 --port 8787 --workspace . --headless
+umask 077
+printf '%s' "$OPENAGENT_SERVER_TOKEN" > .openagent/bridge-token
+cargo run -p openagent-http-runtime --bin openagent-http-runtime -- \
+  --host 127.0.0.1 \
+  --port 8787 \
+  --workspace . \
+  --auth-token-file .openagent/bridge-token
 ```
 
 `--session-root` can pin session ledger storage for clients that need stable resume paths.
-When `OPENAGENT_SERVER_TOKEN` is set, all `/api/*` JSON and SSE endpoints require `Authorization: Bearer <token>`.
-The bundled static console does not yet include a token prompt, so token-protected mode is best used with `--headless` or custom clients.
+When authentication is configured, all `/api/*` JSON and SSE endpoints require
+`Authorization: Bearer <token>`. Keep the token file ignored and readable only
+by the current user.
+The core runtime no longer serves a web UI. Use the Desktop product app from
+`../../app` or a custom client against the API/SSE routes.
 
-Send a one-shot turn to an already running App Bridge:
+Send a one-shot turn to an already running Bridge API service:
 
 ```bash
 openagent client --server-url http://127.0.0.1:8787 "summarize this repository"
@@ -134,7 +134,7 @@ openagent client --server-url http://127.0.0.1:8787 --format json "stream events
 openagent client --server-url http://127.0.0.1:8787 --server-token "$OPENAGENT_SERVER_TOKEN" "run through a secured bridge"
 ```
 
-`openagent client` uses the App Bridge protocol directly:
+`openagent client` uses the Bridge API protocol directly:
 
 1. `POST /api/sessions` or `GET /api/sessions` for session selection.
 2. `POST /api/sessions/{session_id}/turns` to start a turn.
@@ -148,29 +148,25 @@ The bridge reads:
 | --- | --- | --- |
 | `OPENAGENT_WORKSPACE` | current working directory | Session workspace |
 | `OPENAGENT_SESSION_ROOT` | `.openagent/sessions` | File session store root |
-| `OPENAGENT_APP_AGENT_NAME` | `openagent-app` | Agent name |
-| `OPENAGENT_APP_MAX_STEPS` | `0` | Max AgentLoop steps; `0` means OpenCode-style unbounded unless an agent/profile/request sets `steps` |
-| `OPENAGENT_APP_PERMISSION` | `FULL` | Permission ruleset |
-| `OPENAGENT_APP_TOOLS` | `all` | Tool allowlist |
+| `OPENAGENT_BRIDGE_MAX_STEPS` | `0` | Max AgentLoop steps; `0` means OpenCode-style unbounded unless an agent/profile/request sets `steps` |
+| `OPENAGENT_BRIDGE_PERMISSION` | `FULL` | Permission ruleset |
+| `OPENAGENT_BRIDGE_DANGEROUSLY_SKIP_PERMISSIONS` | unset | Auto-approve permission prompts for trusted local smoke runs |
 | `OPENAGENT_TRACE_ROOT` | `.openagent/traces` | Local trace root |
-| `OPENAGENT_SERVER_TOKEN` | unset | Optional Bearer token for App Bridge API/SSE |
+| `OPENAGENT_SERVER_TOKEN` | unset | Optional Bearer token for Bridge API/SSE |
 
 ## CLI Entrypoints
 
 | Command | Purpose |
 | --- | --- |
-| `openagent web` | Start the bundled browser console |
-| `openagent serve` | Start the App Bridge HTTP server |
-| `openagent serve --headless` | Start API/SSE endpoints without the static console |
-| `openagent client` | Send a turn to an already running App Bridge |
-| `openagent client --server-token ...` | Connect to a token-protected App Bridge |
-| `openagent-app` | Lower-level compatibility entrypoint for the same server |
+| `openagent serve` | Start the Bridge API HTTP server |
+| `openagent client` | Send a turn to an already running Bridge API service |
+| `openagent client --server-token ...` | Connect to a token-protected Bridge API service |
 
 ## Non-goals
 
 First version deliberately does not implement:
 
-- full Codex app-server protocol compatibility;
+- full Codex runtime protocol compatibility;
 - marketplace/plugin UI;
 - remote control pairing;
 - complex permission approval UI;
@@ -183,7 +179,8 @@ First version deliberately does not implement:
 2. Make session listing read run summaries and trace links more directly.
 3. Add a thin CLI client that talks to the same bridge.
 4. Connect sandbox binding state to the right-side inspector.
-5. Add Web UI panes for context pack, tool batch, and Langfuse trace.
+5. Expose context pack, tool batch, and trace panes through product clients
+   outside the core runtime.
 
 ## TUI Client
 
@@ -223,7 +220,7 @@ openagent models
 openagent stats
 ```
 
-These commands read the same file-backed session store used by the App Bridge runtime. By default the store is resolved from `OPENAGENT_SESSION_ROOT` or `.openagent/sessions` under the selected workspace.
+These commands read the same file-backed session store used by the Bridge API runtime. By default the store is resolved from `OPENAGENT_SESSION_ROOT` or `.openagent/sessions` under the selected workspace.
 
 ## Provider Auth
 
