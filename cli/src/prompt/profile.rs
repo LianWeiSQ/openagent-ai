@@ -27,11 +27,6 @@ pub(crate) struct RunAgentProfile {
     pub(super) loaded: bool,
 }
 
-const BUILD_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/build.txt");
-const EXPLORE_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/explore.txt");
-const PLAN_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/plan.txt");
-const SCOUT_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/scout.txt");
-
 pub(super) fn provider_and_model_from_args(
     args: &[String],
     agent_profile: Option<&RunAgentProfile>,
@@ -417,119 +412,38 @@ fn agent_profile_from_value(
 }
 
 fn builtin_agent_profiles() -> Vec<RunAgentProfile> {
-    vec![
-        builtin_agent_profile(
-            "build",
-            "Build",
-            "Primary implementation agent for coding, testing, and general project work.",
-            "primary",
-            Some("PLAN_ONLY"),
-            BUILD_AGENT_PROMPT,
-            &[],
-        ),
-        builtin_agent_profile(
-            "general",
-            "General",
-            "General-purpose subagent for complex multi-step implementation, debugging, and research tasks.",
-            "subagent",
-            Some("PLAN_ONLY"),
-            BUILD_AGENT_PROMPT,
-            &[],
-        ),
-        builtin_agent_profile(
-            "explore",
-            "Explore",
-            "Read-only code exploration subagent for fast search, mapping, and evidence gathering.",
-            "subagent",
-            Some("READONLY"),
-            EXPLORE_AGENT_PROMPT,
-            &[
-                "read",
-                "glob",
-                "grep",
-                "ls",
-                "lsp",
-                "code_search",
-                "skill",
-                "todoread",
-            ],
-        ),
-        builtin_agent_profile(
-            "scout",
-            "Scout",
-            "External documentation and dependency research subagent with read-only web fetch access.",
-            "subagent",
-            Some("READONLY"),
-            SCOUT_AGENT_PROMPT,
-            &[
-                "web_fetch",
-                "read",
-                "glob",
-                "grep",
-                "ls",
-                "lsp",
-                "code_search",
-                "skill",
-                "todoread",
-            ],
-        ),
-        builtin_agent_profile(
-            "plan",
-            "Plan",
-            "Planning subagent for architecture analysis, implementation strategy, and task breakdowns.",
-            "subagent",
-            Some("PLAN_ONLY"),
-            PLAN_AGENT_PROMPT,
-            &[
-                "read",
-                "glob",
-                "grep",
-                "ls",
-                "lsp",
-                "code_search",
-                "skill",
-                "todoread",
-                "todowrite",
-                "question",
-            ],
-        ),
-    ]
-}
-
-fn builtin_agent_profile(
-    id: &str,
-    name: &str,
-    description: &str,
-    mode: &str,
-    permission: Option<&str>,
-    prompt: &str,
-    tools: &[&str],
-) -> RunAgentProfile {
-    RunAgentProfile {
-        id: id.to_string(),
-        name: name.to_string(),
-        description: Some(description.to_string()),
-        mode: mode.to_string(),
-        model: None,
-        provider: None,
-        permission: permission.map(str::to_string),
-        task_permissions: Vec::new(),
-        skills: Vec::new(),
-        skill_roots: Vec::new(),
-        skill_permissions: Vec::new(),
-        prompt: Some(prompt.trim_start_matches('\u{feff}').to_string()),
-        tools: tools.iter().map(|item| (*item).to_string()).collect(),
-        max_steps: None,
-        temperature: None,
-        top_p: None,
-        color: None,
-        disabled: false,
-        model_options: BTreeMap::new(),
-        workspace_isolation: false,
-        hidden: false,
-        source_path: None,
-        loaded: true,
-    }
+    builtin_agent_profile_specs()
+        .into_iter()
+        .map(|profile| RunAgentProfile {
+            id: profile.id.to_string(),
+            name: profile.name.to_string(),
+            description: Some(profile.description.to_string()),
+            mode: profile.mode.to_string(),
+            model: None,
+            provider: None,
+            permission: Some(profile.permission.as_str().to_string()),
+            task_permissions: Vec::new(),
+            skills: Vec::new(),
+            skill_roots: Vec::new(),
+            skill_permissions: Vec::new(),
+            prompt: Some(profile.prompt.trim_start_matches('\u{feff}').to_string()),
+            tools: profile
+                .tools
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect(),
+            max_steps: None,
+            temperature: None,
+            top_p: None,
+            color: None,
+            disabled: false,
+            model_options: BTreeMap::new(),
+            workspace_isolation: false,
+            hidden: false,
+            source_path: None,
+            loaded: true,
+        })
+        .collect()
 }
 
 pub(crate) fn agent_profile_public_value(profile: &RunAgentProfile) -> Value {
@@ -560,89 +474,60 @@ pub(crate) fn agent_profile_public_value(profile: &RunAgentProfile) -> Value {
     })
 }
 
-pub(super) fn materialized_provider_messages_for_agent(
-    session: &mut Session,
-    profile: Option<&RunAgentProfile>,
-) -> Vec<ChatMessage> {
-    let mut messages = session
-        .messages
-        .iter()
-        .filter(|message| !is_agent_profile_system_message(message))
-        .cloned()
-        .collect::<Vec<_>>();
-    if let Some(system) = materialized_agent_profile_system_message(
-        session,
-        profile,
-        profile.map_or("", |item| item.mode.as_str()),
-    ) {
-        messages.insert(0, system);
-    }
-    messages
-}
-
-fn is_agent_profile_system_message(message: &ChatMessage) -> bool {
-    message.role == Role::System && message.metadata.get("agent_profile").is_some()
-}
-
-fn materialized_agent_profile_system_message(
+pub(super) fn context_system_sources(
     session: &mut Session,
     profile: Option<&RunAgentProfile>,
     agent_mode: &str,
-) -> Option<ChatMessage> {
-    let Some(profile) = profile else {
-        return None;
-    };
-    let preloaded_skills = profile_preloaded_skill_documents(profile, &session.directory);
-    let available_skills = profile_available_skill_infos(profile, &session.directory);
-    let system_prompt = build_agent_system_prompt(AgentSystemPromptInput {
-        profile_prompt: profile.prompt.as_deref(),
-        workspace_root: &session.directory,
-        preloaded_skills: &preloaded_skills,
-        available_skills: &available_skills,
-        include_instructions: true,
-    })?;
-    if !profile.skills.is_empty() {
+) -> ContextSystemSources {
+    let (preloaded_skills, available_skills) = profile.map_or_else(
+        || (Vec::new(), Vec::new()),
+        |profile| {
+            (
+                profile_preloaded_skill_documents(profile, &session.directory),
+                profile_available_skill_infos(profile, &session.directory),
+            )
+        },
+    );
+    if let Some(profile) = profile.filter(|profile| !profile.skills.is_empty()) {
         session
             .metadata
             .insert("skills".to_string(), json!(profile.skills.clone()));
     } else {
         session.metadata.remove("skills");
     }
-    if !system_prompt.preloaded_skill_names.is_empty() {
+    ContextSystemSources {
+        profile_id: profile.map(|profile| profile.id.clone()),
+        profile_mode: (!agent_mode.trim().is_empty()).then(|| agent_mode.to_string()),
+        profile_prompt: profile.and_then(|profile| profile.prompt.clone()),
+        workspace_root: session.directory.clone(),
+        preloaded_skills,
+        available_skills,
+        legacy_system_sources: Vec::new(),
+        include_instructions: true,
+    }
+}
+
+pub(super) fn apply_context_system_diagnostics(
+    session: &mut Session,
+    diagnostics: Option<&ContextSystemDiagnostics>,
+) {
+    let Some(diagnostics) = diagnostics else {
+        session.metadata.remove("preloaded_skills");
+        session.metadata.remove("dynamic_system_prompt");
+        return;
+    };
+    if !diagnostics.preloaded_skill_names.is_empty() {
         session.metadata.insert(
             "preloaded_skills".to_string(),
-            json!(system_prompt.preloaded_skill_names.clone()),
+            json!(diagnostics.preloaded_skill_names.clone()),
         );
     } else {
         session.metadata.remove("preloaded_skills");
     }
     session.metadata.insert(
         "dynamic_system_prompt".to_string(),
-        json!({
-            "hash": system_prompt.content_hash,
-            "instruction_count": system_prompt.instruction_count,
-            "instruction_total_bytes": system_prompt.instruction_total_bytes,
-            "instructions_truncated": system_prompt.instructions_truncated,
-            "instruction_issues": system_prompt.instruction_issues,
-            "preloaded_skills": system_prompt.preloaded_skill_names,
-        }),
+        diagnostics.session_metadata(),
     );
-    let mut message = chat_message(Role::System, system_prompt.content);
-    message
-        .metadata
-        .insert("agent_profile".to_string(), json!(profile.id.clone()));
-    message
-        .metadata
-        .insert("agent_mode".to_string(), json!(agent_mode));
-    message
-        .metadata
-        .insert("dynamic_system_prompt".to_string(), json!(true));
-    if let Some(dynamic) = session.metadata.get("dynamic_system_prompt") {
-        message
-            .metadata
-            .insert("dynamic_system_prompt_info".to_string(), dynamic.clone());
-    }
-    Some(message)
 }
 
 pub(super) fn filter_tools_for_agent(

@@ -13,11 +13,13 @@ pub(super) fn call_provider_for_run(
     args: &[String],
     provider: &str,
     model_id: &str,
-    messages: &[ChatMessage],
-    tools: &[ToolSchema],
+    context_pack: &ContextPack,
     stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
-    agent_profile: Option<&RunAgentProfile>,
 ) -> Result<ProviderRunResult, String> {
+    context_pack.validate_provider_input()?;
+    let messages = context_pack.messages.as_slice();
+    let tools = context_pack.tools.as_slice();
+    let model_options = &context_pack.model_options;
     if subagent_profile_id(messages).is_some()
         && let Ok(answer) = env::var("OPENAGENT_MOCK_SUBAGENT_ANSWER")
         && !answer.is_empty()
@@ -64,7 +66,15 @@ pub(super) fn call_provider_for_run(
     }
     let api_key = api_key.unwrap_or_default();
     if provider == "anthropic" {
-        call_anthropic_provider(args, &api_key, model_id, messages, tools, stream_sink)
+        call_anthropic_provider(
+            args,
+            &api_key,
+            model_id,
+            messages,
+            tools,
+            model_options,
+            stream_sink,
+        )
     } else {
         call_openai_compatible_provider(
             args,
@@ -73,29 +83,31 @@ pub(super) fn call_provider_for_run(
             model_id,
             messages,
             tools,
+            model_options,
             stream_sink,
-            agent_profile,
         )
     }
 }
 
-fn apply_agent_model_options_to_payload(payload: &mut Value, profile: Option<&RunAgentProfile>) {
-    let Some(profile) = profile else {
-        return;
-    };
+fn apply_model_options_to_payload(
+    payload: &mut Value,
+    model_options: &BTreeMap<String, Value>,
+    wire_api: &str,
+) {
     let Some(object) = payload.as_object_mut() else {
         return;
     };
-    for (key, value) in &profile.model_options {
+    for (key, value) in model_options {
         if provider_payload_option_allowed(key) {
-            object.insert(key.clone(), value.clone());
+            object.insert(
+                if wire_api == "chat" && key == "max_output_tokens" {
+                    "max_tokens".to_string()
+                } else {
+                    key.clone()
+                },
+                value.clone(),
+            );
         }
-    }
-    if let Some(temperature) = profile.temperature {
-        object.insert("temperature".to_string(), json!(temperature));
-    }
-    if let Some(top_p) = profile.top_p {
-        object.insert("top_p".to_string(), json!(top_p));
     }
 }
 
@@ -113,6 +125,8 @@ fn provider_payload_option_allowed(key: &str) -> bool {
             | "skill_roots"
             | "skill_permissions"
             | "skill_permission"
+            | "context_budget"
+            | "context_window"
     )
 }
 
@@ -145,6 +159,7 @@ fn subagent_profile_id(messages: &[ChatMessage]) -> Option<&str> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_openai_compatible_provider(
     args: &[String],
     provider: &str,
@@ -152,8 +167,8 @@ fn call_openai_compatible_provider(
     model_id: &str,
     messages: &[ChatMessage],
     tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
     mut stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
-    agent_profile: Option<&RunAgentProfile>,
 ) -> Result<ProviderRunResult, String> {
     let base_url = provider_base_url(provider, args);
     if is_synthetic_endpoint(&base_url) {
@@ -180,7 +195,10 @@ fn call_openai_compatible_provider(
     config.provider_id = provider.to_string();
     config.base_url = base_url.clone();
     config.wire_api = wire_api.clone();
-    config.reasoning_effort = value_for(args, &["--variant"]);
+    config.reasoning_effort = model_options
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     let stream = provider_streaming_enabled(args);
     let (endpoint, mut payload) = if wire_api == "chat" {
         let mut payload = build_openai_chat_payload(
@@ -210,25 +228,11 @@ fn call_openai_compatible_provider(
         }
         (join_url(&base_url, "responses"), payload)
     };
-    apply_agent_model_options_to_payload(&mut payload, agent_profile);
-    if let Some(max_tokens) =
-        value_for(args, &["--max-output-tokens"]).and_then(|value| value.parse::<u64>().ok())
-        && let Some(object) = payload.as_object_mut()
-    {
-        object.insert(
-            if wire_api == "chat" {
-                "max_tokens"
-            } else {
-                "max_output_tokens"
-            }
-            .to_string(),
-            json!(max_tokens),
-        );
-    }
+    apply_model_options_to_payload(&mut payload, model_options, &wire_api);
     let response = send_provider_request_with_retries(
         &client,
         &endpoint,
-        &api_key,
+        api_key,
         &payload,
         stream,
         provider_request_retries(args),
@@ -376,6 +380,7 @@ fn call_anthropic_provider(
     model_id: &str,
     messages: &[ChatMessage],
     tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
     mut stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
 ) -> Result<ProviderRunResult, String> {
     let timeout = Duration::from_secs(60);
@@ -398,6 +403,14 @@ fn call_anthropic_provider(
     );
     if let Some(object) = payload.as_object_mut() {
         object.insert("stream".to_string(), json!(stream));
+        for key in ["temperature", "top_p"] {
+            if let Some(value) = model_options.get(key) {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(value) = model_options.get("max_output_tokens") {
+            object.insert("max_tokens".to_string(), value.clone());
+        }
     }
     let endpoint = join_url(
         config
@@ -518,6 +531,7 @@ fn provider_events_to_run_result(
                     call_id: call_id.clone(),
                 });
             }
+            ProviderStreamEvent::Retry { .. } | ProviderStreamEvent::Fallback { .. } => {}
         }
     }
     if answer.is_empty()

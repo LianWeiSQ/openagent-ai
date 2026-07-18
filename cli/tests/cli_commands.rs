@@ -19,6 +19,7 @@ use openagent_session::{FileSessionStore, Session, StartRunOptions};
 use serde_json::{Value, json};
 
 type MockServer = thread::JoinHandle<Result<(), String>>;
+type CapturedRequests = Arc<Mutex<Vec<String>>>;
 
 #[test]
 fn cli_commands_fixture_matches_legacy_oracle() -> Result<(), Box<dyn Error>> {
@@ -1306,6 +1307,166 @@ fn binary_run_executes_mock_tool_loop() -> Result<(), Box<dyn Error>> {
     assert_eq!(completed["params"]["final_answer"], "final answer");
     assert_eq!(completed["params"]["steps"], 2);
     assert_eq!(completed["params"]["tool_calls"], 1);
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_local_run_builds_structured_context_pack_for_every_source() -> Result<(), Box<dyn Error>>
+{
+    let temp = temp_dir("openagent-cli-context-pack")?;
+    let workspace = temp.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let session_root = temp.join("sessions");
+    fs::write(workspace.join("context.txt"), "typed local attachment\n")?;
+    let skill_dir = workspace.join("shared-skills/brief");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: brief
+description: Structured context test skill
+---
+Use the structured context test guidance.
+"#,
+    )?;
+    let agent_dir = workspace.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("unified.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "unified",
+            "name": "Unified Context",
+            "mode": "primary",
+            "prompt": "You are the unified context test agent.",
+            "skills": ["brief"],
+            "skill_roots": ["shared-skills"],
+            "tools": ["todowrite", "mcp_tool_demo_echo"],
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "model_options": {
+                "frequency_penalty": 0.1
+            }
+        }))?,
+    )?;
+    let mcp_config = workspace.join("mcp.json");
+    let (port, server) = serve_mcp_json_rpc(1)?;
+    fs::write(
+        &mcp_config,
+        format!(
+            r#"{{
+              "mcp": {{
+                "demo": {{
+                  "type": "remote",
+                  "transport": "http",
+                  "url": "http://127.0.0.1:{port}",
+                  "enabled": true
+                }}
+              }}
+            }}"#
+        ),
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&workspace),
+            "--session-root",
+            path_str(&session_root),
+            "--mcp-config",
+            path_str(&mcp_config),
+            "--agent",
+            "unified",
+            "--file",
+            "context.txt",
+            "--variant",
+            "high",
+            "--max-output-tokens",
+            "2048",
+            "--format",
+            "json",
+            "inspect",
+            "context",
+        ])
+        .env_clear()
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_todo","name":"todowrite","input":{"todos":[{"id":"todo-1","content":"Inspect every context source","status":"in_progress","priority":"high"}]}}]"#,
+        )
+        .env("OPENAGENT_MOCK_ANSWER", "context complete")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server
+        .join()
+        .expect("mcp server thread")
+        .expect("mcp discovery response");
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .ok_or("missing context completion")?;
+    let session_id = completed["params"]["session_id"]
+        .as_str()
+        .ok_or("missing context session id")?;
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(session_id).join("state.latest.json"),
+    )?)?;
+    let user = state["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().find(|message| message["role"] == "user"))
+        .ok_or("missing context user message")?;
+    assert_eq!(user["content"], "inspect context");
+    assert!(
+        !user["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("typed local attachment")
+    );
+    assert_eq!(
+        user["metadata"]["context_attachments"][0]["content"],
+        "typed local attachment\n"
+    );
+    let context = &state["metadata"]["context_pack"];
+    assert_eq!(context["mode"], "active");
+    assert_eq!(context["surface"], "cli");
+    assert_eq!(context["step"], 2);
+    assert_eq!(context["receipt"]["item_kind_counts"]["attachment_file"], 1);
+    assert_eq!(context["receipt"]["item_kind_counts"]["skill_preloaded"], 1);
+    assert_eq!(
+        context["receipt"]["item_kind_counts"]["mcp_tool_manifest"],
+        1
+    );
+    assert_eq!(context["receipt"]["item_kind_counts"]["todo"], 1);
+    assert!(
+        context["receipt"]["item_kind_counts"]["checkpoint"]
+            .as_u64()
+            .is_some_and(|count| count >= 1)
+    );
+    assert_eq!(
+        context["receipt"]["tool_names"],
+        json!(["mcp_tool_demo_echo", "todowrite"])
+    );
+    assert_eq!(
+        context["receipt"]["model_option_keys"],
+        json!([
+            "frequency_penalty",
+            "max_output_tokens",
+            "reasoning_effort",
+            "temperature",
+            "top_p"
+        ])
+    );
+    assert_eq!(state["todos"][0]["id"], "todo-1");
+    assert_eq!(state["todos"][0]["status"], "in_progress");
 
     let _ = fs::remove_dir_all(temp);
     Ok(())
@@ -3022,6 +3183,7 @@ fn binary_attach_and_tui_attach_use_remote_bridge_events() -> Result<(), Box<dyn
     let workspace = temp.join("workspace");
     let session_root = temp.join("sessions");
     fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("context.txt"), "typed CLI attachment\n")?;
     let mut server = spawn_openagent_server(port, &workspace, &session_root)?;
     wait_for_attach(port)?;
 
@@ -3034,6 +3196,15 @@ fn binary_attach_and_tui_attach_use_remote_bridge_events() -> Result<(), Box<dyn
         "secret".to_string(),
         "--format".to_string(),
         "json".to_string(),
+        "--workspace".to_string(),
+        path_str(&workspace).to_string(),
+        "--file".to_string(),
+        "context.txt".to_string(),
+        "--model".to_string(),
+        "gpt-5.5".to_string(),
+        "--variant".to_string(),
+        "high".to_string(),
+        "--thinking".to_string(),
         "hello".to_string(),
         "attach".to_string(),
     ])?;
@@ -3056,6 +3227,83 @@ fn binary_attach_and_tui_attach_use_remote_bridge_events() -> Result<(), Box<dyn
             .iter()
             .any(|event| event["method"] == "turn/completed")
     );
+    let completed = events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .ok_or("missing attached completion")?;
+    let session_id = completed["params"]["session_id"]
+        .as_str()
+        .ok_or("missing attached session id")?;
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(session_id).join("state.latest.json"),
+    )?)?;
+    let user = state["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+        })
+        .ok_or("missing attached user message")?;
+    assert_eq!(user["content"], "hello attach");
+    assert_eq!(
+        user["metadata"]["context_attachments"][0]["content"],
+        "typed CLI attachment\n"
+    );
+    assert_eq!(
+        state["metadata"]["context_pack"]["receipt"]["item_kind_counts"]["attachment_file"],
+        1
+    );
+    assert_eq!(state["metadata"]["model"], "gpt-5.5");
+    assert_eq!(state["metadata"]["variant"], "high");
+    assert_eq!(state["metadata"]["thinking"], "high");
+
+    let client = run_openagent_vec(vec![
+        "client".to_string(),
+        "--server-url".to_string(),
+        url.clone(),
+        "--server-token".to_string(),
+        "secret".to_string(),
+        "--workspace".to_string(),
+        path_str(&workspace).to_string(),
+        "--session".to_string(),
+        session_id.to_string(),
+        "--file".to_string(),
+        "context.txt".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--model".to_string(),
+        "gpt-5.4".to_string(),
+        "--variant".to_string(),
+        "medium".to_string(),
+        "client".to_string(),
+        "context".to_string(),
+    ])?;
+    assert!(
+        client.status.success(),
+        "{}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(session_id).join("state.latest.json"),
+    )?)?;
+    let user = state["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+        })
+        .ok_or("missing client user message")?;
+    assert_eq!(user["content"], "client context");
+    assert_eq!(
+        user["metadata"]["context_attachments"][0]["content"],
+        "typed CLI attachment\n"
+    );
+    assert_eq!(state["metadata"]["model"], "gpt-5.4");
+    assert_eq!(state["metadata"]["variant"], "medium");
 
     let attach = run_openagent_vec(vec![
         "attach".to_string(),
@@ -3086,6 +3334,167 @@ fn binary_attach_and_tui_attach_use_remote_bridge_events() -> Result<(), Box<dyn
     assert!(tui_attach.status.success());
     let payload: Value = serde_json::from_slice(&tui_attach.stdout)?;
     assert_eq!(payload["attached"], true);
+
+    let _ = server.kill();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_local_and_bridge_context_pack_receipts_have_surface_parity() -> Result<(), Box<dyn Error>>
+{
+    let port = free_port()?;
+    let temp = temp_dir("openagent-cli-context-parity")?;
+    let workspace = temp.join("workspace");
+    let local_session_root = temp.join("local-sessions");
+    let bridge_session_root = temp.join("bridge-sessions");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("context.txt"), "surface parity attachment\n")?;
+    let provider_response = json!({
+        "id": "resp_context_parity",
+        "output_text": "surface parity answer",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string();
+    let (provider_port, provider_server, provider_requests) =
+        serve_http_capture_responses_on_free_port(
+            "application/json",
+            vec![provider_response.clone(), provider_response],
+        )?;
+    let provider_url = format!("http://127.0.0.1:{provider_port}");
+
+    let local = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&workspace),
+            "--session-root",
+            path_str(&local_session_root),
+            "--file",
+            "context.txt",
+            "--model",
+            "gpt-5.5",
+            "--format",
+            "json",
+            "surface",
+            "parity",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", &provider_url)
+        .env("OPENAI_WIRE_API", "responses")
+        .output()?;
+    assert!(
+        local.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    let local_events = String::from_utf8(local.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let local_session_id = local_events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .and_then(|event| event["params"]["session_id"].as_str())
+        .ok_or("missing local parity session")?;
+    let local_state: Value = serde_json::from_str(&fs::read_to_string(
+        local_session_root
+            .join(local_session_id)
+            .join("state.latest.json"),
+    )?)?;
+
+    let mut server = spawn_openagent_server_with_provider(
+        port,
+        &workspace,
+        &bridge_session_root,
+        &provider_url,
+    )?;
+    wait_for_attach(port)?;
+    let url = format!("http://127.0.0.1:{port}");
+    let remote = run_openagent_vec(vec![
+        "run".to_string(),
+        "--attach".to_string(),
+        url,
+        "--server-token".to_string(),
+        "secret".to_string(),
+        "--workspace".to_string(),
+        path_str(&workspace).to_string(),
+        "--file".to_string(),
+        "context.txt".to_string(),
+        "--model".to_string(),
+        "gpt-5.5".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "surface".to_string(),
+        "parity".to_string(),
+    ])?;
+    assert!(
+        remote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remote.stderr)
+    );
+    let remote_events = String::from_utf8(remote.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let remote_session_id = remote_events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .and_then(|event| event["params"]["session_id"].as_str())
+        .ok_or("missing remote parity session")?;
+    let remote_state: Value = serde_json::from_str(&fs::read_to_string(
+        bridge_session_root
+            .join(remote_session_id)
+            .join("state.latest.json"),
+    )?)?;
+
+    let local_receipt = &local_state["metadata"]["context_pack"]["receipt"];
+    let remote_receipt = &remote_state["metadata"]["context_pack"]["receipt"];
+    for field in [
+        "message_role_counts",
+        "tool_manifest_count",
+        "tool_names",
+        "model_option_keys",
+        "item_kind_counts",
+        "item_delivery_counts",
+    ] {
+        assert_eq!(
+            local_receipt[field], remote_receipt[field],
+            "context receipt field `{field}` differs across local CLI and Bridge"
+        );
+    }
+    assert_eq!(
+        local_state["messages"][0]["content"],
+        remote_state["messages"][0]["content"]
+    );
+    assert_eq!(
+        local_state["messages"][0]["metadata"]["context_attachments"][0]["content"],
+        remote_state["messages"][0]["metadata"]["context_attachments"][0]["content"]
+    );
+    provider_server
+        .join()
+        .expect("context parity provider server")
+        .expect("context parity provider responses");
+    let provider_requests = provider_requests
+        .lock()
+        .expect("captured context parity provider requests");
+    assert_eq!(provider_requests.len(), 2);
+    let local_provider_request: Value = serde_json::from_str(&provider_requests[0])?;
+    let remote_provider_request: Value = serde_json::from_str(&provider_requests[1])?;
+    assert_eq!(
+        local_provider_request["input"],
+        remote_provider_request["input"]
+    );
+    assert_eq!(
+        local_provider_request["tools"],
+        remote_provider_request["tools"]
+    );
+    assert_eq!(
+        local_receipt["provider_input_hash"],
+        remote_receipt["provider_input_hash"]
+    );
 
     let _ = server.kill();
     let _ = fs::remove_dir_all(temp);
@@ -3139,6 +3548,36 @@ fn spawn_openagent_server(
             "secret",
         ])
         .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?)
+}
+
+fn spawn_openagent_server_with_provider(
+    port: u16,
+    workspace: &Path,
+    session_root: &Path,
+    provider_url: &str,
+) -> Result<Child, Box<dyn Error>> {
+    let port = port.to_string();
+    Ok(Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--workspace",
+            path_str(workspace),
+            "--session-root",
+            path_str(session_root),
+            "--auth-token",
+            "secret",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", provider_url)
+        .env("OPENAI_WIRE_API", "responses")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?)
@@ -3220,7 +3659,7 @@ fn serve_http_responses_on_free_port(
 fn serve_http_capture_once_on_free_port(
     content_type: &str,
     body: String,
-) -> Result<(u16, MockServer, Arc<Mutex<Vec<String>>>), Box<dyn Error>> {
+) -> Result<(u16, MockServer, CapturedRequests), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -3248,7 +3687,7 @@ fn serve_http_capture_once_on_free_port(
 fn serve_http_capture_responses_on_free_port(
     content_type: &str,
     bodies: Vec<String>,
-) -> Result<(u16, MockServer, Arc<Mutex<Vec<String>>>), Box<dyn Error>> {
+) -> Result<(u16, MockServer, CapturedRequests), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let requests = Arc::new(Mutex::new(Vec::new()));

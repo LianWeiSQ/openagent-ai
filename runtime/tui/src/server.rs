@@ -1,7 +1,8 @@
 use std::{collections::BTreeSet, path::PathBuf, time::Duration};
 
 use openagent_bridge_server_client::{
-    RemoteAuth, RemoteRuntimeClient, event_sequence, events_from_payload, turn_id_from_payload,
+    RemoteAuth, RemoteRuntimeClient, RemoteTurnRequest, event_sequence, events_from_payload,
+    turn_id_from_payload,
 };
 use serde_json::{Map, Value, json};
 
@@ -188,8 +189,7 @@ impl BridgeTerminalHandler {
             .unwrap_or_default();
         let parts = rest.split_whitespace().collect::<Vec<_>>();
         let action = parts.first().copied().unwrap_or("list");
-        let refresh =
-            matches!(action, "doctor" | "refresh") || parts.iter().any(|part| *part == "--refresh");
+        let refresh = matches!(action, "doctor" | "refresh") || parts.contains(&"--refresh");
         match action {
             "" | "list" | "ls" | "doctor" | "refresh" => {
                 let payload = self.client.mcp_status(refresh)?;
@@ -485,7 +485,7 @@ impl TerminalEventHandler for BridgeTerminalHandler {
         let session_id = self.ensure_session()?;
         let mut lines = Vec::new();
         let mut options = self.turn_options();
-        let outbound_prompt = if let Some(command) = prompt
+        let (outbound_prompt, attachments) = if let Some(command) = prompt
             .trim()
             .strip_prefix('!')
             .map(str::trim)
@@ -501,15 +501,16 @@ impl TerminalEventHandler for BridgeTerminalHandler {
                 format!("bash tool queued: {command}"),
                 true,
             ));
-            format!("Run shell command:\n{command}")
+            (format!("Run shell command:\n{command}"), Vec::new())
         } else {
             let expanded = expand_file_attachments(&self.workspace, prompt);
             lines.extend(expanded.lines);
-            expanded.prompt
+            (expanded.prompt, expanded.attachments)
         };
-        let payload = self
-            .client
-            .start_turn(&session_id, &outbound_prompt, options)?;
+        let request = RemoteTurnRequest::new(outbound_prompt)
+            .with_attachments(attachments)
+            .with_options(options);
+        let payload = self.client.start_turn_request(&session_id, &request)?;
         self.last_turn_id = turn_id_from_payload(&payload).or_else(|| self.last_turn_id.clone());
         self.remember_payload_events(&payload);
         Ok(lines)

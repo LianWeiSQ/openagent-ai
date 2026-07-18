@@ -116,18 +116,18 @@ pub(super) fn remote_select_session_with_auth(
         .ok_or_else(|| "server did not return a session id".to_string())
 }
 
-pub(super) fn remote_start_turn(
+pub(super) fn remote_start_turn_request(
     server_url: &str,
     token: Option<&str>,
     session_id: &str,
-    prompt: &str,
+    request: &RemoteTurnRequest,
 ) -> Result<Value, String> {
     http_json(
         "POST",
         server_url,
         &format!("/api/sessions/{session_id}/turns"),
         token,
-        Some(json!({"input": prompt})),
+        Some(request.to_payload()),
     )
 }
 
@@ -137,12 +137,26 @@ pub(super) fn remote_start_turn_with_auth(
     session_id: &str,
     prompt: &str,
 ) -> Result<Value, String> {
+    remote_start_turn_request_with_auth(
+        server_url,
+        auth,
+        session_id,
+        &RemoteTurnRequest::new(prompt),
+    )
+}
+
+pub(super) fn remote_start_turn_request_with_auth(
+    server_url: &str,
+    auth: &RemoteAuth,
+    session_id: &str,
+    request: &RemoteTurnRequest,
+) -> Result<Value, String> {
     http_json_with_auth(
         "POST",
         server_url,
         &format!("/api/sessions/{session_id}/turns"),
         auth,
-        Some(json!({"input": prompt})),
+        Some(request.to_payload()),
     )
 }
 

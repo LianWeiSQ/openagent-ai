@@ -3,6 +3,7 @@
 use std::{collections::BTreeSet, io::Read, path::Path, time::Duration};
 
 use openagent_bridge_server::BridgeEvent;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -195,6 +196,100 @@ impl RemoteAuth {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RemoteTurnAttachment {
+    pub kind: String,
+    pub path: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub content_type: String,
+    pub content: String,
+}
+
+impl RemoteTurnAttachment {
+    #[must_use]
+    pub fn new(
+        kind: impl Into<String>,
+        path: impl Into<String>,
+        name: impl Into<String>,
+        size_bytes: u64,
+        content_type: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            path: path.into(),
+            name: name.into(),
+            size_bytes,
+            content_type: content_type.into(),
+            content: content.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn text_file(path: impl Into<String>, content: impl Into<String>) -> Self {
+        let path = path.into();
+        let content = content.into();
+        let name = Path::new(&path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        Self::new(
+            "file",
+            path,
+            name,
+            content.len() as u64,
+            "text/plain",
+            content,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteTurnRequest {
+    pub input: String,
+    pub attachments: Vec<RemoteTurnAttachment>,
+    pub options: Value,
+}
+
+impl RemoteTurnRequest {
+    #[must_use]
+    pub fn new(input: impl Into<String>) -> Self {
+        Self {
+            input: input.into(),
+            attachments: Vec::new(),
+            options: json!({}),
+        }
+    }
+
+    #[must_use]
+    pub fn with_attachments(mut self, attachments: Vec<RemoteTurnAttachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    #[must_use]
+    pub fn with_options(mut self, options: Value) -> Self {
+        self.options = if options.is_object() {
+            options
+        } else {
+            json!({})
+        };
+        self
+    }
+
+    #[must_use]
+    pub fn to_payload(&self) -> Value {
+        let mut payload = self.options.as_object().cloned().unwrap_or_default();
+        payload.insert("input".to_string(), json!(self.input));
+        if !self.attachments.is_empty() {
+            payload.insert("attachments".to_string(), json!(self.attachments));
+        }
+        Value::Object(payload)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteRuntimeClient {
     server_url: String,
@@ -279,6 +374,34 @@ impl RemoteRuntimeClient {
         self.json("GET", &path, None)
     }
 
+    pub fn session_context(&self, session_id: &str, limit: Option<usize>) -> Result<Value, String> {
+        let path = limit.map_or_else(
+            || format!("/api/sessions/{session_id}/context"),
+            |limit| format!("/api/sessions/{session_id}/context?limit={limit}"),
+        );
+        self.json("GET", &path, None)
+    }
+
+    pub fn replay_session_context(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        step: Option<u64>,
+    ) -> Result<Value, String> {
+        let mut body = json!({});
+        if let Some(run_id) = run_id.filter(|value| !value.trim().is_empty()) {
+            body["run_id"] = json!(run_id);
+        }
+        if let Some(step) = step {
+            body["step"] = json!(step);
+        }
+        self.json(
+            "POST",
+            &format!("/api/sessions/{session_id}/context/replay"),
+            Some(body),
+        )
+    }
+
     pub fn search_sessions(&self, query: &str) -> Result<Vec<Value>, String> {
         let path = if query.trim().is_empty() {
             "/api/sessions".to_string()
@@ -336,16 +459,23 @@ impl RemoteRuntimeClient {
         &self,
         session_id: &str,
         prompt: &str,
-        mut extra: Value,
+        extra: Value,
     ) -> Result<Value, String> {
-        if !extra.is_object() {
-            extra = json!({});
-        }
-        extra["input"] = json!(prompt);
+        self.start_turn_request(
+            session_id,
+            &RemoteTurnRequest::new(prompt).with_options(extra),
+        )
+    }
+
+    pub fn start_turn_request(
+        &self,
+        session_id: &str,
+        request: &RemoteTurnRequest,
+    ) -> Result<Value, String> {
         self.json(
             "POST",
             &format!("/api/sessions/{session_id}/turns"),
-            Some(extra),
+            Some(request.to_payload()),
         )
     }
 
@@ -1179,6 +1309,131 @@ mod tests {
     fn links_to_protocol_crate() {
         assert_eq!(crate_name(), "openagent-bridge-server-client");
         assert_eq!(protocol_crate_name(), "openagent-protocol");
+    }
+
+    #[test]
+    fn structured_turn_request_keeps_context_inputs_separate_from_options() {
+        let request = RemoteTurnRequest::new("Review the attached file.")
+            .with_attachments(vec![RemoteTurnAttachment::text_file(
+                "src/main.rs",
+                "fn main() {}\n",
+            )])
+            .with_options(json!({
+                "model": "gpt-5.5",
+                "thinking": "high",
+                "input": "must not override typed input",
+                "attachments": [{"content": "must not override typed attachments"}],
+            }));
+
+        assert_eq!(
+            request.to_payload(),
+            json!({
+                "input": "Review the attached file.",
+                "attachments": [{
+                    "kind": "file",
+                    "path": "src/main.rs",
+                    "name": "main.rs",
+                    "size_bytes": 13,
+                    "content_type": "text/plain",
+                    "content": "fn main() {}\n",
+                }],
+                "model": "gpt-5.5",
+                "thinking": "high",
+            })
+        );
+    }
+
+    #[test]
+    fn session_context_uses_diagnostics_endpoint() -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let mut request = String::new();
+            let mut buffer = [0_u8; 512];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .map_err(|error| error.to_string())?;
+                if read == 0 {
+                    return Err("client closed before request completed".to_string());
+                }
+                request.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if request.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            if !request.starts_with("GET /api/sessions/session_1/context?limit=5 ") {
+                return Err(format!("unexpected request line: {request}"));
+            }
+            let body = r#"{"schema_version":"openagent.context_diagnostics.v1","status":"ready"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .map_err(|error| error.to_string())?;
+            stream.flush().map_err(|error| error.to_string())
+        });
+
+        let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"));
+        let payload = client.session_context("session_1", Some(5))?;
+        assert_eq!(payload["status"], "ready");
+        let server_result = server
+            .join()
+            .map_err(|_| "server thread panicked".to_string())?;
+        assert!(server_result.is_ok(), "{server_result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn replay_session_context_posts_target_without_side_effect_flags() -> Result<(), Box<dyn Error>>
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let mut request = String::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .map_err(|error| error.to_string())?;
+                if read == 0 {
+                    return Err("client closed before request completed".to_string());
+                }
+                request.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if request.contains("\r\n\r\n") && request.contains(r#""step":3"#) {
+                    break;
+                }
+            }
+            if !request.starts_with("POST /api/sessions/session_1/context/replay ") {
+                return Err(format!("unexpected request line: {request}"));
+            }
+            if !request.contains(r#""run_id":"turn_1""#) {
+                return Err(format!("missing replay run id: {request}"));
+            }
+            let body = r#"{"schema_version":"openagent.context_replay.v1","status":"verified","side_effects":{"provider_calls":0,"tool_calls":0}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .map_err(|error| error.to_string())?;
+            stream.flush().map_err(|error| error.to_string())
+        });
+
+        let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"));
+        let payload = client.replay_session_context("session_1", Some("turn_1"), Some(3))?;
+        assert_eq!(payload["status"], "verified");
+        assert_eq!(payload["side_effects"]["provider_calls"], 0);
+        let server_result = server
+            .join()
+            .map_err(|_| "server thread panicked".to_string())?;
+        assert!(server_result.is_ok(), "{server_result:?}");
+        Ok(())
     }
 
     #[test]

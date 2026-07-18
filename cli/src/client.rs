@@ -25,6 +25,14 @@ pub(super) fn client_command(args: &[String]) -> CliRunResult {
             "--command",
             "--command-dir",
             "--format",
+            "--provider",
+            "--model",
+            "--agent",
+            "--variant",
+            "--permission",
+            "--max-steps",
+            "--max-output-tokens",
+            "--context-window",
         ],
     )
     .join(" ");
@@ -33,10 +41,12 @@ pub(super) fn client_command(args: &[String]) -> CliRunResult {
         Ok(files) => files,
         Err(error) => return err_text(1, error),
     };
-    let prompt = build_prompt_with_files(&message, &files);
-    if prompt.trim().is_empty() {
+    if message.trim().is_empty() {
         return err_text(2, "openagent client requires a prompt");
     }
+    let request = RemoteTurnRequest::new(message)
+        .with_attachments(remote_turn_attachments(&files))
+        .with_options(remote_turn_options_from_args(args));
     let session_id = match remote_select_session(
         &server_url,
         server_token.as_deref(),
@@ -47,11 +57,15 @@ pub(super) fn client_command(args: &[String]) -> CliRunResult {
         Ok(session_id) => session_id,
         Err(error) => return err_text(1, error),
     };
-    let payload =
-        match remote_start_turn(&server_url, server_token.as_deref(), &session_id, &prompt) {
-            Ok(payload) => payload,
-            Err(error) => return err_text(1, error),
-        };
+    let payload = match remote_start_turn_request(
+        &server_url,
+        server_token.as_deref(),
+        &session_id,
+        &request,
+    ) {
+        Ok(payload) => payload,
+        Err(error) => return err_text(1, error),
+    };
     if value_for(args, &["--format"]).as_deref() == Some("json") {
         if let Some(events) = payload.get("events").and_then(Value::as_array) {
             return ok_text(

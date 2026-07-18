@@ -435,14 +435,42 @@ pub(super) fn attached_files(
         .collect()
 }
 
-pub(super) fn build_prompt_with_files(message: &str, files: &[(String, String)]) -> String {
-    let mut prompt = message.trim().to_string();
-    for (path, content) in files {
-        prompt.push_str(&format!(
-            "\n\nAttached file: {path}\n\n```text\n{content}\n```"
-        ));
+pub(super) fn remote_turn_attachments(files: &[(String, String)]) -> Vec<RemoteTurnAttachment> {
+    files
+        .iter()
+        .map(|(path, content)| RemoteTurnAttachment::text_file(path, content))
+        .collect()
+}
+
+pub(super) fn remote_turn_options_from_args(args: &[String]) -> Value {
+    let mut options = Map::new();
+    for (flag, key) in [
+        ("--provider", "provider"),
+        ("--model", "model"),
+        ("--agent", "agent"),
+        ("--variant", "variant"),
+        ("--permission", "permission"),
+    ] {
+        if let Some(value) = value_for(args, &[flag]).filter(|value| !value.trim().is_empty()) {
+            options.insert(key.to_string(), json!(value));
+        }
     }
-    prompt
+    for (flag, key) in [
+        ("--max-steps", "max_steps"),
+        ("--max-output-tokens", "max_output_tokens"),
+        ("--context-window", "context_window"),
+    ] {
+        if let Some(value) = value_for(args, &[flag]).and_then(|value| value.parse::<u64>().ok()) {
+            options.insert(key.to_string(), json!(value));
+        }
+    }
+    if has_flag(args, &["--thinking"]) {
+        options.insert("thinking".to_string(), json!("high"));
+    }
+    if has_flag(args, &["--dangerously-skip-permissions"]) {
+        options.insert("dangerously_skip_permissions".to_string(), json!(true));
+    }
+    Value::Object(options)
 }
 
 pub(super) fn parse_headers(headers: &[String]) -> Map<String, Value> {

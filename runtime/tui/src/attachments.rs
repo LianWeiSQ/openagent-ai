@@ -4,6 +4,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use openagent_bridge_server_client::RemoteTurnAttachment;
 
 use crate::{TerminalEventHandler, TimelineLine, TuiState};
 
@@ -23,6 +24,7 @@ pub struct FilePickerState {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ExpandedPrompt {
     pub(crate) prompt: String,
+    pub(crate) attachments: Vec<RemoteTurnAttachment>,
     pub(crate) lines: Vec<TimelineLine>,
 }
 
@@ -41,10 +43,11 @@ pub(crate) fn expand_file_attachments(workspace: &Path, prompt: &str) -> Expande
     if refs.is_empty() {
         return ExpandedPrompt {
             prompt: prompt.to_string(),
+            attachments: Vec::new(),
             lines: Vec::new(),
         };
     }
-    let mut rendered_prompt = prompt.to_string();
+    let mut attachments = Vec::new();
     let mut lines = Vec::new();
     for reference in refs {
         let Some(path) = resolve_attachment_path(workspace, &reference.query) else {
@@ -57,8 +60,7 @@ pub(crate) fn expand_file_attachments(workspace: &Path, prompt: &str) -> Expande
         };
         match render_attachment(workspace, &path, reference.range) {
             Ok(section) => {
-                rendered_prompt.push_str("\n\n");
-                rendered_prompt.push_str(&section.prompt_section);
+                attachments.push(section.attachment);
                 lines.push(TimelineLine::new(
                     "status",
                     format!("attached {}", section.label),
@@ -69,7 +71,8 @@ pub(crate) fn expand_file_attachments(workspace: &Path, prompt: &str) -> Expande
         }
     }
     ExpandedPrompt {
-        prompt: rendered_prompt,
+        prompt: prompt.to_string(),
+        attachments,
         lines,
     }
 }
@@ -77,7 +80,7 @@ pub(crate) fn expand_file_attachments(workspace: &Path, prompt: &str) -> Expande
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AttachmentSection {
     label: String,
-    prompt_section: String,
+    attachment: RemoteTurnAttachment,
 }
 
 fn parse_file_attachment_ref(token: &str) -> Option<FileAttachmentRef> {
@@ -306,7 +309,16 @@ fn render_attachment(
         let bytes = fs::metadata(path).map_err(|error| error.to_string())?.len();
         return Ok(AttachmentSection {
             label: label.clone(),
-            prompt_section: format!("Attached image: {label}\n\n(binary image, {bytes} bytes)"),
+            attachment: RemoteTurnAttachment::new(
+                "image",
+                label,
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("image"),
+                bytes,
+                image_content_type(path),
+                "",
+            ),
         });
     }
     let mut content = fs::read_to_string(path)
@@ -327,8 +339,34 @@ fn render_attachment(
     }
     Ok(AttachmentSection {
         label: label.clone(),
-        prompt_section: format!("Attached file: {label}\n\n```text\n{content}\n```"),
+        attachment: RemoteTurnAttachment::new(
+            "file",
+            label,
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("attachment"),
+            content.len() as u64,
+            "text/plain",
+            content,
+        ),
     })
+}
+
+fn image_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => "image/png",
+    }
 }
 
 pub(crate) fn is_image_path(path: &Path) -> bool {

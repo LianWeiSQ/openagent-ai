@@ -100,6 +100,18 @@ pub(super) fn run_agent_loop(
         runner_facade = runner_facade.with_question_answers(answers);
     }
     let mut ctx = runner_facade.tool_context();
+    ctx.todos = session
+        .todos
+        .iter()
+        .map(|todo| {
+            openagent_tools::TodoItem::new(
+                todo.content.clone(),
+                todo.status.clone(),
+                todo.priority.clone(),
+                todo.id.clone(),
+            )
+        })
+        .collect();
     if let Some(runtime) = mcp_runtime.as_ref() {
         let _ = store.record_event(
             &session.id,
@@ -191,7 +203,7 @@ pub(super) fn run_agent_loop(
             event_sink,
         );
         let mut assistant =
-            assistant_message_for_provider_step(String::new(), &[tool_call.clone()]);
+            assistant_message_for_provider_step(String::new(), std::slice::from_ref(&tool_call));
         assistant.metadata.insert(
             "message_id".to_string(),
             json!(assistant_message_id.clone()),
@@ -230,6 +242,7 @@ pub(super) fn run_agent_loop(
                 skip_permissions,
             },
         );
+        sync_session_todos(session, &ctx, store, run_id);
         let failed = tool_result.error.is_some();
         emit_run_event(
             &mut events,
@@ -303,12 +316,42 @@ pub(super) fn run_agent_loop(
         let assistant_index = session.messages.len() as u64;
         let assistant_message_id = cli_message_id(assistant_index);
         record_step_started(store, &session.id, run_id, step, None);
-        let provider_messages =
-            super::profile::materialized_provider_messages_for_agent(session, agent_profile);
-        let mut on_provider_stream = |event: &ProviderStreamEvent| {
-            if let ProviderStreamEvent::TextDelta { text } = event
-                && !text.is_empty()
-            {
+        let context_pack =
+            super::context::build_cli_context_pack(super::context::CliContextPackRequest {
+                args,
+                provider,
+                model_id,
+                session,
+                store,
+                run_id,
+                step,
+                tools: &tools,
+                mcp_runtime: mcp_runtime.as_ref(),
+                agent_profile,
+            })
+            .map_err(|message| AgentLoopError {
+                message,
+                events: events.clone(),
+                steps: step,
+                finish_reason: Some("context_pack_error".to_string()),
+                paused: false,
+            })?;
+        if context_pack.budget.overflowed {
+            let code = openagent_core::ContextFailureCode::BudgetExceeded.as_str();
+            return Err(AgentLoopError {
+                message: format!(
+                    "[{code}] required context exceeds model input budget for `{model_id}`: estimated_input_tokens={}, input_limit_tokens={}",
+                    context_pack.estimated_input_tokens,
+                    context_pack.budget.input_limit_tokens.unwrap_or_default(),
+                ),
+                events,
+                steps: step,
+                finish_reason: Some(code.to_string()),
+                paused: false,
+            });
+        }
+        let mut on_provider_stream = |event: &ProviderStreamEvent| match event {
+            ProviderStreamEvent::TextDelta { text } if !text.is_empty() => {
                 let mut params = json!({
                     "delta": text,
                     "session_id": session.id.clone(),
@@ -325,15 +368,56 @@ pub(super) fn run_agent_loop(
                     event_sink,
                 );
             }
+            ProviderStreamEvent::Retry {
+                attempt,
+                max_attempts,
+                delay_ms,
+                model,
+                reason,
+            } => emit_run_event(
+                &mut streamed_events,
+                json!({
+                    "method": "provider/retry",
+                    "params": {
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "delay_ms": delay_ms,
+                        "model": model,
+                        "reason": reason,
+                        "session_id": session.id.clone(),
+                        "run_id": run_id,
+                        "step": step,
+                    }
+                }),
+                event_sink,
+            ),
+            ProviderStreamEvent::Fallback {
+                from_model,
+                to_model,
+                reason,
+            } => emit_run_event(
+                &mut streamed_events,
+                json!({
+                    "method": "provider/fallback",
+                    "params": {
+                        "from_model": from_model,
+                        "to_model": to_model,
+                        "reason": reason,
+                        "session_id": session.id.clone(),
+                        "run_id": run_id,
+                        "step": step,
+                    }
+                }),
+                event_sink,
+            ),
+            _ => {}
         };
         let provider_result = call_provider_for_run(
             args,
             provider,
             model_id,
-            &provider_messages,
-            &tools,
+            &context_pack,
             Some(&mut on_provider_stream),
-            agent_profile,
         )
         .map_err(|message| AgentLoopError {
             message,
@@ -706,6 +790,7 @@ pub(super) fn run_agent_loop(
                     paused: true,
                 });
             }
+            sync_session_todos(session, &ctx, store, run_id);
             emit_run_event(
                 &mut events,
                 runner_facade.tool_call_finished_event(
@@ -1693,6 +1778,7 @@ fn process_pending_resume(
             result
         }
     };
+    sync_session_todos(context.session, context.ctx, context.store, context.run_id);
     append_tool_result_to_session(context, pending.step, &pending.call, result)?;
     context.session.metadata.remove("pending_question");
     context.session.metadata.remove("pending_question_response");
@@ -1785,6 +1871,30 @@ fn emit_run_event(
         emit(&event);
     }
     events.push(event);
+}
+
+fn sync_session_todos(
+    session: &mut Session,
+    ctx: &ToolContext,
+    store: &FileSessionStore,
+    run_id: &str,
+) {
+    let todos = ctx
+        .todos
+        .iter()
+        .map(|todo| {
+            openagent_session::TodoItem::new(
+                todo.content.clone(),
+                todo.status.clone(),
+                todo.priority.clone(),
+                todo.id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if session.todos != todos {
+        session.set_todos(todos);
+        let _ = store.save_state(session, Some(run_id));
+    }
 }
 
 fn create_step_checkpoint(

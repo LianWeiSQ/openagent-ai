@@ -9,9 +9,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use openagent_bridge_server_client::{RemoteTurnAttachment, RemoteTurnRequest};
 use openagent_core::{
-    AgentSystemPromptInput, PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
-    build_agent_system_prompt, permission_rule, skill_document_model_invocable,
+    ContextAttachment, ContextAttachmentKind, ContextCheckpoint, ContextItem, ContextPack,
+    ContextPackBuilder, ContextPackInput, ContextSystemDiagnostics, ContextSystemSources,
+    ContextTodo, ContextWorkState, PermissionManager, SkillDocument, SkillRegistry,
+    SkillRegistryOptions, context_pack_build_options_for_model, materialize_context_history,
+    permission_rule, skill_document_model_invocable, tool_manifest_context_item,
 };
 use openagent_mcp::{
     McpTransport, RemoteMcpManager, RemoteMcpToolDescriptor, bridge_tool_output,
@@ -24,9 +28,10 @@ use openagent_provider::{
     AnthropicLanguageModelConfig, OpenAiLanguageModelConfig, ProviderStreamEvent, anthropic_model,
     build_anthropic_payload, build_openai_chat_payload, build_openai_responses_payload,
     default_env_mapping, normalize_anthropic_events, normalize_openai_chat_sse_chunks,
-    normalize_openai_responses_response, normalize_provider, openai_compatible_model,
-    parse_tool_arguments, provider_auth_methods, provider_default_base_url, provider_default_model,
-    provider_label, provider_requires_api_key, summarize_http_error_body,
+    normalize_openai_responses_response, normalize_provider, openagent_context_model,
+    openai_compatible_model, parse_tool_arguments, provider_auth_methods,
+    provider_default_base_url, provider_default_model, provider_label, provider_requires_api_key,
+    summarize_http_error_body,
 };
 use openagent_session::{
     FileSessionStore, Session, SessionEventOptions, SessionForkBoundary, SessionPartOptions,
@@ -34,8 +39,8 @@ use openagent_session::{
 };
 use openagent_tools::{
     SkillPermissionRule, TASK_TOOL_ID, TaskPermissionRule, TaskSubagentDescriptor, ToolContext,
-    Toolkit, fork_skill_task_from_input, parse_agent_profile_schema, register_task_tool,
-    skill_is_visible, task_subagent_is_visible,
+    Toolkit, builtin_agent_profile_specs, fork_skill_task_from_input, parse_agent_profile_schema,
+    register_task_tool, skill_is_visible, task_subagent_is_visible,
 };
 use serde_json::{Map, Value, json};
 
@@ -78,8 +83,8 @@ use models::{models_cache_path, models_command};
 use prompt::{run_prompt_command, run_prompt_command_with_events, split_answer_items};
 use remote::{
     attach_command, http_runtime_command, remote_auth_from_args, remote_events_for_payload,
-    remote_select_session, remote_select_session_with_auth, remote_start_turn,
-    remote_start_turn_with_auth, terminal_command, text_from_bridge_events, tui_command,
+    remote_select_session, remote_select_session_with_auth, remote_start_turn_request,
+    remote_start_turn_request_with_auth, terminal_command, text_from_bridge_events, tui_command,
 };
 use sessions::{
     latest_session_id, session_command, session_export, session_import, session_list, share_session,

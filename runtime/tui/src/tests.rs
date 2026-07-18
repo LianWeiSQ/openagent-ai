@@ -963,10 +963,19 @@ fn composer_expands_file_line_ranges_and_image_attachments() {
 
     let expanded = expand_file_attachments(&root, "review @main.rs:2-3 and @logo.png");
 
-    assert!(expanded.prompt.contains("Attached file: src/main.rs:2-3"));
-    assert!(expanded.prompt.contains("line2\nline3"));
-    assert!(!expanded.prompt.contains("line1\n"));
-    assert!(expanded.prompt.contains("Attached image: logo.png"));
+    assert_eq!(
+        expanded.prompt, "review @main.rs:2-3 and @logo.png",
+        "the user message must not be rewritten with attachment content"
+    );
+    assert_eq!(expanded.attachments.len(), 2);
+    assert_eq!(expanded.attachments[0].kind, "file");
+    assert_eq!(expanded.attachments[0].path, "src/main.rs:2-3");
+    assert_eq!(expanded.attachments[0].content, "line2\nline3");
+    assert!(!expanded.attachments[0].content.contains("line1\n"));
+    assert_eq!(expanded.attachments[1].kind, "image");
+    assert_eq!(expanded.attachments[1].path, "logo.png");
+    assert_eq!(expanded.attachments[1].content_type, "image/png");
+    assert!(expanded.attachments[1].content.is_empty());
     assert_eq!(expanded.lines.len(), 2);
 
     let _ = fs::remove_dir_all(root);
@@ -1994,7 +2003,7 @@ fn bridge_terminal_keyflow_smoke_uses_real_remote_handler() -> Result<(), Box<dy
             .any(|line| line.text.contains("created session: session_smoke"))
     );
 
-    send_key_text("hello bridge", &mut state, &mut handler)?;
+    state.input_buffer = "hello bridge @notes.txt".to_string();
     press_key(KeyCode::Enter, &mut state, &mut handler)?;
     assert_eq!(state.session_id.as_deref(), Some("session_smoke"));
     assert_eq!(state.current_turn_id.as_deref(), Some("turn_smoke"));
@@ -2044,7 +2053,22 @@ fn bridge_terminal_keyflow_smoke_uses_real_remote_handler() -> Result<(), Box<dy
         bridge
             .turn_inputs()
             .iter()
-            .any(|input| input == "hello bridge")
+            .any(|input| input == "hello bridge @notes.txt")
+    );
+    let turn_payloads = bridge.turn_payloads();
+    let turn_payload = turn_payloads.last().expect("turn payload");
+    assert_eq!(turn_payload["input"], "hello bridge @notes.txt");
+    assert_eq!(turn_payload["attachments"][0]["kind"], "file");
+    assert_eq!(turn_payload["attachments"][0]["path"], "notes.txt");
+    assert_eq!(
+        turn_payload["attachments"][0]["content"],
+        "hello from workspace\n"
+    );
+    assert!(
+        turn_payload["input"]
+            .as_str()
+            .is_some_and(|input| !input.contains("Attached file:")),
+        "TUI must use the same structured attachment boundary as Desktop"
     );
 
     bridge.stop();
@@ -3048,6 +3072,7 @@ fn timeline_text(state: &TuiState) -> String {
 struct FakeBridgeState {
     requests: Vec<String>,
     turn_inputs: Vec<String>,
+    turn_payloads: Vec<Value>,
     approval_payloads: Vec<Value>,
     question_payloads: Vec<Value>,
     model_update_payloads: Vec<Value>,
@@ -3103,6 +3128,14 @@ impl FakeBridgeServer {
 
     fn turn_inputs(&self) -> Vec<String> {
         self.state.lock().expect("bridge state").turn_inputs.clone()
+    }
+
+    fn turn_payloads(&self) -> Vec<Value> {
+        self.state
+            .lock()
+            .expect("bridge state")
+            .turn_payloads
+            .clone()
     }
 
     fn approval_payloads(&self) -> Vec<Value> {
@@ -3398,16 +3431,16 @@ fn handle_fake_bridge_connection(
             }),
         ),
         ("POST", "/api/sessions/session_smoke/turns") => {
-            let input = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("input")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
-                .unwrap_or_default();
-            state.lock().expect("bridge state").turn_inputs.push(input);
+            let payload = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({}));
+            let input = payload
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut state = state.lock().expect("bridge state");
+            state.turn_inputs.push(input);
+            state.turn_payloads.push(payload);
+            drop(state);
             write_json(
                 &mut stream,
                 json!({

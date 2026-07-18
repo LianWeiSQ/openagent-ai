@@ -1,12 +1,14 @@
 use super::*;
 
 mod agent_loop;
+mod context;
 mod mcp_runtime;
 mod profile;
 mod provider;
 mod tool;
 
 use agent_loop::{AgentLoopRequest, pending_resume_from_session, run_agent_loop};
+use context::context_attachments_from_files;
 use mcp_runtime::{McpRuntime, execute_mcp_tool, load_mcp_runtime};
 pub(crate) use openagent_mcp::discover_mcp_server_tools;
 use openagent_tools::SessionRunnerFacade;
@@ -76,13 +78,8 @@ pub(super) fn run_prompt_command_with_events(
     let mut session = run_selection.session;
     let store = run_selection.store;
     let pending_resume = pending_resume_from_session(&session);
-    let (message, prompt, has_user_prompt) = match build_run_prompt(
-        args,
-        &workspace,
-        agent_profile.as_ref(),
-        pending_resume.is_some(),
-    ) {
-        Ok(prompt) => prompt,
+    let prompt_parts = match build_run_prompt_parts(args, &workspace, pending_resume.is_some()) {
+        Ok(parts) => parts,
         Err(error) => {
             return err_text(
                 if error.contains("requires a prompt") {
@@ -94,6 +91,10 @@ pub(super) fn run_prompt_command_with_events(
             );
         }
     };
+    let message = prompt_parts.message;
+    let prompt = prompt_parts.prompt;
+    let files = prompt_parts.files;
+    let has_user_prompt = prompt_parts.has_user_prompt;
     let run_id = new_cli_id("run");
     let trace_id = new_cli_id("trace");
     session.status = SessionStatus::Running;
@@ -151,7 +152,28 @@ pub(super) fn run_prompt_command_with_events(
         return err_text(1, format!("failed to start session run: {error}"));
     }
     if has_user_prompt {
-        let user_message = chat_message(Role::User, prompt.clone());
+        let mut user_message = chat_message(Role::User, prompt.clone());
+        let attachments = context_attachments_from_files(&files);
+        if !attachments.is_empty() {
+            user_message.metadata.insert(
+                "display_content".to_string(),
+                json!(prompt.trim().to_string()),
+            );
+            user_message.metadata.insert(
+                "context_attachments".to_string(),
+                Value::Array(
+                    attachments
+                        .iter()
+                        .map(|attachment| {
+                            serde_json::to_value(attachment).unwrap_or_else(|_| json!({}))
+                        })
+                        .collect(),
+                ),
+            );
+            user_message
+                .metadata
+                .insert("attachment_count".to_string(), json!(attachments.len()));
+        }
         let user_index = session.messages.len() as u64;
         session.add(user_message.clone());
         if let Err(error) = store.append_message(&session, &user_message, &run_id, user_index) {
@@ -312,8 +334,10 @@ fn run_attached_command(
     let format = value_for(args, &["--format"]).unwrap_or_else(|| "text".to_string());
     let auth = remote_auth_from_args(args);
     let workspace = workspace_from_args(args);
-    let (_, prompt, _) = match build_run_prompt(args, &workspace, None, false) {
-        Ok(prompt) => prompt,
+    let request = match build_run_prompt_parts(args, &workspace, false) {
+        Ok(parts) => RemoteTurnRequest::new(parts.prompt)
+            .with_attachments(remote_turn_attachments(&parts.files))
+            .with_options(remote_turn_options_from_args(args)),
         Err(error) => {
             return err_text(
                 if error.contains("requires a prompt") {
@@ -336,10 +360,11 @@ fn run_attached_command(
         Ok(session_id) => session_id,
         Err(error) => return err_text(1, error),
     };
-    let payload = match remote_start_turn_with_auth(server_url, &auth, &session_id, &prompt) {
-        Ok(payload) => payload,
-        Err(error) => return err_text(1, error),
-    };
+    let payload =
+        match remote_start_turn_request_with_auth(server_url, &auth, &session_id, &request) {
+            Ok(payload) => payload,
+            Err(error) => return err_text(1, error),
+        };
     let events = match remote_events_for_payload(server_url, &auth, &payload) {
         Ok(events) => events,
         Err(error) => return err_text(1, error),
@@ -389,12 +414,18 @@ fn read_piped_stdin() -> String {
     input
 }
 
-fn build_run_prompt(
+struct RunPromptParts {
+    message: String,
+    prompt: String,
+    files: Vec<(String, String)>,
+    has_user_prompt: bool,
+}
+
+fn build_run_prompt_parts(
     args: &[String],
     workspace: &Path,
-    _agent_profile: Option<&RunAgentProfile>,
     allow_empty_resume: bool,
-) -> Result<(String, String, bool), String> {
+) -> Result<RunPromptParts, String> {
     let message_args = positional_args(args, RUN_POSITIONAL_VALUE_FLAGS);
     let message = message_args.join(" ");
     let stdin_text = read_piped_stdin();
@@ -407,7 +438,12 @@ fn build_run_prompt(
     };
     if message.trim().is_empty() {
         if allow_empty_resume {
-            return Ok((String::new(), String::new(), false));
+            return Ok(RunPromptParts {
+                message: String::new(),
+                prompt: String::new(),
+                files: Vec::new(),
+                has_user_prompt: false,
+            });
         }
         return Err("openagent run requires a prompt or piped stdin".to_string());
     }
@@ -421,12 +457,16 @@ fn build_run_prompt(
             .into_iter()
             .find(|item| item.name == command_name)
             .ok_or_else(|| format!("Command not found: {command_name}"))?;
-        let rendered = render_custom_template(&command.template, &command_args, workspace);
-        build_prompt_with_files(&rendered, &files)
+        render_custom_template(&command.template, &command_args, workspace)
     } else {
-        build_prompt_with_files(&message, &files)
+        message.clone()
     };
-    Ok((message, prompt, true))
+    Ok(RunPromptParts {
+        message,
+        prompt,
+        files,
+        has_user_prompt: true,
+    })
 }
 
 fn err_json_events(
