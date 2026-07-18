@@ -28,6 +28,7 @@ rust-version = "1.85"
 openagent-bridge-server = { path = "runtime/bridge-server" }
 openagent-bridge-server-client = { path = "runtime/bridge-server-client" }
 openagent-core = { path = "src" }
+openagent-eval = { path = "eval" }
 openagent-lsp = { path = "src/lsp" }
 openagent-mcp = { path = "src/mcp" }
 openagent-protocol = { path = "src/protocol" }

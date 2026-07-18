@@ -204,6 +204,35 @@ pub fn openai_compatible_model(provider_id: &str, model_id: &str) -> Model {
 }
 
 #[must_use]
+pub fn openagent_text_model_supported(model_id: &str) -> bool {
+    matches!(
+        model_id,
+        "gpt-5.4" | "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
+}
+
+#[must_use]
+pub fn openagent_context_model(
+    provider_id: &str,
+    model_id: &str,
+    context_window: Option<u64>,
+    max_output: Option<u64>,
+) -> Model {
+    let mut model = openai_compatible_model(provider_id, model_id);
+    model.context_window = context_window.unwrap_or_else(|| {
+        if openagent_text_model_supported(model_id) {
+            128_000
+        } else {
+            model.context_window
+        }
+    });
+    if let Some(max_output) = max_output {
+        model.max_output = max_output;
+    }
+    model
+}
+
+#[must_use]
 pub fn anthropic_model(model_id: &str, context_window: u64, max_output: u64) -> Model {
     Model {
         id: model_id.to_string(),

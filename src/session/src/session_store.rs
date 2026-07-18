@@ -602,6 +602,7 @@ impl FileSessionStore {
             );
         }
         let mut metadata = message.metadata.clone();
+        metadata.remove("context_attachments");
         if let Some(name) = &message.name {
             metadata.insert("name".to_string(), json!(name));
         }
@@ -1072,6 +1073,7 @@ impl FileSessionStore {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_checkpoint(
         &self,
         session_id: &str,
@@ -1146,6 +1148,23 @@ impl FileSessionStore {
             .join("checkpoint.json");
         let value = fs::read_to_string(&path)?;
         serde_json::from_str::<SessionCheckpointRecord>(&value).map_err(Into::into)
+    }
+
+    pub fn list_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Vec<SessionCheckpointRecord>> {
+        let mut checkpoints = read_jsonl(&self.checkpoints_index_path(session_id))?
+            .into_iter()
+            .filter_map(|value| serde_json::from_value::<SessionCheckpointRecord>(value).ok())
+            .collect::<Vec<_>>();
+        checkpoints.sort_by(|left, right| {
+            right
+                .timestamp_ms
+                .cmp(&left.timestamp_ms)
+                .then_with(|| right.checkpoint_id.cmp(&left.checkpoint_id))
+        });
+        Ok(checkpoints)
     }
 
     pub fn diff_checkpoints(
@@ -1282,15 +1301,31 @@ impl FileSessionStore {
         summary: &str,
         compacted_until_message_id: &str,
     ) -> SessionResult<String> {
+        self.append_compaction_boundary_with_metadata(
+            session,
+            run_id,
+            summary,
+            compacted_until_message_id,
+            BTreeMap::new(),
+        )
+    }
+
+    pub fn append_compaction_boundary_with_metadata(
+        &self,
+        session: &mut Session,
+        run_id: &str,
+        summary: &str,
+        compacted_until_message_id: &str,
+        boundary_metadata: BTreeMap<String, Value>,
+    ) -> SessionResult<String> {
         let message_id = format!("msg_compaction_{}", now_ms());
         let index = session.messages.len() as u64;
-        let mut metadata = BTreeMap::from([
-            ("message_id".to_string(), json!(message_id.clone())),
-            (
-                "compacted_until_message_id".to_string(),
-                json!(compacted_until_message_id),
-            ),
-        ]);
+        let mut metadata = boundary_metadata.clone();
+        metadata.insert("message_id".to_string(), json!(message_id.clone()));
+        metadata.insert(
+            "compacted_until_message_id".to_string(),
+            json!(compacted_until_message_id),
+        );
         metadata.insert("kind".to_string(), json!("compaction_boundary"));
         let info = MessageInfo {
             id: message_id.clone(),
@@ -1304,7 +1339,7 @@ impl FileSessionStore {
             run_id: Some(run_id.to_string()),
             step_index: None,
             status: MessageStatus::Completed,
-            metadata,
+            metadata: metadata.clone(),
         };
         append_jsonl(
             &self.transcript_path(&session.id),
@@ -1342,11 +1377,9 @@ impl FileSessionStore {
                 content: json!({
                     "summary": summary,
                     "compacted_until_message_id": compacted_until_message_id,
+                    "metadata": boundary_metadata,
                 }),
-                attributes: BTreeMap::from([(
-                    "compacted_until_message_id".to_string(),
-                    json!(compacted_until_message_id),
-                )]),
+                attributes: metadata.clone(),
                 timestamp_ms: now_ms(),
                 run_id: Some(run_id.to_string()),
                 step_index: None,
@@ -1366,20 +1399,23 @@ impl FileSessionStore {
                 ),
             ]),
         });
+        if let Some(message) = session.messages.last_mut() {
+            message.metadata.extend(boundary_metadata.clone());
+        }
+        let mut event_attributes = boundary_metadata;
+        event_attributes.insert("message_id".to_string(), json!(message_id.clone()));
+        event_attributes.insert(
+            "compacted_until_message_id".to_string(),
+            json!(compacted_until_message_id),
+        );
+        event_attributes.insert("summary_chars".to_string(), json!(summary.chars().count()));
         let _ = self.record_event(
             &session.id,
             run_id,
             "compaction.boundary",
             SessionEventOptions {
                 kind: "compaction".to_string(),
-                attributes: BTreeMap::from([
-                    ("message_id".to_string(), json!(message_id.clone())),
-                    (
-                        "compacted_until_message_id".to_string(),
-                        json!(compacted_until_message_id),
-                    ),
-                    ("summary_chars".to_string(), json!(summary.chars().count())),
-                ]),
+                attributes: event_attributes,
                 ..SessionEventOptions::default()
             },
         );
@@ -3085,6 +3121,38 @@ fn message_parts_from_chat_message(
             step_index: step_index_from_metadata(&message.metadata),
         });
         seq += 1;
+    }
+    if let Some(attachments) = message
+        .metadata
+        .get("context_attachments")
+        .and_then(Value::as_array)
+    {
+        for attachment in attachments {
+            let attributes = attachment
+                .as_object()
+                .map(|object| {
+                    object
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != "content")
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            parts.push(MessagePart {
+                id: stable_part_id(message_id, seq, "file"),
+                message_id: message_id.to_string(),
+                session_id: session_id.to_string(),
+                seq,
+                kind: MessagePartKind::File,
+                status: MessageStatus::Completed,
+                content: attachment.clone(),
+                attributes,
+                timestamp_ms,
+                run_id: (!run_id.is_empty()).then(|| run_id.to_string()),
+                step_index: step_index_from_metadata(&message.metadata),
+            });
+            seq += 1;
+        }
     }
     if message.role == Role::Assistant
         && let Some(tool_calls) = message.metadata.get("tool_calls").and_then(Value::as_array)

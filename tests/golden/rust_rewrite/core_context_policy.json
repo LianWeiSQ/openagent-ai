@@ -44,8 +44,28 @@
     }
   },
   "context_pack": {
+    "budget": {
+      "context_window": 200,
+      "enabled": true,
+      "fixed_overhead_tokens": 9,
+      "input_limit_tokens": 150,
+      "item_budget_tokens": 141,
+      "model_id": "fixture-model",
+      "overflowed": false,
+      "reserved_output_tokens": 50,
+      "selected_item_tokens": 141
+    },
     "estimate_text_tokens": 2,
-    "estimated_input_tokens": 54,
+    "estimated_input_tokens": 150,
+    "stable_prefix": {
+      "cache_eligible": true,
+      "hash": "sha1:fd39c84172b985b0da978a4c40230957a01cda6c",
+      "item_count": 1,
+      "message_count": 1,
+      "schema_version": "openagent.context_stable_prefix.v1",
+      "token_estimate": 49,
+      "tool_manifest_count": 0
+    },
     "items": [
       {
         "content": "[Runtime]\nGoal 6 fixture",
@@ -58,7 +78,83 @@
         "priority": 90,
         "source": "runtime",
         "stable_prefix": false,
-        "token_estimate": 6
+        "token_estimate": 15
+      },
+      {
+        "content": "[Sandbox context]\n{\"mode\": \"opensandbox\", \"remote_workdir\": \"/workspace/project\", \"sandbox_id\": \"sbx_fixture\"}",
+        "id": "sandbox:execution",
+        "kind": "sandbox",
+        "metadata": {
+          "mode": "opensandbox",
+          "remote_workdir": "/workspace/project",
+          "sandbox_id": "sbx_fixture"
+        },
+        "pinned": true,
+        "priority": 85,
+        "source": "session.metadata.execution",
+        "stable_prefix": true,
+        "token_estimate": 40
+      },
+      {
+        "content": "old request",
+        "id": "message:user:0",
+        "kind": "message",
+        "metadata": {
+          "name": null,
+          "role": "user",
+          "tool_call_id": null
+        },
+        "pinned": false,
+        "priority": 40,
+        "source": "session.messages[0]",
+        "stable_prefix": false,
+        "token_estimate": 11
+      },
+      {
+        "content": "grep preview",
+        "id": "tool_result:call-grep",
+        "kind": "tool_result",
+        "metadata": {
+          "name": "grep",
+          "role": "tool",
+          "tool_call_id": "call-grep"
+        },
+        "pinned": false,
+        "priority": 50,
+        "source": "session.messages[1]",
+        "stable_prefix": false,
+        "token_estimate": 19
+      },
+      {
+        "content": "[Todo id=todo-context status=in_progress priority=high]\nport context",
+        "id": "todo:todo-context",
+        "kind": "todo",
+        "metadata": {
+          "active": true,
+          "priority": "high",
+          "status": "in_progress",
+          "todo_id": "todo-context"
+        },
+        "pinned": true,
+        "priority": 80,
+        "source": "session.todos:todo-context",
+        "stable_prefix": false,
+        "token_estimate": 26
+      },
+      {
+        "content": "new request",
+        "id": "message:user:2",
+        "kind": "message",
+        "metadata": {
+          "name": null,
+          "role": "user",
+          "tool_call_id": null
+        },
+        "pinned": true,
+        "priority": 90,
+        "source": "session.messages[2]",
+        "stable_prefix": false,
+        "token_estimate": 11
       },
       {
         "content": "[Structured work state]\nTask:\nContinue Rust rewrite\n\nNext steps:\n- Port context",
@@ -74,80 +170,7 @@
         "priority": 95,
         "source": "session.metadata.context_compaction",
         "stable_prefix": false,
-        "token_estimate": 20
-      },
-      {
-        "content": "[Sandbox context]\n{\"mode\": \"opensandbox\", \"remote_workdir\": \"/workspace/project\", \"sandbox_id\": \"sbx_fixture\"}",
-        "id": "sandbox:execution",
-        "kind": "sandbox",
-        "metadata": {
-          "mode": "opensandbox",
-          "remote_workdir": "/workspace/project",
-          "sandbox_id": "sbx_fixture"
-        },
-        "pinned": true,
-        "priority": 85,
-        "source": "session.metadata.execution",
-        "stable_prefix": true,
-        "token_estimate": 28
-      },
-      {
-        "content": "[Todos]\n- (in_progress/high) port context",
-        "id": "todo:session",
-        "kind": "todo",
-        "metadata": {
-          "count": 1
-        },
-        "pinned": false,
-        "priority": 80,
-        "source": "session.todos",
-        "stable_prefix": false,
-        "token_estimate": 11
-      },
-      {
-        "content": "old request",
-        "id": "message:user:0",
-        "kind": "message",
-        "metadata": {
-          "name": null,
-          "role": "user",
-          "tool_call_id": null
-        },
-        "pinned": false,
-        "priority": 40,
-        "source": "session.messages[0]",
-        "stable_prefix": false,
-        "token_estimate": 3
-      },
-      {
-        "content": "grep preview",
-        "id": "tool_result:call-grep",
-        "kind": "tool_result",
-        "metadata": {
-          "name": "grep",
-          "role": "tool",
-          "tool_call_id": "call-grep"
-        },
-        "pinned": false,
-        "priority": 50,
-        "source": "session.messages[1]",
-        "stable_prefix": false,
-        "token_estimate": 3
-      },
-      {
-        "content": "new request",
-        "id": "message:user:2",
-        "kind": "message",
-        "metadata": {
-          "name": null,
-          "role": "user",
-          "tool_call_id": null
-        },
-        "pinned": false,
-        "priority": 40,
-        "source": "session.messages[2]",
-        "stable_prefix": false,
-        "token_estimate": 3
+        "token_estimate": 30
       },
       {
         "content": "high",
@@ -158,7 +181,7 @@
         "priority": 9,
         "source": "fixture",
         "stable_prefix": false,
-        "token_estimate": 1
+        "token_estimate": 10
       }
     ],
     "trace": [
@@ -171,18 +194,7 @@
         "priority": 90,
         "source": "runtime",
         "stable_prefix": false,
-        "token_estimate": 6
-      },
-      {
-        "drop_reason": null,
-        "included": true,
-        "item_id": "work_state:context_compaction",
-        "kind": "work_state",
-        "pinned": true,
-        "priority": 95,
-        "source": "session.metadata.context_compaction",
-        "stable_prefix": false,
-        "token_estimate": 20
+        "token_estimate": 15
       },
       {
         "drop_reason": null,
@@ -193,21 +205,10 @@
         "priority": 85,
         "source": "session.metadata.execution",
         "stable_prefix": true,
-        "token_estimate": 28
+        "token_estimate": 40
       },
       {
-        "drop_reason": "budget",
-        "included": false,
-        "item_id": "todo:session",
-        "kind": "todo",
-        "pinned": false,
-        "priority": 80,
-        "source": "session.todos",
-        "stable_prefix": false,
-        "token_estimate": 11
-      },
-      {
-        "drop_reason": "budget",
+        "drop_reason": "model_context_budget",
         "included": false,
         "item_id": "message:user:0",
         "kind": "message",
@@ -215,32 +216,54 @@
         "priority": 40,
         "source": "session.messages[0]",
         "stable_prefix": false,
-        "token_estimate": 3
+        "token_estimate": 11
       },
       {
-        "drop_reason": "budget",
-        "included": false,
+        "drop_reason": null,
+        "included": true,
         "item_id": "tool_result:call-grep",
         "kind": "tool_result",
         "pinned": false,
         "priority": 50,
         "source": "session.messages[1]",
         "stable_prefix": false,
-        "token_estimate": 3
+        "token_estimate": 19
       },
       {
-        "drop_reason": "budget",
-        "included": false,
+        "drop_reason": null,
+        "included": true,
+        "item_id": "todo:todo-context",
+        "kind": "todo",
+        "pinned": true,
+        "priority": 80,
+        "source": "session.todos:todo-context",
+        "stable_prefix": false,
+        "token_estimate": 26
+      },
+      {
+        "drop_reason": null,
+        "included": true,
         "item_id": "message:user:2",
         "kind": "message",
-        "pinned": false,
-        "priority": 40,
+        "pinned": true,
+        "priority": 90,
         "source": "session.messages[2]",
         "stable_prefix": false,
-        "token_estimate": 3
+        "token_estimate": 11
       },
       {
-        "drop_reason": "budget",
+        "drop_reason": null,
+        "included": true,
+        "item_id": "work_state:context_compaction",
+        "kind": "work_state",
+        "pinned": true,
+        "priority": 95,
+        "source": "session.metadata.context_compaction",
+        "stable_prefix": false,
+        "token_estimate": 30
+      },
+      {
+        "drop_reason": "model_context_budget",
         "included": false,
         "item_id": "diag",
         "kind": "diagnostic",
@@ -248,7 +271,7 @@
         "priority": 9,
         "source": "fixture",
         "stable_prefix": false,
-        "token_estimate": 1
+        "token_estimate": 10
       }
     ]
   },

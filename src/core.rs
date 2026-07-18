@@ -35,6 +35,29 @@ pub const DEFAULT_COMPACT_REFRESH_MIN_NEW_MESSAGES: u64 = 6;
 pub const DEFAULT_OVERFLOW_KEEP_RECENT_USER_TURNS: u64 = 2;
 pub const DEFAULT_COMPACTION_MODE: &str = "structured_work_state";
 
+pub const CONTEXT_PACK_SCHEMA_VERSION: &str = "openagent.context_pack.v1";
+pub const CONTEXT_PACK_RECEIPT_SCHEMA_VERSION: &str = "openagent.context_pack_receipt.v1";
+pub const CONTEXT_STABLE_PREFIX_SCHEMA_VERSION: &str = "openagent.context_stable_prefix.v1";
+pub const CONTEXT_FAILURE_SCHEMA_VERSION: &str = "openagent.context_failure.v1";
+pub const CONTEXT_PERFORMANCE_SCHEMA_VERSION: &str = "openagent.context_performance.v1";
+pub const CONTEXT_SYSTEM_DIAGNOSTICS_SCHEMA_VERSION: &str =
+    "openagent.context_system_diagnostics.v1";
+pub const CONTEXT_BUILD_WARN_US: u64 = 250_000;
+pub const CONTEXT_PROVIDER_PAYLOAD_SERIALIZE_WARN_US: u64 = 100_000;
+pub const CONTEXT_PROVIDER_PAYLOAD_WARN_BYTES: u64 = 16 * 1024 * 1024;
+pub const CONTEXT_PRIORITY_INSTRUCTION: i64 = 100;
+pub const CONTEXT_PRIORITY_SKILL_PRELOADED: i64 = 98;
+pub const CONTEXT_PRIORITY_WORK_STATE: i64 = 95;
+pub const CONTEXT_PRIORITY_RUNTIME: i64 = 90;
+pub const CONTEXT_PRIORITY_SANDBOX: i64 = 85;
+pub const CONTEXT_PRIORITY_TODO: i64 = 80;
+pub const CONTEXT_PRIORITY_ATTACHMENT: i64 = 75;
+pub const CONTEXT_PRIORITY_SKILL_CATALOG: i64 = 70;
+pub const CONTEXT_PRIORITY_CHECKPOINT: i64 = 65;
+pub const CONTEXT_PRIORITY_TOOL_MANIFEST: i64 = 60;
+pub const CONTEXT_PRIORITY_TOOL_RESULT: i64 = 50;
+pub const CONTEXT_PRIORITY_MESSAGE: i64 = 40;
+
 pub const DEFAULT_MAX_FILE_BYTES: usize = 16 * 1024;
 pub const DEFAULT_MAX_TOTAL_BYTES: usize = 48 * 1024;
 pub const DEFAULT_WORKSPACE_FILES: &[&str] = &["OPENAGENT.md", "AGENTS.md", "CLAUDE.md"];
@@ -43,6 +66,129 @@ pub const DEFAULT_USER_FILES: &[&str] = &["OPENAGENT.md", "instructions.md"];
 const SUPPORTED_STRATEGIES: &[&str] = &["auto", "error", "compact"];
 const SUPPORTED_COUNTING: &[&str] = &["auto", "tiktoken", "heuristic"];
 const SUPPORTED_COMPACTION_MODES: &[&str] = &["structured_work_state"];
+const REQUIRED_CONTEXT_HARD_MINIMUM_BYTES: usize = 96;
+const REQUIRED_CONTEXT_TRUNCATION_REASON: &str = "required_context_budget";
+const REQUIRED_CONTEXT_TRUNCATION_MARKER: &str =
+    "\n[... context truncated to fit model budget ...]\n";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextFailureCode {
+    Unavailable,
+    ReceiptCorrupt,
+    BudgetExceeded,
+    SourceDrift,
+    ReplayUnsupported,
+}
+
+impl ContextFailureCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "context_unavailable",
+            Self::ReceiptCorrupt => "context_receipt_corrupt",
+            Self::BudgetExceeded => "context_budget_exceeded",
+            Self::SourceDrift => "context_source_drift",
+            Self::ReplayUnsupported => "context_replay_unsupported",
+        }
+    }
+
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::Unavailable | Self::ReceiptCorrupt)
+    }
+
+    #[must_use]
+    pub const fn recoverable(self) -> bool {
+        !matches!(self, Self::ReplayUnsupported)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextFailure {
+    pub schema_version: String,
+    pub code: String,
+    pub stage: String,
+    pub message: String,
+    pub retryable: bool,
+    pub recoverable: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub details: BTreeMap<String, Value>,
+}
+
+impl ContextFailure {
+    #[must_use]
+    pub fn new(
+        code: ContextFailureCode,
+        stage: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: CONTEXT_FAILURE_SCHEMA_VERSION.to_string(),
+            code: code.as_str().to_string(),
+            stage: stage.into(),
+            message: message.into(),
+            retryable: code.retryable(),
+            recoverable: code.recoverable(),
+            details: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_details(mut self, details: BTreeMap<String, Value>) -> Self {
+        self.details = details;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ContextPackPerformance {
+    pub schema_version: String,
+    pub materialize_us: u64,
+    pub build_us: u64,
+    pub persist_us: u64,
+    pub provider_payload_build_us: u64,
+    pub provider_payload_serialize_us: u64,
+    pub provider_payload_bytes: u64,
+    pub source_message_count: u64,
+    pub tool_count: u64,
+    pub item_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warning_codes: Vec<String>,
+}
+
+impl ContextPackPerformance {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            schema_version: CONTEXT_PERFORMANCE_SCHEMA_VERSION.to_string(),
+            ..Self::default()
+        }
+    }
+
+    pub fn refresh_warnings(&mut self) {
+        let mut warnings = Vec::new();
+        if self.build_us > CONTEXT_BUILD_WARN_US {
+            warnings.push("context_build_slow".to_string());
+        }
+        if self.provider_payload_serialize_us > CONTEXT_PROVIDER_PAYLOAD_SERIALIZE_WARN_US {
+            warnings.push("provider_payload_serialize_slow".to_string());
+        }
+        if self.provider_payload_bytes > CONTEXT_PROVIDER_PAYLOAD_WARN_BYTES {
+            warnings.push("provider_payload_large".to_string());
+        }
+        self.warning_codes = warnings;
+    }
+
+    #[must_use]
+    pub fn status(&self) -> &'static str {
+        if self.warning_codes.is_empty() {
+            "ok"
+        } else {
+            "warning"
+        }
+    }
+}
 #[must_use]
 pub const fn crate_name() -> &'static str {
     CRATE_NAME
@@ -433,6 +579,25 @@ pub fn load_context_budget_options(
     })
 }
 
+pub fn context_pack_build_options_for_model(
+    options: Option<&Value>,
+    model: &Model,
+    trace_only: bool,
+) -> Result<ContextPackBuildOptions, String> {
+    let budget = load_context_budget_options(options, Some(model))?;
+    Ok(ContextPackBuildOptions {
+        token_budget: budget
+            .enabled
+            .then(|| compute_input_limit_tokens(model, &budget)),
+        bytes_per_token: budget.bytes_per_token,
+        trace_only,
+        model_id: Some(model.id.clone()),
+        context_window: Some(model.context_window),
+        reserved_output_tokens: budget.reserve_output_tokens,
+        fit_required_context: budget.strategy != "error",
+    })
+}
+
 pub fn check_context_budget(
     system: Option<&str>,
     messages: &[ChatMessage],
@@ -496,6 +661,173 @@ pub fn check_context_budget(
     }))
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextDelivery {
+    #[default]
+    Message,
+    ToolManifest,
+    TraceOnly,
+}
+
+fn context_delivery_is_message(delivery: &ContextDelivery) -> bool {
+    *delivery == ContextDelivery::Message
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAttachmentKind {
+    Text,
+    #[default]
+    File,
+    Image,
+    Folder,
+}
+
+impl ContextAttachmentKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::File => "file",
+            Self::Image => "image",
+            Self::Folder => "folder",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "file" => Some(Self::File),
+            "image" => Some(Self::Image),
+            "folder" | "directory" => Some(Self::Folder),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextAttachment {
+    pub id: String,
+    pub kind: ContextAttachmentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+impl ContextAttachment {
+    #[must_use]
+    pub fn new(
+        kind: ContextAttachmentKind,
+        path: Option<String>,
+        name: Option<String>,
+        content_type: impl Into<String>,
+        size_bytes: u64,
+        content: impl Into<String>,
+    ) -> Self {
+        let mut attachment = Self {
+            id: String::new(),
+            kind,
+            path,
+            name,
+            content_type: content_type.into(),
+            size_bytes,
+            content: content.into(),
+            source_message_index: None,
+            metadata: BTreeMap::new(),
+        };
+        attachment.id = stable_context_attachment_id(&attachment);
+        attachment
+    }
+
+    #[must_use]
+    pub fn with_source_message_index(mut self, index: usize) -> Self {
+        self.source_message_index = Some(index);
+        self
+    }
+
+    #[must_use]
+    pub fn stable_id(&self) -> String {
+        stable_context_attachment_id(self)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextTodo {
+    pub id: String,
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+impl ContextTodo {
+    #[must_use]
+    pub fn new(
+        id: Option<String>,
+        content: impl Into<String>,
+        status: impl Into<String>,
+        priority: impl Into<String>,
+    ) -> Self {
+        let content = content.into();
+        let status = status.into();
+        let priority = priority.into();
+        let id = id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "todo_{}",
+                    sha1_hex(&content).chars().take(16).collect::<String>()
+                )
+            });
+        Self {
+            id,
+            content,
+            status,
+            priority,
+            metadata: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextCheckpoint {
+    pub id: String,
+    pub kind: String,
+    pub run_id: String,
+    pub timestamp_ms: u64,
+    pub message_id: Option<String>,
+    pub part_id: Option<String>,
+    pub step_index: Option<u64>,
+    pub file_count: u64,
+    pub total_bytes: u64,
+    pub restored: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextWorkState {
+    pub id: String,
+    pub summary: String,
+    pub format: String,
+    pub source: String,
+    pub message_position: Option<usize>,
+    pub compacted_until_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContextItem {
     pub id: String,
@@ -508,6 +840,8 @@ pub struct ContextItem {
     pub stable_prefix: bool,
     pub ttl_turns: Option<u64>,
     pub metadata: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "context_delivery_is_message")]
+    pub delivery: ContextDelivery,
 }
 
 impl ContextItem {
@@ -530,6 +864,7 @@ impl ContextItem {
             stable_prefix: false,
             ttl_turns: None,
             metadata: BTreeMap::new(),
+            delivery: ContextDelivery::Message,
         }
     }
 }
@@ -545,14 +880,127 @@ pub struct ContextPackTraceEntry {
     pub token_estimate: u64,
     pub included: bool,
     pub drop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "context_delivery_is_message")]
+    pub delivery: ContextDelivery,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_token_estimate: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_duplicate_of: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ContextStablePrefix {
+    pub schema_version: String,
+    pub hash: String,
+    pub item_count: u64,
+    pub message_count: u64,
+    pub tool_manifest_count: u64,
+    pub token_estimate: u64,
+    pub cache_eligible: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextPackReceipt {
+    pub schema_version: String,
+    pub pack_schema_version: String,
+    pub pack_hash: String,
+    pub provider_input_hash: String,
+    pub message_count: u64,
+    pub message_role_counts: BTreeMap<String, u64>,
+    pub tool_manifest_count: u64,
+    pub tool_names: Vec<String>,
+    pub model_option_keys: Vec<String>,
+    pub item_count: u64,
+    pub included_item_count: u64,
+    pub dropped_item_count: u64,
+    pub item_kind_counts: BTreeMap<String, u64>,
+    pub item_delivery_counts: BTreeMap<String, u64>,
+    pub drop_reason_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub truncated_item_count: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub truncation_reason_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub truncation_strategy_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub semantic_duplicate_count: u64,
+    #[serde(default)]
+    pub stable_prefix: ContextStablePrefix,
+    pub estimated_input_tokens: u64,
+    pub budget: ContextPackBudget,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ContextPackBudget {
+    pub enabled: bool,
+    pub model_id: Option<String>,
+    pub context_window: Option<u64>,
+    pub reserved_output_tokens: u64,
+    pub input_limit_tokens: Option<u64>,
+    pub fixed_overhead_tokens: u64,
+    pub item_budget_tokens: Option<u64>,
+    pub selected_item_tokens: u64,
+    pub overflowed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContextPack {
+    pub schema_version: String,
+    pub pack_hash: String,
+    pub provider_input_hash: String,
     pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolSchema>,
+    pub model_options: BTreeMap<String, Value>,
     pub items: Vec<ContextItem>,
     pub trace: Vec<ContextPackTraceEntry>,
+    #[serde(default)]
+    pub stable_prefix: ContextStablePrefix,
+    #[serde(default)]
+    pub system_diagnostics: Option<ContextSystemDiagnostics>,
     pub estimated_input_tokens: u64,
+    pub budget: ContextPackBudget,
+    pub receipt: ContextPackReceipt,
+}
+
+impl ContextPack {
+    pub fn validate_provider_input(&self) -> Result<(), String> {
+        if self.schema_version != CONTEXT_PACK_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported context pack schema: {}",
+                self.schema_version
+            ));
+        }
+        if self.receipt.schema_version != CONTEXT_PACK_RECEIPT_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported context receipt schema: {}",
+                self.receipt.schema_version
+            ));
+        }
+        let provider_input_hash =
+            context_provider_input_hash(&self.messages, &self.tools, &self.model_options);
+        if self.provider_input_hash != provider_input_hash
+            || self.receipt.provider_input_hash != provider_input_hash
+        {
+            return Err("context pack provider input hash mismatch".to_string());
+        }
+        let pack_hash = context_pack_hash(
+            &self.messages,
+            &self.tools,
+            &self.model_options,
+            &self.items,
+            &self.trace,
+        );
+        if self.pack_hash != pack_hash || self.receipt.pack_hash != pack_hash {
+            return Err("context pack integrity hash mismatch".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -560,6 +1008,10 @@ pub struct ContextPackBuildOptions {
     pub token_budget: Option<u64>,
     pub bytes_per_token: u64,
     pub trace_only: bool,
+    pub model_id: Option<String>,
+    pub context_window: Option<u64>,
+    pub reserved_output_tokens: u64,
+    pub fit_required_context: bool,
 }
 
 impl Default for ContextPackBuildOptions {
@@ -568,6 +1020,10 @@ impl Default for ContextPackBuildOptions {
             token_budget: None,
             bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
             trace_only: true,
+            model_id: None,
+            context_window: None,
+            reserved_output_tokens: 0,
+            fit_required_context: true,
         }
     }
 }
@@ -587,51 +1043,152 @@ impl ContextPackBuilder {
 
     #[must_use]
     pub fn build(&self, input: ContextPackInput) -> ContextPack {
-        let mut items = self.collect_items(&input);
-        items = self.with_estimates(self.dedupe_items(items));
-        let trace = self.project(&items);
+        let input = normalize_context_pack_input(input);
+        let system = input
+            .system_sources
+            .as_ref()
+            .and_then(materialize_context_system_sources);
+        let mut items = self.collect_items_with_system(&input, system.as_ref());
+        items = self.semantic_dedupe_items(self.dedupe_items(items));
+        items = self.with_estimates(items);
+        let fixed_overhead_tokens = estimate_context_pack_fixed_overhead(
+            &input.tools,
+            &input.model_options,
+            self.options.bytes_per_token,
+        );
+        let item_budget_tokens = self
+            .options
+            .token_budget
+            .map(|budget| budget.saturating_sub(fixed_overhead_tokens));
+        if self.options.fit_required_context
+            && let Some(item_budget_tokens) = item_budget_tokens
+        {
+            items = self.fit_required_items(items, item_budget_tokens);
+        }
+        let trace = self.project(&items, item_budget_tokens);
         let included_ids = trace
             .iter()
             .filter(|entry| entry.included)
             .map(|entry| entry.item_id.clone())
             .collect::<BTreeSet<_>>();
-        let estimated_input_tokens = items
+        let selected_item_tokens = items
             .iter()
-            .filter(|item| included_ids.contains(&item.id))
+            .filter(|item| {
+                included_ids.contains(&item.id) && item.delivery == ContextDelivery::Message
+            })
             .map(|item| item.token_estimate)
             .sum();
+        let estimated_input_tokens = fixed_overhead_tokens.saturating_add(selected_item_tokens);
+        let overflowed = trace.iter().any(|entry| {
+            !entry.included && entry.drop_reason.as_deref() == Some("required_budget_exhausted")
+        }) || self
+            .options
+            .token_budget
+            .is_some_and(|budget| fixed_overhead_tokens > budget);
+        let budget = ContextPackBudget {
+            enabled: self.options.token_budget.is_some(),
+            model_id: self.options.model_id.clone(),
+            context_window: self.options.context_window,
+            reserved_output_tokens: self.options.reserved_output_tokens,
+            input_limit_tokens: self.options.token_budget,
+            fixed_overhead_tokens,
+            item_budget_tokens,
+            selected_item_tokens,
+            overflowed,
+        };
         let messages = if self.options.trace_only {
-            input.messages
+            let mut messages = input.messages;
+            if let Some(system) = system.as_ref() {
+                messages.insert(0, item_to_message(&system.assembled));
+            }
+            messages
         } else {
-            items
-                .iter()
-                .filter(|item| included_ids.contains(&item.id))
+            let selected = items.iter().filter(|item| {
+                included_ids.contains(&item.id) && item.delivery == ContextDelivery::Message
+            });
+            selected
+                .clone()
+                .filter(|item| item.stable_prefix)
+                .chain(selected.filter(|item| !item.stable_prefix))
                 .map(item_to_message)
                 .collect()
         };
+        let tools = input.tools;
+        let model_options = input.model_options;
+        let stable_prefix = context_stable_prefix(
+            &items,
+            &trace,
+            &tools,
+            &model_options,
+            self.options.model_id.as_deref(),
+            fixed_overhead_tokens,
+            overflowed,
+        );
+        let provider_input_hash = context_provider_input_hash(&messages, &tools, &model_options);
+        let pack_hash = context_pack_hash(&messages, &tools, &model_options, &items, &trace);
+        let receipt = context_pack_receipt(
+            &pack_hash,
+            &provider_input_hash,
+            &messages,
+            &tools,
+            &model_options,
+            &items,
+            &trace,
+            &stable_prefix,
+            estimated_input_tokens,
+            &budget,
+        );
         ContextPack {
+            schema_version: CONTEXT_PACK_SCHEMA_VERSION.to_string(),
+            pack_hash,
+            provider_input_hash,
             messages,
+            tools,
+            model_options,
             items,
             trace,
+            stable_prefix,
+            system_diagnostics: system.map(|system| system.diagnostics),
             estimated_input_tokens,
+            budget,
+            receipt,
         }
     }
 
     #[must_use]
     pub fn collect_items(&self, input: &ContextPackInput) -> Vec<ContextItem> {
+        let input = normalize_context_pack_input(input.clone());
+        let system = input
+            .system_sources
+            .as_ref()
+            .and_then(materialize_context_system_sources);
+        self.collect_items_with_system(&input, system.as_ref())
+    }
+
+    fn collect_items_with_system(
+        &self,
+        input: &ContextPackInput,
+        system: Option<&ContextSystemMaterialization>,
+    ) -> Vec<ContextItem> {
         let mut items = Vec::new();
+        if let Some(system) = system {
+            items.extend(system.sources.clone());
+            items.push(system.assembled.clone());
+        }
         if let Some(runtime_context) = input.runtime_context.as_ref().map(|item| item.trim())
             && !runtime_context.is_empty()
         {
-            let mut item =
-                ContextItem::new("runtime:current", "runtime", "runtime", runtime_context, 90);
+            let mut item = ContextItem::new(
+                "runtime:current",
+                "runtime",
+                "runtime",
+                runtime_context,
+                CONTEXT_PRIORITY_RUNTIME,
+            );
             item.pinned = true;
             item.metadata
                 .insert("synthetic".to_string(), Value::Bool(true));
             items.push(item);
-        }
-        if let Some(work_state) = work_state_item(&input.metadata, input.messages.len()) {
-            items.push(work_state);
         }
         let empty_execution = Value::Object(Map::new());
         let execution = input
@@ -642,10 +1199,22 @@ impl ContextPackBuilder {
         if let Some(sandbox) = sandbox_item(execution) {
             items.push(sandbox);
         }
-        if let Some(todo) = todo_item(&input.todos) {
-            items.push(todo);
-        }
-        items.extend(message_items(&input.messages));
+        let todos = todo_items(&input.todos);
+        let checkpoints = checkpoint_items(&input.checkpoints);
+        let work_state = work_state_item(
+            input.work_state.as_ref(),
+            &input.metadata,
+            input.messages.len(),
+        );
+        items.extend(message_and_session_context_items(
+            &input.messages,
+            &input.attachments,
+            work_state,
+            todos,
+            checkpoints,
+        ));
+        items.extend(input.skills.clone());
+        items.extend(input.tool_manifests.clone());
         items.extend(input.extra_items.clone());
         items
     }
@@ -654,16 +1223,22 @@ impl ContextPackBuilder {
         items
             .into_iter()
             .map(|mut item| {
-                if item.token_estimate == 0 {
-                    item.token_estimate =
-                        estimate_text_tokens(&item.content, self.options.bytes_per_token);
+                if item.token_estimate == 0 && item.delivery == ContextDelivery::Message {
+                    item.token_estimate = estimate_context_message_tokens(
+                        &item_to_message(&item),
+                        self.options.bytes_per_token,
+                    );
                 }
                 item
             })
             .collect()
     }
 
-    fn project(&self, items: &[ContextItem]) -> Vec<ContextPackTraceEntry> {
+    fn project(
+        &self,
+        items: &[ContextItem],
+        item_budget_tokens: Option<u64>,
+    ) -> Vec<ContextPackTraceEntry> {
         let mut included = BTreeSet::new();
         let mut dropped = BTreeMap::new();
         let mut used = 0u64;
@@ -681,20 +1256,41 @@ impl ContextPackBuilder {
                 ))
         });
         for (_index, item) in ranked {
-            if self.options.token_budget.is_none_or(|budget| budget == 0)
-                || item.pinned
-                || used + item.token_estimate <= self.options.token_budget.unwrap_or(0)
+            if let Some(duplicate_of) = item
+                .metadata
+                .get("context_semantic_duplicate_of")
+                .and_then(Value::as_str)
+            {
+                dropped.insert(item.id.clone(), "semantic_duplicate".to_string());
+                debug_assert!(!duplicate_of.is_empty());
+            } else if item.delivery != ContextDelivery::Message
+                || item_budget_tokens.is_none()
+                || used + item.token_estimate <= item_budget_tokens.unwrap_or(0)
             {
                 included.insert(item.id.clone());
-                used += item.token_estimate;
+                if item.delivery == ContextDelivery::Message {
+                    used += item.token_estimate;
+                }
             } else {
-                dropped.insert(item.id.clone(), "budget".to_string());
+                dropped.insert(
+                    item.id.clone(),
+                    if item.pinned {
+                        "required_budget_exhausted".to_string()
+                    } else {
+                        "model_context_budget".to_string()
+                    },
+                );
             }
         }
         items
             .iter()
             .map(|item| {
                 let is_included = included.contains(&item.id);
+                let truncated = item
+                    .metadata
+                    .get("context_truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 ContextPackTraceEntry {
                     item_id: item.id.clone(),
                     kind: item.kind.clone(),
@@ -714,9 +1310,117 @@ impl ContextPackBuilder {
                                 .unwrap_or_else(|| "not_selected".to_string()),
                         )
                     },
+                    delivery: item.delivery,
+                    truncated,
+                    original_token_estimate: truncated.then(|| {
+                        item.metadata
+                            .get("context_original_token_estimate")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(item.token_estimate)
+                    }),
+                    truncation_reason: truncated.then(|| {
+                        item.metadata
+                            .get("context_truncation_reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("required_context_budget")
+                            .to_string()
+                    }),
+                    truncation_strategy: truncated.then(|| {
+                        item.metadata
+                            .get("context_truncation_strategy")
+                            .and_then(Value::as_str)
+                            .unwrap_or("head_tail")
+                            .to_string()
+                    }),
+                    semantic_duplicate_of: item
+                        .metadata
+                        .get("context_semantic_duplicate_of")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
                 }
             })
             .collect()
+    }
+
+    fn fit_required_items(
+        &self,
+        mut items: Vec<ContextItem>,
+        item_budget_tokens: u64,
+    ) -> Vec<ContextItem> {
+        let mut required_indices = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.pinned && item.delivery == ContextDelivery::Message)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let required_tokens = required_indices
+            .iter()
+            .map(|index| items[*index].token_estimate)
+            .sum::<u64>();
+        if required_tokens <= item_budget_tokens {
+            return items;
+        }
+
+        required_indices.sort_by_key(|index| {
+            (
+                required_context_truncation_order(&items[*index]),
+                items[*index].priority,
+                *index,
+            )
+        });
+        let mut overflow = required_tokens.saturating_sub(item_budget_tokens);
+        for index in &required_indices {
+            if overflow == 0 {
+                break;
+            }
+            let current = items[*index].clone();
+            let minimum_bytes = required_context_minimum_bytes(&current);
+            let minimum = truncate_required_context_item(
+                &current,
+                minimum_bytes,
+                self.options.bytes_per_token,
+            );
+            let max_reduction = current
+                .token_estimate
+                .saturating_sub(minimum.token_estimate);
+            if max_reduction == 0 {
+                continue;
+            }
+            let target_tokens = current
+                .token_estimate
+                .saturating_sub(overflow.min(max_reduction));
+            let fitted = fit_required_context_item_to_tokens(
+                &current,
+                target_tokens,
+                minimum_bytes,
+                self.options.bytes_per_token,
+            );
+            let actual_reduction = current.token_estimate.saturating_sub(fitted.token_estimate);
+            overflow = overflow.saturating_sub(actual_reduction);
+            items[*index] = fitted;
+        }
+
+        if overflow > 0 {
+            for index in required_indices {
+                if overflow == 0 {
+                    break;
+                }
+                let current = items[index].clone();
+                let minimum = truncate_required_context_item(
+                    &current,
+                    REQUIRED_CONTEXT_HARD_MINIMUM_BYTES,
+                    self.options.bytes_per_token,
+                );
+                let reduction = current
+                    .token_estimate
+                    .saturating_sub(minimum.token_estimate);
+                if reduction > 0 {
+                    overflow = overflow.saturating_sub(reduction);
+                    items[index] = minimum;
+                }
+            }
+        }
+        items
     }
 
     fn dedupe_items(&self, items: Vec<ContextItem>) -> Vec<ContextItem> {
@@ -737,16 +1441,569 @@ impl ContextPackBuilder {
             .filter_map(|item_id| by_id.remove(&item_id))
             .collect()
     }
+
+    fn semantic_dedupe_items(&self, mut items: Vec<ContextItem>) -> Vec<ContextItem> {
+        let mut winners = BTreeMap::<String, String>::new();
+        for item in &mut items {
+            let Some(fingerprint) = semantic_context_fingerprint(item) else {
+                continue;
+            };
+            if let Some(winner_id) = winners.get(&fingerprint) {
+                item.metadata.insert(
+                    "context_semantic_duplicate_of".to_string(),
+                    Value::String(winner_id.clone()),
+                );
+                item.metadata.insert(
+                    "context_semantic_fingerprint".to_string(),
+                    Value::String(fingerprint),
+                );
+            } else {
+                winners.insert(fingerprint, item.id.clone());
+            }
+        }
+        items
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ContextPackInput {
+    pub system_sources: Option<ContextSystemSources>,
     pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolSchema>,
+    pub model_options: BTreeMap<String, Value>,
+    pub attachments: Vec<ContextAttachment>,
+    pub work_state: Option<ContextWorkState>,
+    pub todos: Vec<ContextTodo>,
+    pub checkpoints: Vec<ContextCheckpoint>,
+    pub skills: Vec<ContextItem>,
+    pub tool_manifests: Vec<ContextItem>,
     pub metadata: BTreeMap<String, Value>,
-    pub todos: Vec<Value>,
     pub runtime_context: Option<String>,
     pub sandbox_metadata: Option<Value>,
     pub extra_items: Vec<ContextItem>,
+}
+
+fn normalize_context_pack_input(mut input: ContextPackInput) -> ContextPackInput {
+    let history = materialize_context_history(input.messages);
+    for attachment in &mut input.attachments {
+        let Some(source_message_index) = attachment.source_message_index else {
+            continue;
+        };
+        attachment.source_message_index = history
+            .message_index_map
+            .get(source_message_index)
+            .copied()
+            .flatten();
+    }
+    if let Some(work_state) = input.work_state.as_mut()
+        && let Some(message_position) = work_state.message_position
+    {
+        work_state.message_position = history
+            .message_position_map
+            .get(message_position)
+            .copied()
+            .or_else(|| history.message_position_map.last().copied());
+    }
+    input.messages = history.messages;
+    if input.work_state.is_none() {
+        input.work_state = history.work_state;
+    }
+    if !history.legacy_system_sources.is_empty() {
+        input
+            .system_sources
+            .get_or_insert_with(ContextSystemSources::default)
+            .legacy_system_sources
+            .extend(history.legacy_system_sources);
+    }
+    input
+}
+
+#[must_use]
+pub fn context_provider_input_hash(
+    messages: &[ChatMessage],
+    tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+) -> String {
+    let messages = messages
+        .iter()
+        .map(|message| {
+            json!({
+                "role": role_str(&message.role),
+                "content": message.content,
+                "name": message.name,
+                "tool_call_id": message.tool_call_id,
+                "context_attachment": message.metadata.get("context_attachment"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "messages": messages,
+        "tools": tools,
+        "model_options": model_options,
+    });
+    format!("sha1:{}", sha1_hex(&stable_json_dumps(&payload)))
+}
+
+fn context_stable_prefix(
+    items: &[ContextItem],
+    trace: &[ContextPackTraceEntry],
+    tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+    model_id: Option<&str>,
+    fixed_overhead_tokens: u64,
+    overflowed: bool,
+) -> ContextStablePrefix {
+    let included = trace
+        .iter()
+        .filter(|entry| entry.included)
+        .map(|entry| entry.item_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let stable_items = items
+        .iter()
+        .filter(|item| {
+            item.stable_prefix
+                && item.delivery != ContextDelivery::TraceOnly
+                && included.contains(item.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let messages = stable_items
+        .iter()
+        .filter(|item| item.delivery == ContextDelivery::Message)
+        .map(|item| item_to_message(item))
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "schema_version": CONTEXT_STABLE_PREFIX_SCHEMA_VERSION,
+        "model_id": model_id,
+        "messages": messages.iter().map(|message| json!({
+            "role": role_str(&message.role),
+            "content": message.content,
+            "name": message.name,
+            "tool_call_id": message.tool_call_id,
+        })).collect::<Vec<_>>(),
+        "tools": tools,
+        "model_options": model_options,
+    });
+    ContextStablePrefix {
+        schema_version: CONTEXT_STABLE_PREFIX_SCHEMA_VERSION.to_string(),
+        hash: format!("sha1:{}", sha1_hex(&stable_json_dumps(&payload))),
+        item_count: stable_items.len() as u64,
+        message_count: messages.len() as u64,
+        tool_manifest_count: stable_items
+            .iter()
+            .filter(|item| item.delivery == ContextDelivery::ToolManifest)
+            .count() as u64,
+        token_estimate: fixed_overhead_tokens.saturating_add(
+            stable_items
+                .iter()
+                .filter(|item| item.delivery == ContextDelivery::Message)
+                .map(|item| item.token_estimate)
+                .sum::<u64>(),
+        ),
+        cache_eligible: !overflowed && (!messages.is_empty() || !tools.is_empty()),
+    }
+}
+
+fn semantic_context_fingerprint(item: &ContextItem) -> Option<String> {
+    if !item.stable_prefix || item.content.trim().is_empty() {
+        return None;
+    }
+    let kind = if item.kind == "instruction"
+        || (item.kind == "message"
+            && item.metadata.get("role").and_then(Value::as_str) == Some("system"))
+    {
+        "instruction"
+    } else {
+        item.kind.as_str()
+    };
+    let normalized = item
+        .content
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let payload = json!({
+        "kind": kind,
+        "delivery": context_delivery_name(item.delivery),
+        "content": normalized.trim(),
+    });
+    Some(format!("sha1:{}", sha1_hex(&stable_json_dumps(&payload))))
+}
+
+fn estimate_context_pack_fixed_overhead(
+    tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+    bytes_per_token: u64,
+) -> u64 {
+    estimate_serialized_tokens(
+        &json!({
+            "tools": tools,
+            "model_options": model_options,
+        }),
+        bytes_per_token,
+    )
+}
+
+fn estimate_context_message_tokens(message: &ChatMessage, bytes_per_token: u64) -> u64 {
+    let materialized =
+        materialize_openai_compatible_payload(None, std::slice::from_ref(message), &[], None, None);
+    estimate_serialized_tokens(&Value::Array(materialized.messages), bytes_per_token)
+}
+
+fn required_context_truncation_order(item: &ContextItem) -> u8 {
+    if item.kind == "checkpoint" {
+        0
+    } else if item.kind.starts_with("attachment_") {
+        10
+    } else if item.kind == "todo" {
+        20
+    } else if matches!(item.kind.as_str(), "runtime" | "sandbox") {
+        30
+    } else if item.kind == "work_state" {
+        40
+    } else if item.metadata.get("role").and_then(Value::as_str) == Some("system") {
+        50
+    } else if item.metadata.get("role").and_then(Value::as_str) == Some("user") {
+        60
+    } else {
+        35
+    }
+}
+
+fn required_context_minimum_bytes(item: &ContextItem) -> usize {
+    if item.kind == "checkpoint" {
+        128
+    } else if item.kind.starts_with("attachment_") {
+        320
+    } else if matches!(item.kind.as_str(), "todo" | "runtime" | "sandbox") {
+        256
+    } else if item.kind == "work_state" {
+        512
+    } else if item.metadata.get("role").and_then(Value::as_str) == Some("system") {
+        768
+    } else if item.metadata.get("role").and_then(Value::as_str) == Some("user") {
+        640
+    } else {
+        256
+    }
+}
+
+fn fit_required_context_item_to_tokens(
+    item: &ContextItem,
+    target_tokens: u64,
+    minimum_bytes: usize,
+    bytes_per_token: u64,
+) -> ContextItem {
+    if item.token_estimate <= target_tokens || item.content.len() <= minimum_bytes {
+        return item.clone();
+    }
+    let mut low = minimum_bytes.min(item.content.len());
+    let mut high = item.content.len().saturating_sub(1);
+    let mut best = truncate_required_context_item(item, low, bytes_per_token);
+    if best.token_estimate > target_tokens {
+        return best;
+    }
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let candidate = truncate_required_context_item(item, middle, bytes_per_token);
+        if candidate.token_estimate <= target_tokens {
+            best = candidate;
+            low = middle.saturating_add(1);
+        } else if middle == 0 {
+            break;
+        } else {
+            high = middle - 1;
+        }
+    }
+    best
+}
+
+fn truncate_required_context_item(
+    item: &ContextItem,
+    max_bytes: usize,
+    bytes_per_token: u64,
+) -> ContextItem {
+    if item.content.len() <= max_bytes {
+        return item.clone();
+    }
+    let (strategy, preserve_header) = required_context_truncation_strategy(item);
+    let content = if strategy == "instruction_sections_head_tail" {
+        truncate_instruction_sections_head_tail(&item.content, max_bytes)
+    } else {
+        truncate_context_head_tail(&item.content, max_bytes, preserve_header)
+    };
+    let mut fitted = item.clone();
+    let original_token_estimate = fitted
+        .metadata
+        .get("context_original_token_estimate")
+        .and_then(Value::as_u64)
+        .unwrap_or(item.token_estimate);
+    let original_bytes = fitted
+        .metadata
+        .get("context_original_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(item.content.len() as u64);
+    fitted.content = content;
+    fitted
+        .metadata
+        .insert("context_truncated".to_string(), Value::Bool(true));
+    fitted.metadata.insert(
+        "context_truncation_reason".to_string(),
+        Value::String(REQUIRED_CONTEXT_TRUNCATION_REASON.to_string()),
+    );
+    fitted.metadata.insert(
+        "context_truncation_strategy".to_string(),
+        Value::String(strategy.to_string()),
+    );
+    fitted.metadata.insert(
+        "context_original_token_estimate".to_string(),
+        json!(original_token_estimate),
+    );
+    fitted
+        .metadata
+        .insert("context_original_bytes".to_string(), json!(original_bytes));
+    fitted.metadata.insert(
+        "context_retained_bytes".to_string(),
+        json!(fitted.content.len()),
+    );
+    fitted.token_estimate =
+        estimate_context_message_tokens(&item_to_message(&fitted), bytes_per_token);
+    fitted
+}
+
+fn required_context_truncation_strategy(item: &ContextItem) -> (&'static str, bool) {
+    if item.kind.starts_with("attachment_") {
+        ("attachment_header_head_tail", true)
+    } else if item.kind == "todo" {
+        ("todo_header_head_tail", true)
+    } else if item.kind == "work_state" {
+        ("work_state_sections_head_tail", true)
+    } else if item.metadata.get("role").and_then(Value::as_str) == Some("system") {
+        ("instruction_sections_head_tail", false)
+    } else if item.metadata.get("role").and_then(Value::as_str) == Some("user") {
+        ("latest_user_head_tail", false)
+    } else {
+        ("head_tail", item.content.starts_with('['))
+    }
+}
+
+fn truncate_instruction_sections_head_tail(text: &str, max_bytes: usize) -> String {
+    let Some(instruction_start) = text.find("<instructions>") else {
+        return truncate_context_head_tail(text, max_bytes, false);
+    };
+    let instruction_body_start = instruction_start + "<instructions>".len();
+    let Some(relative_end) = text[instruction_body_start..].find("</instructions>") else {
+        return truncate_context_head_tail(text, max_bytes, false);
+    };
+    let instruction_end = instruction_body_start + relative_end;
+    let prefix = &text[..instruction_body_start];
+    let instructions = &text[instruction_body_start..instruction_end];
+    let suffix = &text[instruction_end..];
+    let marker_count = 3usize;
+    let marker_bytes = REQUIRED_CONTEXT_TRUNCATION_MARKER
+        .len()
+        .saturating_mul(marker_count);
+    if max_bytes <= marker_bytes + 16 {
+        return truncate_context_head_tail(text, max_bytes, false);
+    }
+    let retained_budget = max_bytes - marker_bytes;
+    let prefix_budget = retained_budget / 5;
+    let instruction_head_budget = retained_budget.saturating_mul(3) / 10;
+    let instruction_tail_budget = retained_budget.saturating_mul(3) / 10;
+    let suffix_budget = retained_budget
+        .saturating_sub(prefix_budget)
+        .saturating_sub(instruction_head_budget)
+        .saturating_sub(instruction_tail_budget);
+    format!(
+        "{}{}{}{}{}{}{}",
+        utf8_prefix(prefix, prefix_budget),
+        REQUIRED_CONTEXT_TRUNCATION_MARKER,
+        utf8_prefix(instructions, instruction_head_budget),
+        REQUIRED_CONTEXT_TRUNCATION_MARKER,
+        utf8_suffix(instructions, instruction_tail_budget),
+        REQUIRED_CONTEXT_TRUNCATION_MARKER,
+        utf8_suffix(suffix, suffix_budget),
+    )
+}
+
+fn truncate_context_head_tail(text: &str, max_bytes: usize, preserve_header: bool) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    if max_bytes <= REQUIRED_CONTEXT_TRUNCATION_MARKER.len() + 8 {
+        return utf8_prefix(text, max_bytes).to_string();
+    }
+
+    let (header, body) = if preserve_header {
+        text.find('\n')
+            .map(|newline| text.split_at(newline + 1))
+            .filter(|(header, _)| {
+                header.len() + REQUIRED_CONTEXT_TRUNCATION_MARKER.len() + 8 < max_bytes
+            })
+            .unwrap_or(("", text))
+    } else {
+        ("", text)
+    };
+    let retained_budget = max_bytes
+        .saturating_sub(header.len())
+        .saturating_sub(REQUIRED_CONTEXT_TRUNCATION_MARKER.len());
+    let head_budget = retained_budget.saturating_mul(2) / 3;
+    let tail_budget = retained_budget.saturating_sub(head_budget);
+    format!(
+        "{}{}{}{}",
+        header,
+        utf8_prefix(body, head_budget),
+        REQUIRED_CONTEXT_TRUNCATION_MARKER,
+        utf8_suffix(body, tail_budget),
+    )
+}
+
+fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn utf8_suffix(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+fn estimate_serialized_tokens(value: &Value, bytes_per_token: u64) -> u64 {
+    let bytes = stable_json_dumps(value).len() as u64;
+    bytes
+        .div_ceil(bytes_per_token.max(1))
+        .max(u64::from(bytes > 0))
+}
+
+fn context_pack_hash(
+    messages: &[ChatMessage],
+    tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+    items: &[ContextItem],
+    trace: &[ContextPackTraceEntry],
+) -> String {
+    let payload = json!({
+        "schema_version": CONTEXT_PACK_SCHEMA_VERSION,
+        "provider_input_hash": context_provider_input_hash(messages, tools, model_options),
+        "items": items,
+        "trace": trace,
+    });
+    format!("sha1:{}", sha1_hex(&stable_json_dumps(&payload)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn context_pack_receipt(
+    pack_hash: &str,
+    provider_input_hash: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+    items: &[ContextItem],
+    trace: &[ContextPackTraceEntry],
+    stable_prefix: &ContextStablePrefix,
+    estimated_input_tokens: u64,
+    budget: &ContextPackBudget,
+) -> ContextPackReceipt {
+    let mut message_role_counts = BTreeMap::new();
+    for message in messages {
+        increment_count(&mut message_role_counts, role_str(&message.role));
+    }
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let model_option_keys = model_options.keys().cloned().collect::<Vec<_>>();
+    let mut item_kind_counts = BTreeMap::new();
+    let mut item_delivery_counts = BTreeMap::new();
+    for item in items {
+        increment_count(&mut item_kind_counts, &item.kind);
+        increment_count(
+            &mut item_delivery_counts,
+            context_delivery_name(item.delivery),
+        );
+    }
+    let mut drop_reason_counts = BTreeMap::new();
+    for entry in trace.iter().filter(|entry| !entry.included) {
+        increment_count(
+            &mut drop_reason_counts,
+            entry.drop_reason.as_deref().unwrap_or("not_selected"),
+        );
+    }
+    let mut truncation_reason_counts = BTreeMap::new();
+    let mut truncation_strategy_counts = BTreeMap::new();
+    let truncated_item_count = trace.iter().filter(|entry| entry.truncated).count() as u64;
+    let semantic_duplicate_count = trace
+        .iter()
+        .filter(|entry| entry.semantic_duplicate_of.is_some())
+        .count() as u64;
+    for entry in trace.iter().filter(|entry| entry.truncated) {
+        increment_count(
+            &mut truncation_reason_counts,
+            entry
+                .truncation_reason
+                .as_deref()
+                .unwrap_or("required_context_budget"),
+        );
+        increment_count(
+            &mut truncation_strategy_counts,
+            entry.truncation_strategy.as_deref().unwrap_or("head_tail"),
+        );
+    }
+    let included_item_count = trace.iter().filter(|entry| entry.included).count() as u64;
+    ContextPackReceipt {
+        schema_version: CONTEXT_PACK_RECEIPT_SCHEMA_VERSION.to_string(),
+        pack_schema_version: CONTEXT_PACK_SCHEMA_VERSION.to_string(),
+        pack_hash: pack_hash.to_string(),
+        provider_input_hash: provider_input_hash.to_string(),
+        message_count: messages.len() as u64,
+        message_role_counts,
+        tool_manifest_count: tools.len() as u64,
+        tool_names,
+        model_option_keys,
+        item_count: items.len() as u64,
+        included_item_count,
+        dropped_item_count: trace.len() as u64 - included_item_count,
+        item_kind_counts,
+        item_delivery_counts,
+        drop_reason_counts,
+        truncated_item_count,
+        truncation_reason_counts,
+        truncation_strategy_counts,
+        semantic_duplicate_count,
+        stable_prefix: stable_prefix.clone(),
+        estimated_input_tokens,
+        budget: budget.clone(),
+    }
+}
+
+fn context_delivery_name(delivery: ContextDelivery) -> &'static str {
+    match delivery {
+        ContextDelivery::Message => "message",
+        ContextDelivery::ToolManifest => "tool_manifest",
+        ContextDelivery::TraceOnly => "trace_only",
+    }
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn increment_count(counts: &mut BTreeMap<String, u64>, key: &str) {
+    let count = counts.entry(key.to_string()).or_default();
+    *count = count.saturating_add(1);
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -806,7 +2063,7 @@ impl InstructionItem {
             format!("[Instruction: {}]\n{}", self.display_path, self.content)
                 .trim()
                 .to_string(),
-            100,
+            CONTEXT_PRIORITY_INSTRUCTION,
         );
         item.pinned = true;
         item.stable_prefix = true;
@@ -833,31 +2090,202 @@ impl InstructionContext {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct AgentSystemPromptInput<'a> {
-    pub profile_prompt: Option<&'a str>,
-    pub workspace_root: &'a Path,
-    pub preloaded_skills: &'a [SkillDocument],
-    pub available_skills: &'a [SkillInfo],
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct AgentSystemPrompt {
+    content: String,
+    content_hash: String,
+    preloaded_skill_names: Vec<String>,
+    instruction_count: u64,
+    instruction_total_bytes: usize,
+    instructions_truncated: bool,
+    instruction_issues: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ContextSystemSources {
+    pub profile_id: Option<String>,
+    pub profile_mode: Option<String>,
+    pub profile_prompt: Option<String>,
+    pub workspace_root: PathBuf,
+    pub preloaded_skills: Vec<SkillDocument>,
+    pub available_skills: Vec<SkillInfo>,
+    #[serde(default)]
+    pub legacy_system_sources: Vec<ContextLegacySystemSource>,
     pub include_instructions: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct AgentSystemPrompt {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextLegacySystemSource {
+    pub id: String,
+    pub source: String,
     pub content: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContextHistoryMaterialization {
+    pub messages: Vec<ChatMessage>,
+    pub legacy_system_sources: Vec<ContextLegacySystemSource>,
+    pub work_state: Option<ContextWorkState>,
+    pub discarded_profile_system_count: u64,
+    pub message_index_map: Vec<Option<usize>>,
+    pub message_position_map: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ContextSystemDiagnostics {
+    pub schema_version: String,
+    pub profile_id: Option<String>,
+    pub profile_mode: Option<String>,
     pub content_hash: String,
     pub preloaded_skill_names: Vec<String>,
     pub instruction_count: u64,
     pub instruction_total_bytes: usize,
     pub instructions_truncated: bool,
     pub instruction_issues: Vec<String>,
+    pub legacy_system_count: u64,
+}
+
+impl ContextSystemDiagnostics {
+    #[must_use]
+    pub fn session_metadata(&self) -> Value {
+        json!({
+            "schema_version": self.schema_version,
+            "profile_id": self.profile_id,
+            "profile_mode": self.profile_mode,
+            "hash": self.content_hash,
+            "instruction_count": self.instruction_count,
+            "instruction_total_bytes": self.instruction_total_bytes,
+            "instructions_truncated": self.instructions_truncated,
+            "instruction_issues": self.instruction_issues,
+            "preloaded_skills": self.preloaded_skill_names,
+            "legacy_system_count": self.legacy_system_count,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ContextSystemMaterialization {
+    assembled: ContextItem,
+    sources: Vec<ContextItem>,
+    diagnostics: ContextSystemDiagnostics,
 }
 
 #[must_use]
-pub fn build_agent_system_prompt(input: AgentSystemPromptInput<'_>) -> Option<AgentSystemPrompt> {
+pub fn materialize_context_history(messages: Vec<ChatMessage>) -> ContextHistoryMaterialization {
+    let mut materialized = ContextHistoryMaterialization::default();
+    for (index, message) in messages.into_iter().enumerate() {
+        materialized
+            .message_position_map
+            .push(materialized.messages.len());
+        materialized.message_index_map.push(None);
+        if message.role != Role::System {
+            materialized.message_index_map[index] = Some(materialized.messages.len());
+            materialized.messages.push(message);
+            continue;
+        }
+        if message.metadata.contains_key("agent_profile")
+            || message
+                .metadata
+                .get("dynamic_system_prompt")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            materialized.discarded_profile_system_count = materialized
+                .discarded_profile_system_count
+                .saturating_add(1);
+            continue;
+        }
+        if message.metadata.get("kind").and_then(Value::as_str) == Some("compaction_boundary") {
+            materialized.work_state = Some(context_work_state_from_boundary(message));
+            continue;
+        }
+        let content = message.content.trim().to_string();
+        if content.is_empty() {
+            continue;
+        }
+        let source = message
+            .metadata
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|source| !source.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("session.messages[{index}]"));
+        let identity = message
+            .metadata
+            .get("message_id")
+            .and_then(Value::as_str)
+            .filter(|message_id| !message_id.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "{index}:{}",
+                    sha1_hex(&content).chars().take(16).collect::<String>()
+                )
+            });
+        materialized
+            .legacy_system_sources
+            .push(ContextLegacySystemSource {
+                id: format!("legacy_system:{identity}"),
+                source,
+                content,
+            });
+    }
+    materialized
+        .message_position_map
+        .push(materialized.messages.len());
+    materialized
+}
+
+fn context_work_state_from_boundary(message: ChatMessage) -> ContextWorkState {
+    let mut metadata = message.metadata;
+    let id = metadata
+        .get("message_id")
+        .and_then(Value::as_str)
+        .unwrap_or("compaction")
+        .to_string();
+    let format = metadata
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("session_compaction_boundary_v1")
+        .to_string();
+    let source = metadata
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("session.transcript.compaction")
+        .to_string();
+    let compacted_until_message_id = metadata
+        .get("compacted_until_message_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    for key in [
+        "kind",
+        "message_id",
+        "compacted_until_message_id",
+        "format",
+        "source",
+    ] {
+        metadata.remove(key);
+    }
+    ContextWorkState {
+        id,
+        summary: message.content,
+        format,
+        source,
+        message_position: Some(0),
+        compacted_until_message_id,
+        metadata,
+    }
+}
+
+fn build_agent_system_prompt_from_context(
+    profile_prompt: Option<&str>,
+    instructions: Option<&InstructionContext>,
+    preloaded_skills: &[SkillDocument],
+    available_skills: &[SkillInfo],
+    legacy_system_sources: &[ContextLegacySystemSource],
+) -> Option<AgentSystemPrompt> {
     let mut prompt_parts = Vec::new();
-    if let Some(prompt) = input
-        .profile_prompt
+    if let Some(prompt) = profile_prompt
         .map(|value| value.trim_start_matches('\u{feff}').trim())
         .filter(|value| !value.is_empty())
     {
@@ -868,27 +2296,28 @@ pub fn build_agent_system_prompt(input: AgentSystemPromptInput<'_>) -> Option<Ag
     let mut instruction_total_bytes = 0;
     let mut instructions_truncated = false;
     let mut instruction_issues = Vec::new();
-    if input.include_instructions {
-        let instructions = InstructionContextLoader::new(input.workspace_root, None).load();
+    if let Some(instructions) = instructions {
         instruction_count = instructions.items.len() as u64;
         instruction_total_bytes = instructions.total_bytes;
         instructions_truncated = instructions.truncated;
         instruction_issues = instructions.issues.clone();
-        if let Some(rendered) = render_instruction_context_for_system_prompt(&instructions) {
+        if let Some(rendered) = render_instruction_context_for_system_prompt(instructions) {
             prompt_parts.push(rendered);
         }
     }
 
-    let preloaded_skill_names = input
-        .preloaded_skills
+    let preloaded_skill_names = preloaded_skills
         .iter()
         .map(|skill| skill.name.clone())
         .collect::<Vec<_>>();
-    if let Some(skills) = render_preloaded_skills(input.preloaded_skills) {
+    if let Some(skills) = render_preloaded_skills(preloaded_skills) {
         prompt_parts.push(skills);
     }
-    if let Some(skills) = render_available_skills(input.available_skills) {
+    if let Some(skills) = render_available_skills(available_skills) {
         prompt_parts.push(skills);
+    }
+    for legacy in legacy_system_sources {
+        prompt_parts.push(legacy.content.clone());
     }
 
     let content = prompt_parts
@@ -909,6 +2338,148 @@ pub fn build_agent_system_prompt(input: AgentSystemPromptInput<'_>) -> Option<Ag
         instructions_truncated,
         instruction_issues,
     })
+}
+
+fn materialize_context_system_sources(
+    sources: &ContextSystemSources,
+) -> Option<ContextSystemMaterialization> {
+    let instructions = sources
+        .include_instructions
+        .then(|| InstructionContextLoader::new(sources.workspace_root.clone(), None).load());
+    let legacy_system_sources = dedupe_legacy_system_sources(&sources.legacy_system_sources);
+    let system_prompt = build_agent_system_prompt_from_context(
+        sources.profile_prompt.as_deref(),
+        instructions.as_ref(),
+        &sources.preloaded_skills,
+        &sources.available_skills,
+        &legacy_system_sources,
+    )?;
+    let diagnostics = ContextSystemDiagnostics {
+        schema_version: CONTEXT_SYSTEM_DIAGNOSTICS_SCHEMA_VERSION.to_string(),
+        profile_id: sources.profile_id.clone(),
+        profile_mode: sources.profile_mode.clone(),
+        content_hash: system_prompt.content_hash.clone(),
+        preloaded_skill_names: system_prompt.preloaded_skill_names.clone(),
+        instruction_count: system_prompt.instruction_count,
+        instruction_total_bytes: system_prompt.instruction_total_bytes,
+        instructions_truncated: system_prompt.instructions_truncated,
+        instruction_issues: system_prompt.instruction_issues.clone(),
+        legacy_system_count: legacy_system_sources.len() as u64,
+    };
+    let mut materialized_sources = Vec::new();
+    if let Some(profile_prompt) = sources
+        .profile_prompt
+        .as_deref()
+        .map(|value| value.trim_start_matches('\u{feff}').trim())
+        .filter(|value| !value.is_empty())
+    {
+        let profile_id = sources.profile_id.as_deref().unwrap_or("default");
+        let mut profile_item = ContextItem::new(
+            format!("profile_prompt:{profile_id}"),
+            "profile_prompt",
+            format!("agent.profile:{profile_id}"),
+            profile_prompt,
+            CONTEXT_PRIORITY_INSTRUCTION,
+        );
+        profile_item.pinned = true;
+        profile_item.stable_prefix = true;
+        profile_item.delivery = ContextDelivery::TraceOnly;
+        profile_item.metadata = BTreeMap::from([
+            ("profile_id".to_string(), json!(sources.profile_id)),
+            ("profile_mode".to_string(), json!(sources.profile_mode)),
+            ("embedded_in".to_string(), json!("context.system_sources")),
+        ]);
+        materialized_sources.push(profile_item);
+    }
+    if let Some(instructions) = instructions.as_ref() {
+        materialized_sources.extend(instructions.to_context_items().into_iter().map(|mut item| {
+            item.delivery = ContextDelivery::TraceOnly;
+            item.metadata
+                .insert("embedded_in".to_string(), json!("context.system_sources"));
+            item
+        }));
+    }
+    materialized_sources.extend(skill_context_items(
+        &sources.preloaded_skills,
+        &sources.available_skills,
+    ));
+    materialized_sources.extend(legacy_system_sources.iter().map(|legacy| {
+        let mut item = ContextItem::new(
+            legacy.id.clone(),
+            "legacy_system",
+            legacy.source.clone(),
+            legacy.content.clone(),
+            CONTEXT_PRIORITY_INSTRUCTION,
+        );
+        item.pinned = true;
+        item.stable_prefix = true;
+        item.delivery = ContextDelivery::TraceOnly;
+        item.metadata
+            .insert("embedded_in".to_string(), json!("context.system_sources"));
+        item
+    }));
+
+    let mut assembled = ContextItem::new(
+        "system:context_sources",
+        "message",
+        "context.system_sources",
+        system_prompt.content,
+        CONTEXT_PRIORITY_INSTRUCTION,
+    );
+    assembled.pinned = true;
+    assembled.stable_prefix = true;
+    assembled
+        .metadata
+        .insert("role".to_string(), json!("system"));
+    assembled
+        .metadata
+        .insert("dynamic_system_prompt".to_string(), json!(true));
+    assembled.metadata.insert(
+        "dynamic_system_prompt_info".to_string(),
+        diagnostics.session_metadata(),
+    );
+    if let Some(profile_id) = sources.profile_id.as_ref() {
+        assembled
+            .metadata
+            .insert("agent_profile".to_string(), json!(profile_id));
+    }
+    if let Some(profile_mode) = sources.profile_mode.as_ref() {
+        assembled
+            .metadata
+            .insert("agent_mode".to_string(), json!(profile_mode));
+    }
+    let mut provider_metadata = assembled.metadata.clone();
+    provider_metadata.remove("role");
+    assembled.metadata.insert(
+        "message_metadata".to_string(),
+        serde_json::to_value(provider_metadata).unwrap_or_default(),
+    );
+    Some(ContextSystemMaterialization {
+        assembled,
+        sources: materialized_sources,
+        diagnostics,
+    })
+}
+
+fn dedupe_legacy_system_sources(
+    sources: &[ContextLegacySystemSource],
+) -> Vec<ContextLegacySystemSource> {
+    let mut seen = BTreeSet::new();
+    sources
+        .iter()
+        .filter(|source| {
+            let normalized = source
+                .content
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n");
+            seen.insert(sha1_hex(normalized.trim()))
+        })
+        .cloned()
+        .collect()
 }
 
 fn render_instruction_context_for_system_prompt(context: &InstructionContext) -> Option<String> {
@@ -1645,6 +3216,95 @@ pub fn render_preloaded_skills(skills: &[SkillDocument]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+#[must_use]
+pub fn skill_context_items(
+    preloaded: &[SkillDocument],
+    available: &[SkillInfo],
+) -> Vec<ContextItem> {
+    let mut items = Vec::new();
+    for skill in preloaded
+        .iter()
+        .filter(|skill| skill_document_model_invocable(skill))
+    {
+        let Some(content) = render_preloaded_skills(std::slice::from_ref(skill)) else {
+            continue;
+        };
+        let mut item = ContextItem::new(
+            format!("skill:preloaded:{}", skill.name),
+            "skill_preloaded",
+            format!("skill.document:{}", skill.name),
+            content,
+            CONTEXT_PRIORITY_SKILL_PRELOADED,
+        );
+        item.pinned = true;
+        item.stable_prefix = true;
+        item.delivery = ContextDelivery::TraceOnly;
+        item.metadata = BTreeMap::from([
+            ("name".to_string(), json!(skill.name)),
+            ("description".to_string(), json!(skill.description)),
+            ("location".to_string(), json!(skill.location)),
+            ("embedded_in".to_string(), json!("agent_system_prompt")),
+        ]);
+        items.push(item);
+    }
+    for skill in available
+        .iter()
+        .filter(|skill| skill_info_model_invocable(skill))
+    {
+        let Some(content) = render_available_skills(std::slice::from_ref(skill)) else {
+            continue;
+        };
+        let mut item = ContextItem::new(
+            format!("skill:available:{}", skill.name),
+            "skill_available",
+            format!("skill.catalog:{}", skill.name),
+            content,
+            CONTEXT_PRIORITY_SKILL_CATALOG,
+        );
+        item.stable_prefix = true;
+        item.delivery = ContextDelivery::TraceOnly;
+        item.metadata = BTreeMap::from([
+            ("name".to_string(), json!(skill.name)),
+            ("description".to_string(), json!(skill.description)),
+            ("location".to_string(), json!(skill.location)),
+            ("embedded_in".to_string(), json!("agent_system_prompt")),
+        ]);
+        items.push(item);
+    }
+    items.sort_by(|left, right| left.id.cmp(&right.id));
+    items
+}
+
+#[must_use]
+pub fn tool_manifest_context_item(
+    id: impl Into<String>,
+    source: impl Into<String>,
+    tool: &ToolSchema,
+    metadata: BTreeMap<String, Value>,
+) -> ContextItem {
+    let mut item = ContextItem::new(
+        id,
+        "mcp_tool_manifest",
+        source,
+        stable_json_dumps(&json!({
+            "name": tool.name,
+            "description": tool.description,
+            "schema": tool.schema,
+            "group": tool.group,
+            "dangerous": tool.dangerous,
+        })),
+        CONTEXT_PRIORITY_TOOL_MANIFEST,
+    );
+    item.stable_prefix = true;
+    item.delivery = ContextDelivery::ToolManifest;
+    item.metadata = metadata;
+    item.metadata
+        .insert("tool_name".to_string(), json!(tool.name));
+    item.metadata
+        .insert("tool_group".to_string(), json!(tool.group));
+    item
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2269,9 +3929,34 @@ fn tool_message_diagnostics(
 }
 
 fn work_state_item(
+    work_state: Option<&ContextWorkState>,
     metadata: &BTreeMap<String, Value>,
     message_count: usize,
 ) -> Option<ContextItem> {
+    if let Some(work_state) = work_state.filter(|item| !item.summary.trim().is_empty()) {
+        let mut item = ContextItem::new(
+            format!("work_state:{}", work_state.id),
+            "work_state",
+            work_state.source.clone(),
+            format!("[Work state]\n{}", work_state.summary.trim()),
+            CONTEXT_PRIORITY_WORK_STATE,
+        );
+        item.pinned = true;
+        item.metadata = BTreeMap::from([
+            ("work_state_id".to_string(), json!(work_state.id)),
+            ("format".to_string(), json!(work_state.format)),
+            (
+                "message_position".to_string(),
+                json!(work_state.message_position),
+            ),
+            (
+                "compacted_until_message_id".to_string(),
+                json!(work_state.compacted_until_message_id),
+            ),
+        ]);
+        item.metadata.extend(work_state.metadata.clone());
+        return Some(item);
+    }
     let compaction = get_context_compaction(metadata, message_count)?;
     let summary = compaction.get("summary")?.as_str()?.to_string();
     let mut item = ContextItem::new(
@@ -2279,7 +3964,7 @@ fn work_state_item(
         "work_state",
         "session.metadata.context_compaction",
         summary,
-        95,
+        CONTEXT_PRIORITY_WORK_STATE,
     );
     item.pinned = true;
     item.metadata.insert(
@@ -2404,7 +4089,7 @@ fn sandbox_item(execution: &Value) -> Option<ContextItem> {
             "[Sandbox context]\n{}",
             stable_json_dumps(&json!(safe_payload))
         ),
-        85,
+        CONTEXT_PRIORITY_SANDBOX,
     );
     item.pinned = true;
     item.stable_prefix = true;
@@ -2412,100 +4097,311 @@ fn sandbox_item(execution: &Value) -> Option<ContextItem> {
     Some(item)
 }
 
-fn todo_item(todos: &[Value]) -> Option<ContextItem> {
-    if todos.is_empty() {
-        return None;
-    }
-    let mut normalized = Vec::new();
-    for (index, todo) in todos.iter().enumerate() {
-        let mut payload = todo.as_object().cloned().unwrap_or_default();
-        payload
-            .entry("id".to_string())
-            .or_insert_with(|| json!(format!("todo-{}", index + 1)));
-        normalized.push(payload);
-    }
-    if normalized.is_empty() {
-        return None;
-    }
-    let mut lines = vec!["[Todos]".to_string()];
-    for todo in &normalized {
-        lines.push(format!(
-            "- ({}/{}) {}",
-            todo.get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("pending"),
-            todo.get("priority")
-                .and_then(Value::as_str)
-                .unwrap_or("medium"),
-            todo.get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-        ));
-    }
-    let mut item = ContextItem::new(
-        "todo:session",
-        "todo",
-        "session.todos",
-        lines.join("\n").trim().to_string(),
-        80,
-    );
-    item.metadata
-        .insert("count".to_string(), json!(normalized.len()));
-    Some(item)
-}
-
-fn message_items(messages: &[ChatMessage]) -> Vec<ContextItem> {
-    messages
+fn todo_items(todos: &[ContextTodo]) -> Vec<ContextItem> {
+    todos
         .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let kind = if message.role == Role::Tool {
-                "tool_result"
-            } else {
-                "message"
-            };
-            let identifier = message
-                .tool_call_id
-                .clone()
-                .unwrap_or_else(|| format!("{}:{index}", role_str(&message.role)));
-            let mut metadata = BTreeMap::new();
-            metadata.insert("role".to_string(), json!(role_str(&message.role)));
-            metadata.insert(
-                "name".to_string(),
-                message.name.clone().map_or(Value::Null, Value::String),
-            );
-            metadata.insert(
-                "tool_call_id".to_string(),
-                message
-                    .tool_call_id
-                    .clone()
-                    .map_or(Value::Null, Value::String),
-            );
+        .filter(|todo| !todo.content.trim().is_empty())
+        .map(|todo| {
+            let status = todo.status.trim().to_ascii_lowercase();
+            let active = !matches!(status.as_str(), "completed" | "cancelled" | "canceled");
             let mut item = ContextItem::new(
-                format!("{kind}:{identifier}"),
-                kind,
-                format!("session.messages[{index}]"),
-                message.content.clone(),
-                if kind == "tool_result" { 50 } else { 40 },
+                format!("todo:{}", todo.id),
+                "todo",
+                format!("session.todos:{}", todo.id),
+                format!(
+                    "[Todo id={} status={} priority={}]\n{}",
+                    todo.id,
+                    if status.is_empty() {
+                        "pending"
+                    } else {
+                        status.as_str()
+                    },
+                    if todo.priority.trim().is_empty() {
+                        "medium"
+                    } else {
+                        todo.priority.trim()
+                    },
+                    todo.content.trim()
+                ),
+                if active {
+                    CONTEXT_PRIORITY_TODO
+                } else {
+                    CONTEXT_PRIORITY_MESSAGE
+                },
             );
-            item.metadata = metadata;
+            item.pinned = active;
+            item.metadata = BTreeMap::from([
+                ("todo_id".to_string(), json!(todo.id)),
+                ("status".to_string(), json!(todo.status)),
+                ("priority".to_string(), json!(todo.priority)),
+                ("active".to_string(), json!(active)),
+            ]);
+            item.metadata.extend(todo.metadata.clone());
             item
         })
         .collect()
 }
 
+fn checkpoint_items(checkpoints: &[ContextCheckpoint]) -> Vec<ContextItem> {
+    checkpoints
+        .iter()
+        .filter(|checkpoint| !checkpoint.id.trim().is_empty())
+        .map(|checkpoint| {
+            let mut item = ContextItem::new(
+                format!("checkpoint:{}", checkpoint.id),
+                "checkpoint",
+                format!("session.checkpoints:{}", checkpoint.id),
+                format!(
+                    "[Checkpoint id={} kind={} step={} files={} bytes={} restored={}]",
+                    checkpoint.id,
+                    checkpoint.kind,
+                    checkpoint
+                        .step_index
+                        .map_or_else(|| "unknown".to_string(), |step| step.to_string()),
+                    checkpoint.file_count,
+                    checkpoint.total_bytes,
+                    checkpoint.restored,
+                ),
+                CONTEXT_PRIORITY_CHECKPOINT,
+            );
+            item.pinned = checkpoint.restored;
+            item.metadata = BTreeMap::from([
+                ("checkpoint_id".to_string(), json!(checkpoint.id)),
+                ("kind".to_string(), json!(checkpoint.kind)),
+                ("run_id".to_string(), json!(checkpoint.run_id)),
+                ("timestamp_ms".to_string(), json!(checkpoint.timestamp_ms)),
+                ("message_id".to_string(), json!(checkpoint.message_id)),
+                ("part_id".to_string(), json!(checkpoint.part_id)),
+                ("step_index".to_string(), json!(checkpoint.step_index)),
+                ("file_count".to_string(), json!(checkpoint.file_count)),
+                ("total_bytes".to_string(), json!(checkpoint.total_bytes)),
+                ("restored".to_string(), json!(checkpoint.restored)),
+            ]);
+            item.metadata.extend(checkpoint.metadata.clone());
+            item
+        })
+        .collect()
+}
+
+fn message_and_session_context_items(
+    messages: &[ChatMessage],
+    attachments: &[ContextAttachment],
+    work_state: Option<ContextItem>,
+    todos: Vec<ContextItem>,
+    checkpoints: Vec<ContextItem>,
+) -> Vec<ContextItem> {
+    let mut items = Vec::new();
+    let mut attached = BTreeSet::new();
+    let work_state_position = work_state
+        .as_ref()
+        .and_then(|item| {
+            item.metadata
+                .get("message_position")
+                .and_then(Value::as_u64)
+        })
+        .map(|position| (position as usize).min(messages.len()));
+    let session_context_position = messages
+        .iter()
+        .rposition(|message| message.role == Role::User)
+        .unwrap_or(messages.len());
+    let mut work_state = work_state;
+    let mut session_items = Some(todos.into_iter().chain(checkpoints).collect::<Vec<_>>());
+    for position in 0..=messages.len() {
+        if work_state_position == Some(position)
+            && let Some(item) = work_state.take()
+        {
+            items.push(item);
+        }
+        if session_context_position == position
+            && let Some(context) = session_items.take()
+        {
+            items.extend(context);
+        }
+        let Some(message) = messages.get(position) else {
+            continue;
+        };
+        let index = position;
+        items.push(message_context_item(
+            index,
+            message,
+            index == session_context_position && message.role == Role::User,
+        ));
+        for (attachment_index, attachment) in attachments
+            .iter()
+            .enumerate()
+            .filter(|(_, attachment)| attachment.source_message_index == Some(index))
+        {
+            items.push(attachment_context_item(attachment, index, attachment_index));
+            attached.insert(attachment_index);
+        }
+    }
+    if let Some(item) = work_state {
+        items.push(item);
+    }
+    if let Some(context) = session_items {
+        items.extend(context);
+    }
+    for (attachment_index, attachment) in attachments.iter().enumerate() {
+        if attached.contains(&attachment_index) {
+            continue;
+        }
+        let source_message_index = attachment
+            .source_message_index
+            .unwrap_or(messages.len().saturating_sub(1));
+        items.push(attachment_context_item(
+            attachment,
+            source_message_index,
+            attachment_index,
+        ));
+    }
+    items
+}
+
+fn message_context_item(index: usize, message: &ChatMessage, latest_user: bool) -> ContextItem {
+    let kind = if message.role == Role::Tool {
+        "tool_result"
+    } else {
+        "message"
+    };
+    let identifier = message
+        .tool_call_id
+        .clone()
+        .unwrap_or_else(|| format!("{}:{index}", role_str(&message.role)));
+    let mut metadata = BTreeMap::new();
+    metadata.insert("role".to_string(), json!(role_str(&message.role)));
+    metadata.insert(
+        "name".to_string(),
+        message.name.clone().map_or(Value::Null, Value::String),
+    );
+    metadata.insert(
+        "tool_call_id".to_string(),
+        message
+            .tool_call_id
+            .clone()
+            .map_or(Value::Null, Value::String),
+    );
+    if !message.metadata.is_empty() {
+        metadata.insert(
+            "message_metadata".to_string(),
+            serde_json::to_value(&message.metadata).unwrap_or_default(),
+        );
+    }
+    let mut item = ContextItem::new(
+        format!("{kind}:{identifier}"),
+        kind,
+        format!("session.messages[{index}]"),
+        message.content.clone(),
+        if kind == "tool_result" {
+            CONTEXT_PRIORITY_TOOL_RESULT
+        } else {
+            CONTEXT_PRIORITY_MESSAGE
+        },
+    );
+    if message.role == Role::System {
+        item.priority = CONTEXT_PRIORITY_INSTRUCTION;
+        item.pinned = true;
+        item.stable_prefix = true;
+    } else if latest_user {
+        item.priority = CONTEXT_PRIORITY_RUNTIME;
+        item.pinned = true;
+    }
+    item.metadata = metadata;
+    item
+}
+
+fn attachment_context_item(
+    attachment: &ContextAttachment,
+    source_message_index: usize,
+    attachment_index: usize,
+) -> ContextItem {
+    let kind = format!("attachment_{}", attachment.kind.as_str());
+    let mut item = ContextItem::new(
+        format!(
+            "attachment:{}:message:{source_message_index}",
+            attachment.id
+        ),
+        kind,
+        format!("session.messages[{source_message_index}].attachments[{attachment_index}]"),
+        render_context_attachment(attachment),
+        CONTEXT_PRIORITY_ATTACHMENT,
+    );
+    item.pinned = true;
+    item.metadata = BTreeMap::from([
+        ("role".to_string(), json!("user")),
+        ("attachment_id".to_string(), json!(attachment.id)),
+        ("attachment_kind".to_string(), json!(attachment.kind)),
+        (
+            "context_attachment".to_string(),
+            serde_json::to_value(attachment).unwrap_or_default(),
+        ),
+        (
+            "source_message_index".to_string(),
+            json!(source_message_index),
+        ),
+    ]);
+    item
+}
+
+fn render_context_attachment(attachment: &ContextAttachment) -> String {
+    let label = attachment
+        .path
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| attachment.name.as_deref().filter(|value| !value.is_empty()))
+        .unwrap_or(attachment.id.as_str());
+    let header = format!(
+        "[Attachment id={} kind={} path={} content_type={} size_bytes={}]",
+        attachment.id,
+        attachment.kind.as_str(),
+        label,
+        attachment.content_type,
+        attachment.size_bytes
+    );
+    if attachment.content.is_empty() {
+        header
+    } else {
+        format!("{header}\n{}", attachment.content)
+    }
+}
+
 fn item_to_message(item: &ContextItem) -> ChatMessage {
-    ChatMessage {
-        role: Role::Assistant,
-        content: item.content.clone(),
-        name: None,
-        tool_call_id: None,
-        metadata: BTreeMap::from([
+    let role = match item.metadata.get("role").and_then(Value::as_str) {
+        Some("user") => Role::User,
+        Some("assistant") => Role::Assistant,
+        Some("tool") => Role::Tool,
+        _ => Role::System,
+    };
+    let mut metadata = if matches!(item.kind.as_str(), "message" | "tool_result") {
+        item.metadata
+            .get("message_metadata")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    } else {
+        BTreeMap::from([
             ("synthetic_context_item".to_string(), json!(true)),
             ("context_item_id".to_string(), json!(item.id)),
             ("context_item_kind".to_string(), json!(item.kind)),
             ("context_item_source".to_string(), json!(item.source)),
-        ]),
+        ])
+    };
+    if let Some(attachment) = item.metadata.get("context_attachment") {
+        metadata.insert("context_attachment".to_string(), attachment.clone());
+    }
+    ChatMessage {
+        role,
+        content: item.content.clone(),
+        name: item
+            .metadata
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        tool_call_id: item
+            .metadata
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        metadata,
     }
 }
 
@@ -2782,10 +4678,30 @@ fn io_error(error: io::Error) -> String {
 }
 
 fn sha1_hex_12(value: &str) -> String {
+    sha1_hex(value).chars().take(12).collect()
+}
+
+fn stable_context_attachment_id(attachment: &ContextAttachment) -> String {
+    let content_hash = sha1_hex(&attachment.content);
+    let identity = stable_json_dumps(&json!({
+        "kind": attachment.kind,
+        "path": attachment.path,
+        "name": attachment.name,
+        "content_type": attachment.content_type,
+        "size_bytes": attachment.size_bytes,
+        "content_hash": content_hash,
+    }));
+    format!(
+        "att_{}",
+        sha1_hex(&identity).chars().take(16).collect::<String>()
+    )
+}
+
+fn sha1_hex(value: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(value.as_bytes());
     let digest = hasher.finalize();
-    format!("{digest:x}").chars().take(12).collect()
+    format!("{digest:x}")
 }
 
 #[cfg(test)]

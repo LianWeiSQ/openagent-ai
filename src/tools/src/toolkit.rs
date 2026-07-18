@@ -33,6 +33,134 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const TASK_TOOL_ID: &str = "task";
 pub const WEB_FETCH_TOOL_ID: &str = "web_fetch";
 pub const LSP_TOOL_ID: &str = "lsp";
+pub const DEFAULT_BUILD_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/build.txt");
+
+const EXPLORE_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/explore.txt");
+const PLAN_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/plan.txt");
+const SCOUT_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/scout.txt");
+const REVIEW_AGENT_PROMPT: &str = "You are OpenAgent Reviewer. Focus on correctness, regressions, risk, and missing tests. Prefer evidence from tools and keep findings concise.";
+const READONLY_AGENT_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "ls",
+    "lsp",
+    "code_search",
+    "skill",
+    "todoread",
+];
+const PLAN_AGENT_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "ls",
+    "lsp",
+    "code_search",
+    "skill",
+    "todoread",
+    "todowrite",
+    "question",
+];
+const SCOUT_AGENT_TOOLS: &[&str] = &[
+    "web_fetch",
+    "read",
+    "glob",
+    "grep",
+    "ls",
+    "lsp",
+    "code_search",
+    "skill",
+    "todoread",
+];
+
+#[derive(Clone, Debug)]
+pub struct BuiltinAgentProfileSpec {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub mode: &'static str,
+    pub permission: PermissionRuleset,
+    pub prompt: &'static str,
+    pub tools: &'static [&'static str],
+}
+
+#[must_use]
+pub fn builtin_agent_profile_specs() -> Vec<BuiltinAgentProfileSpec> {
+    vec![
+        BuiltinAgentProfileSpec {
+            id: "build",
+            name: "Build",
+            description: "Primary implementation agent for coding, testing, and general project work.",
+            mode: "primary",
+            permission: PermissionRuleset::PlanOnly,
+            prompt: DEFAULT_BUILD_AGENT_PROMPT,
+            tools: &[],
+        },
+        BuiltinAgentProfileSpec {
+            id: "coder",
+            name: "Coder",
+            description: "Implementation-focused subagent for coding, testing, and focused changes.",
+            mode: "subagent",
+            permission: PermissionRuleset::PlanOnly,
+            prompt: DEFAULT_BUILD_AGENT_PROMPT,
+            tools: &[],
+        },
+        BuiltinAgentProfileSpec {
+            id: "general",
+            name: "General",
+            description: "General-purpose subagent for complex multi-step implementation, debugging, and research tasks.",
+            mode: "subagent",
+            permission: PermissionRuleset::PlanOnly,
+            prompt: DEFAULT_BUILD_AGENT_PROMPT,
+            tools: &[],
+        },
+        BuiltinAgentProfileSpec {
+            id: "explore",
+            name: "Explore",
+            description: "Read-only code exploration subagent for fast search, mapping, and evidence gathering.",
+            mode: "subagent",
+            permission: PermissionRuleset::Readonly,
+            prompt: EXPLORE_AGENT_PROMPT,
+            tools: READONLY_AGENT_TOOLS,
+        },
+        BuiltinAgentProfileSpec {
+            id: "scout",
+            name: "Scout",
+            description: "External documentation and dependency research subagent with read-only web fetch access.",
+            mode: "subagent",
+            permission: PermissionRuleset::Readonly,
+            prompt: SCOUT_AGENT_PROMPT,
+            tools: SCOUT_AGENT_TOOLS,
+        },
+        BuiltinAgentProfileSpec {
+            id: "plan",
+            name: "Plan",
+            description: "Planning subagent for architecture analysis, implementation strategy, and task breakdowns.",
+            mode: "subagent",
+            permission: PermissionRuleset::PlanOnly,
+            prompt: PLAN_AGENT_PROMPT,
+            tools: PLAN_AGENT_TOOLS,
+        },
+        BuiltinAgentProfileSpec {
+            id: "planner",
+            name: "Planner",
+            description: "Plan-first subagent for large changes and staged execution.",
+            mode: "subagent",
+            permission: PermissionRuleset::PlanOnly,
+            prompt: PLAN_AGENT_PROMPT,
+            tools: PLAN_AGENT_TOOLS,
+        },
+        BuiltinAgentProfileSpec {
+            id: "reviewer",
+            name: "Reviewer",
+            description: "Review-focused subagent for correctness, regressions, risk, and missing tests.",
+            mode: "subagent",
+            permission: PermissionRuleset::Readonly,
+            prompt: REVIEW_AGENT_PROMPT,
+            tools: READONLY_AGENT_TOOLS,
+        },
+    ]
+}
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
@@ -1330,6 +1458,7 @@ impl SessionRunnerFacade {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn turn_terminal_event(
         &self,
         method: &str,
@@ -2427,16 +2556,7 @@ fn skill_tool_pattern_matches(pattern: &str, tool_id: &str) -> bool {
         return true;
     }
     let lowered = pattern.to_ascii_lowercase();
-    let normalized = match lowered.as_str() {
-        "bash" => "bash",
-        "read" => "read",
-        "write" => "write",
-        "edit" => "edit",
-        "glob" => "glob",
-        "grep" => "grep",
-        "skill" => "skill",
-        other => other,
-    };
+    let normalized = lowered.as_str();
     normalized == tool_id
         || (normalized.ends_with('*') && tool_id.starts_with(normalized.trim_end_matches('*')))
 }

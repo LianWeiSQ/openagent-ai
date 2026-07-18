@@ -786,6 +786,7 @@ dependencies = [
  "openagent-bridge-server",
  "openagent-bridge-server-client",
  "openagent-core",
+ "openagent-eval",
  "openagent-lsp",
  "openagent-mcp",
  "openagent-protocol",

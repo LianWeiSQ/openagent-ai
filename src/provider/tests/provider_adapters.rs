@@ -9,9 +9,9 @@ use openagent_provider::{
     AnthropicLanguageModelConfig, OpenAiLanguageModelConfig, build_anthropic_payload,
     build_openai_chat_payload, build_openai_responses_payload, default_env_mapping,
     known_provider_ids, normalize_anthropic_events, normalize_openai_chat_sse_chunks,
-    normalize_openai_responses_response, parse_tool_arguments, provider_auth_methods,
-    provider_default_base_url, provider_default_model, provider_label, provider_requires_api_key,
-    summarize_http_error_body,
+    normalize_openai_responses_response, openagent_context_model, openagent_text_model_supported,
+    parse_tool_arguments, provider_auth_methods, provider_default_base_url, provider_default_model,
+    provider_label, provider_requires_api_key, summarize_http_error_body,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -78,6 +78,19 @@ fn provider_factories_cover_models_and_missing_provider_errors() {
         provider_label("bad provider"),
         Err("Invalid provider id: bad provider".to_string())
     );
+}
+
+#[test]
+fn openagent_context_models_share_runtime_limits() {
+    assert!(openagent_text_model_supported("gpt-5.5"));
+    assert!(!openagent_text_model_supported("custom-model"));
+    assert_eq!(
+        openagent_context_model("openai", "gpt-5.5", None, None).context_window,
+        128_000
+    );
+    let overridden = openagent_context_model("openai", "gpt-5.5", Some(64_000), Some(8_192));
+    assert_eq!(overridden.context_window, 64_000);
+    assert_eq!(overridden.max_output, 8_192);
 }
 
 fn assert_openai_chat_stream(fixture: &Value) {

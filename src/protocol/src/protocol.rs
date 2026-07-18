@@ -438,13 +438,17 @@ pub fn message_parts_to_chat_messages(messages: &[MessageWithParts]) -> Vec<Chat
             }
             Role::System | Role::User => {
                 let content = text_content_from_parts(&message.parts);
-                if content.is_empty() {
+                let attachments = attachment_content_from_parts(&message.parts);
+                if content.is_empty() && attachments.is_empty() {
                     continue;
                 }
                 let mut metadata = message.info.metadata.clone();
                 metadata
                     .entry("message_id".to_string())
                     .or_insert_with(|| json_value_string(message.info.id.clone()));
+                if !attachments.is_empty() {
+                    metadata.insert("context_attachments".to_string(), Value::Array(attachments));
+                }
                 normalized.push(ChatMessage {
                     role: message.info.role.clone(),
                     content,
@@ -685,6 +689,23 @@ fn text_content_from_parts(parts: &[MessagePart]) -> String {
         .filter_map(part_text)
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn attachment_content_from_parts(parts: &[MessagePart]) -> Vec<Value> {
+    parts
+        .iter()
+        .filter(|part| part.kind == MessagePartKind::File)
+        .map(|part| match &part.content {
+            Value::Object(_) => part.content.clone(),
+            content => serde_json::json!({
+                "id": part.id,
+                "kind": "file",
+                "content_type": "application/octet-stream",
+                "size_bytes": 0,
+                "content": content,
+            }),
+        })
+        .collect()
 }
 
 fn part_text(part: &MessagePart) -> Option<String> {
