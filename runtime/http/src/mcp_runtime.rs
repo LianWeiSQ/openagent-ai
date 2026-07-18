@@ -203,7 +203,7 @@ pub(super) fn apply_mcp_lifecycle_to_manager(manager: &mut RemoteMcpManager, wor
         .filter_map(|server| {
             let key = mcp_lifecycle_key(workspace, &server.name);
             let fingerprint = mcp_server_fingerprint(server);
-            let update = {
+            {
                 let Ok(mut registry) = mcp_lifecycle_registry().lock() else {
                     return None;
                 };
@@ -217,8 +217,7 @@ pub(super) fn apply_mcp_lifecycle_to_manager(manager: &mut RemoteMcpManager, wor
                 } else {
                     None
                 }
-            };
-            update
+            }
         })
         .collect::<Vec<_>>();
     for (server_name, descriptors, refreshed_at) in updates {
@@ -421,7 +420,7 @@ pub(super) fn mcp_manager_payload(
         "writable": source.writable_path.is_some(),
         "config_path": source.writable_path.as_ref().map(|path| path.to_string_lossy().to_string()),
         "readonly_reason": source.readonly_reason,
-        "status": mcp_manager_status(&manager),
+        "status": mcp_manager_status(manager),
         "error": null,
         "servers": servers,
     })

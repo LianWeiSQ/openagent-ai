@@ -14,6 +14,10 @@ use std::{
 };
 
 use openagent_bridge_server_client::{RemoteAuth, RemoteRuntimeClient};
+use openagent_eval::{
+    ExplorationQualityResult, ExplorationQualityRubric, compare_exploration_quality,
+    exploration_observation_from_bridge_turn, score_exploration_quality,
+};
 use openagent_http_runtime::http_runtime_fixture;
 use serde_json::Value;
 
@@ -269,8 +273,8 @@ fn files_route_uses_source_only_scan_profile() -> Result<(), Box<dyn Error>> {
         .iter()
         .filter_map(|entry| entry["path"].as_str())
         .collect::<Vec<_>>();
-    assert!(paths.iter().any(|path| *path == "src"));
-    assert!(paths.iter().any(|path| *path == "src/main.rs"));
+    assert!(paths.contains(&"src"));
+    assert!(paths.contains(&"src/main.rs"));
     for ignored in [
         "target",
         "jobs",
@@ -882,8 +886,19 @@ You are the HTTP dynamic profile.
         serde_json::json!({"agent": "dynamic"}),
     )?;
     assert_eq!(second_turn["status"], "completed");
+    let context = client.session_context(&session_id, Some(2))?;
+    assert_eq!(
+        context["latest"]["system_diagnostics"]["profile_id"],
+        "dynamic"
+    );
+    assert!(
+        context["latest"]["system_diagnostics"]["content_hash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty())
+    );
 
     let _ = server.kill();
+    let _ = server.wait();
     let _ = provider_thread.join();
     let requests = provider_requests.lock().expect("provider requests");
     assert_eq!(requests.len(), 2);
@@ -892,6 +907,71 @@ You are the HTTP dynamic profile.
     assert!(requests[1].contains("HTTP_SECOND_TURN_INSTRUCTION"));
     assert!(!requests[1].contains("HTTP_FIRST_TURN_INSTRUCTION"));
     assert!(requests[1].contains("You are the HTTP dynamic profile."));
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    let receipts = state["metadata"]["context_pack_receipts"]
+        .as_array()
+        .expect("context pack receipts");
+    assert_eq!(receipts.len(), 2);
+    assert_ne!(
+        receipts[0]["receipt"]["provider_input_hash"],
+        receipts[1]["receipt"]["provider_input_hash"]
+    );
+    assert_ne!(
+        receipts[0]["receipt"]["stable_prefix"]["hash"],
+        receipts[1]["receipt"]["stable_prefix"]["hash"]
+    );
+    assert_eq!(receipts[0]["prefix_cache"]["status"], "miss");
+    assert_eq!(receipts[1]["prefix_cache"]["status"], "changed");
+    assert_eq!(
+        receipts[1]["system_diagnostics"]["schema_version"],
+        "openagent.context_system_diagnostics.v1"
+    );
+    assert_eq!(receipts[1]["system_diagnostics"]["profile_id"], "dynamic");
+    assert!(
+        receipts[1]["system_diagnostics"]["instruction_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        !receipts[1]
+            .to_string()
+            .contains("HTTP_SECOND_TURN_INSTRUCTION")
+    );
+    for turn in [&first_turn, &second_turn] {
+        let run_id = turn["turn"]["id"].as_str().expect("turn id");
+        let context_events = read_session_event_records(&session_root, &session_id, run_id)?
+            .into_iter()
+            .filter(|event| event["event"] == "context.pack_built")
+            .collect::<Vec<_>>();
+        assert_eq!(context_events.len(), 1);
+        assert_eq!(context_events[0]["attributes"]["mode"], "active");
+    }
+    let mut restarted = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "fake-model"),
+        ],
+    )?;
+    wait_for_server(port)?;
+    let recovered = client.get_session(&session_id)?;
+    assert_eq!(
+        recovered["metadata"]["context_pack"]["receipt"],
+        state["metadata"]["context_pack"]["receipt"]
+    );
+    assert_eq!(
+        recovered["metadata"]["context_pack_receipts"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let _ = restarted.kill();
 
     let _ = fs::remove_dir_all(temp);
     Ok(())
@@ -1001,6 +1081,49 @@ fn remote_runtime_client_uses_real_provider_endpoint_for_plain_turn() -> Result<
                 && event["params"]["delta"] == "real provider answer")
     );
 
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    let context_pack = &state["metadata"]["context_pack"];
+    assert_eq!(
+        context_pack["schema_version"],
+        "openagent.turn_context_pack.v1"
+    );
+    assert_eq!(context_pack["mode"], "active");
+    assert_eq!(context_pack["run_id"], started["turn"]["id"]);
+    assert_eq!(context_pack["step"], 1);
+    assert_eq!(
+        context_pack["receipt"]["schema_version"],
+        "openagent.context_pack_receipt.v1"
+    );
+    assert_eq!(context_pack["receipt"]["message_count"], 1);
+    assert!(
+        context_pack["receipt"]["tool_manifest_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    let receipts = state["metadata"]["context_pack_receipts"]
+        .as_array()
+        .expect("context pack receipts");
+    assert_eq!(receipts, std::slice::from_ref(context_pack));
+    assert!(state["metadata"].get("context_pack_shadow").is_none());
+    let receipt_text = context_pack.to_string();
+    assert!(!receipt_text.contains("test-key"));
+    assert!(!receipt_text.contains("ask provider"));
+    assert!(!receipt_text.contains("real provider answer"));
+    let run_id = started["turn"]["id"].as_str().expect("turn id");
+    let context_events = read_session_event_records(&session_root, &session_id, run_id)?
+        .into_iter()
+        .filter(|event| event["event"] == "context.pack_built")
+        .collect::<Vec<_>>();
+    assert_eq!(context_events.len(), 1);
+    assert_eq!(context_events[0]["attributes"]["step"], 1);
+    assert_eq!(context_events[0]["attributes"]["mode"], "active");
+    assert_eq!(
+        context_events[0]["attributes"]["receipt"],
+        context_pack["receipt"]
+    );
+
     let _ = server.kill();
     let _ = provider_thread.join();
     let _ = fs::remove_dir_all(temp);
@@ -1008,15 +1131,403 @@ fn remote_runtime_client_uses_real_provider_endpoint_for_plain_turn() -> Result<
 }
 
 #[test]
-fn remote_runtime_client_retries_retryable_provider_502_same_model() -> Result<(), Box<dyn Error>> {
+fn active_context_budget_removes_oversized_history_from_provider_payload()
+-> Result<(), Box<dyn Error>> {
+    let old_answer = format!("OLD_CONTEXT_MARKER {}", "historical-output ".repeat(7_000));
+    let first = serde_json::json!({
+        "id": "resp_budget_history",
+        "output_text": old_answer,
+        "usage": {"input_tokens": 5, "output_tokens": 20}
+    });
+    let second = serde_json::json!({
+        "id": "resp_budget_final",
+        "output_text": "budgeted context answer",
+        "usage": {"input_tokens": 8, "output_tokens": 3}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![first, second])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-context-budget")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "fake-model"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let budget = serde_json::json!({
+        "context_budget": {
+            "context_window": 30_000,
+            "reserve_output_tokens": 4_000,
+            "input_safety_margin_tokens": 1_000,
+            "bytes_per_token": 3
+        }
+    });
+    let first_turn = client.start_turn(&session_id, "first request", budget.clone())?;
+    assert_eq!(first_turn["status"], "completed");
+    let second_turn = client.start_turn(&session_id, "LATEST_BUDGET_REQUEST", budget)?;
+    assert_eq!(second_turn["status"], "completed");
+    assert_eq!(
+        second_turn["turn"]["final_answer"],
+        "budgeted context answer"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("LATEST_BUDGET_REQUEST"));
+    assert!(!requests[1].contains("OLD_CONTEXT_MARKER"));
+    assert!(!requests[1].contains("context_budget"));
+    drop(requests);
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    let receipt = &state["metadata"]["context_pack"]["receipt"];
+    assert_eq!(receipt["budget"]["enabled"], true);
+    assert_eq!(receipt["budget"]["model_id"], "fake-model");
+    assert_eq!(receipt["budget"]["context_window"], 30_000);
+    assert_eq!(receipt["budget"]["reserved_output_tokens"], 4_000);
+    assert_eq!(receipt["budget"]["input_limit_tokens"], 25_000);
+    assert_eq!(receipt["drop_reason_counts"]["model_context_budget"], 1);
+    assert!(
+        receipt["estimated_input_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens <= 25_000)
+    );
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn active_context_budget_fits_required_attachment_and_latest_user_before_provider_call()
+-> Result<(), Box<dyn Error>> {
+    let response = serde_json::json!({
+        "id": "resp_required_context_fit",
+        "output_text": "required context fitted",
+        "usage": {"input_tokens": 120, "output_tokens": 4}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![response])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-required-context-fit")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(workspace.join(".openagent/agents"))?;
+    fs::write(
+        workspace.join(".openagent/agents/required-fit.md"),
+        r#"---
+id: required-fit
+name: Required Fit
+mode: primary
+tools: ["read"]
+---
+PROFILE_REQUIRED_HEAD
+Keep workspace instructions and the latest user request.
+PROFILE_REQUIRED_TAIL
+"#,
+    )?;
+    fs::write(
+        workspace.join("OPENAGENT.md"),
+        format!(
+            "PROJECT_INSTRUCTION_HEAD\n{}\nPROJECT_INSTRUCTION_TAIL",
+            "project-rule ".repeat(800)
+        ),
+    )?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "fake-model"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let latest_user = format!(
+        "LATEST_REQUIRED_HEAD\n{}UNRETAINED_USER_MIDDLE{}\nLATEST_REQUIRED_TAIL",
+        "latest-left ".repeat(6_000),
+        "latest-right ".repeat(6_000)
+    );
+    let attachment = format!(
+        "ATTACHMENT_REQUIRED_HEAD\n{}UNRETAINED_ATTACHMENT_MIDDLE{}\nATTACHMENT_REQUIRED_TAIL",
+        "attachment-left ".repeat(6_000),
+        "attachment-right ".repeat(6_000)
+    );
+    let started = client.start_turn(
+        &session_id,
+        &latest_user,
+        serde_json::json!({
+            "agent": "required-fit",
+            "attachments": [{
+                "kind": "file",
+                "path": "/workspace/large-required.md",
+                "name": "large-required.md",
+                "content_type": "text/markdown",
+                "size_bytes": attachment.len(),
+                "content": attachment
+            }],
+            "context_budget": {
+                "strategy": "compact",
+                "context_window": 12_000,
+                "reserve_output_tokens": 1_000,
+                "input_safety_margin_tokens": 500,
+                "bytes_per_token": 3
+            }
+        }),
+    )?;
+    assert_eq!(started["status"], "completed");
+    assert_eq!(started["turn"]["final_answer"], "required context fitted");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    for marker in [
+        "PROJECT_INSTRUCTION_HEAD",
+        "PROJECT_INSTRUCTION_TAIL",
+        "LATEST_REQUIRED_HEAD",
+        "LATEST_REQUIRED_TAIL",
+        "ATTACHMENT_REQUIRED_HEAD",
+        "ATTACHMENT_REQUIRED_TAIL",
+        "context truncated to fit model budget",
+    ] {
+        assert!(request.contains(marker), "missing provider marker {marker}");
+    }
+    assert!(!request.contains("UNRETAINED_USER_MIDDLE"));
+    assert!(!request.contains("UNRETAINED_ATTACHMENT_MIDDLE"));
+    assert!(request.len() < 120_000);
+    drop(requests);
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    let receipt = &state["metadata"]["context_pack"]["receipt"];
+    assert_eq!(receipt["budget"]["overflowed"], false);
+    assert!(
+        receipt["truncated_item_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 2)
+    );
+    assert!(
+        receipt["truncation_reason_counts"]["required_context_budget"]
+            .as_u64()
+            .is_some_and(|count| count >= 2)
+    );
+    assert!(
+        receipt["truncation_strategy_counts"]["attachment_header_head_tail"]
+            .as_u64()
+            .is_some_and(|count| count >= 1)
+    );
+    let run_id = started["turn"]["id"].as_str().expect("turn id");
+    let context_events = read_session_event_records(&session_root, &session_id, run_id)?;
+    assert_eq!(
+        context_events
+            .iter()
+            .filter(|event| event["event"] == "context.auto_compacted")
+            .count(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn context_budget_auto_compacts_and_rebuilds_across_restart() -> Result<(), Box<dyn Error>> {
+    let responses = vec![
+        serde_json::json!({
+            "id": "resp_compact_history_1",
+            "output_text": format!("HISTORY_ONE {}", "alpha-history ".repeat(1_500)),
+            "usage": {"input_tokens": 5, "output_tokens": 2_000}
+        }),
+        serde_json::json!({
+            "id": "resp_compact_history_2",
+            "output_text": format!("HISTORY_TWO {}", "beta-history ".repeat(1_500)),
+            "usage": {"input_tokens": 5, "output_tokens": 2_000}
+        }),
+        serde_json::json!({
+            "id": "resp_compact_history_3",
+            "output_text": format!("HISTORY_THREE {}", "gamma-history ".repeat(1_500)),
+            "usage": {"input_tokens": 5, "output_tokens": 2_000}
+        }),
+        serde_json::json!({
+            "id": "resp_compact_final",
+            "output_text": "automatic compaction completed",
+            "usage": {"input_tokens": 80, "output_tokens": 4}
+        }),
+        serde_json::json!({
+            "id": "resp_compact_restarted",
+            "output_text": "automatic compaction recovered",
+            "usage": {"input_tokens": 84, "output_tokens": 4}
+        }),
+    ];
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(responses)?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-auto-context-compaction")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let provider_env = [
+        ("OPENAI_API_KEY", "test-key"),
+        ("OPENAI_BASE_URL", provider_base_url.as_str()),
+        ("OPENAI_WIRE_API", "responses"),
+        ("OPENAI_MODEL", "fake-model"),
+    ];
+    let mut server = spawn_runtime_with_env(port, &workspace, &session_root, &provider_env)?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    for turn in 1..=3 {
+        let started = client.start_turn(
+            &session_id,
+            &format!("history request {turn}"),
+            serde_json::json!({}),
+        )?;
+        assert_eq!(started["status"], "completed");
+    }
+    let compact_budget = serde_json::json!({
+        "context_budget": {
+            "bytes_per_token": 3,
+            "compact_refresh_min_new_messages": 2,
+            "compact_summary_max_output_tokens": 128,
+            "context_window": 8_000,
+            "input_safety_margin_tokens": 500,
+            "prune_keep_recent_user_turns": 1,
+            "reserve_output_tokens": 1_000,
+            "strategy": "compact"
+        }
+    });
+    let compacted = client.start_turn(
+        &session_id,
+        "AUTO_COMPACT_LATEST_REQUEST",
+        compact_budget.clone(),
+    )?;
+    assert_eq!(compacted["status"], "completed");
+    assert_eq!(
+        compacted["turn"]["final_answer"],
+        "automatic compaction completed"
+    );
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    let rebuild = &state["metadata"]["context_pack"]["rebuild"];
+    assert_eq!(rebuild["reason"], "history_budget_pressure");
+    assert!(
+        rebuild["before_receipt"]["drop_reason_counts"]["model_context_budget"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert_eq!(rebuild["after_receipt"]["budget"]["overflowed"], false);
+    assert_eq!(rebuild["compaction"]["automatic"], true);
+    assert_eq!(
+        state["metadata"]["compact"]["format"],
+        "structured_work_state"
+    );
+    assert_eq!(state["metadata"]["compact"]["automatic"], true);
+    let compact_run_id = compacted["turn"]["id"].as_str().expect("compact turn id");
+    let context_events = read_session_event_records(&session_root, &session_id, compact_run_id)?;
+    assert_eq!(
+        context_events
+            .iter()
+            .filter(|event| event["event"] == "context.auto_compacted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        context_events
+            .iter()
+            .filter(|event| event["event"] == "context.pack_built")
+            .count(),
+        1
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let mut restarted = spawn_runtime_with_env(port, &workspace, &session_root, &provider_env)?;
+    wait_for_server(port)?;
+    let recovered = client.start_turn(
+        &session_id,
+        "AFTER_COMPACTION_RESTART_REQUEST",
+        compact_budget,
+    )?;
+    assert_eq!(recovered["status"], "completed");
+    assert_eq!(
+        recovered["turn"]["final_answer"],
+        "automatic compaction recovered"
+    );
+
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 5);
+    assert!(requests[3].contains("AUTO_COMPACT_LATEST_REQUEST"));
+    assert!(requests[3].contains("[Structured work state]"));
+    assert!(requests[3].len() < 40_000);
+    assert!(requests[4].contains("AFTER_COMPACTION_RESTART_REQUEST"));
+    assert!(requests[4].contains("[Structured work state]"));
+    drop(requests);
+
+    let transcript = fs::read_to_string(session_root.join(&session_id).join("transcript.jsonl"))?;
+    let message_ids = transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["schema_version"] == "openagent.message.v2")
+        .filter_map(|record| record["info"]["id"].as_str().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        message_ids.len(),
+        message_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn remote_runtime_client_retries_retryable_provider_503_same_model() -> Result<(), Box<dyn Error>> {
     let (provider_port, provider_thread, provider_requests) =
         spawn_fake_openai_responses_provider_http_sequence(vec![
             (
-                502,
+                503,
                 serde_json::json!({
                     "error": {
-                        "message": "Upstream service temporarily unavailable",
-                        "type": "upstream_error"
+                        "message": "Service temporarily unavailable",
+                        "type": "api_error"
                     }
                 }),
             ),
@@ -1052,7 +1563,20 @@ fn remote_runtime_client_retries_retryable_provider_502_same_model() -> Result<(
     let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
         .with_auth(RemoteAuth::bearer("secret"));
     let session_id = client.create_session(&workspace, None)?;
-    let started = client.start_turn(&session_id, "ask provider", serde_json::json!({}))?;
+    let started = client.start_turn(
+        &session_id,
+        "ask provider",
+        serde_json::json!({
+            "attachments": [{
+                "kind": "file",
+                "path": "/workspace/retry-evidence.md",
+                "name": "retry-evidence.md",
+                "content_type": "text/markdown",
+                "size_bytes": 20,
+                "content": "typed retry evidence"
+            }]
+        }),
+    )?;
 
     assert_eq!(started["status"], "completed");
     assert_eq!(started["turn"]["final_answer"], "retried provider answer");
@@ -1072,6 +1596,54 @@ fn remote_runtime_client_retries_retryable_provider_502_same_model() -> Result<(
     let second: Value = serde_json::from_str(&requests[1])?;
     assert_eq!(first["model"], "fake-model");
     assert_eq!(second["model"], "fake-model");
+    assert_eq!(first, second);
+    let input = first["input"].as_array().expect("responses input");
+    assert!(
+        input
+            .iter()
+            .any(|item| { item["role"] == "user" && item["content"] == "ask provider" })
+    );
+    let attachment_message = input
+        .iter()
+        .find(|item| {
+            item["role"] == "user"
+                && item["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("typed retry evidence"))
+        })
+        .expect("typed attachment provider message");
+    assert!(
+        attachment_message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("kind=file"))
+    );
+    drop(requests);
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    let receipts = state["metadata"]["context_pack_receipts"]
+        .as_array()
+        .expect("context pack receipts");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["run_id"], started["turn"]["id"]);
+    assert_eq!(receipts[0]["step"], 1);
+    assert_eq!(receipts[0]["prefix_cache"]["status"], "miss");
+    assert_eq!(receipts[0]["prefix_cache"]["retry_reuses_pack"], true);
+    assert!(
+        receipts[0]["receipt"]["stable_prefix"]["hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha1:"))
+    );
+    assert_eq!(
+        receipts[0]["receipt"]["item_kind_counts"]["attachment_file"],
+        1
+    );
+    let run_id = started["turn"]["id"].as_str().expect("turn id");
+    let context_event_count = read_session_event_records(&session_root, &session_id, run_id)?
+        .iter()
+        .filter(|event| event["event"] == "context.pack_built")
+        .count();
+    assert_eq!(context_event_count, 1);
 
     let _ = server.kill();
     let _ = provider_thread.join();
@@ -1325,6 +1897,19 @@ fn remote_runtime_client_continues_provider_after_tool_call() -> Result<(), Box<
         event["method"] == "item/agentMessage/delta"
             && event["params"]["delta"] == "tool result says alpha"
     }));
+    let context = client.session_context(&session_id, Some(4))?;
+    assert_eq!(context["status"], "ready");
+    assert!(
+        context["latest"]["receipt"]["tool_manifest_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    let global_events = client.global_events(0)?;
+    assert!(global_events.iter().any(|event| {
+        event["method"] == "context/updated"
+            && event["params"]["session_id"] == session_id
+            && event["params"]["diagnostics"]["receipt"]["pack_hash"].is_string()
+    }));
 
     let _ = server.kill();
     let _ = provider_thread.join();
@@ -1332,6 +1917,454 @@ fn remote_runtime_client_continues_provider_after_tool_call() -> Result<(), Box<
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("function_call_output"));
     assert!(requests[1].contains("alpha"));
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn context_pack_representative_repository_exploration_meets_quality_baseline()
+-> Result<(), Box<dyn Error>> {
+    let prepare_todo = serde_json::json!({
+        "id": "resp_quality_prepare_todo",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_quality_todo",
+            "name": "todowrite",
+            "arguments": serde_json::json!({
+                "todos": [{
+                    "id": "todo-context-audit",
+                    "content": "Trace ContextPackBuilder through the provider boundary",
+                    "status": "in_progress",
+                    "priority": "high"
+                }]
+            }).to_string()
+        }],
+        "usage": {"input_tokens": 5, "output_tokens": 2}
+    });
+    let prepare_final = serde_json::json!({
+        "id": "resp_quality_prepare_final",
+        "output_text": "audit context prepared",
+        "usage": {"input_tokens": 8, "output_tokens": 3}
+    });
+    let explore_tools = serde_json::json!({
+        "id": "resp_quality_explore_tools",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "call_quality_ls",
+                "name": "ls",
+                "arguments": "{\"path\":\".\"}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_quality_grep",
+                "name": "grep",
+                "arguments": "{\"pattern\":\"ContextPackBuilder\",\"path\":\".\",\"include\":\"*.rs\"}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_quality_read_readme",
+                "name": "read",
+                "arguments": "{\"file_path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_quality_read_manifest",
+                "name": "read",
+                "arguments": "{\"file_path\":\"Cargo.toml\"}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_quality_read_core",
+                "name": "read",
+                "arguments": "{\"file_path\":\"src/core.rs\"}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_quality_read_http",
+                "name": "read",
+                "arguments": "{\"file_path\":\"runtime/http/src/http_runtime.rs\"}"
+            }
+        ],
+        "usage": {"input_tokens": 20, "output_tokens": 8}
+    });
+    let explore_final = serde_json::json!({
+        "id": "resp_quality_explore_final",
+        "output_text": concat!(
+            "Evidence from README.md and Cargo.toml identifies the Rust workspace. ",
+            "src/core.rs owns ContextPackBuilder, while runtime/http/src/http_runtime.rs ",
+            "enforces the provider boundary. The project instruction, attachment, ",
+            "preloaded skill, todo, and checkpoint were all available to the audit."
+        ),
+        "usage": {"input_tokens": 35, "output_tokens": 18}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![
+            prepare_todo,
+            prepare_final,
+            explore_tools,
+            explore_final,
+        ])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-context-quality")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(workspace.join(".openagent/agents"))?;
+    fs::create_dir_all(workspace.join(".openagent/skills/repo-audit"))?;
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("runtime/http/src"))?;
+    fs::write(
+        workspace.join(".openagent/agents/context-explorer.md"),
+        r#"---
+id: context-explorer
+name: Context Explorer
+mode: primary
+permission: FULL
+skills: ["repo-audit"]
+tools: ["ls", "grep", "read", "todoread", "todowrite"]
+steps: 8
+---
+Inspect repository evidence before answering and cite the owning files.
+"#,
+    )?;
+    fs::write(
+        workspace.join(".openagent/skills/repo-audit/SKILL.md"),
+        r#"---
+name: repo-audit
+description: Evidence-first repository architecture audit
+---
+PRELOADED_REPO_AUDIT_SKILL: inspect manifests, entrypoints, and ownership boundaries.
+"#,
+    )?;
+    fs::write(
+        workspace.join("OPENAGENT.md"),
+        concat!(
+            "PROJECT_CONTEXT_RULE: read README.md, Cargo.toml, src/core.rs, and ",
+            "runtime/http/src/http_runtime.rs before answering. Cite evidence."
+        ),
+    )?;
+    fs::write(
+        workspace.join("README.md"),
+        "# Representative OpenHarness\nRust Agent Runtime quality fixture.\n",
+    )?;
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"src\", \"runtime/http\"]\n",
+    )?;
+    fs::write(
+        workspace.join("src/core.rs"),
+        "pub struct ContextPackBuilder;\n// Owns context assembly.\n",
+    )?;
+    fs::write(
+        workspace.join("runtime/http/src/http_runtime.rs"),
+        "fn provider_boundary() { /* accepts a verified ContextPack */ }\n",
+    )?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "fake-model"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let prepared = client.start_turn(
+        &session_id,
+        "Prepare the architecture audit.",
+        serde_json::json!({
+            "agent": "context-explorer",
+            "permission": "FULL"
+        }),
+    )?;
+    assert_eq!(prepared["status"], "completed");
+    let explored = client.start_turn(
+        &session_id,
+        "Map the ContextPackBuilder ownership and provider path with evidence.",
+        serde_json::json!({
+            "agent": "context-explorer",
+            "permission": "FULL",
+            "attachments": [{
+                "kind": "file",
+                "path": "audit-focus.md",
+                "name": "audit-focus.md",
+                "content_type": "text/markdown",
+                "size_bytes": 72,
+                "content": "ATTACHMENT_FOCUS: verify context assembly and provider boundary ownership."
+            }]
+        }),
+    )?;
+    assert_eq!(explored["status"], "completed");
+    let context = client.session_context(&session_id, Some(8))?;
+    let observation = exploration_observation_from_bridge_turn(
+        "context-pack-repository-audit",
+        &explored,
+        &context,
+    );
+    let rubric = ExplorationQualityRubric {
+        case_id: "context-pack-repository-audit".to_string(),
+        required_context_kinds: [
+            "attachment_file",
+            "checkpoint",
+            "message",
+            "skill_preloaded",
+            "todo",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        required_available_tools: ["grep", "ls", "read", "todoread", "todowrite"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        required_files: [
+            "Cargo.toml",
+            "README.md",
+            "runtime/http/src/http_runtime.rs",
+            "src/core.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        required_tools_used: ["grep", "ls", "read"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        required_answer_terms: [
+            "attachment",
+            "cargo.toml",
+            "checkpoint",
+            "contextpackbuilder",
+            "project instruction",
+            "provider boundary",
+            "runtime/http/src/http_runtime.rs",
+            "src/core.rs",
+            "todo",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        forbidden_tools: ["bash", "edit", "write"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        max_failed_tool_calls: 0,
+        max_duplicate_tool_calls: 0,
+        minimum_score: 100.0,
+    };
+    let quality = score_exploration_quality(&rubric, &observation);
+    assert!(
+        quality.passed,
+        "quality gate failed: {:?}",
+        quality.failure_reasons
+    );
+    assert_eq!(quality.score, 100.0);
+    let baseline: ExplorationQualityResult = serde_json::from_str(&fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/golden/rust_rewrite/context_pack_exploration_quality.json"),
+    )?)?;
+    let comparison = compare_exploration_quality(&baseline, &quality, 0.0);
+    assert!(
+        comparison.passed,
+        "quality baseline regressed: {:?}",
+        comparison.regressions
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 4);
+    for marker in [
+        "ATTACHMENT_FOCUS",
+        "PRELOADED_REPO_AUDIT_SKILL",
+        "PROJECT_CONTEXT_RULE",
+        "[Checkpoint id=",
+        "[Todo id=todo-context-audit",
+    ] {
+        assert!(
+            requests[2].contains(marker),
+            "representative provider request missing {marker}"
+        );
+    }
+    for marker in [
+        "Owns context assembly",
+        "Representative OpenHarness",
+        "accepts a verified ContextPack",
+        "members",
+    ] {
+        assert!(
+            requests[3].contains(marker),
+            "tool result context missing {marker}"
+        );
+    }
+    drop(requests);
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn context_pack_recovers_todo_checkpoint_and_work_state_after_restart() -> Result<(), Box<dyn Error>>
+{
+    let first = serde_json::json!({
+        "id": "resp_context_todo",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_context_todo",
+            "name": "todowrite",
+            "arguments": serde_json::json!({
+                "todos": [{
+                    "id": "todo-context",
+                    "content": "Keep typed context across restart",
+                    "status": "in_progress",
+                    "priority": "high"
+                }]
+            }).to_string()
+        }],
+        "usage": {"input_tokens": 5, "output_tokens": 1}
+    });
+    let second = serde_json::json!({
+        "id": "resp_context_first_final",
+        "output_text": "typed context captured",
+        "usage": {"input_tokens": 9, "output_tokens": 4}
+    });
+    let third = serde_json::json!({
+        "id": "resp_context_recovered",
+        "output_text": "typed context recovered",
+        "usage": {"input_tokens": 8, "output_tokens": 3}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![first, second, third])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-context-recovery")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("tracked.txt"), "context\n")?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let provider_env = [
+        ("OPENAI_API_KEY", "test-key"),
+        ("OPENAI_BASE_URL", provider_base_url.as_str()),
+        ("OPENAI_WIRE_API", "responses"),
+        ("OPENAI_MODEL", "fake-model"),
+    ];
+    let mut server = spawn_runtime_with_env(port, &workspace, &session_root, &provider_env)?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let first_turn = client.start_turn(&session_id, "capture context", serde_json::json!({}))?;
+    assert_eq!(first_turn["status"], "completed");
+    assert_eq!(first_turn["turn"]["final_answer"], "typed context captured");
+
+    let state_before_compact: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    assert_eq!(
+        state_before_compact["todos"][0]["id"],
+        serde_json::json!("todo-context")
+    );
+    assert_eq!(
+        state_before_compact["todos"][0]["status"],
+        serde_json::json!("in_progress")
+    );
+    let initial_receipts = state_before_compact["metadata"]["context_pack_receipts"]
+        .as_array()
+        .expect("initial context receipts");
+    assert_eq!(initial_receipts.len(), 2);
+    assert_eq!(
+        initial_receipts[0]["receipt"]["stable_prefix"]["hash"],
+        initial_receipts[1]["receipt"]["stable_prefix"]["hash"]
+    );
+    assert_eq!(initial_receipts[0]["prefix_cache"]["status"], "miss");
+    assert_eq!(initial_receipts[1]["prefix_cache"]["status"], "reused");
+    assert_eq!(
+        initial_receipts[1]["prefix_cache"]["reused_from"]["run_id"],
+        first_turn["turn"]["id"]
+    );
+    assert_eq!(
+        initial_receipts[1]["prefix_cache"]["reused_from"]["step"],
+        1
+    );
+    {
+        let requests = provider_requests.lock().expect("provider requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("[Todo id=todo-context"));
+        assert!(requests[1].contains("[Checkpoint id="));
+    }
+
+    let compacted = client.compact_session(&session_id)?;
+    assert_eq!(compacted["status"], "compacted");
+    assert!(
+        compacted["summary"]["boundary_message_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let mut restarted = spawn_runtime_with_env(port, &workspace, &session_root, &provider_env)?;
+    wait_for_server(port)?;
+    let second_turn =
+        client.start_turn(&session_id, "continue after restart", serde_json::json!({}))?;
+    assert_eq!(second_turn["status"], "completed");
+    assert_eq!(
+        second_turn["turn"]["final_answer"],
+        "typed context recovered"
+    );
+
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].contains("[Work state]"));
+    assert!(requests[2].contains("[Todo id=todo-context"));
+    assert!(requests[2].contains("[Checkpoint id="));
+    drop(requests);
+
+    let recovered: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    let receipt = &recovered["metadata"]["context_pack"]["receipt"];
+    assert_eq!(receipt["item_kind_counts"]["work_state"], 1);
+    assert_eq!(receipt["item_kind_counts"]["todo"], 1);
+    assert_eq!(receipt["item_kind_counts"]["checkpoint"], 1);
+    let receipt_text = receipt.to_string();
+    assert!(!receipt_text.contains("Keep typed context across restart"));
+    assert!(!receipt_text.contains("typed context captured"));
+    assert!(!receipt_text.contains("test-key"));
+    let recovered_receipts = recovered["metadata"]["context_pack_receipts"]
+        .as_array()
+        .expect("recovered context receipts");
+    assert_eq!(recovered_receipts.len(), 3);
+    let prefix_hashes = recovered_receipts
+        .iter()
+        .filter_map(|item| {
+            item["receipt"]["stable_prefix"]["hash"]
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(prefix_hashes.len(), 1);
+    assert_eq!(recovered_receipts[2]["prefix_cache"]["status"], "reused");
+    assert_eq!(
+        recovered_receipts[2]["prefix_cache"]["reused_from"]["run_id"],
+        first_turn["turn"]["id"]
+    );
+    assert_eq!(
+        recovered_receipts[2]["prefix_cache"]["reused_from"]["step"],
+        2
+    );
+
     let _ = fs::remove_dir_all(temp);
     Ok(())
 }
@@ -1410,6 +2443,24 @@ fn remote_runtime_client_provider_loop_executes_mcp_tool() -> Result<(), Box<dyn
                 .as_str()
                 .is_some_and(|value| value.contains("mcp echo: from-provider"))
     }));
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(&session_id).join("state.latest.json"),
+    )?)?;
+    let context_receipts = state["metadata"]["context_pack_receipts"]
+        .as_array()
+        .expect("context pack receipts")
+        .clone();
+    assert_eq!(context_receipts.len(), 2);
+    for receipt in &context_receipts {
+        assert_eq!(
+            receipt["receipt"]["item_kind_counts"]["mcp_tool_manifest"],
+            1
+        );
+        assert_eq!(
+            receipt["receipt"]["item_delivery_counts"]["tool_manifest"],
+            1
+        );
+    }
 
     let _ = server.kill();
     let _ = provider_thread.join();
@@ -1419,6 +2470,30 @@ fn remote_runtime_client_provider_loop_executes_mcp_tool() -> Result<(), Box<dyn
     assert!(provider_requests[0].contains(mcp_tool));
     assert!(provider_requests[1].contains("function_call_output"));
     assert!(provider_requests[1].contains("mcp echo: from-provider"));
+    for (index, request) in provider_requests.iter().enumerate() {
+        let request: Value = serde_json::from_str(request)?;
+        let mut request_tool_names = request["tools"]
+            .as_array()
+            .expect("provider tools")
+            .iter()
+            .filter_map(|tool| {
+                tool.get("name")
+                    .or_else(|| tool.pointer("/function/name"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        request_tool_names.sort();
+        let receipt_tool_names = context_receipts[index]["receipt"]["tool_names"]
+            .as_array()
+            .expect("receipt tool names")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(receipt_tool_names, request_tool_names);
+        assert!(receipt_tool_names.iter().any(|name| name == mcp_tool));
+    }
     let mcp_requests = mcp_requests.lock().expect("mcp requests");
     assert_eq!(mcp_requests.len(), 2);
     assert!(mcp_requests[0].contains("\"method\":\"tools/list\""));
@@ -1707,6 +2782,19 @@ Use runtime preloaded guidance.
         child_state["metadata"]["preloaded_skills"],
         serde_json::json!(["runtime-brief"])
     );
+    let child_context_receipt = child_state["metadata"]["context_pack_receipts"]
+        .as_array()
+        .and_then(|receipts| receipts.last())
+        .ok_or("missing child context pack receipt")?;
+    assert_eq!(
+        child_context_receipt["receipt"]["item_kind_counts"]["skill_preloaded"],
+        1
+    );
+    assert!(
+        child_context_receipt["receipt"]["item_delivery_counts"]["trace_only"]
+            .as_u64()
+            .is_some_and(|count| count >= 1)
+    );
     let tasks = client.tasks(&session_id)?;
     let task = tasks
         .iter()
@@ -1859,6 +2947,7 @@ fn task_subagent_scout_fetches_external_docs() -> Result<(), Box<dyn Error>> {
             "glob",
             "grep",
             "ls",
+            "lsp",
             "code_search",
             "skill",
             "todoread"
@@ -1892,6 +2981,7 @@ fn task_subagent_scout_fetches_external_docs() -> Result<(), Box<dyn Error>> {
             "glob",
             "grep",
             "ls",
+            "lsp",
             "read",
             "skill",
             "todoread",
@@ -4880,7 +5970,11 @@ fn async_turn_queues_second_session_when_global_worker_quota_full() -> Result<()
     let first_turn_id = first["turn_id"].as_str().expect("first turn id");
     assert_eq!(first["status"], "running");
     for _ in 0..40 {
-        if provider_requests.lock().expect("provider requests").len() >= 1 {
+        if !provider_requests
+            .lock()
+            .expect("provider requests")
+            .is_empty()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -5270,7 +6364,11 @@ fn async_turn_recovers_persisted_queued_turn_after_runtime_restart() -> Result<(
     let first = json_body(&first_response)?;
     let first_turn_id = first["turn_id"].as_str().expect("first turn id");
     for _ in 0..40 {
-        if provider_requests.lock().expect("provider requests").len() >= 1 {
+        if !provider_requests
+            .lock()
+            .expect("provider requests")
+            .is_empty()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -5409,7 +6507,11 @@ fn async_turn_recovery_respects_live_queue_lease_owner() -> Result<(), Box<dyn E
     let first = json_body(&first_response)?;
     let first_turn_id = first["turn_id"].as_str().expect("first turn id");
     for _ in 0..40 {
-        if provider_requests.lock().expect("provider requests").len() >= 1 {
+        if !provider_requests
+            .lock()
+            .expect("provider requests")
+            .is_empty()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -6126,13 +7228,10 @@ fn spawn_fake_openai_responses_provider_sequence(
                 let Ok((mut stream, _addr)) = listener.accept() else {
                     break;
                 };
-                let mut buffer = [0_u8; 16384];
-                let read = stream.read(&mut buffer).unwrap_or_default();
-                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-                if let Some((_, body)) = request.split_once("\r\n\r\n") {
-                    if let Ok(mut items) = captured.lock() {
-                        items.push(body.to_string());
-                    }
+                if let Ok(body) = read_http_request_body(&mut stream)
+                    && let Ok(mut items) = captured.lock()
+                {
+                    items.push(body);
                 }
                 let body = body_value.to_string();
                 let response = format!(
@@ -6161,13 +7260,10 @@ fn spawn_fake_openai_responses_provider_http_sequence(
                 let Ok((mut stream, _addr)) = listener.accept() else {
                     break;
                 };
-                let mut buffer = [0_u8; 16384];
-                let read = stream.read(&mut buffer).unwrap_or_default();
-                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-                if let Some((_, body)) = request.split_once("\r\n\r\n")
+                if let Ok(body) = read_http_request_body(&mut stream)
                     && let Ok(mut items) = captured.lock()
                 {
-                    items.push(body.to_string());
+                    items.push(body);
                 }
                 let reason = if status == 200 { "OK" } else { "ERROR" };
                 let body = body_value.to_string();
@@ -6181,6 +7277,45 @@ fn spawn_fake_openai_responses_provider_http_sequence(
         }),
         requests,
     ))
+}
+
+fn read_http_request_body(stream: &mut TcpStream) -> Result<String, Box<dyn Error>> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let (header_end, content_length) = loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Err("request ended before headers were complete".into());
+        }
+        request.extend_from_slice(&buffer[..read]);
+        let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or_default();
+        break (header_end, content_length);
+    };
+    while request.len() < header_end.saturating_add(content_length) {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+    let body_end = header_end.saturating_add(content_length).min(request.len());
+    Ok(String::from_utf8_lossy(&request[header_end..body_end]).into_owned())
 }
 
 fn spawn_fake_mcp_server() -> Result<FakeMcpServer, Box<dyn Error>> {

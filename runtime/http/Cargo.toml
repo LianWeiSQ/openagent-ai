@@ -21,6 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 
+[dev-dependencies]
+openagent-eval.workspace = true
+
 [lib]
 path = "src/http_runtime.rs"
 

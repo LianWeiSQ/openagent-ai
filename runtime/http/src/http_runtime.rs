@@ -17,9 +17,14 @@ use openagent_bridge_server::{
     record_control_response_payload, tui_control_request_for_path,
 };
 use openagent_core::{
-    AgentSystemPromptInput, PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
-    build_agent_system_prompt, permission_rule, skill_document_model_invocable,
-    skill_info_model_invocable,
+    ContextAttachment, ContextAttachmentKind, ContextBudgetOptions, ContextCheckpoint,
+    ContextFailure, ContextFailureCode, ContextItem, ContextPack, ContextPackBuildOptions,
+    ContextPackBuilder, ContextPackInput, ContextPackPerformance, ContextPackReceipt,
+    ContextPackTraceEntry, ContextSystemDiagnostics, ContextSystemSources, ContextTodo,
+    ContextWorkState, PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
+    context_pack_build_options_for_model, load_context_budget_options, materialize_context_history,
+    permission_rule, skill_document_model_invocable, skill_info_model_invocable,
+    tool_manifest_context_item,
 };
 use openagent_lsp::{
     LspOperation, LspQuery, lsp_doctor, lsp_status, operation_from_str, query_workspace,
@@ -32,25 +37,27 @@ use openagent_mcp::{
     unavailable_tool_result,
 };
 use openagent_protocol::{
-    ChatMessage, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema, Usage,
+    ChatMessage, Model, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema, Usage,
+    WorkState, render_work_state,
 };
 use openagent_provider::{
     OpenAiLanguageModelConfig, ProviderStreamEvent, build_openai_chat_payload,
     build_openai_responses_payload, default_env_mapping, normalize_openai_chat_sse_chunks,
     normalize_openai_responses_response, normalize_openai_responses_stream_events,
-    normalize_provider, parse_tool_arguments, provider_default_base_url, provider_default_model,
-    provider_label, provider_requires_api_key, summarize_http_error_body,
+    normalize_provider, openagent_context_model, openagent_text_model_supported,
+    parse_tool_arguments, provider_default_base_url, provider_default_model, provider_label,
+    provider_requires_api_key, summarize_http_error_body,
 };
 use openagent_session::{
-    FileSessionStore, Session, SessionEventOptions, SessionPartOptions, SessionStatus,
-    StartRunOptions,
+    FileSessionStore, Session, SessionCheckpointRecord, SessionEventOptions, SessionPartOptions,
+    SessionStatus, StartRunOptions, TodoItem as SessionTodoItem,
 };
 use openagent_tools::{
-    SessionRunnerFacade, SkillPermissionRule, TASK_TOOL_ID, TaskPermissionRule,
-    TaskSubagentDescriptor, TaskSubagentRoute, ToolContext, Toolkit, fork_skill_task_from_input,
-    parse_agent_profile_schema, prepare_isolated_workspace, register_task_tool,
-    resolve_path_in_root, select_task_subagent_for_prompt, skill_is_visible,
-    task_subagent_is_visible,
+    DEFAULT_BUILD_AGENT_PROMPT, SessionRunnerFacade, SkillPermissionRule, TASK_TOOL_ID,
+    TaskPermissionRule, TaskSubagentDescriptor, TaskSubagentRoute, ToolContext, Toolkit,
+    builtin_agent_profile_specs, fork_skill_task_from_input, parse_agent_profile_schema,
+    prepare_isolated_workspace, register_task_tool, resolve_path_in_root,
+    select_task_subagent_for_prompt, skill_is_visible, task_subagent_is_visible,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -61,10 +68,10 @@ mod turn_runtime;
 
 use bridge_routes::*;
 pub use bridge_routes::{
-    CliRunResult, HttpResponseSpec, build_run_prompt, command_text_from_args, docker_smoke_command,
-    dockerfile_lines, emit_bridge_events, format_http_error, health_payload, parse_cli_args,
-    parse_sse_data, parse_sse_response_lines, route_health, route_options, route_unauthorized,
-    route_unknown, run_cli,
+    CliRunResult, HttpResponseSpec, command_text_from_args, docker_smoke_command, dockerfile_lines,
+    emit_bridge_events, format_http_error, health_payload, parse_cli_args, parse_sse_data,
+    parse_sse_response_lines, route_health, route_options, route_unauthorized, route_unknown,
+    run_cli,
 };
 use mcp_runtime::*;
 use turn_runtime::*;
@@ -93,11 +100,6 @@ const MAX_TERMINAL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TASK_RUN_LOCK_STALE_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_BACKGROUND_TASK_WORKER_POLL_MS: u64 = 100;
 const DEFAULT_MAX_SUBAGENT_DEPTH: u64 = 3;
-const BUILD_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/build.txt");
-const EXPLORE_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/explore.txt");
-const PLAN_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/plan.txt");
-const SCOUT_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/scout.txt");
-const REVIEW_AGENT_PROMPT: &str = "You are OpenAgent Reviewer. Focus on correctness, regressions, risk, and missing tests. Prefer evidence from tools and keep findings concise.";
 const TURN_INTERRUPTED_ERROR: &str = "turn interrupted";
 const TURN_JOB_INDEX_FILE: &str = ".openagent-runtime/turn_jobs.json";
 const TURN_QUEUE_DIR: &str = ".openagent-runtime/turn_queue";
@@ -107,6 +109,7 @@ const TURN_JOB_INDEX_SCHEMA_VERSION: u64 = 1;
 const TURN_QUEUE_PAYLOAD_SCHEMA_VERSION: u64 = 1;
 const TURN_QUEUE_LEASE_SCHEMA_VERSION: u64 = 1;
 const TURN_RETRY_PAYLOAD_SCHEMA_VERSION: u64 = 1;
+const CONTEXT_DIAGNOSTICS_SCHEMA_VERSION: &str = "openagent.context_diagnostics.v1";
 const TURN_JOB_TERMINAL_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_TURN_JOB_INDEX_ENTRIES: usize = 200;
 const DEFAULT_MAX_QUEUED_TURNS_PER_SESSION: usize = 8;
@@ -282,10 +285,14 @@ fn model_records_for_runtime(
     .filter(|model| runtime_model_supported(model))
     .collect::<Vec<_>>();
     let configured_model = config.model.trim().to_string();
-    if !configured_model.is_empty() && !models.iter().any(|model| model == &configured_model) {
+    if !configured_model.is_empty()
+        && configured_model != "gpt-5.6"
+        && !runtime_image_model_supported(&configured_model)
+        && !models.iter().any(|model| model == &configured_model)
+    {
         models.insert(0, configured_model.clone());
     }
-    models.sort();
+    models.sort_by(|left, right| right.cmp(left));
     models.dedup();
     models
         .into_iter()
@@ -306,21 +313,27 @@ fn model_records_for_runtime(
 }
 
 fn supported_runtime_models() -> Vec<String> {
-    ["gpt-5.4", "gpt-5.5", "gpt-image-1.5", "gpt-image-2"]
-        .iter()
-        .map(|model| (*model).to_string())
-        .collect()
+    [
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+    ]
+    .iter()
+    .map(|model| (*model).to_string())
+    .collect()
 }
 
 fn runtime_model_supported(model: &str) -> bool {
     matches!(
         model,
-        "gpt-5.4" | "gpt-5.5" | "gpt-image-1.5" | "gpt-image-2"
+        "gpt-5.4" | "gpt-5.6-terra" | "gpt-5.6-sol" | "gpt-5.6-luna" | "gpt-5.5"
     )
 }
 
 fn runtime_text_model_supported(model: &str) -> bool {
-    matches!(model, "gpt-5.4" | "gpt-5.5")
+    openagent_text_model_supported(model)
 }
 
 fn runtime_image_model_supported(model: &str) -> bool {
@@ -845,143 +858,38 @@ fn markdown_runtime_agent_profile_value(path: &Path) -> Result<Value, String> {
 }
 
 fn builtin_runtime_subagent_profiles() -> Vec<RuntimeSubagentProfile> {
-    vec![
-        builtin_runtime_subagent_profile(
-            "coder",
-            "Coder",
-            "Implementation-focused profile",
-            PermissionRuleset::PlanOnly,
-            BUILD_AGENT_PROMPT,
-            &[],
-        ),
-        builtin_runtime_subagent_profile(
-            "reviewer",
-            "Reviewer",
-            "Review and risk-focused profile",
-            PermissionRuleset::Readonly,
-            REVIEW_AGENT_PROMPT,
-            &[
-                "read",
-                "glob",
-                "grep",
-                "ls",
-                "code_search",
-                "skill",
-                "todoread",
-            ],
-        ),
-        builtin_runtime_subagent_profile(
-            "planner",
-            "Planner",
-            "Plan-first profile for large changes",
-            PermissionRuleset::PlanOnly,
-            PLAN_AGENT_PROMPT,
-            &[
-                "read",
-                "glob",
-                "grep",
-                "ls",
-                "code_search",
-                "skill",
-                "todoread",
-                "todowrite",
-                "question",
-            ],
-        ),
-        builtin_runtime_subagent_profile(
-            "general",
-            "General",
-            "General-purpose subagent for complex multi-step tasks",
-            PermissionRuleset::PlanOnly,
-            BUILD_AGENT_PROMPT,
-            &[],
-        ),
-        builtin_runtime_subagent_profile(
-            "explore",
-            "Explore",
-            "Read-only code exploration subagent",
-            PermissionRuleset::Readonly,
-            EXPLORE_AGENT_PROMPT,
-            &[
-                "read",
-                "glob",
-                "grep",
-                "ls",
-                "code_search",
-                "skill",
-                "todoread",
-            ],
-        ),
-        builtin_runtime_subagent_profile(
-            "scout",
-            "Scout",
-            "External documentation and dependency research subagent with read-only web fetch access",
-            PermissionRuleset::Readonly,
-            SCOUT_AGENT_PROMPT,
-            &[
-                "web_fetch",
-                "read",
-                "glob",
-                "grep",
-                "ls",
-                "code_search",
-                "skill",
-                "todoread",
-            ],
-        ),
-        builtin_runtime_subagent_profile(
-            "plan",
-            "Plan",
-            "Planning subagent for architecture and task breakdowns",
-            PermissionRuleset::PlanOnly,
-            PLAN_AGENT_PROMPT,
-            &[
-                "read",
-                "glob",
-                "grep",
-                "ls",
-                "code_search",
-                "skill",
-                "todoread",
-                "todowrite",
-                "question",
-            ],
-        ),
-    ]
-}
-
-fn builtin_runtime_subagent_profile(
-    id: &str,
-    name: &str,
-    description: &str,
-    permission: PermissionRuleset,
-    prompt: &str,
-    tools: &[&str],
-) -> RuntimeSubagentProfile {
-    RuntimeSubagentProfile {
-        id: id.to_string(),
-        name: name.to_string(),
-        description: description.to_string(),
-        mode: "subagent".to_string(),
-        permission,
-        task_permissions: Vec::new(),
-        skills: Vec::new(),
-        skill_roots: Vec::new(),
-        skill_permissions: Vec::new(),
-        prompt: prompt.trim_start_matches('\u{feff}').to_string(),
-        tools: tools.iter().map(|item| (*item).to_string()).collect(),
-        provider: None,
-        model: None,
-        max_steps: None,
-        temperature: None,
-        top_p: None,
-        color: None,
-        disabled: false,
-        model_options: BTreeMap::new(),
-        workspace_isolation: false,
-        hidden: false,
-        source_path: None,
-    }
+    builtin_agent_profile_specs()
+        .into_iter()
+        .filter(|profile| runtime_is_subagent_mode(profile.mode))
+        .map(|profile| RuntimeSubagentProfile {
+            id: profile.id.to_string(),
+            name: profile.name.to_string(),
+            description: profile.description.to_string(),
+            mode: profile.mode.to_string(),
+            permission: profile.permission,
+            task_permissions: Vec::new(),
+            skills: Vec::new(),
+            skill_roots: Vec::new(),
+            skill_permissions: Vec::new(),
+            prompt: profile.prompt.trim_start_matches('\u{feff}').to_string(),
+            tools: profile
+                .tools
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect(),
+            provider: None,
+            model: None,
+            max_steps: None,
+            temperature: None,
+            top_p: None,
+            color: None,
+            disabled: false,
+            model_options: BTreeMap::new(),
+            workspace_isolation: false,
+            hidden: false,
+            source_path: None,
+        })
+        .collect()
 }
 
 fn runtime_agent_profile_from_value(
@@ -1011,7 +919,7 @@ fn runtime_agent_profile_from_value(
         prompt: schema
             .prompt
             .as_deref()
-            .unwrap_or(BUILD_AGENT_PROMPT)
+            .unwrap_or(DEFAULT_BUILD_AGENT_PROMPT)
             .trim_start_matches('\u{feff}')
             .to_string(),
         tools: schema.tools,
@@ -2288,17 +2196,38 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
         .save_state(&session, None)
         .map_err(|error| error.to_string())?;
     let summary = summarize_session_messages(&session);
+    let message_count = session.messages.len();
+    let run_id = new_id("compact");
+    let compacted_until_message_id = session.messages.last().map(|message| {
+        message
+            .metadata
+            .get("message_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| runtime_message_id(message_count.saturating_sub(1) as u64))
+    });
+    let boundary_message_id = match compacted_until_message_id.as_deref() {
+        Some(message_id) => Some(
+            store
+                .append_compaction_boundary(&mut session, &run_id, &summary, message_id)
+                .map_err(|error| format!("failed to create compaction boundary: {error}"))?,
+        ),
+        None => None,
+    };
     session.status = SessionStatus::Idle;
     session.metadata.insert(
         "compact".to_string(),
         json!({
             "compacted_at_ms": now_ms(),
-            "message_count": session.messages.len(),
+            "message_count": message_count,
             "summary": summary,
+            "format": "session_summary_v1",
+            "compacted_until_message_id": compacted_until_message_id,
+            "boundary_message_id": boundary_message_id,
         }),
     );
     store
-        .save_state(&session, None)
+        .save_state(&session, Some(&run_id))
         .map_err(|error| error.to_string())?;
     Ok(json!({
         "session_id": session.id,
@@ -2859,6 +2788,811 @@ fn session_diff_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<
     }))
 }
 
+fn session_context_diagnostics_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    request_path: &str,
+) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let store = FileSessionStore::new(session_root(config));
+    let session = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let limit = query_param(request_path, "limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(12)
+        .clamp(1, MAX_CONTEXT_PACK_RECEIPTS);
+    Ok(context_diagnostics_payload_for_session(&session, limit))
+}
+
+fn replay_session_context_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let request = if body.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(body)
+            .map_err(|error| format!("invalid context replay request: {error}"))?
+    };
+    if !request.is_object() {
+        return Err("context replay request must be a JSON object".to_string());
+    }
+    let store = FileSessionStore::new(session_root(config));
+    let mut session = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let requested_run_id = request
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let requested_step = request.get("step").and_then(Value::as_u64);
+    let explicit_target = requested_run_id.is_some() || requested_step.is_some();
+    let raw_latest = session.metadata.get("context_pack").cloned();
+    let latest_replayable = raw_latest
+        .as_ref()
+        .and_then(|raw| runtime_context_replay_target(raw).ok());
+    let target = if explicit_target {
+        context_replay_history(&session).into_iter().find(|target| {
+            requested_run_id.is_none_or(|run_id| target.run_id == run_id)
+                && requested_step.is_none_or(|step| target.step == step)
+        })
+    } else {
+        latest_replayable.or_else(|| context_replay_history(&session).into_iter().next())
+    };
+    let latest_requires_recovery = !explicit_target
+        && raw_latest
+            .as_ref()
+            .is_none_or(|raw| runtime_context_replay_target(raw).is_err());
+
+    let mut reasons = Vec::new();
+    let (status, target_run_id, target_step, target_receipt, rebuilt_pack, replay_spec) =
+        if let Some(target) = target {
+            if !target.spec.unsafe_model_option_keys.is_empty() {
+                reasons.push(format!(
+                    "unsupported_model_options:{}",
+                    target.spec.unsafe_model_option_keys.join(",")
+                ));
+                (
+                    "unrecoverable",
+                    Some(target.run_id),
+                    Some(target.step),
+                    Some(target.receipt),
+                    None,
+                    None,
+                )
+            } else {
+                let agent_profile = runtime_agent_profile_for_session(&session);
+                let rebuilt = runtime_context_pack_from_replay_spec(
+                    &store,
+                    &mut session,
+                    agent_profile.as_ref(),
+                    &target.spec,
+                );
+                reasons.extend(context_replay_drift_reasons(
+                    &target.receipt,
+                    &rebuilt.receipt,
+                ));
+                let status = if latest_requires_recovery {
+                    "rebuilt"
+                } else if reasons.is_empty() {
+                    "verified"
+                } else {
+                    "drifted"
+                };
+                (
+                    status,
+                    Some(target.run_id),
+                    Some(target.step),
+                    Some(target.receipt),
+                    Some(rebuilt),
+                    Some(target.spec),
+                )
+            }
+        } else if explicit_target {
+            reasons.push("target_receipt_not_found".to_string());
+            ("unrecoverable", None, None, None, None, None)
+        } else {
+            reasons.push(if raw_latest.is_some() {
+                "latest_receipt_corrupt_or_legacy".to_string()
+            } else {
+                "latest_receipt_missing".to_string()
+            });
+            let (pack, spec) = runtime_current_context_recovery_pack(&store, &mut session)?;
+            if spec.unsafe_model_option_keys.is_empty() {
+                ("rebuilt", None, None, None, Some(pack), Some(spec))
+            } else {
+                reasons.push(format!(
+                    "unsupported_model_options:{}",
+                    spec.unsafe_model_option_keys.join(",")
+                ));
+                ("unrecoverable", None, None, None, Some(pack), None)
+            }
+        };
+
+    let replay_id = new_id("context_replay");
+    let rebuilt_receipt = rebuilt_pack.as_ref().map(|pack| pack.receipt.clone());
+    let failure = context_replay_failure(status, &reasons);
+    let summary = json!({
+        "schema_version": CONTEXT_REPLAY_RESULT_SCHEMA_VERSION,
+        "replay_id": replay_id,
+        "session_id": session.id,
+        "status": status,
+        "target": {
+            "run_id": target_run_id,
+            "step": target_step,
+            "receipt": target_receipt,
+        },
+        "rebuilt": {
+            "receipt": rebuilt_receipt,
+        },
+        "reasons": reasons,
+        "failure": failure,
+        "side_effects": {
+            "provider_calls": 0,
+            "tool_calls": 0,
+            "checkpoint_restores": 0,
+            "mcp_lifecycle_changes": 0,
+        },
+    });
+    if status == "rebuilt" {
+        let pack = rebuilt_pack
+            .as_ref()
+            .ok_or_else(|| "context replay did not produce a rebuilt pack".to_string())?;
+        let spec = replay_spec
+            .as_ref()
+            .ok_or_else(|| "context replay did not produce a replay spec".to_string())?;
+        runtime_persist_context_recovery(&store, &mut session, &replay_id, pack, spec, &summary)?;
+    } else {
+        persist_context_replay_summary(&store, &mut session, &replay_id, &summary)?;
+    }
+    if let Some(event) = context_replayed_bridge_event(&session, &summary) {
+        append_bridge_events(&store.root, &session.id, &replay_id, &mut [event]);
+    }
+    let mut response = summary;
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "diagnostics".to_string(),
+            context_diagnostics_payload_for_session(&session, 12),
+        );
+    }
+    Ok(response)
+}
+
+struct RuntimeContextReplayTarget {
+    run_id: String,
+    step: u64,
+    receipt: ContextPackReceipt,
+    spec: RuntimeContextReplaySpec,
+}
+
+fn runtime_context_replay_target(raw: &Value) -> Result<RuntimeContextReplayTarget, String> {
+    let run_id = raw
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "context receipt is missing run_id".to_string())?
+        .to_string();
+    let step = raw
+        .get("step")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "context receipt is missing step".to_string())?;
+    let receipt = serde_json::from_value::<ContextPackReceipt>(
+        raw.get("receipt")
+            .cloned()
+            .ok_or_else(|| "context receipt is missing receipt data".to_string())?,
+    )
+    .map_err(|error| format!("context receipt is corrupt: {error}"))?;
+    let spec = serde_json::from_value::<RuntimeContextReplaySpec>(
+        raw.get("replay_spec")
+            .cloned()
+            .ok_or_else(|| "context receipt does not contain a replay spec".to_string())?,
+    )
+    .map_err(|error| format!("context replay spec is corrupt: {error}"))?;
+    if spec.schema_version != CONTEXT_REPLAY_SPEC_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported context replay spec: {}",
+            spec.schema_version
+        ));
+    }
+    Ok(RuntimeContextReplayTarget {
+        run_id,
+        step,
+        receipt,
+        spec,
+    })
+}
+
+fn context_replay_history(session: &Session) -> Vec<RuntimeContextReplayTarget> {
+    session
+        .metadata
+        .get("context_pack_receipts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .filter_map(|raw| runtime_context_replay_target(raw).ok())
+        .collect()
+}
+
+fn context_replay_drift_reasons(
+    target: &ContextPackReceipt,
+    rebuilt: &ContextPackReceipt,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if target.provider_input_hash != rebuilt.provider_input_hash {
+        reasons.push("provider_input_changed".to_string());
+    }
+    if target.message_count != rebuilt.message_count
+        || target.message_role_counts != rebuilt.message_role_counts
+    {
+        reasons.push("message_projection_changed".to_string());
+    }
+    if target.tool_names != rebuilt.tool_names
+        || target.tool_manifest_count != rebuilt.tool_manifest_count
+    {
+        reasons.push("tool_catalog_changed".to_string());
+    }
+    if target.model_option_keys != rebuilt.model_option_keys {
+        reasons.push("model_options_changed".to_string());
+    }
+    if target.item_kind_counts != rebuilt.item_kind_counts {
+        reasons.push("context_sources_changed".to_string());
+    }
+    if target.drop_reason_counts != rebuilt.drop_reason_counts
+        || target.truncation_reason_counts != rebuilt.truncation_reason_counts
+    {
+        reasons.push("context_budget_selection_changed".to_string());
+    }
+    if target.budget != rebuilt.budget {
+        reasons.push("context_budget_changed".to_string());
+    }
+    if target.stable_prefix.hash != rebuilt.stable_prefix.hash {
+        reasons.push("stable_prefix_changed".to_string());
+    }
+    if target.pack_hash != rebuilt.pack_hash && reasons.is_empty() {
+        reasons.push("context_pack_changed".to_string());
+    }
+    reasons
+}
+
+fn runtime_current_context_recovery_pack(
+    store: &FileSessionStore,
+    session: &mut Session,
+) -> Result<(ContextPack, RuntimeContextReplaySpec), String> {
+    let payload = json!({});
+    let provider = session.metadata.get("provider").and_then(Value::as_str);
+    let provider_config = runtime_provider_config(provider, Some(&payload), Some(session))?;
+    let model_options = runtime_provider_model_options(session, &payload);
+    let context_model = runtime_context_model(&provider_config, session, &payload);
+    let context_budget_options = runtime_context_budget_options(session, &payload);
+    let build_options =
+        context_pack_build_options_for_model(Some(&context_budget_options), &context_model, false)?;
+    let agent_profile = runtime_agent_profile_for_session(session);
+    let toolkit = toolkit_with_runtime_task_tool(session, agent_profile.as_ref());
+    let tools =
+        filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref());
+    let pack = runtime_context_pack_for_agent(
+        store,
+        session,
+        &tools,
+        &model_options,
+        None,
+        agent_profile.as_ref(),
+        build_options.clone(),
+    );
+    let spec = runtime_context_replay_spec(
+        store,
+        session,
+        &pack,
+        None,
+        agent_profile.as_ref(),
+        build_options,
+    );
+    Ok((pack, spec))
+}
+
+fn runtime_persist_context_recovery(
+    store: &FileSessionStore,
+    session: &mut Session,
+    replay_id: &str,
+    pack: &ContextPack,
+    spec: &RuntimeContextReplaySpec,
+    summary: &Value,
+) -> Result<(), String> {
+    let mut receipts = session
+        .metadata
+        .get("context_pack_receipts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let prefix_cache = runtime_context_prefix_cache_status(&receipts, pack, replay_id, 0);
+    let envelope = json!({
+        "schema_version": "openagent.turn_context_pack.v1",
+        "mode": "recovery",
+        "run_id": replay_id,
+        "step": 0,
+        "receipt": pack.receipt,
+        "trace": pack.trace,
+        "system_diagnostics": pack.system_diagnostics,
+        "prefix_cache": prefix_cache,
+        "replay_spec": spec,
+        "recovery": {
+            "status": summary["status"],
+            "reasons": summary["reasons"],
+            "target": summary["target"],
+        },
+    });
+    receipts.push(envelope.clone());
+    if receipts.len() > MAX_CONTEXT_PACK_RECEIPTS {
+        receipts.drain(..receipts.len() - MAX_CONTEXT_PACK_RECEIPTS);
+    }
+    session
+        .metadata
+        .insert("context_pack".to_string(), envelope);
+    session
+        .metadata
+        .insert("context_pack_receipts".to_string(), Value::Array(receipts));
+    persist_context_replay_summary(store, session, replay_id, summary)
+}
+
+fn persist_context_replay_summary(
+    store: &FileSessionStore,
+    session: &mut Session,
+    replay_id: &str,
+    summary: &Value,
+) -> Result<(), String> {
+    let public = public_context_replay_result(summary);
+    session
+        .metadata
+        .insert("context_replay_last".to_string(), public.clone());
+    store
+        .record_event(
+            &session.id,
+            replay_id,
+            "context.pack_replayed",
+            SessionEventOptions {
+                kind: "context".to_string(),
+                attributes: public
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                ..SessionEventOptions::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    store
+        .save_state(session, Some(replay_id))
+        .map_err(|error| error.to_string())
+}
+
+fn context_diagnostics_payload_for_session(session: &Session, limit: usize) -> Value {
+    let raw_history = session
+        .metadata
+        .get("context_pack_receipts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut corrupt_count = 0_u64;
+    let history = raw_history
+        .iter()
+        .rev()
+        .filter_map(|raw| match public_context_pack_envelope(raw) {
+            Ok(envelope) => Some(envelope),
+            Err(()) => {
+                corrupt_count = corrupt_count.saturating_add(1);
+                None
+            }
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+    let raw_latest = session.metadata.get("context_pack");
+    let latest_result = raw_latest.map(public_context_pack_envelope);
+    let latest_corrupt = latest_result.as_ref().is_some_and(Result::is_err);
+    if latest_corrupt {
+        corrupt_count = corrupt_count.saturating_add(1);
+    }
+    let latest = latest_result
+        .and_then(Result::ok)
+        .or_else(|| history.first().cloned());
+    let latest_failure = latest
+        .as_ref()
+        .and_then(|envelope| envelope.get("failure"))
+        .filter(|failure| !failure.is_null())
+        .cloned();
+    let status = if latest.is_some() {
+        if latest_corrupt || latest_failure.is_some() {
+            "degraded"
+        } else {
+            "ready"
+        }
+    } else if raw_latest.is_some() || !raw_history.is_empty() {
+        "corrupt"
+    } else {
+        "unavailable"
+    };
+    let failure = latest_failure.or_else(|| match status {
+        "corrupt" => Some(public_context_failure(&ContextFailure::new(
+            ContextFailureCode::ReceiptCorrupt,
+            "diagnostics",
+            "Context receipt is corrupt and cannot be inspected.",
+        ))),
+        "unavailable" => Some(public_context_failure(&ContextFailure::new(
+            ContextFailureCode::Unavailable,
+            "diagnostics",
+            "Context diagnostics are not available until the first turn is built.",
+        ))),
+        _ if latest_corrupt => Some(public_context_failure(&ContextFailure::new(
+            ContextFailureCode::ReceiptCorrupt,
+            "diagnostics",
+            "The latest Context receipt is corrupt; a historical receipt is shown.",
+        ))),
+        _ => None,
+    });
+    json!({
+        "schema_version": CONTEXT_DIAGNOSTICS_SCHEMA_VERSION,
+        "session_id": session.id,
+        "status": status,
+        "latest": latest,
+        "history": history,
+        "history_count": raw_history.len(),
+        "returned_count": history.len(),
+        "corrupt_count": corrupt_count,
+        "failure": failure,
+        "last_replay": session
+            .metadata
+            .get("context_replay_last")
+            .map(public_context_replay_result),
+        "redaction": {
+            "content_included": false,
+            "prompt_included": false,
+            "attachment_content_included": false,
+            "secret_values_included": false,
+        },
+    })
+}
+
+fn public_context_replay_result(raw: &Value) -> Value {
+    let reasons = raw
+        .get("reasons")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(sanitize_context_diagnostic_label)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "schema_version": CONTEXT_REPLAY_RESULT_SCHEMA_VERSION,
+        "replay_id": raw.get("replay_id").and_then(Value::as_str),
+        "session_id": raw.get("session_id").and_then(Value::as_str),
+        "status": raw.get("status").and_then(Value::as_str),
+        "target": {
+            "run_id": raw.pointer("/target/run_id").and_then(Value::as_str),
+            "step": raw.pointer("/target/step").and_then(Value::as_u64),
+        },
+        "reasons": reasons,
+        "failure": raw.get("failure").and_then(|failure| {
+            serde_json::from_value::<ContextFailure>(failure.clone()).ok()
+        }).map(|failure| public_context_failure(&failure)),
+        "side_effects": {
+            "provider_calls": raw.pointer("/side_effects/provider_calls").and_then(Value::as_u64).unwrap_or_default(),
+            "tool_calls": raw.pointer("/side_effects/tool_calls").and_then(Value::as_u64).unwrap_or_default(),
+            "checkpoint_restores": raw.pointer("/side_effects/checkpoint_restores").and_then(Value::as_u64).unwrap_or_default(),
+            "mcp_lifecycle_changes": raw.pointer("/side_effects/mcp_lifecycle_changes").and_then(Value::as_u64).unwrap_or_default(),
+        },
+    })
+}
+
+fn public_context_pack_envelope(raw: &Value) -> Result<Value, ()> {
+    let receipt =
+        raw.get("receipt").cloned().ok_or(()).and_then(|value| {
+            serde_json::from_value::<ContextPackReceipt>(value).map_err(|_| ())
+        })?;
+    let trace = raw
+        .get("trace")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    serde_json::from_value::<ContextPackTraceEntry>(entry.clone())
+                        .ok()
+                        .map(|entry| public_context_trace_entry(&entry))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let prefix_cache = public_context_prefix_cache(raw.get("prefix_cache"));
+    let rebuild_reason = raw
+        .pointer("/rebuild/reason")
+        .and_then(Value::as_str)
+        .map(sanitize_context_diagnostic_label);
+    let performance = raw
+        .get("performance")
+        .and_then(|value| serde_json::from_value::<ContextPackPerformance>(value.clone()).ok())
+        .map(|value| public_context_performance(&value));
+    let failure = raw
+        .get("failure")
+        .and_then(|value| serde_json::from_value::<ContextFailure>(value.clone()).ok())
+        .map(|value| public_context_failure(&value));
+    let system_diagnostics = raw
+        .get("system_diagnostics")
+        .and_then(|value| serde_json::from_value::<ContextSystemDiagnostics>(value.clone()).ok())
+        .map(|value| public_context_system_diagnostics(&value));
+    Ok(json!({
+        "schema_version": "openagent.turn_context_diagnostics.v1",
+        "mode": raw.get("mode").and_then(Value::as_str).unwrap_or("active"),
+        "run_id": raw.get("run_id").and_then(Value::as_str),
+        "step": raw.get("step").and_then(Value::as_u64),
+        "receipt": receipt,
+        "trace": trace,
+        "prefix_cache": prefix_cache,
+        "rebuilt": raw.get("rebuild").is_some_and(|value| !value.is_null()),
+        "rebuild_reason": rebuild_reason,
+        "performance": performance,
+        "failure": failure,
+        "system_diagnostics": system_diagnostics,
+    }))
+}
+
+fn public_context_system_diagnostics(diagnostics: &ContextSystemDiagnostics) -> Value {
+    json!({
+        "schema_version": diagnostics.schema_version,
+        "profile_id": diagnostics.profile_id,
+        "profile_mode": diagnostics.profile_mode,
+        "content_hash": diagnostics.content_hash,
+        "preloaded_skill_names": diagnostics.preloaded_skill_names,
+        "instruction_count": diagnostics.instruction_count,
+        "instruction_total_bytes": diagnostics.instruction_total_bytes,
+        "instructions_truncated": diagnostics.instructions_truncated,
+        "legacy_system_count": diagnostics.legacy_system_count,
+        "instruction_issues": diagnostics
+            .instruction_issues
+            .iter()
+            .map(|issue| sanitize_context_diagnostic_label(issue))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn public_context_performance(performance: &ContextPackPerformance) -> Value {
+    json!({
+        "schema_version": performance.schema_version,
+        "status": performance.status(),
+        "materialize_us": performance.materialize_us,
+        "build_us": performance.build_us,
+        "persist_us": performance.persist_us,
+        "provider_payload_build_us": performance.provider_payload_build_us,
+        "provider_payload_serialize_us": performance.provider_payload_serialize_us,
+        "provider_payload_bytes": performance.provider_payload_bytes,
+        "source_message_count": performance.source_message_count,
+        "tool_count": performance.tool_count,
+        "item_count": performance.item_count,
+        "warning_codes": performance
+            .warning_codes
+            .iter()
+            .map(|code| sanitize_context_diagnostic_label(code))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn public_context_failure(failure: &ContextFailure) -> Value {
+    let mut details = serde_json::Map::new();
+    for key in [
+        "model",
+        "estimated_input_tokens",
+        "input_limit_tokens",
+        "receipt_count",
+    ] {
+        let Some(value) = failure.details.get(key) else {
+            continue;
+        };
+        let value = if value.is_string() {
+            Value::String(sanitize_context_diagnostic_label(
+                value.as_str().unwrap_or_default(),
+            ))
+        } else if value.is_number() || value.is_boolean() {
+            value.clone()
+        } else {
+            continue;
+        };
+        details.insert(key.to_string(), value);
+    }
+    json!({
+        "schema_version": failure.schema_version,
+        "code": sanitize_context_diagnostic_label(&failure.code),
+        "stage": sanitize_context_diagnostic_label(&failure.stage),
+        "message": sanitize_context_diagnostic_label(&failure.message),
+        "retryable": failure.retryable,
+        "recoverable": failure.recoverable,
+        "details": details,
+    })
+}
+
+fn context_replay_failure(status: &str, reasons: &[String]) -> Option<ContextFailure> {
+    let reason_count = reasons.len();
+    match status {
+        "drifted" => Some(
+            ContextFailure::new(
+                ContextFailureCode::SourceDrift,
+                "replay",
+                "Context replay detected source drift.",
+            )
+            .with_details(BTreeMap::from([(
+                "receipt_count".to_string(),
+                json!(reason_count),
+            )])),
+        ),
+        "unrecoverable" => Some(
+            ContextFailure::new(
+                ContextFailureCode::ReplayUnsupported,
+                "replay",
+                "Context replay cannot rebuild this receipt safely.",
+            )
+            .with_details(BTreeMap::from([(
+                "receipt_count".to_string(),
+                json!(reason_count),
+            )])),
+        ),
+        _ => None,
+    }
+}
+
+fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
+    json!({
+        "kind": sanitize_context_diagnostic_label(&entry.kind),
+        "source": sanitize_context_diagnostic_source(&entry.source),
+        "priority": entry.priority,
+        "pinned": entry.pinned,
+        "stable_prefix": entry.stable_prefix,
+        "token_estimate": entry.token_estimate,
+        "included": entry.included,
+        "drop_reason": entry.drop_reason.as_deref().map(sanitize_context_diagnostic_label),
+        "delivery": entry.delivery,
+        "truncated": entry.truncated,
+        "original_token_estimate": entry.original_token_estimate,
+        "truncation_reason": entry.truncation_reason.as_deref().map(sanitize_context_diagnostic_label),
+        "truncation_strategy": entry.truncation_strategy.as_deref().map(sanitize_context_diagnostic_label),
+        "semantic_duplicate": entry.semantic_duplicate_of.is_some(),
+    })
+}
+
+fn public_context_prefix_cache(raw: Option<&Value>) -> Value {
+    let raw = raw.and_then(Value::as_object);
+    json!({
+        "schema_version": "openagent.context_prefix_cache.v1",
+        "scope": raw.and_then(|value| value.get("scope")).and_then(Value::as_str),
+        "status": raw.and_then(|value| value.get("status")).and_then(Value::as_str),
+        "cache_eligible": raw.and_then(|value| value.get("cache_eligible")).and_then(Value::as_bool).unwrap_or(false),
+        "stable_prefix_hash": raw.and_then(|value| value.get("stable_prefix_hash")).and_then(Value::as_str),
+        "stable_prefix_token_estimate": raw.and_then(|value| value.get("stable_prefix_token_estimate")).and_then(Value::as_u64).unwrap_or_default(),
+        "retry_reuses_pack": raw.and_then(|value| value.get("retry_reuses_pack")).and_then(Value::as_bool).unwrap_or(false),
+        "reused_from": raw.and_then(|value| value.get("reused_from")).and_then(Value::as_object).map(|value| json!({
+            "run_id": value.get("run_id").and_then(Value::as_str),
+            "step": value.get("step").and_then(Value::as_u64),
+        })),
+    })
+}
+
+fn sanitize_context_diagnostic_source(raw: &str) -> String {
+    let without_query = raw.split(['?', '#']).next().unwrap_or_default().trim();
+    let without_credentials = without_query
+        .split_once("://")
+        .map(|(scheme, rest)| {
+            let host_and_path = rest.rsplit_once('@').map_or(rest, |(_, tail)| tail);
+            format!("{scheme}://{host_and_path}")
+        })
+        .unwrap_or_else(|| without_query.to_string());
+    sanitize_context_diagnostic_label(&without_credentials)
+}
+
+fn sanitize_context_diagnostic_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    if [
+        "authorization:",
+        "api_key=",
+        "apikey=",
+        "access_token=",
+        "auth_token=",
+        "bearer ",
+        "sk-",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return "[redacted]".to_string();
+    }
+    trimmed.chars().take(240).collect()
+}
+
+fn context_updated_bridge_event(session: &Session, run_id: &str, step: u64) -> Option<Value> {
+    let payload = context_diagnostics_payload_for_session(session, 1);
+    let latest = payload.get("latest")?.clone();
+    if latest.is_null() {
+        return None;
+    }
+    Some(json!({
+        "method": "context/updated",
+        "params": {
+            "thread_id": session.id,
+            "session_id": session.id,
+            "turn_id": run_id,
+            "run_id": run_id,
+            "step": step,
+            "status": payload["status"],
+            "diagnostics": latest,
+        }
+    }))
+}
+
+fn context_replayed_bridge_event(session: &Session, replay: &Value) -> Option<Value> {
+    let replay_id = replay.get("replay_id").and_then(Value::as_str)?;
+    Some(json!({
+        "method": "context/replayed",
+        "params": {
+            "thread_id": session.id,
+            "session_id": session.id,
+            "replay_id": replay_id,
+            "status": replay.get("status").and_then(Value::as_str),
+            "reasons": replay.get("reasons").cloned().unwrap_or_else(|| json!([])),
+            "failure": replay
+                .get("failure")
+                .and_then(|failure| serde_json::from_value::<ContextFailure>(failure.clone()).ok())
+                .map(|failure| public_context_failure(&failure)),
+            "side_effects": replay.get("side_effects").cloned().unwrap_or_else(|| json!({})),
+        }
+    }))
+}
+
+fn context_performance_bridge_event(
+    session: &Session,
+    run_id: &str,
+    step: u64,
+    performance: &ContextPackPerformance,
+) -> Value {
+    json!({
+        "method": "context/performance",
+        "params": {
+            "thread_id": session.id,
+            "session_id": session.id,
+            "turn_id": run_id,
+            "run_id": run_id,
+            "step": step,
+            "performance": public_context_performance(performance),
+        }
+    })
+}
+
+fn context_failed_bridge_event(
+    session: &Session,
+    run_id: &str,
+    step: u64,
+    failure: &ContextFailure,
+) -> Value {
+    json!({
+        "method": "context/failed",
+        "params": {
+            "thread_id": session.id,
+            "session_id": session.id,
+            "turn_id": run_id,
+            "run_id": run_id,
+            "step": step,
+            "failure": public_context_failure(failure),
+        }
+    })
+}
+
 fn session_checkpoints_payload(
     config: &HttpRuntimeConfig,
     session_id: &str,
@@ -2873,21 +3607,14 @@ fn session_checkpoints_payload(
     let _ = store
         .load_session(session_id)
         .map_err(|error| error.to_string())?;
-    let path = store
-        .root
-        .join(session_id)
-        .join("checkpoints")
-        .join("index.jsonl");
-    let mut checkpoints = read_jsonl_values(&path);
-    checkpoints.sort_by(|left, right| {
-        right["timestamp_ms"]
-            .as_u64()
-            .cmp(&left["timestamp_ms"].as_u64())
-    });
+    let checkpoints = store
+        .list_checkpoints(session_id)
+        .map_err(|error| error.to_string())?;
+    let latest = checkpoints.first().cloned();
     Ok(json!({
         "session_id": session_id,
         "count": checkpoints.len(),
-        "latest": checkpoints.first().cloned().unwrap_or(Value::Null),
+        "latest": latest,
         "checkpoints": checkpoints,
     }))
 }
@@ -4012,6 +4739,14 @@ struct RuntimeProviderResult {
     usage: Usage,
     source: String,
     finish_reason: String,
+    payload_performance: RuntimeProviderPayloadPerformance,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeProviderPayloadPerformance {
+    build_us: u64,
+    serialize_us: u64,
+    bytes: u64,
 }
 
 struct OpenAiRuntimeProviderRequest<'a> {
@@ -4022,9 +4757,7 @@ struct OpenAiRuntimeProviderRequest<'a> {
     wire_api: &'a str,
     timeout_s: u64,
     stream: bool,
-    messages: &'a [ChatMessage],
-    tools: &'a [openagent_protocol::ToolSchema],
-    model_options: BTreeMap<String, Value>,
+    context_pack: &'a ContextPack,
 }
 
 #[derive(Clone, Debug)]
@@ -4072,20 +4805,160 @@ struct RuntimeProviderLoopInput<'a> {
     carry: RuntimeProviderLoopCarry,
 }
 
+struct RuntimeProviderTurnInput<'a> {
+    store: &'a FileSessionStore,
+    session: &'a mut Session,
+    run_id: &'a str,
+    step: u64,
+    payload: &'a Value,
+    tools: &'a [ToolSchema],
+    mcp_runtime: Option<&'a RuntimeMcpRuntime>,
+    agent_profile: Option<&'a RuntimeSubagentProfile>,
+}
+
 fn provider_turn_result(
-    store: &FileSessionStore,
-    session: &mut Session,
-    payload: &Value,
-    tools: &[ToolSchema],
-    agent_profile: Option<&RuntimeSubagentProfile>,
+    input: RuntimeProviderTurnInput<'_>,
     stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
     should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<RuntimeProviderResult, String> {
+    let RuntimeProviderTurnInput {
+        store,
+        session,
+        run_id,
+        step,
+        payload,
+        tools,
+        mcp_runtime,
+        agent_profile,
+    } = input;
     let provider = payload
         .get("provider")
         .and_then(Value::as_str)
         .or_else(|| session.metadata.get("provider").and_then(Value::as_str));
     let provider_config = runtime_provider_config(provider, Some(payload), Some(session))?;
+    let model_options = runtime_provider_model_options(session, payload);
+    let context_model = runtime_context_model(&provider_config, session, payload);
+    let context_budget_options = runtime_context_budget_options(session, payload);
+    let context_budget =
+        load_context_budget_options(Some(&context_budget_options), Some(&context_model))?;
+    let context_pack_options =
+        context_pack_build_options_for_model(Some(&context_budget_options), &context_model, false)?;
+    let (mut context_pack, mut context_performance) = runtime_context_pack_for_agent_timed(
+        store,
+        session,
+        tools,
+        &model_options,
+        mcp_runtime,
+        agent_profile,
+        context_pack_options.clone(),
+    );
+    let mut rebuild = None;
+    if runtime_context_pack_needs_auto_compaction(&context_pack, &context_budget)
+        && let Some(compaction) = runtime_auto_compact_context(
+            store,
+            session,
+            run_id,
+            step,
+            &context_pack,
+            &context_budget,
+        )?
+    {
+        let before_receipt = context_pack.receipt.clone();
+        let (rebuilt_pack, rebuilt_performance) = runtime_context_pack_for_agent_timed(
+            store,
+            session,
+            tools,
+            &model_options,
+            mcp_runtime,
+            agent_profile,
+            context_pack_options.clone(),
+        );
+        context_pack = rebuilt_pack;
+        context_performance.materialize_us = context_performance
+            .materialize_us
+            .saturating_add(rebuilt_performance.materialize_us);
+        context_performance.build_us = context_performance
+            .build_us
+            .saturating_add(rebuilt_performance.build_us);
+        context_performance.source_message_count = rebuilt_performance.source_message_count;
+        context_performance.tool_count = rebuilt_performance.tool_count;
+        context_performance.item_count = rebuilt_performance.item_count;
+        context_performance.refresh_warnings();
+        rebuild = Some(json!({
+            "reason": compaction["reason"],
+            "before_receipt": before_receipt,
+            "after_receipt": context_pack.receipt,
+            "compaction": compaction,
+        }));
+    }
+    let replay_spec = runtime_context_replay_spec(
+        store,
+        session,
+        &context_pack,
+        mcp_runtime,
+        agent_profile,
+        context_pack_options,
+    );
+    let persist_started = Instant::now();
+    runtime_persist_context_pack_receipt_with_diagnostics(
+        store,
+        session,
+        run_id,
+        step,
+        &context_pack,
+        rebuild.as_ref(),
+        Some(&replay_spec),
+        Some(&context_performance),
+        None,
+    )?;
+    context_performance.persist_us = elapsed_micros(persist_started);
+    context_performance.refresh_warnings();
+    runtime_update_context_pack_diagnostics(
+        store,
+        session,
+        run_id,
+        step,
+        Some(&context_performance),
+        None,
+    )?;
+    if let Some(event) = context_updated_bridge_event(session, run_id, step) {
+        append_bridge_events(&store.root, &session.id, run_id, &mut [event]);
+    }
+    if context_pack.budget.overflowed {
+        let message = format!(
+            "required context exceeds model input budget for `{}`: estimated_input_tokens={}, input_limit_tokens={}",
+            provider_config.model,
+            context_pack.estimated_input_tokens,
+            context_pack.budget.input_limit_tokens.unwrap_or_default(),
+        );
+        let failure = ContextFailure::new(
+            ContextFailureCode::BudgetExceeded,
+            "budget",
+            message.clone(),
+        )
+        .with_details(BTreeMap::from([
+            ("model".to_string(), json!(provider_config.model)),
+            (
+                "estimated_input_tokens".to_string(),
+                json!(context_pack.estimated_input_tokens),
+            ),
+            (
+                "input_limit_tokens".to_string(),
+                json!(context_pack.budget.input_limit_tokens.unwrap_or_default()),
+            ),
+        ]));
+        runtime_update_context_pack_diagnostics(
+            store,
+            session,
+            run_id,
+            step,
+            Some(&context_performance),
+            Some(&failure),
+        )?;
+        let event = context_failed_bridge_event(session, run_id, step, &failure);
+        append_bridge_events(&store.root, &session.id, run_id, &mut [event]);
+        return Err(format!("[{}] {message}", failure.code));
+    }
     if provider_config.requires_api_key && provider_config.api_key.is_none() {
         return Ok(RuntimeProviderResult {
             answer: format!(
@@ -4096,6 +4969,7 @@ fn provider_turn_result(
             usage: Usage::default(),
             source: "provider_missing_api_key".to_string(),
             finish_reason: "configuration_required".to_string(),
+            payload_performance: RuntimeProviderPayloadPerformance::default(),
         });
     }
     let api_key = provider_config.api_key.clone().unwrap_or_default();
@@ -4104,10 +4978,7 @@ fn provider_turn_result(
         .and_then(Value::as_u64)
         .unwrap_or(60);
     let stream = provider_streaming_enabled_for_turn(payload);
-    let provider_messages =
-        runtime_materialized_provider_messages_for_agent(store, session, agent_profile);
-    let model_options = runtime_provider_model_options(session, payload);
-    call_openai_compatible_provider_for_runtime(
+    let result = call_openai_compatible_provider_for_runtime(
         OpenAiRuntimeProviderRequest {
             provider: &provider_config.provider,
             model: &provider_config.model,
@@ -4116,13 +4987,26 @@ fn provider_turn_result(
             wire_api: &provider_config.wire_api,
             timeout_s: timeout,
             stream,
-            messages: &provider_messages,
-            tools,
-            model_options,
+            context_pack: &context_pack,
         },
         stream_sink,
         should_cancel,
-    )
+    )?;
+    context_performance.provider_payload_build_us = result.payload_performance.build_us;
+    context_performance.provider_payload_serialize_us = result.payload_performance.serialize_us;
+    context_performance.provider_payload_bytes = result.payload_performance.bytes;
+    context_performance.refresh_warnings();
+    runtime_update_context_pack_diagnostics(
+        store,
+        session,
+        run_id,
+        step,
+        Some(&context_performance),
+        None,
+    )?;
+    let event = context_performance_bridge_event(session, run_id, step, &context_performance);
+    append_bridge_events(&store.root, &session.id, run_id, &mut [event]);
+    Ok(result)
 }
 
 fn runtime_provider_model_options(session: &Session, payload: &Value) -> BTreeMap<String, Value> {
@@ -4135,6 +5019,76 @@ fn runtime_provider_model_options(session: &Session, payload: &Value) -> BTreeMa
     merge_explicit_model_options_from_value(payload, &mut options);
     merge_temperature_top_p_from_value(payload, &mut options);
     options
+}
+
+fn runtime_context_model(
+    provider: &RuntimeProviderConfig,
+    session: &Session,
+    payload: &Value,
+) -> Model {
+    let context_window =
+        runtime_context_limit_value(session, payload, "context_window").or_else(|| {
+            std::env::var("OPENAGENT_CONTEXT_WINDOW")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        });
+    let max_output =
+        runtime_context_limit_value(session, payload, "max_output_tokens").or_else(|| {
+            std::env::var("OPENAGENT_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        });
+    openagent_context_model(
+        &provider.provider,
+        &provider.model,
+        context_window,
+        max_output,
+    )
+}
+
+fn runtime_context_limit_value(session: &Session, payload: &Value, key: &str) -> Option<u64> {
+    payload
+        .get(key)
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            payload
+                .get("context_budget")
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| session.metadata.get(key).and_then(Value::as_u64))
+        .or_else(|| {
+            session
+                .metadata
+                .get("context_budget")
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_u64)
+        })
+}
+
+fn runtime_context_budget_options(session: &Session, payload: &Value) -> Value {
+    let mut context_budget = Map::new();
+    for source in [
+        session.metadata.get("context_budget"),
+        session
+            .metadata
+            .get("model_options")
+            .and_then(|value| value.get("context_budget")),
+        payload
+            .get("model_options")
+            .and_then(|value| value.get("context_budget")),
+        payload
+            .get("options")
+            .and_then(|value| value.get("context_budget")),
+        payload.get("context_budget"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_object)
+    {
+        context_budget.extend(source.clone());
+    }
+    json!({"context_budget": context_budget})
 }
 
 fn merge_model_options_from_value(value: Option<&Value>, options: &mut BTreeMap<String, Value>) {
@@ -4211,6 +5165,8 @@ fn runtime_provider_option_allowed(key: &str) -> bool {
             | "skill_roots"
             | "skill_permissions"
             | "skill_permission"
+            | "context_budget"
+            | "context_window"
     )
 }
 
@@ -4238,10 +5194,12 @@ fn call_openai_compatible_provider_for_runtime(
         wire_api,
         timeout_s,
         stream,
-        messages,
-        tools,
-        model_options,
+        context_pack,
     } = request;
+    context_pack.validate_provider_input()?;
+    let messages = context_pack.messages.as_slice();
+    let tools = context_pack.tools.as_slice();
+    let model_options = &context_pack.model_options;
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(timeout_s.max(1)))
@@ -4261,7 +5219,7 @@ fn call_openai_compatible_provider_for_runtime(
             stream,
             messages,
             tools,
-            &model_options,
+            model_options,
             system_prompt.as_deref(),
             &mut stream_sink,
             should_cancel,
@@ -4298,6 +5256,7 @@ fn call_openai_compatible_provider_for_runtime(
         .unwrap_or_else(|| "provider request failed".to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_openai_compatible_provider_model(
     client: &reqwest::blocking::Client,
     provider: &str,
@@ -4313,6 +5272,7 @@ fn call_openai_compatible_provider_model(
     stream_sink: &mut Option<&mut dyn FnMut(&ProviderStreamEvent)>,
     should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<RuntimeProviderResult, RuntimeProviderCallError> {
+    let payload_build_started = Instant::now();
     let mut config = OpenAiLanguageModelConfig::new(api_key, model);
     config.provider_id = provider.to_string();
     config.base_url = base_url.to_string();
@@ -4332,7 +5292,22 @@ fn call_openai_compatible_provider_model(
         }
         (join_url(base_url, "responses"), payload)
     };
-    apply_runtime_model_options_to_payload(&mut payload, &model_options);
+    apply_runtime_model_options_to_payload(&mut payload, model_options);
+    let payload_build_us = elapsed_micros(payload_build_started);
+    let payload_serialize_started = Instant::now();
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|error| RuntimeProviderCallError {
+            message: format!("provider payload serialization failed: {error}"),
+            retryable: false,
+        })?
+        .len()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let payload_performance = RuntimeProviderPayloadPerformance {
+        build_us: payload_build_us,
+        serialize_us: elapsed_micros(payload_serialize_started),
+        bytes: payload_bytes,
+    };
     let response = send_runtime_provider_request(
         client,
         &endpoint,
@@ -4370,16 +5345,19 @@ fn call_openai_compatible_provider_model(
             chunks.push(chunk);
             Ok(())
         })
-        .map_err(|error| provider_stream_error(error))?;
+        .map_err(provider_stream_error)?;
         let events = if wire_api == "chat" {
             normalize_openai_chat_sse_chunks(&chunks)
         } else {
             normalize_openai_responses_stream_events(&chunks)
         };
-        return Ok(provider_events_to_runtime_result(
-            &events,
-            format!("{provider}:{wire_api}:stream"),
-            None,
+        return Ok(runtime_result_with_payload_performance(
+            provider_events_to_runtime_result(
+                &events,
+                format!("{provider}:{wire_api}:stream"),
+                None,
+            ),
+            payload_performance,
         ));
     }
     let raw = response
@@ -4393,18 +5371,29 @@ fn call_openai_compatible_provider_model(
         retryable: false,
     })?;
     if wire_api == "chat" {
-        Ok(openai_chat_response_to_runtime_result(
-            &value,
-            format!("{provider}:chat"),
+        Ok(runtime_result_with_payload_performance(
+            openai_chat_response_to_runtime_result(&value, format!("{provider}:chat")),
+            payload_performance,
         ))
     } else {
         let events = normalize_openai_responses_response(&value);
-        Ok(provider_events_to_runtime_result(
-            &events,
-            format!("{provider}:responses"),
-            Some(&value),
+        Ok(runtime_result_with_payload_performance(
+            provider_events_to_runtime_result(
+                &events,
+                format!("{provider}:responses"),
+                Some(&value),
+            ),
+            payload_performance,
         ))
     }
+}
+
+fn runtime_result_with_payload_performance(
+    mut result: RuntimeProviderResult,
+    performance: RuntimeProviderPayloadPerformance,
+) -> RuntimeProviderResult {
+    result.payload_performance = performance;
+    result
 }
 
 fn runtime_provider_model_candidates(primary_model: &str) -> Vec<String> {
@@ -4440,6 +5429,9 @@ fn runtime_provider_model_candidates_with_fallback(
                 match primary.as_str() {
                     "gpt-5.5" => vec!["gpt-5.4".to_string()],
                     "gpt-5.4" => vec!["gpt-5.5".to_string()],
+                    "gpt-5.6-sol" => vec!["gpt-5.6-terra".to_string(), "gpt-5.6-luna".to_string()],
+                    "gpt-5.6-terra" => vec!["gpt-5.6-sol".to_string(), "gpt-5.6-luna".to_string()],
+                    "gpt-5.6-luna" => vec!["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()],
                     _ => Vec::new(),
                 }
             } else {
@@ -4487,6 +5479,7 @@ fn provider_stream_error(error: String) -> RuntimeProviderCallError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_runtime_provider_request(
     client: &reqwest::blocking::Client,
     endpoint: &str,
@@ -4795,6 +5788,7 @@ fn openai_chat_response_to_runtime_result(value: &Value, source: String) -> Runt
         tool_calls,
         usage,
         source,
+        payload_performance: RuntimeProviderPayloadPerformance::default(),
     }
 }
 
@@ -4842,6 +5836,7 @@ fn provider_events_to_runtime_result(
         usage,
         source,
         finish_reason,
+        payload_performance: RuntimeProviderPayloadPerformance::default(),
     }
 }
 
@@ -5009,6 +6004,10 @@ fn runtime_message_id(index: u64) -> String {
     format!("msg_{index}")
 }
 
+fn runtime_turn_message_id(run_id: &str, kind: &str, step: u64) -> String {
+    format!("msg_{run_id}_{kind}_{step}")
+}
+
 fn latest_assistant_message_id_for_tool(session: &Session, tool_call: &ToolCall) -> Option<String> {
     session.messages.iter().rev().find_map(|message| {
         if message.role != Role::Assistant {
@@ -5122,7 +6121,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         }
         let step = carry.next_step;
         let assistant_index = session.messages.len() as u64;
-        let assistant_message_id = runtime_message_id(assistant_index);
+        let assistant_message_id = runtime_turn_message_id(run_id, "assistant", step);
         runtime_record_step_started(store, &session.id, run_id, step, None);
         let mut streamed_text = false;
         let mut reasoning_chars = 0_u64;
@@ -5236,11 +6235,16 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         };
         let should_cancel = || turn_cancel_requested(run_id);
         let provider_result = match provider_turn_result(
-            store,
-            session,
-            payload,
-            &visible_tools,
-            agent_profile.as_ref(),
+            RuntimeProviderTurnInput {
+                store,
+                session,
+                run_id,
+                step,
+                payload,
+                tools: &visible_tools,
+                mcp_runtime: mcp_runtime.as_ref(),
+                agent_profile: agent_profile.as_ref(),
+            },
             Some(&mut on_provider_stream),
             Some(&should_cancel),
         ) {
@@ -6233,88 +7237,930 @@ fn validate_runtime_task_resume_session(
     Ok(())
 }
 
-fn runtime_materialized_provider_messages_for_agent(
+const MAX_CONTEXT_PACK_RECEIPTS: usize = 64;
+const CONTEXT_REPLAY_SPEC_SCHEMA_VERSION: &str = "openagent.context_replay_spec.v1";
+const CONTEXT_REPLAY_RESULT_SCHEMA_VERSION: &str = "openagent.context_replay.v1";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RuntimeContextReplaySpec {
+    schema_version: String,
+    materialized_message_count: usize,
+    tools: Vec<ToolSchema>,
+    model_options: BTreeMap<String, Value>,
+    unsafe_model_option_keys: Vec<String>,
+    build_options: ContextPackBuildOptions,
+    todos: Vec<ContextTodo>,
+    checkpoints: Vec<ContextCheckpoint>,
+    tool_manifests: Vec<ContextItem>,
+    work_state: Option<ContextWorkState>,
+}
+
+fn runtime_context_pack_for_agent(
+    store: &FileSessionStore,
+    session: &mut Session,
+    tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+    mcp_runtime: Option<&RuntimeMcpRuntime>,
+    agent_profile: Option<&RuntimeSubagentProfile>,
+    build_options: ContextPackBuildOptions,
+) -> ContextPack {
+    runtime_context_pack_for_agent_timed(
+        store,
+        session,
+        tools,
+        model_options,
+        mcp_runtime,
+        agent_profile,
+        build_options,
+    )
+    .0
+}
+
+fn runtime_context_pack_for_agent_timed(
+    store: &FileSessionStore,
+    session: &mut Session,
+    tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+    mcp_runtime: Option<&RuntimeMcpRuntime>,
+    agent_profile: Option<&RuntimeSubagentProfile>,
+    build_options: ContextPackBuildOptions,
+) -> (ContextPack, ContextPackPerformance) {
+    let materialize_started = Instant::now();
+    let materialized =
+        runtime_materialized_provider_context_for_agent(store, session, agent_profile);
+    let tool_manifests = runtime_mcp_tool_manifest_items(mcp_runtime, tools);
+    let todos = runtime_context_todos(&session.todos);
+    let checkpoints = runtime_context_checkpoints(store, session);
+    let materialize_us = elapsed_micros(materialize_started);
+    let source_message_count = materialized.source_message_count as u64;
+    let build_started = Instant::now();
+    let pack = ContextPackBuilder::new(Some(build_options)).build(ContextPackInput {
+        system_sources: Some(materialized.system_sources),
+        messages: materialized.messages,
+        tools: tools.to_vec(),
+        model_options: model_options.clone(),
+        attachments: materialized.attachments,
+        work_state: materialized.work_state,
+        todos,
+        checkpoints,
+        skills: Vec::new(),
+        tool_manifests,
+        metadata: BTreeMap::new(),
+        runtime_context: None,
+        sandbox_metadata: None,
+        extra_items: Vec::new(),
+    });
+    runtime_apply_context_system_diagnostics(session, pack.system_diagnostics.as_ref());
+    let mut performance = ContextPackPerformance::new();
+    performance.materialize_us = materialize_us;
+    performance.build_us = elapsed_micros(build_started);
+    performance.source_message_count = source_message_count;
+    performance.tool_count = pack.tools.len() as u64;
+    performance.item_count = pack.items.len() as u64;
+    performance.refresh_warnings();
+    (pack, performance)
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+fn runtime_context_replay_spec(
+    store: &FileSessionStore,
+    session: &mut Session,
+    pack: &ContextPack,
+    mcp_runtime: Option<&RuntimeMcpRuntime>,
+    agent_profile: Option<&RuntimeSubagentProfile>,
+    build_options: ContextPackBuildOptions,
+) -> RuntimeContextReplaySpec {
+    let materialized =
+        runtime_materialized_provider_context_for_agent(store, session, agent_profile);
+    let (model_options, unsafe_model_option_keys) =
+        safe_context_replay_model_options(&pack.model_options);
+    RuntimeContextReplaySpec {
+        schema_version: CONTEXT_REPLAY_SPEC_SCHEMA_VERSION.to_string(),
+        materialized_message_count: materialized.source_message_count,
+        tools: pack.tools.clone(),
+        model_options,
+        unsafe_model_option_keys,
+        build_options,
+        todos: runtime_context_todos(&session.todos),
+        checkpoints: runtime_context_checkpoints(store, session),
+        tool_manifests: runtime_mcp_tool_manifest_items(mcp_runtime, &pack.tools),
+        work_state: materialized.work_state,
+    }
+}
+
+fn safe_context_replay_model_options(
+    model_options: &BTreeMap<String, Value>,
+) -> (BTreeMap<String, Value>, Vec<String>) {
+    const SAFE_KEYS: &[&str] = &[
+        "frequency_penalty",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "max_tokens",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "service_tier",
+        "stop",
+        "temperature",
+        "tool_choice",
+        "top_p",
+        "verbosity",
+    ];
+    let mut safe = BTreeMap::new();
+    let mut unsafe_keys = Vec::new();
+    for (key, value) in model_options {
+        if SAFE_KEYS.contains(&key.as_str()) {
+            safe.insert(key.clone(), value.clone());
+        } else {
+            unsafe_keys.push(key.clone());
+        }
+    }
+    (safe, unsafe_keys)
+}
+
+fn runtime_context_pack_from_replay_spec(
+    store: &FileSessionStore,
+    session: &mut Session,
+    agent_profile: Option<&RuntimeSubagentProfile>,
+    spec: &RuntimeContextReplaySpec,
+) -> ContextPack {
+    let materialized = runtime_materialized_provider_context_for_agent_bounded(
+        store,
+        session,
+        agent_profile,
+        Some(spec.materialized_message_count),
+    );
+    let pack = ContextPackBuilder::new(Some(spec.build_options.clone())).build(ContextPackInput {
+        system_sources: Some(materialized.system_sources),
+        messages: materialized.messages,
+        tools: spec.tools.clone(),
+        model_options: spec.model_options.clone(),
+        attachments: materialized.attachments,
+        work_state: spec.work_state.clone(),
+        todos: spec.todos.clone(),
+        checkpoints: spec.checkpoints.clone(),
+        skills: Vec::new(),
+        tool_manifests: spec.tool_manifests.clone(),
+        metadata: BTreeMap::new(),
+        runtime_context: None,
+        sandbox_metadata: None,
+        extra_items: Vec::new(),
+    });
+    runtime_apply_context_system_diagnostics(session, pack.system_diagnostics.as_ref());
+    pack
+}
+
+fn runtime_context_pack_needs_auto_compaction(
+    pack: &ContextPack,
+    options: &ContextBudgetOptions,
+) -> bool {
+    if !options.enabled || !matches!(options.strategy.as_str(), "auto" | "compact") {
+        return false;
+    }
+    pack.budget.overflowed
+        || pack.trace.iter().any(|entry| {
+            !entry.included
+                && entry.drop_reason.as_deref() == Some("model_context_budget")
+                && matches!(entry.kind.as_str(), "message" | "tool_result")
+        })
+}
+
+fn runtime_auto_compact_context(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    step: u64,
+    pack: &ContextPack,
+    options: &ContextBudgetOptions,
+) -> Result<Option<Value>, String> {
+    let overflowed = pack.budget.overflowed;
+    let reason = if overflowed {
+        "required_context_overflow"
+    } else {
+        "history_budget_pressure"
+    };
+    let keep_recent_user_turns = if overflowed {
+        options.overflow_keep_recent_user_turns
+    } else {
+        options.prune_keep_recent_user_turns
+    };
+    let Some((boundary_index, compacted_until_message_id)) =
+        runtime_auto_compaction_boundary(&session.messages, keep_recent_user_turns)
+    else {
+        return Ok(None);
+    };
+    let compacted_message_count = boundary_index.saturating_add(1);
+    if !overflowed && compacted_message_count < options.compact_refresh_min_new_messages as usize {
+        return Ok(None);
+    }
+
+    let state = runtime_compaction_work_state(session, &session.messages[..=boundary_index]);
+    let item_budget = pack.budget.item_budget_tokens.unwrap_or_default();
+    let summary_token_budget = options
+        .compact_summary_max_output_tokens
+        .min(item_budget.saturating_div(3).max(1));
+    let summary = truncate_runtime_context_text(
+        &render_work_state(&state),
+        summary_token_budget.saturating_mul(options.bytes_per_token) as usize,
+    );
+    if summary.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let source = "runtime_auto_compaction_v1";
+    let boundary_metadata = BTreeMap::from([
+        ("automatic".to_string(), json!(true)),
+        ("before_pack_hash".to_string(), json!(pack.pack_hash)),
+        (
+            "compacted_message_count".to_string(),
+            json!(compacted_message_count),
+        ),
+        ("format".to_string(), json!("structured_work_state")),
+        ("reason".to_string(), json!(reason)),
+        ("source".to_string(), json!(source)),
+        ("step".to_string(), json!(step)),
+    ]);
+    let boundary_message_id = store
+        .append_compaction_boundary_with_metadata(
+            session,
+            run_id,
+            &summary,
+            &compacted_until_message_id,
+            boundary_metadata,
+        )
+        .map_err(|error| format!("failed to create automatic compaction boundary: {error}"))?;
+    let compacted_at_ms = now_ms();
+    session.metadata.insert(
+        "compact".to_string(),
+        json!({
+            "automatic": true,
+            "before_pack_hash": pack.pack_hash,
+            "boundary_message_id": boundary_message_id,
+            "compacted_at_ms": compacted_at_ms,
+            "compacted_message_count": compacted_message_count,
+            "compacted_until_message_id": compacted_until_message_id,
+            "format": "structured_work_state",
+            "message_count": session.messages.len(),
+            "reason": reason,
+            "run_id": run_id,
+            "source": source,
+            "state": state,
+            "step": step,
+            "summary": summary,
+        }),
+    );
+    let compaction = json!({
+        "automatic": true,
+        "before_pack_hash": pack.pack_hash,
+        "boundary_message_id": boundary_message_id,
+        "compacted_message_count": compacted_message_count,
+        "compacted_until_message_id": compacted_until_message_id,
+        "reason": reason,
+        "source": source,
+        "step": step,
+        "summary_tokens_estimate": summary_token_budget,
+    });
+    store
+        .record_event(
+            &session.id,
+            run_id,
+            "context.auto_compacted",
+            SessionEventOptions {
+                kind: "context".to_string(),
+                attributes: compaction
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                ..SessionEventOptions::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    store
+        .save_state(session, Some(run_id))
+        .map_err(|error| error.to_string())?;
+    Ok(Some(compaction))
+}
+
+fn runtime_auto_compaction_boundary(
+    messages: &[ChatMessage],
+    keep_recent_user_turns: u64,
+) -> Option<(usize, String)> {
+    let user_positions = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == Role::User).then_some(index))
+        .collect::<Vec<_>>();
+    let keep_recent_user_turns = keep_recent_user_turns.max(1) as usize;
+    if user_positions.len() <= keep_recent_user_turns {
+        return None;
+    }
+    let preserve_from = user_positions[user_positions.len() - keep_recent_user_turns];
+    (0..preserve_from).rev().find_map(|index| {
+        let message_id = messages[index]
+            .metadata
+            .get("message_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())?;
+        Some((index, message_id.to_string()))
+    })
+}
+
+fn runtime_compaction_work_state(session: &Session, messages: &[ChatMessage]) -> WorkState {
+    let task = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User && !message.content.trim().is_empty())
+        .map(|message| compacted_message_line(message, 480))
+        .unwrap_or_else(|| "Continue the current workspace task.".to_string());
+    let mut progress = messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
+        .take(4)
+        .map(|message| compacted_message_line(message, 280))
+        .collect::<Vec<_>>();
+    progress.reverse();
+    let mut tool_findings = messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == Role::Tool && !message.content.trim().is_empty())
+        .take(6)
+        .map(|message| {
+            let finding = compacted_message_line(message, 220);
+            message
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .map_or(finding.clone(), |name| format!("{name}: {finding}"))
+        })
+        .collect::<Vec<_>>();
+    tool_findings.reverse();
+    let blockers = messages
+        .iter()
+        .filter(|message| {
+            message.role == Role::Tool
+                && (message.metadata.contains_key("error")
+                    || message.content.to_ascii_lowercase().contains("error"))
+        })
+        .rev()
+        .take(3)
+        .map(|message| compacted_message_line(message, 220))
+        .collect::<Vec<_>>();
+    let todos = session
+        .todos
+        .iter()
+        .filter(|todo| !matches!(todo.status.as_str(), "completed" | "cancelled" | "canceled"))
+        .map(|todo| todo.content.trim().to_string())
+        .filter(|todo| !todo.is_empty())
+        .collect::<Vec<_>>();
+    WorkState {
+        task,
+        progress,
+        tool_findings,
+        todos: todos.clone(),
+        blockers,
+        next_steps: todos,
+        ..WorkState::default()
+    }
+}
+
+fn compacted_message_line(message: &ChatMessage, max_chars: usize) -> String {
+    let text = message
+        .content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.chars().count() <= max_chars {
+        text
+    } else {
+        format!("{}...", text.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn truncate_runtime_context_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let suffix = "\n[Compaction summary truncated]";
+    if end <= suffix.len() {
+        return text[..end].to_string();
+    }
+    let mut content_end = end - suffix.len();
+    while content_end > 0 && !text.is_char_boundary(content_end) {
+        content_end -= 1;
+    }
+    format!("{}{}", &text[..content_end], suffix)
+}
+
+fn runtime_mcp_tool_manifest_items(
+    mcp_runtime: Option<&RuntimeMcpRuntime>,
+    tools: &[ToolSchema],
+) -> Vec<ContextItem> {
+    let Some(runtime) = mcp_runtime else {
+        return Vec::new();
+    };
+    let visible_tools = tools
+        .iter()
+        .map(|tool| (tool.name.as_str(), tool))
+        .collect::<BTreeMap<_, _>>();
+    runtime
+        .descriptors
+        .values()
+        .filter_map(|descriptor| {
+            let tool = visible_tools.get(descriptor.dynamic_name.as_str())?;
+            Some(tool_manifest_context_item(
+                format!("mcp_tool:{}", descriptor.dynamic_name),
+                format!("mcp.server:{}", descriptor.server_name),
+                tool,
+                BTreeMap::from([
+                    ("server_name".to_string(), json!(descriptor.server_name)),
+                    ("original_name".to_string(), json!(descriptor.original_name)),
+                    ("dynamic_name".to_string(), json!(descriptor.dynamic_name)),
+                    ("title".to_string(), json!(descriptor.title)),
+                ]),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn runtime_persist_context_pack_receipt_with_replay(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    step: u64,
+    pack: &ContextPack,
+    rebuild: Option<&Value>,
+    replay_spec: Option<&RuntimeContextReplaySpec>,
+) -> Result<(), String> {
+    runtime_persist_context_pack_receipt_with_diagnostics(
+        store,
+        session,
+        run_id,
+        step,
+        pack,
+        rebuild,
+        replay_spec,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_persist_context_pack_receipt_with_diagnostics(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    step: u64,
+    pack: &ContextPack,
+    rebuild: Option<&Value>,
+    replay_spec: Option<&RuntimeContextReplaySpec>,
+    performance: Option<&ContextPackPerformance>,
+    failure: Option<&ContextFailure>,
+) -> Result<(), String> {
+    let mut receipts = session
+        .metadata
+        .get("context_pack_receipts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let prefix_cache = runtime_context_prefix_cache_status(&receipts, pack, run_id, step);
+    let mut envelope = json!({
+        "schema_version": "openagent.turn_context_pack.v1",
+        "mode": "active",
+        "run_id": run_id,
+        "step": step,
+        "receipt": pack.receipt,
+        "trace": pack.trace,
+        "system_diagnostics": pack.system_diagnostics,
+        "prefix_cache": prefix_cache,
+    });
+    if let Some(rebuild) = rebuild
+        && let Some(object) = envelope.as_object_mut()
+    {
+        object.insert("rebuild".to_string(), rebuild.clone());
+    }
+    if let Some(replay_spec) = replay_spec
+        && let Some(object) = envelope.as_object_mut()
+    {
+        object.insert(
+            "replay_spec".to_string(),
+            serde_json::to_value(replay_spec).map_err(|error| error.to_string())?,
+        );
+    }
+    if let Some(performance) = performance
+        && let Some(object) = envelope.as_object_mut()
+    {
+        object.insert(
+            "performance".to_string(),
+            serde_json::to_value(performance).map_err(|error| error.to_string())?,
+        );
+    }
+    if let Some(failure) = failure
+        && let Some(object) = envelope.as_object_mut()
+    {
+        object.insert(
+            "failure".to_string(),
+            serde_json::to_value(failure).map_err(|error| error.to_string())?,
+        );
+    }
+    let already_persisted = receipts.iter().any(|existing| {
+        existing.get("run_id").and_then(Value::as_str) == Some(run_id)
+            && existing.get("step").and_then(Value::as_u64) == Some(step)
+            && existing
+                .pointer("/receipt/pack_hash")
+                .and_then(Value::as_str)
+                == Some(pack.pack_hash.as_str())
+    });
+    receipts.retain(|existing| {
+        existing.get("run_id").and_then(Value::as_str) != Some(run_id)
+            || existing.get("step").and_then(Value::as_u64) != Some(step)
+    });
+    receipts.push(envelope.clone());
+    if receipts.len() > MAX_CONTEXT_PACK_RECEIPTS {
+        receipts.drain(..receipts.len() - MAX_CONTEXT_PACK_RECEIPTS);
+    }
+    session
+        .metadata
+        .insert("context_pack".to_string(), envelope.clone());
+    session
+        .metadata
+        .insert("context_pack_receipts".to_string(), Value::Array(receipts));
+    if !already_persisted {
+        store
+            .record_event(
+                &session.id,
+                run_id,
+                "context.pack_built",
+                SessionEventOptions {
+                    kind: "context".to_string(),
+                    attributes: BTreeMap::from([
+                        ("mode".to_string(), json!("active")),
+                        ("step".to_string(), json!(step)),
+                        ("receipt".to_string(), json!(pack.receipt)),
+                        (
+                            "trace".to_string(),
+                            Value::Array(
+                                pack.trace.iter().map(public_context_trace_entry).collect(),
+                            ),
+                        ),
+                        ("prefix_cache".to_string(), json!(prefix_cache)),
+                        ("rebuild".to_string(), json!(rebuild)),
+                        (
+                            "performance".to_string(),
+                            performance
+                                .map(public_context_performance)
+                                .unwrap_or(Value::Null),
+                        ),
+                        (
+                            "failure".to_string(),
+                            failure.map(public_context_failure).unwrap_or(Value::Null),
+                        ),
+                    ]),
+                    ..SessionEventOptions::default()
+                },
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    store
+        .save_state(session, Some(run_id))
+        .map_err(|error| error.to_string())
+}
+
+fn runtime_update_context_pack_diagnostics(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    step: u64,
+    performance: Option<&ContextPackPerformance>,
+    failure: Option<&ContextFailure>,
+) -> Result<(), String> {
+    let performance = performance
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let failure = failure
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let apply = |value: &mut Value| {
+        if value.get("run_id").and_then(Value::as_str) != Some(run_id)
+            || value.get("step").and_then(Value::as_u64) != Some(step)
+        {
+            return;
+        }
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        if let Some(performance) = &performance {
+            object.insert("performance".to_string(), performance.clone());
+        }
+        if let Some(failure) = &failure {
+            object.insert("failure".to_string(), failure.clone());
+        }
+    };
+    if let Some(latest) = session.metadata.get_mut("context_pack") {
+        apply(latest);
+    }
+    if let Some(history) = session
+        .metadata
+        .get_mut("context_pack_receipts")
+        .and_then(Value::as_array_mut)
+    {
+        for envelope in history {
+            apply(envelope);
+        }
+    }
+    store
+        .save_state(session, Some(run_id))
+        .map_err(|error| error.to_string())
+}
+
+fn runtime_context_prefix_cache_status(
+    receipts: &[Value],
+    pack: &ContextPack,
+    run_id: &str,
+    step: u64,
+) -> Value {
+    let prefix = &pack.stable_prefix;
+    if !prefix.cache_eligible {
+        return json!({
+            "schema_version": "openagent.context_prefix_cache.v1",
+            "scope": "logical_prefix_reuse",
+            "status": "bypass",
+            "cache_eligible": false,
+            "stable_prefix_hash": prefix.hash,
+            "stable_prefix_token_estimate": prefix.token_estimate,
+            "retry_reuses_pack": true,
+        });
+    }
+    let previous = receipts.iter().rev().find(|receipt| {
+        (receipt.get("run_id").and_then(Value::as_str) != Some(run_id)
+            || receipt.get("step").and_then(Value::as_u64) != Some(step))
+            && receipt
+                .pointer("/receipt/stable_prefix/cache_eligible")
+                .and_then(Value::as_bool)
+                == Some(true)
+    });
+    let reused = receipts.iter().rev().find(|receipt| {
+        (receipt.get("run_id").and_then(Value::as_str) != Some(run_id)
+            || receipt.get("step").and_then(Value::as_u64) != Some(step))
+            && receipt
+                .pointer("/receipt/stable_prefix/cache_eligible")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && receipt
+                .pointer("/receipt/stable_prefix/hash")
+                .and_then(Value::as_str)
+                == Some(prefix.hash.as_str())
+    });
+    let status = if reused.is_some() {
+        "reused"
+    } else if previous.is_some() {
+        "changed"
+    } else {
+        "miss"
+    };
+    json!({
+        "schema_version": "openagent.context_prefix_cache.v1",
+        "scope": "logical_prefix_reuse",
+        "status": status,
+        "cache_eligible": true,
+        "stable_prefix_hash": prefix.hash,
+        "stable_prefix_token_estimate": prefix.token_estimate,
+        "retry_reuses_pack": true,
+        "reused_from": reused.map(|receipt| json!({
+            "run_id": receipt.get("run_id").cloned().unwrap_or(Value::Null),
+            "step": receipt.get("step").cloned().unwrap_or(Value::Null),
+        })),
+    })
+}
+
+struct RuntimeMaterializedProviderContext {
+    messages: Vec<ChatMessage>,
+    attachments: Vec<ContextAttachment>,
+    work_state: Option<ContextWorkState>,
+    system_sources: ContextSystemSources,
+    source_message_count: usize,
+}
+
+fn runtime_materialized_provider_context_for_agent(
     store: &FileSessionStore,
     session: &mut Session,
     profile: Option<&RuntimeSubagentProfile>,
-) -> Vec<ChatMessage> {
-    let mut messages = store
-        .materialized_chat_messages(session)
-        .unwrap_or_else(|_| session.messages.clone())
-        .into_iter()
-        .filter(|message| !runtime_is_agent_profile_system_message(message))
-        .collect::<Vec<_>>();
-    if let Some(system) = runtime_materialized_agent_system_message(
-        session,
-        profile,
-        profile.map_or("", |item| item.mode.as_str()),
-    ) {
-        messages.insert(0, system);
-    }
-    messages
+) -> RuntimeMaterializedProviderContext {
+    runtime_materialized_provider_context_for_agent_bounded(store, session, profile, None)
 }
 
-fn runtime_is_agent_profile_system_message(message: &ChatMessage) -> bool {
-    message.role == Role::System && message.metadata.get("agent_profile").is_some()
-}
-
-fn runtime_materialized_agent_system_message(
+fn runtime_materialized_provider_context_for_agent_bounded(
+    store: &FileSessionStore,
     session: &mut Session,
     profile: Option<&RuntimeSubagentProfile>,
-    agent_mode: &str,
-) -> Option<ChatMessage> {
-    let profile = profile?;
-    let preloaded_skills = runtime_preloaded_skill_documents(profile, &session.directory);
-    let available_skills = runtime_available_skill_infos(profile, &session.directory);
-    let system_prompt = build_agent_system_prompt(AgentSystemPromptInput {
-        profile_prompt: Some(profile.prompt.as_str()),
-        workspace_root: &session.directory,
-        preloaded_skills: &preloaded_skills,
-        available_skills: &available_skills,
-        include_instructions: true,
-    })?;
-    if !profile.skills.is_empty() {
+    message_limit: Option<usize>,
+) -> RuntimeMaterializedProviderContext {
+    let mut source_messages = store
+        .materialized_chat_messages(session)
+        .unwrap_or_else(|_| session.messages.clone());
+    if let Some(message_limit) = message_limit {
+        source_messages.truncate(message_limit);
+    }
+    let source_message_count = source_messages.len();
+    let history = materialize_context_history(source_messages);
+    let messages = history.messages;
+    let mut system_sources = runtime_context_system_sources(session, profile);
+    system_sources.legacy_system_sources = history.legacy_system_sources;
+    let work_state = history
+        .work_state
+        .or_else(|| runtime_legacy_context_work_state(session, messages.len()));
+    let attachments = runtime_context_attachments(&messages);
+    RuntimeMaterializedProviderContext {
+        messages,
+        attachments,
+        work_state,
+        system_sources,
+        source_message_count,
+    }
+}
+
+fn runtime_legacy_context_work_state(
+    session: &Session,
+    message_position: usize,
+) -> Option<ContextWorkState> {
+    let compact = session.metadata.get("compact")?.as_object()?;
+    let summary = compact.get("summary")?.as_str()?.trim();
+    if summary.is_empty() {
+        return None;
+    }
+    Some(ContextWorkState {
+        id: compact
+            .get("boundary_message_id")
+            .and_then(Value::as_str)
+            .unwrap_or("legacy_compact")
+            .to_string(),
+        summary: summary.to_string(),
+        format: compact
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("session_summary_v1")
+            .to_string(),
+        source: "session.metadata.compact".to_string(),
+        message_position: Some(message_position),
+        compacted_until_message_id: compact
+            .get("compacted_until_message_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        metadata: BTreeMap::new(),
+    })
+}
+
+fn runtime_context_todos(todos: &[SessionTodoItem]) -> Vec<ContextTodo> {
+    todos
+        .iter()
+        .map(|todo| {
+            ContextTodo::new(
+                Some(todo.id.clone()),
+                todo.content.clone(),
+                todo.status.clone(),
+                todo.priority.clone(),
+            )
+        })
+        .collect()
+}
+
+fn runtime_context_checkpoints(
+    store: &FileSessionStore,
+    session: &Session,
+) -> Vec<ContextCheckpoint> {
+    let restored_id = session
+        .metadata
+        .get("latest_checkpoint_restore")
+        .and_then(Value::as_object)
+        .and_then(|restore| restore.get("checkpoint_id"))
+        .and_then(Value::as_str);
+    let checkpoints = store.list_checkpoints(&session.id).unwrap_or_default();
+    let mut selected = checkpoints.iter().take(1).collect::<Vec<_>>();
+    if let Some(restored_id) = restored_id
+        && let Some(restored) = checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == restored_id)
+        && !selected
+            .iter()
+            .any(|checkpoint| checkpoint.checkpoint_id == restored_id)
+    {
+        selected.push(restored);
+    }
+    selected
+        .into_iter()
+        .map(|checkpoint| context_checkpoint(checkpoint, restored_id))
+        .collect()
+}
+
+fn context_checkpoint(
+    checkpoint: &SessionCheckpointRecord,
+    restored_id: Option<&str>,
+) -> ContextCheckpoint {
+    ContextCheckpoint {
+        id: checkpoint.checkpoint_id.clone(),
+        kind: checkpoint.kind.clone(),
+        run_id: checkpoint.run_id.clone(),
+        timestamp_ms: checkpoint.timestamp_ms,
+        message_id: checkpoint.message_id.clone(),
+        part_id: checkpoint.part_id.clone(),
+        step_index: checkpoint.step_index,
+        file_count: checkpoint.file_count,
+        total_bytes: checkpoint.total_bytes,
+        restored: restored_id == Some(checkpoint.checkpoint_id.as_str()),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn runtime_context_attachments(messages: &[ChatMessage]) -> Vec<ContextAttachment> {
+    messages
+        .iter()
+        .enumerate()
+        .flat_map(|(message_index, message)| {
+            message
+                .metadata
+                .get("context_attachments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |value| {
+                    let mut attachment =
+                        serde_json::from_value::<ContextAttachment>(value.clone()).ok()?;
+                    attachment.id = attachment.stable_id();
+                    attachment.source_message_index = Some(message_index);
+                    Some(attachment)
+                })
+        })
+        .collect()
+}
+
+fn runtime_context_system_sources(
+    session: &mut Session,
+    profile: Option<&RuntimeSubagentProfile>,
+) -> ContextSystemSources {
+    let (preloaded_skills, available_skills) = profile.map_or_else(
+        || (Vec::new(), Vec::new()),
+        |profile| {
+            (
+                runtime_preloaded_skill_documents(profile, &session.directory),
+                runtime_available_skill_infos(profile, &session.directory),
+            )
+        },
+    );
+    if let Some(profile) = profile.filter(|profile| !profile.skills.is_empty()) {
         session
             .metadata
             .insert("skills".to_string(), json!(profile.skills.clone()));
     } else {
         session.metadata.remove("skills");
     }
-    if !system_prompt.preloaded_skill_names.is_empty() {
+    ContextSystemSources {
+        profile_id: profile.map(|profile| profile.id.clone()),
+        profile_mode: profile.map(|profile| profile.mode.clone()),
+        profile_prompt: profile.map(|profile| profile.prompt.clone()),
+        workspace_root: session.directory.clone(),
+        preloaded_skills,
+        available_skills,
+        legacy_system_sources: Vec::new(),
+        include_instructions: true,
+    }
+}
+
+fn runtime_apply_context_system_diagnostics(
+    session: &mut Session,
+    diagnostics: Option<&ContextSystemDiagnostics>,
+) {
+    let Some(diagnostics) = diagnostics else {
+        session.metadata.remove("preloaded_skills");
+        session.metadata.remove("dynamic_system_prompt");
+        return;
+    };
+    if !diagnostics.preloaded_skill_names.is_empty() {
         session.metadata.insert(
             "preloaded_skills".to_string(),
-            json!(system_prompt.preloaded_skill_names.clone()),
+            json!(diagnostics.preloaded_skill_names.clone()),
         );
     } else {
         session.metadata.remove("preloaded_skills");
     }
     session.metadata.insert(
         "dynamic_system_prompt".to_string(),
-        json!({
-            "hash": system_prompt.content_hash,
-            "instruction_count": system_prompt.instruction_count,
-            "instruction_total_bytes": system_prompt.instruction_total_bytes,
-            "instructions_truncated": system_prompt.instructions_truncated,
-            "instruction_issues": system_prompt.instruction_issues,
-            "preloaded_skills": system_prompt.preloaded_skill_names,
-        }),
+        diagnostics.session_metadata(),
     );
-    let mut system = runtime_chat_message(Role::System, system_prompt.content);
-    system
-        .metadata
-        .insert("agent_profile".to_string(), json!(profile.id.clone()));
-    system
-        .metadata
-        .insert("agent_mode".to_string(), json!(agent_mode));
-    system
-        .metadata
-        .insert("dynamic_system_prompt".to_string(), json!(true));
-    if let Some(dynamic) = session.metadata.get("dynamic_system_prompt") {
-        system
-            .metadata
-            .insert("dynamic_system_prompt_info".to_string(), dynamic.clone());
-    }
-    Some(system)
 }
 
 fn runtime_preloaded_skill_documents(
@@ -6777,7 +8623,43 @@ fn append_completed_tool_result(
     if let Some(change) = patch.as_ref() {
         events.push(patch_detected_event(session, run_id, change));
     }
-    append_tool_result_to_session(store, session, run_id, step, tool_call, tool_result)
+    let todos_changed = sync_session_todos_from_tool_result(session, tool_call, tool_result);
+    append_tool_result_to_session(store, session, run_id, step, tool_call, tool_result)?;
+    if todos_changed {
+        store
+            .save_state(session, Some(run_id))
+            .map_err(|error| format!("failed to persist session todos: {error}"))?;
+    }
+    Ok(())
+}
+
+fn sync_session_todos_from_tool_result(
+    session: &mut Session,
+    tool_call: &ToolCall,
+    tool_result: &ToolResult,
+) -> bool {
+    if tool_result.error.is_some() || !matches!(tool_call.name.as_str(), "todowrite" | "todoread") {
+        return false;
+    }
+    let Some(todos) = tool_result.metadata.get("todos").and_then(Value::as_array) else {
+        return false;
+    };
+    let todos = todos
+        .iter()
+        .filter_map(|todo| serde_json::from_value::<SessionTodoItem>(todo.clone()).ok())
+        .collect::<Vec<_>>();
+    if todos.len()
+        != tool_result
+            .metadata
+            .get("todos")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+        || session.todos == todos
+    {
+        return false;
+    }
+    session.set_todos(todos);
+    true
 }
 
 fn append_tool_result_to_session(
@@ -7422,7 +9304,6 @@ fn start_turn_payload_inner(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let attachments = turn_attachments_from_payload(&payload)?;
-    let model_input = build_turn_input_with_attachments(input, &attachments);
     let permission_ruleset = permission_ruleset_for_turn(&payload)?;
     let skip_permissions = skip_permissions_for_turn(&payload);
     let store = FileSessionStore::new(session_root(config));
@@ -7468,11 +9349,24 @@ fn start_turn_payload_inner(
                     .collect(),
             ),
         );
+        user_metadata.insert(
+            "context_attachments".to_string(),
+            Value::Array(
+                attachments
+                    .iter()
+                    .map(|attachment| serde_json::to_value(&attachment.context).unwrap_or_default())
+                    .collect(),
+            ),
+        );
         user_metadata.insert("attachment_count".to_string(), json!(attachments.len()));
     }
+    user_metadata.insert(
+        "message_id".to_string(),
+        json!(runtime_turn_message_id(&run_id, "user", 0)),
+    );
     let user = ChatMessage {
         role: Role::User,
-        content: model_input,
+        content: input.to_string(),
         name: None,
         tool_call_id: None,
         metadata: user_metadata,
@@ -7482,7 +9376,7 @@ fn start_turn_payload_inner(
     let _ = store.append_message(&session, &user, &run_id, user_index);
     let mut tool_calls = tool_calls_from_turn_payload(&payload)?;
     if tool_calls.is_empty()
-        && let Some(call) = manual_runtime_subagent_tool_call(&input)
+        && let Some(call) = manual_runtime_subagent_tool_call(input)
     {
         tool_calls.push(call);
     }
@@ -7543,20 +9437,8 @@ fn validate_start_turn_payload(payload: &Value) -> Result<(), String> {
 
 #[derive(Clone, Debug)]
 struct TurnAttachment {
-    prompt_path: String,
-    content: String,
+    context: ContextAttachment,
     metadata: Value,
-}
-
-fn build_turn_input_with_attachments(input: &str, attachments: &[TurnAttachment]) -> String {
-    if attachments.is_empty() {
-        return input.to_string();
-    }
-    let files = attachments
-        .iter()
-        .map(|attachment| (attachment.prompt_path.as_str(), attachment.content.as_str()))
-        .collect::<Vec<_>>();
-    build_run_prompt(input, &files)
 }
 
 fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>, String> {
@@ -7586,9 +9468,8 @@ fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>,
                 .and_then(Value::as_str)
                 .unwrap_or("file")
                 .trim();
-            if kind != "file" {
-                return Err(format!("attachment {index} has unsupported kind {kind}"));
-            }
+            let kind = ContextAttachmentKind::parse(kind)
+                .ok_or_else(|| format!("attachment {index} has unsupported kind {kind}"))?;
             let content = object
                 .get("content")
                 .and_then(Value::as_str)
@@ -7611,13 +9492,6 @@ fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>,
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let prompt_path = if !path.is_empty() {
-                path.clone()
-            } else if !name.is_empty() {
-                name.clone()
-            } else {
-                format!("attachment-{index}.txt")
-            };
             let size_bytes = object
                 .get("size_bytes")
                 .or_else(|| object.get("sizeBytes"))
@@ -7630,11 +9504,27 @@ fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>,
                 .unwrap_or("text/plain");
             let content_chars = content.chars().count();
             let content_lines = content.lines().count();
-            Ok(TurnAttachment {
-                prompt_path,
+            let mut context = ContextAttachment::new(
+                kind,
+                (!path.is_empty()).then_some(path.clone()),
+                (!name.is_empty()).then_some(name.clone()),
+                content_type,
+                size_bytes,
                 content,
+            );
+            if let Some(external_id) = object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                context
+                    .metadata
+                    .insert("external_id".to_string(), json!(external_id.trim()));
+            }
+            Ok(TurnAttachment {
                 metadata: json!({
-                    "kind": "file",
+                    "id": context.id,
+                    "kind": context.kind,
                     "path": path,
                     "name": name,
                     "size_bytes": size_bytes,
@@ -7642,6 +9532,7 @@ fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>,
                     "content_chars": content_chars,
                     "content_lines": content_lines,
                 }),
+                context,
             })
         })
         .collect()
@@ -7898,7 +9789,7 @@ fn run_http_tool_turn(
     )
     .tool_context();
     let mut events = vec![turn_started_event(session, run_id)];
-    let assistant_message_id = runtime_message_id(session.messages.len() as u64 + tool_call_count);
+    let assistant_message_id = runtime_turn_message_id(run_id, "assistant", tool_call_count.max(1));
     let start_checkpoint = runtime_create_step_checkpoint(
         store,
         &session.id,
@@ -8181,7 +10072,7 @@ fn respond_approval_payload(
             .and_then(Value::as_str)
             .map(ToString::to_string)
             .or_else(|| latest_assistant_message_id_for_tool(&session, &tool_call))
-            .unwrap_or_else(|| runtime_message_id(session.messages.len() as u64));
+            .unwrap_or_else(|| runtime_turn_message_id(&run_id, "assistant", approval_step.max(1)));
         if let Some(resume) = take_pending_provider_turn(&mut session) {
             append_interaction_resolution_part(
                 &store, &session, &run_id, "approval", &approval, &resolved, "allowed",
@@ -9212,10 +11103,15 @@ pub fn http_runtime_fixture() -> Value {
             "message_text": command_text_from_args(&["hello", "runtime"], Some(""), true),
             "stdin_text": command_text_from_args(&[], Some("from stdin\n"), false),
             "empty_tty_text": command_text_from_args(&[], Some(""), true),
-            "with_file": build_run_prompt(
-                "summarize",
-                &[(format!("{workspace}/notes.txt").as_str(), "alpha\nbeta\n")]
-            ),
+            "structured_turn": {
+                "message": "summarize",
+                "attachments": [{
+                    "kind": "file",
+                    "path": format!("{workspace}/notes.txt"),
+                    "content_type": "text/plain",
+                    "size_bytes": 11,
+                }],
+            },
         },
         "client": {
             "select_sessions": {
@@ -9660,6 +11556,9 @@ while True:
                 "gpt-5.4".to_string(),
                 "gpt-5.3".to_string(),
                 "gpt-5.5".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-5.6".to_string(),
                 "gpt-image-1.5".to_string(),
                 "gpt-image-2".to_string(),
                 "server-local".to_string(),
@@ -9674,7 +11573,7 @@ while True:
 
         assert_eq!(
             ids,
-            vec!["gpt-5.4", "gpt-5.5", "gpt-image-1.5", "gpt-image-2"]
+            vec!["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4"]
         );
     }
 
@@ -9690,6 +11589,10 @@ while True:
         assert_eq!(
             runtime_provider_model_candidates_with_fallback("gpt-5.3", Some("gpt-5.3,gpt-5.4")),
             vec!["gpt-5.3", "gpt-5.4"]
+        );
+        assert_eq!(
+            runtime_provider_model_candidates_with_fallback("gpt-5.6-sol", None),
+            vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
         );
         assert_eq!(
             runtime_provider_model_candidates_with_fallback("custom-child-model", None),
@@ -11048,14 +12951,586 @@ fn escape_json_string(value: &str) -> String {
             user["info"]["metadata"]["attachments"][0]["name"],
             json!("openagent-note.md")
         );
+        let attachment_id = user["info"]["metadata"]["attachments"][0]["id"]
+            .as_str()
+            .expect("attachment id");
+        assert!(attachment_id.starts_with("att_"));
         let text = user["parts"][0]["content"]
             .as_str()
             .expect("user text part");
-        assert!(text.contains("review attachment"));
-        assert!(text.contains("Attached file: /tmp/openagent-note.md"));
-        assert!(text.contains("hello attached"));
+        assert_eq!(text, "review attachment");
+        let file = user["parts"]
+            .as_array()
+            .expect("user parts")
+            .iter()
+            .find(|part| part["kind"] == "file")
+            .expect("file part");
+        assert_eq!(file["content"]["id"], json!(attachment_id));
+        assert_eq!(file["content"]["kind"], json!("file"));
+        assert_eq!(file["content"]["path"], json!("/tmp/openagent-note.md"));
+        assert_eq!(file["content"]["content"], json!("hello attached\n"));
+
+        let store = FileSessionStore::new(session_root);
+        let mut restored = store.load_session(session_id).expect("restored session");
+        let materialized =
+            runtime_materialized_provider_context_for_agent(&store, &mut restored, None);
+        assert_eq!(materialized.attachments.len(), 1);
+        assert_eq!(materialized.attachments[0].id, attachment_id);
+        assert_eq!(materialized.attachments[0].source_message_index, Some(0));
+        let pack = runtime_context_pack_for_agent(
+            &store,
+            &mut restored,
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            ContextPackBuildOptions {
+                trace_only: false,
+                ..ContextPackBuildOptions::default()
+            },
+        );
+        let user_index = pack
+            .messages
+            .iter()
+            .position(|message| {
+                message.role == Role::User && message.content == "review attachment"
+            })
+            .expect("original user message");
+        assert_eq!(pack.messages[user_index + 1].role, Role::User);
+        assert!(
+            pack.messages[user_index + 1]
+                .content
+                .contains("hello attached")
+        );
+        assert_eq!(
+            pack.receipt.item_kind_counts.get("attachment_file"),
+            Some(&1)
+        );
+        assert_eq!(pack.receipt.item_kind_counts.get("checkpoint"), Some(&1));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_system_history_survives_restart_and_replays_through_context_builder() {
+        let root = std::env::temp_dir().join(format!("openagent-http-legacy-system-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created["session_id"].as_str().expect("session id");
+        let store = FileSessionStore::new(session_root);
+        let mut session = store.load_session(session_id).expect("session");
+
+        let mut compacted_user =
+            runtime_chat_message(Role::User, "Old request before compaction".to_string());
+        compacted_user
+            .metadata
+            .insert("message_id".to_string(), json!("compacted-user-0"));
+        session.add(compacted_user.clone());
+        store
+            .append_message(&session, &compacted_user, "run_legacy", 0)
+            .expect("append compacted user");
+
+        store
+            .append_compaction_boundary(
+                &mut session,
+                "run_legacy",
+                "Resume the compacted implementation",
+                "compacted-user-0",
+            )
+            .expect("append compaction boundary");
+
+        let mut stale_profile =
+            runtime_chat_message(Role::System, "STALE_PROFILE_SYSTEM".to_string());
+        stale_profile
+            .metadata
+            .insert("agent_profile".to_string(), json!("old-profile"));
+        stale_profile
+            .metadata
+            .insert("message_id".to_string(), json!("legacy-profile-2"));
+        session.add(stale_profile.clone());
+        store
+            .append_message(&session, &stale_profile, "run_legacy", 2)
+            .expect("append stale profile");
+
+        let mut legacy = runtime_chat_message(Role::System, "LEGACY_PROJECT_SYSTEM".to_string());
+        legacy
+            .metadata
+            .insert("message_id".to_string(), json!("legacy-system-3"));
+        session.add(legacy.clone());
+        store
+            .append_message(&session, &legacy, "run_legacy", 3)
+            .expect("append legacy system");
+
+        let mut user = runtime_chat_message(Role::User, "Continue the migration".to_string());
+        user.metadata.insert(
+            "message_id".to_string(),
+            json!(runtime_turn_message_id("run_legacy", "user", 4)),
+        );
+        session.add(user.clone());
+        store
+            .append_message(&session, &user, "run_legacy", 4)
+            .expect("append user");
+        store
+            .save_state(&session, Some("run_legacy"))
+            .expect("save legacy session");
+
+        let mut restarted = FileSessionStore::new(root.join("sessions"))
+            .load_session(session_id)
+            .expect("restart session");
+        let materialized =
+            runtime_materialized_provider_context_for_agent(&store, &mut restarted, None);
+        assert_eq!(materialized.source_message_count, 4);
+        assert_eq!(materialized.messages, vec![user]);
+        assert_eq!(materialized.system_sources.legacy_system_sources.len(), 1);
+        assert_eq!(
+            materialized
+                .work_state
+                .as_ref()
+                .map(|work_state| work_state.summary.as_str()),
+            Some("Resume the compacted implementation")
+        );
+
+        let build_options = ContextPackBuildOptions {
+            trace_only: false,
+            ..ContextPackBuildOptions::default()
+        };
+        let pack = runtime_context_pack_for_agent(
+            &store,
+            &mut restarted,
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            build_options.clone(),
+        );
+        let dynamic_system = pack
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .metadata
+                    .get("dynamic_system_prompt")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .expect("dynamic system");
+        assert!(dynamic_system.content.contains("LEGACY_PROJECT_SYSTEM"));
+        assert!(!dynamic_system.content.contains("STALE_PROFILE_SYSTEM"));
+        assert_eq!(
+            pack.system_diagnostics
+                .as_ref()
+                .map(|diagnostics| diagnostics.legacy_system_count),
+            Some(1)
+        );
+        assert_eq!(pack.receipt.item_kind_counts.get("legacy_system"), Some(&1));
+        pack.validate_provider_input().expect("provider input");
+
+        let spec =
+            runtime_context_replay_spec(&store, &mut restarted, &pack, None, None, build_options);
+        runtime_persist_context_pack_receipt_with_replay(
+            &store,
+            &mut restarted,
+            "run_legacy",
+            1,
+            &pack,
+            None,
+            Some(&spec),
+        )
+        .expect("persist replay receipt");
+        let replay = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/api/sessions/{session_id}/context/replay"),
+                headers: BTreeMap::new(),
+                body: "{}".to_string(),
+            },
+            &config,
+        );
+        assert_eq!(replay.status, 200);
+        let replay = replay.body.expect("replay body");
+        assert_eq!(replay["status"], "verified");
+        assert_eq!(
+            replay["rebuilt"]["receipt"]["pack_hash"],
+            json!(pack.pack_hash)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_diagnostics_are_persistent_explainable_and_redacted() {
+        let root = std::env::temp_dir().join(format!("openagent-http-context-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created["session_id"].as_str().expect("session id");
+        let store = FileSessionStore::new(session_root.clone());
+        let mut session = store.load_session(session_id).expect("session");
+        let mut required = ContextItem::new(
+            "instruction:test",
+            "instruction",
+            "https://user:password@example.test/AGENTS.md?token=super-secret",
+            "PRIVATE PROMPT BODY",
+            100,
+        );
+        required.pinned = true;
+        required.stable_prefix = true;
+        required.token_estimate = 40;
+        let mut dropped = ContextItem::new(
+            "attachment:secret",
+            "attachment_file",
+            "session.messages[0].attachments[0]",
+            "ATTACHMENT SECRET BODY",
+            1,
+        );
+        dropped.token_estimate = 200;
+        let pack = ContextPackBuilder::new(Some(ContextPackBuildOptions {
+            token_budget: Some(120),
+            trace_only: false,
+            ..ContextPackBuildOptions::default()
+        }))
+        .build(ContextPackInput {
+            extra_items: vec![required, dropped],
+            ..ContextPackInput::default()
+        });
+        let mut performance = ContextPackPerformance::new();
+        performance.materialize_us = 1_250;
+        performance.build_us = 2_500;
+        performance.persist_us = 3_750;
+        performance.provider_payload_build_us = 400;
+        performance.provider_payload_serialize_us = 500;
+        performance.provider_payload_bytes = 8_192;
+        performance.source_message_count = 2;
+        performance.tool_count = 1;
+        performance.item_count = 2;
+        performance.refresh_warnings();
+        runtime_persist_context_pack_receipt_with_diagnostics(
+            &store,
+            &mut session,
+            "run_context",
+            1,
+            &pack,
+            None,
+            None,
+            Some(&performance),
+            None,
+        )
+        .expect("persist context receipt");
+
+        let response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: format!("/api/sessions/{session_id}/context?limit=4"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(response.status, 200);
+        let diagnostics = response.body.expect("context diagnostics body");
+        assert_eq!(
+            diagnostics["schema_version"],
+            CONTEXT_DIAGNOSTICS_SCHEMA_VERSION
+        );
+        assert_eq!(diagnostics["status"], "ready");
+        assert_eq!(diagnostics["latest"]["receipt"]["included_item_count"], 1);
+        assert_eq!(diagnostics["latest"]["receipt"]["dropped_item_count"], 1);
+        assert_eq!(
+            diagnostics["latest"]["trace"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(diagnostics["latest"]["performance"]["status"], "ok");
+        assert_eq!(
+            diagnostics["latest"]["performance"]["provider_payload_bytes"],
+            8_192
+        );
+        assert_eq!(
+            diagnostics["latest"]["performance"]["source_message_count"],
+            2
+        );
+        assert_eq!(
+            diagnostics["latest"]["trace"][0]["source"],
+            "https://example.test/AGENTS.md"
+        );
+        assert_eq!(diagnostics["redaction"]["content_included"], false);
+        let serialized = stable_json_dumps(&diagnostics);
+        for forbidden in [
+            "PRIVATE PROMPT BODY",
+            "ATTACHMENT SECRET BODY",
+            "password",
+            "super-secret",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked `{forbidden}`");
+        }
+
+        let restarted = session_context_diagnostics_payload(
+            &config,
+            session_id,
+            &format!("/api/sessions/{session_id}/context?limit=1"),
+        )
+        .expect("diagnostics after restart");
+        assert_eq!(restarted["latest"]["receipt"]["pack_hash"], pack.pack_hash);
+        let event = context_updated_bridge_event(&session, "run_context", 1).expect("event");
+        assert_eq!(event["method"], "context/updated");
+        let event_text = stable_json_dumps(&event);
+        assert!(!event_text.contains("PRIVATE PROMPT BODY"));
+        assert!(!event_text.contains("ATTACHMENT SECRET BODY"));
+        assert_eq!(
+            event["params"]["diagnostics"]["performance"]["provider_payload_bytes"],
+            8_192
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_diagnostics_expose_stable_failures_without_private_details() {
+        let root =
+            std::env::temp_dir().join(format!("openagent-http-context-failure-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created["session_id"].as_str().expect("session id");
+        let store = FileSessionStore::new(session_root);
+        let mut session = store.load_session(session_id).expect("session");
+
+        let unavailable = context_diagnostics_payload_for_session(&session, 4);
+        assert_eq!(unavailable["status"], "unavailable");
+        assert_eq!(
+            unavailable["failure"]["code"],
+            ContextFailureCode::Unavailable.as_str()
+        );
+
+        session
+            .metadata
+            .insert("context_pack".to_string(), json!({"corrupt": true}));
+        let corrupt = context_diagnostics_payload_for_session(&session, 4);
+        assert_eq!(corrupt["status"], "corrupt");
+        assert_eq!(
+            corrupt["failure"]["code"],
+            ContextFailureCode::ReceiptCorrupt.as_str()
+        );
+
+        let private_failure = ContextFailure::new(
+            ContextFailureCode::BudgetExceeded,
+            "budget",
+            "budget exceeded",
+        )
+        .with_details(BTreeMap::from([
+            ("model".to_string(), json!("gpt-safe")),
+            ("api_key".to_string(), json!("sk-never-public")),
+            ("prompt".to_string(), json!("PRIVATE PROMPT")),
+            ("estimated_input_tokens".to_string(), json!(120_000)),
+        ]));
+        let public = public_context_failure(&private_failure);
+        assert_eq!(public["details"]["model"], "gpt-safe");
+        assert_eq!(public["details"]["estimated_input_tokens"], 120_000);
+        let serialized = stable_json_dumps(&public);
+        assert!(!serialized.contains("sk-never-public"));
+        assert!(!serialized.contains("PRIVATE PROMPT"));
+
+        let drift = context_replay_failure("drifted", &["source_changed".to_string()])
+            .expect("drift failure");
+        assert_eq!(drift.code, ContextFailureCode::SourceDrift.as_str());
+        let unsupported = context_replay_failure("unrecoverable", &["legacy".to_string()])
+            .expect("unsupported failure");
+        assert_eq!(
+            unsupported.code,
+            ContextFailureCode::ReplayUnsupported.as_str()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_replay_verifies_historical_boundary_and_recovers_corrupt_latest() {
+        let root = std::env::temp_dir().join(format!("openagent-http-replay-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created["session_id"].as_str().expect("session id");
+        let store = FileSessionStore::new(session_root);
+        let mut session = store.load_session(session_id).expect("session");
+        let mut user =
+            runtime_chat_message(Role::User, "private replay boundary message".to_string());
+        user.metadata.insert(
+            "message_id".to_string(),
+            json!(runtime_turn_message_id("run_replay", "user", 0)),
+        );
+        session.add(user.clone());
+        store
+            .append_message(&session, &user, "run_replay", 0)
+            .expect("append replay user");
+        store
+            .save_state(&session, Some("run_replay"))
+            .expect("save replay user");
+
+        let build_options = ContextPackBuildOptions {
+            trace_only: false,
+            ..ContextPackBuildOptions::default()
+        };
+        let pack = runtime_context_pack_for_agent(
+            &store,
+            &mut session,
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            build_options.clone(),
+        );
+        let spec =
+            runtime_context_replay_spec(&store, &mut session, &pack, None, None, build_options);
+        runtime_persist_context_pack_receipt_with_replay(
+            &store,
+            &mut session,
+            "run_replay",
+            1,
+            &pack,
+            None,
+            Some(&spec),
+        )
+        .expect("persist replayable receipt");
+
+        let mut later = runtime_chat_message(
+            Role::Assistant,
+            "later message must not enter historical replay".to_string(),
+        );
+        later.metadata.insert(
+            "message_id".to_string(),
+            json!(runtime_turn_message_id("run_replay", "assistant", 1)),
+        );
+        let later_index = session.messages.len() as u64;
+        session.add(later.clone());
+        store
+            .append_message(&session, &later, "run_replay", later_index)
+            .expect("append later message");
+        store
+            .save_state(&session, Some("run_replay"))
+            .expect("save later message");
+
+        let verified_response = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/api/sessions/{session_id}/context/replay"),
+                headers: BTreeMap::new(),
+                body: "{}".to_string(),
+            },
+            &config,
+        );
+        assert_eq!(verified_response.status, 200);
+        let verified = verified_response.body.expect("verified replay body");
+        assert_eq!(verified["status"], "verified");
+        assert_eq!(
+            verified["target"]["receipt"]["pack_hash"],
+            json!(pack.pack_hash)
+        );
+        assert_eq!(
+            verified["rebuilt"]["receipt"]["pack_hash"],
+            verified["target"]["receipt"]["pack_hash"]
+        );
+        assert_eq!(verified["side_effects"]["provider_calls"], 0);
+        assert_eq!(verified["side_effects"]["tool_calls"], 0);
+        assert_eq!(verified["side_effects"]["checkpoint_restores"], 0);
+        assert_eq!(verified["side_effects"]["mcp_lifecycle_changes"], 0);
+        assert!(!stable_json_dumps(&verified).contains("private replay boundary message"));
+
+        let mut corrupt = store.load_session(session_id).expect("reloaded session");
+        corrupt
+            .metadata
+            .insert("context_pack".to_string(), json!({"corrupt": true}));
+        store
+            .save_state(&corrupt, Some("run_replay"))
+            .expect("persist corrupt latest");
+        let rebuilt_response = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/api/sessions/{session_id}/context/replay"),
+                headers: BTreeMap::new(),
+                body: "{}".to_string(),
+            },
+            &config,
+        );
+        assert_eq!(rebuilt_response.status, 200);
+        let rebuilt = rebuilt_response.body.expect("rebuilt replay body");
+        assert_eq!(rebuilt["status"], "rebuilt");
+        assert_eq!(rebuilt["diagnostics"]["status"], "ready");
+        assert_eq!(rebuilt["diagnostics"]["latest"]["mode"], "recovery");
+        assert_eq!(
+            rebuilt["diagnostics"]["latest"]["receipt"]["pack_hash"],
+            json!(pack.pack_hash)
+        );
+        assert_eq!(
+            rebuilt["diagnostics"]["last_replay"]["side_effects"]["provider_calls"],
+            0
+        );
+
+        let restarted = FileSessionStore::new(root.join("sessions"))
+            .load_session(session_id)
+            .expect("recovery survives restart");
+        let diagnostics = context_diagnostics_payload_for_session(&restarted, 4);
+        assert_eq!(diagnostics["latest"]["mode"], "recovery");
+        assert_eq!(diagnostics["last_replay"]["status"], "rebuilt");
+        assert!(!stable_json_dumps(&diagnostics).contains("private replay boundary message"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_replay_spec_keeps_known_model_options_and_drops_unknown_values() {
+        let options = BTreeMap::from([
+            ("reasoning_effort".to_string(), json!("high")),
+            ("service_tier".to_string(), json!("priority")),
+            (
+                "custom_auth_token".to_string(),
+                json!("private-context-replay-secret"),
+            ),
+        ]);
+        let (safe, unsafe_keys) = safe_context_replay_model_options(&options);
+        assert_eq!(safe["reasoning_effort"], "high");
+        assert_eq!(safe["service_tier"], "priority");
+        assert_eq!(unsafe_keys, vec!["custom_auth_token"]);
+        assert!(
+            !serde_json::to_string(&safe)
+                .expect("safe options")
+                .contains("private-context-replay-secret")
+        );
     }
 
     #[test]

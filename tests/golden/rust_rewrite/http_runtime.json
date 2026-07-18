@@ -100,7 +100,17 @@
     "empty_tty_text": "",
     "message_text": "hello runtime",
     "stdin_text": "from stdin",
-    "with_file": "summarize\n\nAttached file: /tmp/openagent-rust-rewrite-fixture-goal12/workspace/notes.txt\n\n```text\nalpha\nbeta\n\n```"
+    "structured_turn": {
+      "attachments": [
+        {
+          "content_type": "text/plain",
+          "kind": "file",
+          "path": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace/notes.txt",
+          "size_bytes": 11
+        }
+      ],
+      "message": "summarize"
+    }
   },
   "runtime": {
     "config": {

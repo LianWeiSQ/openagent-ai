@@ -761,9 +761,9 @@ pub(super) fn list_turn_jobs_payload(config: &HttpRuntimeConfig, request_path: &
     let mut jobs = jobs_by_id
         .into_values()
         .map(|mut job| {
-            if !memory_ids.contains(&job.turn_id)
-                && !turn_job_status_terminal(&job.status)
-                && !(job.status == "queued" && queued_payload_ids.contains(&job.turn_id))
+            if !(memory_ids.contains(&job.turn_id)
+                || turn_job_status_terminal(&job.status)
+                || job.status == "queued" && queued_payload_ids.contains(&job.turn_id))
             {
                 job.status = "interrupted".to_string();
                 job.cancel_requested = true;
@@ -1117,8 +1117,7 @@ pub(super) fn persisted_turn_job_payload(root: &Path, turn_id: &str) -> Option<V
         if job.turn_id != turn_id {
             continue;
         }
-        if !turn_job_status_terminal(&job.status) && !(job.status == "queued" && payload_persisted)
-        {
+        if !(turn_job_status_terminal(&job.status) || job.status == "queued" && payload_persisted) {
             job.status = "interrupted".to_string();
             job.cancel_requested = true;
             job.cancel_requested_at_ms.get_or_insert(now);

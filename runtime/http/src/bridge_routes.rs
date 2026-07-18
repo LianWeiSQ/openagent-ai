@@ -151,6 +151,7 @@ pub fn bridge_protocol_payload() -> Value {
             "sessions": "GET|POST /api/sessions",
             "session": "GET|PATCH|DELETE /api/sessions/{session_id}",
             "messages": "GET /api/sessions/{session_id}/messages",
+            "context": "GET /api/sessions/{session_id}/context; POST /api/sessions/{session_id}/context/replay",
             "turns": "GET /api/turns; POST /api/sessions/{session_id}/turns; set body async=true or query ?async=true for 202 accepted background run",
             "turn": "GET /api/turns/{turn_id}",
             "retry": "POST /api/turns/{turn_id}/retry",
@@ -182,6 +183,10 @@ pub fn bridge_protocol_payload() -> Value {
             "item/toolCall/failed",
             "item/question/requested",
             "item/question/resolved",
+            "context/updated",
+            "context/replayed",
+            "context/performance",
+            "context/failed",
             "turn/approval_requested",
             "turn/approval_resolved",
             "checkpoint/created",
@@ -294,18 +299,6 @@ pub fn emit_bridge_events(events: &[Value], output_format: &str, verbose: bool) 
     }
     result.exit_code = if status == "completed" { 0 } else { 1 };
     result
-}
-
-#[must_use]
-pub fn build_run_prompt(message: &str, files: &[(&str, &str)]) -> String {
-    let mut parts = Vec::new();
-    if !message.trim().is_empty() {
-        parts.push(message.trim().to_string());
-    }
-    for (path, content) in files {
-        parts.push(format!("Attached file: {path}\n\n```text\n{content}\n```"));
-    }
-    parts.join("\n\n").trim().to_string()
 }
 
 #[must_use]
@@ -849,6 +842,29 @@ pub(super) fn route_dynamic_request(
         && request.method == "GET"
     {
         return match session_messages_payload(config, parts[2], &request.path) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => session_error_response(error),
+        };
+    }
+    if parts.len() == 5
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "context"
+        && parts[4] == "replay"
+        && request.method == "POST"
+    {
+        return match replay_session_context_payload(config, parts[2], &request.body) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => session_error_response(error),
+        };
+    }
+    if parts.len() == 4
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "context"
+        && request.method == "GET"
+    {
+        return match session_context_diagnostics_payload(config, parts[2], &request.path) {
             Ok(payload) => json_response(200, payload),
             Err(error) => session_error_response(error),
         };
