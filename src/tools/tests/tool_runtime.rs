@@ -99,7 +99,7 @@ fn shared_agent_profile_schema_parses_skill_task_config_without_model_option_lea
         "task_permissions",
         "skills",
     ] {
-        assert!(schema.model_options.get(reserved).is_none());
+        assert!(!schema.model_options.contains_key(reserved));
     }
 
     let error = parse_agent_profile_schema(&json!({"mode": "worker"}), "bad", "Bad")
@@ -154,14 +154,15 @@ fn session_runner_facade_builds_shared_tool_context_contract() {
 #[test]
 fn session_runner_facade_parses_question_answers_from_json_contract() {
     assert_eq!(
-        question_answers_from_json(&json!([["yes", true], [42, 3.5]])).unwrap(),
+        question_answers_from_json(&json!([["yes", true], [42, 3.5]]))
+            .expect("grouped question answers"),
         vec![
             vec!["yes".to_string(), "true".to_string()],
             vec!["42".to_string(), "3.5".to_string()],
         ]
     );
     assert_eq!(
-        question_answers_from_json(&json!(["alpha", false, 7])).unwrap(),
+        question_answers_from_json(&json!(["alpha", false, 7])).expect("flat question answers"),
         vec![
             vec!["alpha".to_string()],
             vec!["false".to_string()],
@@ -755,10 +756,7 @@ fn lsp_tool_reports_status_and_queries_configured_server() -> Result<(), Box<dyn
         &mut ctx,
     );
     assert!(status.error.is_none());
-    assert_eq!(
-        status.metadata["server_count"].as_u64().unwrap_or_default() >= 1,
-        true
-    );
+    assert!(status.metadata["server_count"].as_u64().unwrap_or_default() >= 1);
     assert!(status.output.contains("\"fake\""));
 
     let symbols = toolkit.execute(
@@ -1168,7 +1166,7 @@ fn prepare_isolated_workspace_copies_workspace_without_heavy_dirs() -> Result<()
 
     let isolation = prepare_isolated_workspace(&source, &isolation_root, "task/one")?;
     let isolated = PathBuf::from(&isolation.workspace);
-    assert_eq!(isolation.enabled, true);
+    assert!(isolation.enabled);
     assert_eq!(isolation.method, "directory_copy");
     assert!(isolated.join("src").join("main.rs").exists());
     assert!(!isolated.join("target").exists());

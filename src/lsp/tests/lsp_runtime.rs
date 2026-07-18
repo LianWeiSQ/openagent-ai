@@ -307,23 +307,13 @@ fn query_aggregates_multiple_matching_lsp_servers() -> Result<(), Box<dyn Error>
     )?;
     assert_eq!(symbols.server_id, "fake-alpha");
     assert_eq!(symbols.server_ids, vec!["fake-alpha", "fake-beta"]);
-    assert_eq!(symbols.result.as_array().map(Vec::len), Some(2));
-    assert!(
-        symbols
-            .result
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["name"] == "alpha")
-    );
-    assert!(
-        symbols
-            .result
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["name"] == "beta")
-    );
+    let results = symbols
+        .result
+        .as_array()
+        .expect("aggregated document symbols");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|item| item["name"] == "alpha"));
+    assert!(results.iter().any(|item| item["name"] == "beta"));
     assert_eq!(shutdown_workspace_clients(&root), 2);
     let _ = fs::remove_dir_all(root);
     Ok(())

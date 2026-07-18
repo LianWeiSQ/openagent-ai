@@ -333,14 +333,13 @@ impl LspClientPool {
         let mut keys = self
             .clients
             .iter()
-            .filter_map(|(key, client)| {
-                (client.workspace == workspace).then(|| {
-                    (
-                        client.server_id.clone(),
-                        path_to_string(&client.root),
-                        key.clone(),
-                    )
-                })
+            .filter(|(_, client)| client.workspace == workspace)
+            .map(|(key, client)| {
+                (
+                    client.server_id.clone(),
+                    path_to_string(&client.root),
+                    key.clone(),
+                )
             })
             .collect::<Vec<_>>();
         keys.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
@@ -403,7 +402,8 @@ impl LspClientPool {
         let keys = self
             .broken
             .iter()
-            .filter_map(|(key, broken)| (broken.workspace == workspace).then(|| key.clone()))
+            .filter(|(_, broken)| broken.workspace == workspace)
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in keys {
             self.broken.remove(&key);
@@ -588,7 +588,8 @@ pub fn shutdown_workspace_clients(workspace: impl AsRef<Path>) -> usize {
     let keys = pool
         .clients
         .iter()
-        .filter_map(|(key, client)| (client.workspace == workspace).then(|| key.clone()))
+        .filter(|(_, client)| client.workspace == workspace)
+        .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     let mut removed = 0usize;
     for key in keys {
@@ -2442,8 +2443,10 @@ fn path_command(command: &str) -> Option<PathBuf> {
 }
 
 fn command_name_candidates(command: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    candidates.push(command.to_string());
+    #[cfg(not(windows))]
+    let candidates = vec![command.to_string()];
+    #[cfg(windows)]
+    let mut candidates = vec![command.to_string()];
     #[cfg(windows)]
     {
         if !command.ends_with(".cmd") {

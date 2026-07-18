@@ -513,7 +513,7 @@ fn file_session_store_keeps_tool_call_pending_while_waiting_for_question() {
         .find(|part| part.kind == MessagePartKind::Tool)
         .expect("tool part exists");
     assert_eq!(tool_part.status, MessageStatus::Pending);
-    assert!(tool_part.attributes.get("interrupted").is_none());
+    assert!(!tool_part.attributes.contains_key("interrupted"));
 
     fs::remove_dir_all(root).expect("temporary session store is removed");
 }
