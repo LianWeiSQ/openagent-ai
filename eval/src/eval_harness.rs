@@ -121,6 +121,405 @@ pub struct HarborSuccessSpec<'a> {
     pub elapsed_ms: i64,
 }
 
+pub const EXPLORATION_QUALITY_SCHEMA_VERSION: &str = "openagent.eval.exploration_quality.v1";
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationQualityRubric {
+    pub case_id: String,
+    pub required_context_kinds: BTreeSet<String>,
+    pub required_available_tools: BTreeSet<String>,
+    pub required_files: BTreeSet<String>,
+    pub required_tools_used: BTreeSet<String>,
+    pub required_answer_terms: BTreeSet<String>,
+    pub forbidden_tools: BTreeSet<String>,
+    pub max_failed_tool_calls: u64,
+    pub max_duplicate_tool_calls: u64,
+    pub minimum_score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub target: Option<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationQualityObservation {
+    pub case_id: String,
+    pub completed: bool,
+    pub context_item_kinds: BTreeSet<String>,
+    pub available_tools: BTreeSet<String>,
+    pub explored_files: BTreeSet<String>,
+    pub tool_calls: Vec<ExplorationToolCall>,
+    pub final_answer: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationQualityBreakdown {
+    pub context_coverage: f64,
+    pub available_tool_coverage: f64,
+    pub file_coverage: f64,
+    pub required_tool_coverage: f64,
+    pub answer_coverage: f64,
+    pub tool_efficiency: f64,
+    pub completion: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationQualityResult {
+    pub schema_version: String,
+    pub case_id: String,
+    pub passed: bool,
+    pub score: f64,
+    pub breakdown: ExplorationQualityBreakdown,
+    pub missing_context_kinds: Vec<String>,
+    pub missing_available_tools: Vec<String>,
+    pub missing_files: Vec<String>,
+    pub missing_tools_used: Vec<String>,
+    pub missing_answer_terms: Vec<String>,
+    pub forbidden_tools_used: Vec<String>,
+    pub failed_tool_calls: u64,
+    pub duplicate_tool_calls: u64,
+    pub failure_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationQualityComparison {
+    pub schema_version: String,
+    pub case_id: String,
+    pub passed: bool,
+    pub baseline_score: f64,
+    pub current_score: f64,
+    pub score_delta: f64,
+    pub regressions: Vec<String>,
+}
+
+#[must_use]
+pub fn exploration_observation_from_bridge_turn(
+    case_id: &str,
+    turn: &Value,
+    context: &Value,
+) -> ExplorationQualityObservation {
+    let receipt = context
+        .get("latest")
+        .and_then(|latest| latest.get("receipt"))
+        .unwrap_or(&Value::Null);
+    let context_item_kinds = receipt
+        .get("item_kind_counts")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, count)| count.as_u64().unwrap_or_default() > 0)
+        .map(|(kind, _)| kind.clone())
+        .collect::<BTreeSet<_>>();
+    let available_tools = receipt
+        .get("tool_names")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+
+    let mut started = BTreeMap::<String, (String, Option<String>)>::new();
+    let mut finished = BTreeMap::<String, String>::new();
+    for event in turn
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = event.get("params").unwrap_or(&Value::Null);
+        let call_id = params
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if call_id.is_empty() {
+            continue;
+        }
+        if method == "item/toolCall/started" {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let target = params.get("input").and_then(exploration_tool_target);
+            started.insert(call_id.to_string(), (name, target));
+        } else if method == "item/toolCall/completed" {
+            finished.insert(call_id.to_string(), "completed".to_string());
+        } else if method == "item/toolCall/failed" {
+            finished.insert(call_id.to_string(), "failed".to_string());
+        }
+    }
+
+    let mut tool_calls = started
+        .into_iter()
+        .map(|(call_id, (name, target))| ExplorationToolCall {
+            status: finished
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_else(|| "pending".to_string()),
+            call_id,
+            name,
+            target,
+        })
+        .collect::<Vec<_>>();
+    tool_calls.sort_by(|left, right| left.call_id.cmp(&right.call_id));
+    let explored_files = tool_calls
+        .iter()
+        .filter(|call| call.name == "read" && call.status == "completed")
+        .filter_map(|call| call.target.as_deref())
+        .map(normalize_exploration_path)
+        .collect::<BTreeSet<_>>();
+    let final_answer = turn
+        .get("turn")
+        .and_then(|value| value.get("final_answer"))
+        .and_then(Value::as_str)
+        .or_else(|| turn.get("final_answer").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+
+    ExplorationQualityObservation {
+        case_id: case_id.to_string(),
+        completed: turn.get("status").and_then(Value::as_str) == Some("completed"),
+        context_item_kinds,
+        available_tools,
+        explored_files,
+        tool_calls,
+        final_answer,
+    }
+}
+
+#[must_use]
+pub fn score_exploration_quality(
+    rubric: &ExplorationQualityRubric,
+    observation: &ExplorationQualityObservation,
+) -> ExplorationQualityResult {
+    let observed_tools = observation
+        .tool_calls
+        .iter()
+        .map(|call| call.name.clone())
+        .collect::<BTreeSet<_>>();
+    let missing_context_kinds = missing_values(
+        &rubric.required_context_kinds,
+        &observation.context_item_kinds,
+    );
+    let missing_available_tools = missing_values(
+        &rubric.required_available_tools,
+        &observation.available_tools,
+    );
+    let missing_files = missing_values(&rubric.required_files, &observation.explored_files);
+    let missing_tools_used = missing_values(&rubric.required_tools_used, &observed_tools);
+    let answer = observation.final_answer.to_ascii_lowercase();
+    let missing_answer_terms = rubric
+        .required_answer_terms
+        .iter()
+        .filter(|term| !answer.contains(&term.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let forbidden_tools_used = rubric
+        .forbidden_tools
+        .intersection(&observed_tools)
+        .cloned()
+        .collect::<Vec<_>>();
+    let failed_tool_calls = observation
+        .tool_calls
+        .iter()
+        .filter(|call| call.status != "completed")
+        .count() as u64;
+    let unique_tool_calls = observation
+        .tool_calls
+        .iter()
+        .map(|call| {
+            format!(
+                "{}:{}",
+                call.name,
+                call.target.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let duplicate_tool_calls = observation
+        .tool_calls
+        .len()
+        .saturating_sub(unique_tool_calls.len()) as u64;
+    let tool_efficiency = if failed_tool_calls <= rubric.max_failed_tool_calls
+        && duplicate_tool_calls <= rubric.max_duplicate_tool_calls
+    {
+        1.0
+    } else {
+        0.0
+    };
+    let breakdown = ExplorationQualityBreakdown {
+        context_coverage: coverage(
+            rubric.required_context_kinds.len(),
+            missing_context_kinds.len(),
+        ),
+        available_tool_coverage: coverage(
+            rubric.required_available_tools.len(),
+            missing_available_tools.len(),
+        ),
+        file_coverage: coverage(rubric.required_files.len(), missing_files.len()),
+        required_tool_coverage: coverage(
+            rubric.required_tools_used.len(),
+            missing_tools_used.len(),
+        ),
+        answer_coverage: coverage(
+            rubric.required_answer_terms.len(),
+            missing_answer_terms.len(),
+        ),
+        tool_efficiency,
+        completion: if observation.completed { 1.0 } else { 0.0 },
+    };
+    let score = breakdown.context_coverage * 15.0
+        + breakdown.available_tool_coverage * 10.0
+        + breakdown.file_coverage * 25.0
+        + breakdown.required_tool_coverage * 15.0
+        + breakdown.answer_coverage * 25.0
+        + breakdown.tool_efficiency * 5.0
+        + breakdown.completion * 5.0;
+    let mut failure_reasons = Vec::new();
+    push_missing_reason(
+        &mut failure_reasons,
+        "context kinds",
+        &missing_context_kinds,
+    );
+    push_missing_reason(
+        &mut failure_reasons,
+        "available tools",
+        &missing_available_tools,
+    );
+    push_missing_reason(&mut failure_reasons, "files", &missing_files);
+    push_missing_reason(&mut failure_reasons, "tools used", &missing_tools_used);
+    push_missing_reason(&mut failure_reasons, "answer terms", &missing_answer_terms);
+    if !forbidden_tools_used.is_empty() {
+        failure_reasons.push(format!(
+            "forbidden tools used: {}",
+            forbidden_tools_used.join(", ")
+        ));
+    }
+    if failed_tool_calls > rubric.max_failed_tool_calls {
+        failure_reasons.push(format!(
+            "failed tool calls exceeded limit: {failed_tool_calls} > {}",
+            rubric.max_failed_tool_calls
+        ));
+    }
+    if duplicate_tool_calls > rubric.max_duplicate_tool_calls {
+        failure_reasons.push(format!(
+            "duplicate tool calls exceeded limit: {duplicate_tool_calls} > {}",
+            rubric.max_duplicate_tool_calls
+        ));
+    }
+    if !observation.completed {
+        failure_reasons.push("turn did not complete".to_string());
+    }
+    if score < rubric.minimum_score {
+        failure_reasons.push(format!(
+            "quality score below minimum: {score:.3} < {:.3}",
+            rubric.minimum_score
+        ));
+    }
+    let passed = failure_reasons.is_empty();
+
+    ExplorationQualityResult {
+        schema_version: EXPLORATION_QUALITY_SCHEMA_VERSION.to_string(),
+        case_id: if rubric.case_id.is_empty() {
+            observation.case_id.clone()
+        } else {
+            rubric.case_id.clone()
+        },
+        passed,
+        score,
+        breakdown,
+        missing_context_kinds,
+        missing_available_tools,
+        missing_files,
+        missing_tools_used,
+        missing_answer_terms,
+        forbidden_tools_used,
+        failed_tool_calls,
+        duplicate_tool_calls,
+        failure_reasons,
+    }
+}
+
+#[must_use]
+pub fn compare_exploration_quality(
+    baseline: &ExplorationQualityResult,
+    current: &ExplorationQualityResult,
+    maximum_score_regression: f64,
+) -> ExplorationQualityComparison {
+    let mut regressions = Vec::new();
+    let score_delta = current.score - baseline.score;
+    if score_delta < -maximum_score_regression.abs() {
+        regressions.push(format!(
+            "score regressed by {:.3}, allowed regression is {:.3}",
+            -score_delta,
+            maximum_score_regression.abs()
+        ));
+    }
+    for (name, baseline_value, current_value) in [
+        (
+            "context_coverage",
+            baseline.breakdown.context_coverage,
+            current.breakdown.context_coverage,
+        ),
+        (
+            "available_tool_coverage",
+            baseline.breakdown.available_tool_coverage,
+            current.breakdown.available_tool_coverage,
+        ),
+        (
+            "file_coverage",
+            baseline.breakdown.file_coverage,
+            current.breakdown.file_coverage,
+        ),
+        (
+            "required_tool_coverage",
+            baseline.breakdown.required_tool_coverage,
+            current.breakdown.required_tool_coverage,
+        ),
+        (
+            "answer_coverage",
+            baseline.breakdown.answer_coverage,
+            current.breakdown.answer_coverage,
+        ),
+    ] {
+        if current_value < baseline_value {
+            regressions.push(format!(
+                "{name} regressed: {current_value:.3} < {baseline_value:.3}"
+            ));
+        }
+    }
+    if current.failed_tool_calls > baseline.failed_tool_calls {
+        regressions.push(format!(
+            "failed tool calls increased: {} > {}",
+            current.failed_tool_calls, baseline.failed_tool_calls
+        ));
+    }
+    if current.duplicate_tool_calls > baseline.duplicate_tool_calls {
+        regressions.push(format!(
+            "duplicate tool calls increased: {} > {}",
+            current.duplicate_tool_calls, baseline.duplicate_tool_calls
+        ));
+    }
+    if baseline.passed && !current.passed {
+        regressions.push("current quality gate failed after a passing baseline".to_string());
+    }
+    ExplorationQualityComparison {
+        schema_version: EXPLORATION_QUALITY_SCHEMA_VERSION.to_string(),
+        case_id: current.case_id.clone(),
+        passed: regressions.is_empty(),
+        baseline_score: baseline.score,
+        current_score: current.score,
+        score_delta,
+        regressions,
+    }
+}
+
 #[must_use]
 pub fn aggregate_results(results: &[EvalResult]) -> Value {
     let total = results.len() as i64;
@@ -1218,6 +1617,41 @@ fn average(values: impl Iterator<Item = f64>) -> f64 {
 
 fn compare_f64(left: f64, right: f64) -> Ordering {
     left.partial_cmp(&right).unwrap_or(Ordering::Equal)
+}
+
+fn exploration_tool_target(input: &Value) -> Option<String> {
+    ["file_path", "path", "pattern", "query", "command"]
+        .into_iter()
+        .find_map(|key| input.get(key).and_then(Value::as_str))
+        .map(normalize_exploration_path)
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_exploration_path(path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    normalized
+        .strip_prefix("./")
+        .unwrap_or(&normalized)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn missing_values(expected: &BTreeSet<String>, actual: &BTreeSet<String>) -> Vec<String> {
+    expected.difference(actual).cloned().collect()
+}
+
+fn coverage(expected: usize, missing: usize) -> f64 {
+    if expected == 0 {
+        1.0
+    } else {
+        expected.saturating_sub(missing) as f64 / expected as f64
+    }
+}
+
+fn push_missing_reason(reasons: &mut Vec<String>, label: &str, missing: &[String]) {
+    if !missing.is_empty() {
+        reasons.push(format!("missing {label}: {}", missing.join(", ")));
+    }
 }
 
 fn computed_success_rate(results: &[Value]) -> f64 {

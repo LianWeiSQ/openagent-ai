@@ -1,0 +1,24 @@
+{
+  "schema_version": "openagent.eval.exploration_quality.v1",
+  "case_id": "context-pack-repository-audit",
+  "passed": true,
+  "score": 100.0,
+  "breakdown": {
+    "context_coverage": 1.0,
+    "available_tool_coverage": 1.0,
+    "file_coverage": 1.0,
+    "required_tool_coverage": 1.0,
+    "answer_coverage": 1.0,
+    "tool_efficiency": 1.0,
+    "completion": 1.0
+  },
+  "missing_context_kinds": [],
+  "missing_available_tools": [],
+  "missing_files": [],
+  "missing_tools_used": [],
+  "missing_answer_terms": [],
+  "forbidden_tools_used": [],
+  "failed_tool_calls": 0,
+  "duplicate_tool_calls": 0,
+  "failure_reasons": []
+}
