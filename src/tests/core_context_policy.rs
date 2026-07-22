@@ -16,13 +16,13 @@ use openagent_core::{
     ContextPackPerformance, ContextSystemSources, ContextTodo, ContextWorkState,
     InstructionContextLoader, InstructionLoadOptions, PermissionManager, SkillDocument, SkillInfo,
     SkillRegistry, SkillRegistryOptions, check_context_budget, context_provider_input_hash,
-    estimate_text_tokens, format_context_budget_error, load_context_budget_options,
-    materialize_context_history, pattern_for, permission_rule, skill_context_items,
-    tool_manifest_context_item,
+    context_work_state_from_compact_metadata, estimate_text_tokens, format_context_budget_error,
+    load_context_budget_options, materialize_context_history, pattern_for, permission_rule,
+    skill_context_items, tool_manifest_context_item,
 };
 use openagent_protocol::{
-    ChatMessage, Model, ModelCapabilities, ModelPricing, PermissionAction, PermissionRuleset, Role,
-    ToolSchema,
+    ChatMessage, ContextEpoch, Model, ModelCapabilities, ModelPricing, PermissionAction,
+    PermissionRuleset, Role, ToolSchema, WorkState,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -562,6 +562,78 @@ fn active_context_pack_normalizes_legacy_system_and_preserves_conversation_exact
         pack.provider_input_hash,
         context_provider_input_hash(&pack.messages, &pack.tools, &pack.model_options)
     );
+}
+
+#[test]
+fn typed_context_epoch_materializes_as_work_state_without_legacy_system_projection() {
+    let mut epoch = ContextEpoch::manual(
+        "epoch-7",
+        "session-1",
+        "run-1",
+        1_781_840_000_000,
+        7,
+        Some("message-6".to_string()),
+        "Resume from the typed context epoch",
+    )
+    .into_automatic(
+        "model_context_budget",
+        "sha1:before",
+        3,
+        128,
+        WorkState {
+            task: "Continue the typed epoch migration".to_string(),
+            ..WorkState::default()
+        },
+    );
+    epoch.parent_epoch_id = Some("epoch-6".to_string());
+    epoch.boundary_message_id = Some("message-epoch-7".to_string());
+    let mut boundary = chat(Role::System, epoch.summary.as_str());
+    boundary.metadata.extend(BTreeMap::from([
+        ("kind".to_string(), json!("context_epoch")),
+        ("message_id".to_string(), json!("message-epoch-7")),
+        (
+            "context_epoch".to_string(),
+            serde_json::to_value(&epoch).expect("context epoch serializes"),
+        ),
+    ]));
+    let user = chat(Role::User, "Continue after the epoch");
+
+    let history = materialize_context_history(vec![boundary, user.clone()]);
+    assert_eq!(history.messages, vec![user]);
+    assert!(history.legacy_system_sources.is_empty());
+    let work_state = history.work_state.expect("typed epoch work state");
+    assert_eq!(work_state.id, "epoch-7");
+    assert_eq!(work_state.format, "structured_work_state");
+    assert_eq!(work_state.source, "runtime_auto_compaction_v1");
+    assert_eq!(
+        work_state.compacted_until_message_id.as_deref(),
+        Some("message-6")
+    );
+    assert_eq!(work_state.metadata["schema_version"], epoch.schema_version);
+    assert_eq!(work_state.metadata["parent_epoch_id"], "epoch-6");
+    assert_eq!(work_state.metadata["trigger"], "automatic");
+
+    let restored = context_work_state_from_compact_metadata(
+        &serde_json::to_value(&epoch).expect("epoch serializes"),
+        9,
+    )
+    .expect("typed session metadata restores");
+    assert_eq!(restored.id, "epoch-7");
+    assert_eq!(restored.message_position, Some(9));
+
+    let legacy = context_work_state_from_compact_metadata(
+        &json!({
+            "summary": "Legacy compact metadata",
+            "format": "session_summary_v1",
+            "boundary_message_id": "legacy-boundary",
+            "compacted_until_message_id": "legacy-message",
+        }),
+        4,
+    )
+    .expect("legacy session metadata remains readable");
+    assert_eq!(legacy.id, "legacy-boundary");
+    assert_eq!(legacy.source, "session.metadata.compact");
+    assert_eq!(legacy.message_position, Some(4));
 }
 
 #[test]

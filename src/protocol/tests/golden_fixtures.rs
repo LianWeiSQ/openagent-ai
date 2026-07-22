@@ -1,12 +1,12 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use openagent_protocol::{
-    AgentDescriptor, AgentResult, AgentSpec, ArtifactRef, ChatMessage, CompactionRecord,
-    FanoutBudget, FinishReason, Model, ModelCapabilities, ModelPricing, PermissionMode,
-    PermissionRuleset, RUNTIME_OPTION_KEYS, Role, RunContext, RunLimits, RunStatus, StreamEvent,
-    SwarmUsage, ToolCall, ToolDefinitionSchemaFixture, ToolExecutionSchema, ToolExecutionScope,
-    ToolResult, ToolSchema, Usage, WorkState, WorkStateFile, build_compaction_record,
-    materialize_openai_compatible_payload, render_work_state, ruleset,
+    AgentDescriptor, AgentResult, AgentSpec, ArtifactRef, ChatMessage, ContextEpoch, FanoutBudget,
+    FinishReason, Model, ModelCapabilities, ModelPricing, PermissionMode, PermissionRuleset,
+    RUNTIME_OPTION_KEYS, Role, RunContext, RunLimits, RunStatus, StreamEvent, SwarmUsage, ToolCall,
+    ToolDefinitionSchemaFixture, ToolExecutionSchema, ToolExecutionScope, ToolResult, ToolSchema,
+    Usage, WorkState, WorkStateFile, materialize_openai_compatible_payload, render_work_state,
+    ruleset,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -251,11 +251,22 @@ fn tool_definition_schema_fixture() -> Value {
 fn context_state_fixture() -> Value {
     let state = fixture_work_state();
     let rendered = render_work_state(&state);
-    let compaction_record: CompactionRecord = build_compaction_record(state, 7, 1_781_840_000_000);
+    let mut context_epoch = ContextEpoch::manual(
+        "epoch-fixture",
+        "session-fixture",
+        "run-fixture",
+        1_781_840_000_000,
+        7,
+        Some("message-7".to_string()),
+        rendered.clone(),
+    )
+    .into_automatic("model_context_budget", "sha1:before-pack", 3, 256, state);
+    context_epoch.parent_epoch_id = Some("epoch-previous".to_string());
+    context_epoch.boundary_message_id = Some("message-epoch-fixture".to_string());
     json!({
         "schema_version": 1,
         "rendered": rendered,
-        "compaction_record": compaction_record,
+        "context_epoch": context_epoch,
     })
 }
 

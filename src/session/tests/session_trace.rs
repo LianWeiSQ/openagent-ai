@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use openagent_protocol::{ChatMessage, Role, Usage};
+use openagent_protocol::{ChatMessage, ContextEpoch, Role, Usage};
 use openagent_protocol::{MessagePartKind, MessageStatus, message_parts_to_chat_messages};
 use openagent_session::{
     AgentTraceRecorder, FileSessionStore, ObservationConfig, ObservationEvent,
@@ -733,14 +733,28 @@ fn file_session_store_compaction_boundary_skips_compacted_context() {
             .append_message(&session, &message, "run_compact", index as u64)
             .expect("message appends");
     }
-    let boundary_id = store
-        .append_compaction_boundary(
+    let epoch = store
+        .append_context_epoch(
             &mut session,
-            "run_compact",
-            "Summary of compacted context.",
-            "msg_compact_2",
+            ContextEpoch::manual(
+                "epoch_compact",
+                "session_compact",
+                "run_compact",
+                2,
+                2,
+                Some("msg_compact_2".to_string()),
+                "Summary of compacted context.",
+            ),
         )
-        .expect("compaction boundary appends");
+        .expect("context epoch appends");
+    let boundary_id = epoch
+        .boundary_message_id
+        .clone()
+        .expect("epoch boundary message id");
+    let stored_epochs = store
+        .list_context_epochs("session_compact")
+        .expect("context epochs load");
+    assert_eq!(stored_epochs, vec![epoch]);
     let current = ChatMessage {
         role: Role::User,
         content: "fresh context".to_string(),
@@ -762,6 +776,202 @@ fn file_session_store_compaction_boundary_skips_compacted_context() {
     let projected = message_parts_to_chat_messages(&messages);
     assert_eq!(projected[0].content, "Summary of compacted context.");
     assert_eq!(projected[1].content, "fresh context");
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
+fn file_session_store_context_epochs_form_a_durable_parent_chain() {
+    let root = unique_temp_dir("openagent-context-epoch-chain");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_epoch_chain", root.join("workspace"));
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_epoch_chain".to_string(),
+                trace_id: "trace_epoch_chain".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+
+    for (index, message_id) in ["msg_epoch_1", "msg_epoch_2"].into_iter().enumerate() {
+        let message = ChatMessage {
+            role: Role::User,
+            content: format!("context {index}"),
+            name: None,
+            tool_call_id: None,
+            metadata: BTreeMap::from([("message_id".to_string(), json!(message_id))]),
+        };
+        session.add(message.clone());
+        store
+            .append_message(&session, &message, "run_epoch_chain", index as u64)
+            .expect("message appends");
+    }
+
+    let first = store
+        .append_context_epoch(
+            &mut session,
+            ContextEpoch::manual(
+                "epoch_first",
+                "session_epoch_chain",
+                "run_epoch_chain",
+                3,
+                2,
+                Some("msg_epoch_2".to_string()),
+                "First summary.",
+            ),
+        )
+        .expect("first epoch appends");
+    let next = ChatMessage {
+        role: Role::User,
+        content: "new context".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_epoch_3"))]),
+    };
+    session.add(next.clone());
+    store
+        .append_message(&session, &next, "run_epoch_chain", 3)
+        .expect("new message appends");
+    let second = store
+        .append_context_epoch(
+            &mut session,
+            ContextEpoch::manual(
+                "epoch_second",
+                "session_epoch_chain",
+                "run_epoch_chain",
+                4,
+                2,
+                Some("msg_epoch_3".to_string()),
+                "Second summary.",
+            ),
+        )
+        .expect("second epoch appends");
+    store
+        .save_state(&session, Some("run_epoch_chain"))
+        .expect("epoch metadata persists");
+
+    assert_eq!(second.parent_epoch_id.as_deref(), Some("epoch_first"));
+    assert_eq!(
+        store
+            .list_context_epochs("session_epoch_chain")
+            .expect("epochs load"),
+        vec![first, second]
+    );
+    let reloaded = store
+        .load_session("session_epoch_chain")
+        .expect("session reloads");
+    assert_eq!(reloaded.metadata["compact"]["epoch_id"], "epoch_second");
+    assert_eq!(
+        reloaded.metadata["compact"]["parent_epoch_id"],
+        "epoch_first"
+    );
+
+    fs::remove_dir_all(root).expect("temporary session store is removed");
+}
+
+#[test]
+fn file_session_store_reads_legacy_compaction_boundaries() {
+    let root = unique_temp_dir("openagent-legacy-compaction-boundary");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_legacy_compact", root.join("workspace"));
+    store
+        .start_run(
+            &mut session,
+            StartRunOptions {
+                run_id: "run_legacy_compact".to_string(),
+                trace_id: "trace_legacy_compact".to_string(),
+                agent_name: "agent".to_string(),
+                model_id: Some("model".to_string()),
+                provider_id: Some("provider".to_string()),
+                permission: "FULL".to_string(),
+                max_steps: 3,
+                started_at_ms: Some(1),
+            },
+        )
+        .expect("run starts");
+
+    let old = ChatMessage {
+        role: Role::User,
+        content: "old context".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_legacy_old"))]),
+    };
+    session.add(old.clone());
+    store
+        .append_message(&session, &old, "run_legacy_compact", 0)
+        .expect("old message appends");
+    let boundary = ChatMessage {
+        role: Role::System,
+        content: "Legacy summary.".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([
+            ("message_id".to_string(), json!("msg_legacy_boundary")),
+            ("kind".to_string(), json!("compaction_boundary")),
+            (
+                "compacted_until_message_id".to_string(),
+                json!("msg_legacy_old"),
+            ),
+        ]),
+    };
+    session.add(boundary.clone());
+    store
+        .append_message(&session, &boundary, "run_legacy_compact", 1)
+        .expect("legacy boundary message appends");
+    store
+        .append_part(
+            "session_legacy_compact",
+            "run_legacy_compact",
+            "compaction",
+            SessionPartOptions {
+                message_id: Some("msg_legacy_boundary".to_string()),
+                content: Some(json!({
+                    "summary": "Legacy summary.",
+                    "compacted_until_message_id": "msg_legacy_old",
+                    "metadata": {"format": "session_compaction_boundary_v1"},
+                })),
+                attributes: BTreeMap::from([(
+                    "compacted_until_message_id".to_string(),
+                    json!("msg_legacy_old"),
+                )]),
+                status: "completed".to_string(),
+                ..SessionPartOptions::default()
+            },
+        )
+        .expect("legacy compaction part appends");
+    let fresh = ChatMessage {
+        role: Role::User,
+        content: "fresh context".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::from([("message_id".to_string(), json!("msg_legacy_fresh"))]),
+    };
+    session.add(fresh.clone());
+    store
+        .append_message(&session, &fresh, "run_legacy_compact", 2)
+        .expect("fresh message appends");
+
+    let messages = store
+        .list_messages_with_parts("session_legacy_compact", None, None)
+        .expect("legacy boundary remains readable");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].info.id, "msg_legacy_boundary");
+    assert_eq!(messages[1].info.id, "msg_legacy_fresh");
+    assert!(
+        store
+            .list_context_epochs("session_legacy_compact")
+            .expect("typed epoch listing succeeds")
+            .is_empty()
+    );
 
     fs::remove_dir_all(root).expect("temporary session store is removed");
 }
@@ -837,14 +1047,24 @@ fn file_session_store_compaction_boundary_preserves_loaded_skill_output() {
         .append_message(&session, &compacted_until, "run_compact_skill", 2)
         .expect("cutoff message appends");
 
-    let boundary_id = store
-        .append_compaction_boundary(
+    let epoch = store
+        .append_context_epoch(
             &mut session,
-            "run_compact_skill",
-            "Summary of compacted context.",
-            "msg_skill_cutoff",
+            ContextEpoch::manual(
+                "epoch_compact_skill",
+                "session_compact_skill",
+                "run_compact_skill",
+                3,
+                3,
+                Some("msg_skill_cutoff".to_string()),
+                "Summary of compacted context.",
+            ),
         )
-        .expect("compaction boundary appends");
+        .expect("context epoch appends");
+    let boundary_id = epoch
+        .boundary_message_id
+        .clone()
+        .expect("epoch boundary message id");
     let fresh = ChatMessage {
         role: Role::User,
         content: "fresh context".to_string(),

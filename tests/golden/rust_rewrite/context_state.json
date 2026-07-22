@@ -1,9 +1,18 @@
 {
-  "compaction_record": {
-    "compacted_until": 7,
+  "context_epoch": {
+    "before_pack_hash": "sha1:before-pack",
+    "boundary_message_id": "message-epoch-fixture",
+    "compacted_message_count": 7,
+    "compacted_until_message_id": "message-7",
+    "created_at_ms": 1781840000000,
+    "epoch_id": "epoch-fixture",
     "format": "structured_work_state",
-    "schema_version": 1,
-    "source": "model_json",
+    "parent_epoch_id": "epoch-previous",
+    "reason": "model_context_budget",
+    "run_id": "run-fixture",
+    "schema_version": "openagent.context_epoch.v1",
+    "session_id": "session-fixture",
+    "source": "runtime_auto_compaction_v1",
     "state": {
       "blockers": [],
       "decisions": [
@@ -34,8 +43,10 @@
         "No live network calls are required."
       ]
     },
+    "step": 3,
     "summary": "[Structured work state]\nTask:\nFreeze Python behavior for Rust rewrite.\n\nProgress:\n- Captured protocol fixtures.\n\nDecisions:\n- Fixtures must be deterministic.\n\nFiles:\n- doc/rust-rewrite-plan.md (created) - Goal 0 contract.\n\nTool findings:\n- No live network calls are required.\n\nTodos:\n- Compare Rust serde output against fixtures.\n\nNext steps:\n- Implement Rust protocol crate.\n\nRisks:\n- Later live-provider smoke tests need credentials.",
-    "updated_at": 1781840000000
+    "summary_token_estimate": 256,
+    "trigger": "automatic"
   },
   "rendered": "[Structured work state]\nTask:\nFreeze Python behavior for Rust rewrite.\n\nProgress:\n- Captured protocol fixtures.\n\nDecisions:\n- Fixtures must be deterministic.\n\nFiles:\n- doc/rust-rewrite-plan.md (created) - Goal 0 contract.\n\nTool findings:\n- No live network calls are required.\n\nTodos:\n- Compare Rust serde output against fixtures.\n\nNext steps:\n- Implement Rust protocol crate.\n\nRisks:\n- Later live-provider smoke tests need credentials.",
   "schema_version": 1

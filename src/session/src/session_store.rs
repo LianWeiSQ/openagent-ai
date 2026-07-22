@@ -5,14 +5,14 @@ use std::{
     env,
     fs::{self, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use openagent_protocol::{
-    ChatMessage, MessageInfo, MessagePart, MessagePartKind, MessageStatus, MessageWithParts, Role,
-    Usage, message_parts_to_chat_messages,
+    ChatMessage, ContextEpoch, MessageInfo, MessagePart, MessagePartKind, MessageStatus,
+    MessageWithParts, Role, Usage, message_parts_to_chat_messages,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -1294,50 +1294,55 @@ impl FileSessionStore {
             }))
     }
 
-    pub fn append_compaction_boundary(
+    pub fn append_context_epoch(
         &self,
         session: &mut Session,
-        run_id: &str,
-        summary: &str,
-        compacted_until_message_id: &str,
-    ) -> SessionResult<String> {
-        self.append_compaction_boundary_with_metadata(
-            session,
-            run_id,
-            summary,
-            compacted_until_message_id,
-            BTreeMap::new(),
-        )
-    }
-
-    pub fn append_compaction_boundary_with_metadata(
-        &self,
-        session: &mut Session,
-        run_id: &str,
-        summary: &str,
-        compacted_until_message_id: &str,
-        boundary_metadata: BTreeMap<String, Value>,
-    ) -> SessionResult<String> {
-        let message_id = format!("msg_compaction_{}", now_ms());
+        mut epoch: ContextEpoch,
+    ) -> SessionResult<ContextEpoch> {
+        epoch
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if epoch.session_id != session.id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "context epoch session_id does not match session",
+            )
+            .into());
+        }
+        if epoch.parent_epoch_id.is_none() {
+            epoch.parent_epoch_id = session
+                .metadata
+                .get("compact")
+                .and_then(context_epoch_from_value)
+                .filter(|previous| previous.boundary_message_id.is_some())
+                .map(|previous| previous.epoch_id);
+        }
+        let message_id = epoch
+            .boundary_message_id
+            .clone()
+            .unwrap_or_else(|| format!("msg_{}", epoch.epoch_id));
+        epoch.boundary_message_id = Some(message_id.clone());
+        epoch
+            .validate_boundary()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let epoch_value = serde_json::to_value(&epoch)?;
         let index = session.messages.len() as u64;
-        let mut metadata = boundary_metadata.clone();
-        metadata.insert("message_id".to_string(), json!(message_id.clone()));
-        metadata.insert(
-            "compacted_until_message_id".to_string(),
-            json!(compacted_until_message_id),
-        );
-        metadata.insert("kind".to_string(), json!("compaction_boundary"));
+        let metadata = BTreeMap::from([
+            ("message_id".to_string(), json!(message_id.clone())),
+            ("kind".to_string(), json!("context_epoch")),
+            ("context_epoch".to_string(), epoch_value.clone()),
+        ]);
         let info = MessageInfo {
             id: message_id.clone(),
             session_id: session.id.clone(),
             parent_message_id: parent_message_id_from_session(session, index),
             seq: Some(index),
             role: Role::System,
-            created_at_ms: now_ms(),
-            updated_at_ms: Some(now_ms()),
-            completed_at_ms: Some(now_ms()),
-            run_id: Some(run_id.to_string()),
-            step_index: None,
+            created_at_ms: epoch.created_at_ms,
+            updated_at_ms: Some(epoch.created_at_ms),
+            completed_at_ms: Some(epoch.created_at_ms),
+            run_id: Some(epoch.run_id.clone()),
+            step_index: epoch.step,
             status: MessageStatus::Completed,
             metadata: metadata.clone(),
         };
@@ -1358,11 +1363,11 @@ impl FileSessionStore {
                 seq: 1,
                 kind: MessagePartKind::Text,
                 status: MessageStatus::Completed,
-                content: json!(summary),
+                content: json!(epoch.summary),
                 attributes: BTreeMap::from([("role".to_string(), json!("system"))]),
-                timestamp_ms: now_ms(),
-                run_id: Some(run_id.to_string()),
-                step_index: None,
+                timestamp_ms: epoch.created_at_ms,
+                run_id: Some(epoch.run_id.clone()),
+                step_index: epoch.step,
             },
         )?;
         self.append_message_part_v2(
@@ -1374,52 +1379,68 @@ impl FileSessionStore {
                 seq: 2,
                 kind: MessagePartKind::Compaction,
                 status: MessageStatus::Completed,
-                content: json!({
-                    "summary": summary,
-                    "compacted_until_message_id": compacted_until_message_id,
-                    "metadata": boundary_metadata,
-                }),
-                attributes: metadata.clone(),
-                timestamp_ms: now_ms(),
-                run_id: Some(run_id.to_string()),
-                step_index: None,
+                content: epoch_value.clone(),
+                attributes: epoch.diagnostics(),
+                timestamp_ms: epoch.created_at_ms,
+                run_id: Some(epoch.run_id.clone()),
+                step_index: epoch.step,
             },
         )?;
         session.add(ChatMessage {
             role: Role::System,
-            content: summary.to_string(),
+            content: epoch.summary.clone(),
             name: None,
             tool_call_id: None,
-            metadata: BTreeMap::from([
-                ("message_id".to_string(), json!(message_id.clone())),
-                ("kind".to_string(), json!("compaction_boundary")),
-                (
-                    "compacted_until_message_id".to_string(),
-                    json!(compacted_until_message_id),
-                ),
-            ]),
+            metadata,
         });
-        if let Some(message) = session.messages.last_mut() {
-            message.metadata.extend(boundary_metadata.clone());
-        }
-        let mut event_attributes = boundary_metadata;
-        event_attributes.insert("message_id".to_string(), json!(message_id.clone()));
-        event_attributes.insert(
-            "compacted_until_message_id".to_string(),
-            json!(compacted_until_message_id),
-        );
-        event_attributes.insert("summary_chars".to_string(), json!(summary.chars().count()));
+        session.metadata.insert("compact".to_string(), epoch_value);
         let _ = self.record_event(
             &session.id,
-            run_id,
-            "compaction.boundary",
+            &epoch.run_id,
+            "context.epoch_created",
             SessionEventOptions {
                 kind: "compaction".to_string(),
-                attributes: event_attributes,
+                attributes: epoch.diagnostics(),
                 ..SessionEventOptions::default()
             },
         );
-        Ok(message_id)
+        Ok(epoch)
+    }
+
+    pub fn list_context_epochs(&self, session_id: &str) -> SessionResult<Vec<ContextEpoch>> {
+        let mut epochs = Vec::<(String, String, ContextEpoch)>::new();
+        let mut removed_messages = BTreeSet::<String>::new();
+        let mut removed_parts = BTreeSet::<String>::new();
+        for value in read_jsonl(&self.transcript_path(session_id))? {
+            match value.get("schema_version").and_then(Value::as_str) {
+                Some("openagent.message_part.v2") => {
+                    let record: StoredMessagePartV2 = serde_json::from_value(value)?;
+                    if record.part.kind == MessagePartKind::Compaction
+                        && let Some(epoch) = context_epoch_from_compaction_part(&record.part)
+                    {
+                        epochs.push((record.part.message_id, record.part.id, epoch));
+                    }
+                }
+                Some("openagent.message_tombstone.v2") => {
+                    if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
+                        removed_messages.insert(message_id.to_string());
+                    }
+                }
+                Some("openagent.message_part_tombstone.v2") => {
+                    if let Some(part_id) = value.get("part_id").and_then(Value::as_str) {
+                        removed_parts.insert(part_id.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(epochs
+            .into_iter()
+            .filter(|(message_id, part_id, _)| {
+                !removed_messages.contains(message_id) && !removed_parts.contains(part_id)
+            })
+            .map(|(_, _, epoch)| epoch)
+            .collect())
     }
 
     pub fn truncate_messages_after(
@@ -3564,16 +3585,19 @@ fn apply_compaction_boundaries(messages: &mut Vec<MessageWithParts>) {
                     .parts
                     .iter()
                     .find(|part| part.kind == MessagePartKind::Compaction)?;
-                let compacted_until = part
-                    .content
-                    .get("compacted_until_message_id")
-                    .and_then(Value::as_str)
+                let compacted_until = context_epoch_from_compaction_part(part)
+                    .and_then(|epoch| epoch.compacted_until_message_id)
                     .or_else(|| {
-                        part.attributes
+                        part.content
                             .get("compacted_until_message_id")
                             .and_then(Value::as_str)
-                    })
-                    .map(ToString::to_string);
+                            .or_else(|| {
+                                part.attributes
+                                    .get("compacted_until_message_id")
+                                    .and_then(Value::as_str)
+                            })
+                            .map(ToString::to_string)
+                    });
                 Some((index, compacted_until))
             })
     else {
@@ -3602,6 +3626,21 @@ fn apply_compaction_boundaries(messages: &mut Vec<MessageWithParts>) {
             normalize_message_lineage(messages);
         }
     }
+}
+
+fn context_epoch_from_value(value: &Value) -> Option<ContextEpoch> {
+    serde_json::from_value::<ContextEpoch>(value.clone())
+        .ok()
+        .filter(|epoch| epoch.is_current() && epoch.validate().is_ok())
+}
+
+fn context_epoch_from_compaction_part(part: &MessagePart) -> Option<ContextEpoch> {
+    context_epoch_from_value(&part.content)
+        .or_else(|| part.content.get("epoch").and_then(context_epoch_from_value))
+        .filter(|epoch| epoch.validate_boundary().is_ok())
+        .filter(|epoch| epoch.session_id == part.session_id)
+        .filter(|epoch| epoch.boundary_message_id.as_deref() == Some(part.message_id.as_str()))
+        .filter(|epoch| part.run_id.as_deref() == Some(epoch.run_id.as_str()))
 }
 
 fn message_contains_loaded_skill_output(message: &MessageWithParts) -> bool {

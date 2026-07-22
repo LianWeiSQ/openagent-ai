@@ -1,5 +1,9 @@
 //! Shared protocol contracts for OpenAgent.
 
+mod context_epoch;
+
+pub use context_epoch::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -957,17 +961,6 @@ pub struct WorkStateFile {
     pub note: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct CompactionRecord {
-    pub schema_version: u64,
-    pub format: String,
-    pub state: WorkState,
-    pub summary: String,
-    pub compacted_until: u64,
-    pub updated_at: u64,
-    pub source: String,
-}
-
 #[must_use]
 pub fn render_work_state(state: &WorkState) -> String {
     let mut sections = vec![
@@ -991,23 +984,6 @@ pub fn render_work_state(state: &WorkState) -> String {
     append_text_section(&mut sections, "Risks", &state.risks);
 
     sections.join("\n").trim().to_string()
-}
-
-#[must_use]
-pub fn build_compaction_record(
-    state: WorkState,
-    compacted_until: u64,
-    updated_at: u64,
-) -> CompactionRecord {
-    CompactionRecord {
-        schema_version: 1,
-        format: "structured_work_state".to_string(),
-        summary: render_work_state(&state),
-        state,
-        compacted_until,
-        updated_at,
-        source: "model_json".to_string(),
-    }
 }
 
 fn readonly_tools() -> impl Iterator<Item = &'static str> {

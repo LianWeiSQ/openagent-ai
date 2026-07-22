@@ -4,11 +4,12 @@
 
 - original_user_request: 收口 ContextPackBuilder 为唯一模型输入入口；补齐 ContextItem taxonomy；依次实现 typed ContextEpoch、micro compact、semantic anchor registry、budget allocator、compact eval/golden suite；每阶段完整测试并推送 GitHub。
 - objective_locked: 按上述顺序完成七个可独立验证、可独立推送的上下文压缩阶段。
-- current_slice: S2 completed - 全部 ContextItem 来源已使用版本化 typed taxonomy，旧 item/trace 可兼容升级，公开 diagnostics 与 receipt 可观测。
-- slice_boundary: `openagent-core` taxonomy/schema/builder/trace/receipt、HTTP public diagnostics、定向测试与架构文档；不修改 ContextEpoch 或压缩算法。
-- success_criteria: 每个 builder item 都有 current taxonomy；旧 item 自动升级；trace/receipt 可观测；provider payload 不泄漏 taxonomy；golden、Core、HTTP 测试通过；阶段提交已推送。
-- milestones: S1-S2 completed; S3-S7 pending.
+- current_slice: S3 completed - 手动与自动压缩统一写入版本化 `ContextEpoch`，session ledger、重启/replay、CLI/HTTP ContextPack 恢复与 diagnostics 共用 typed contract。
+- slice_boundary: `openagent-protocol` ContextEpoch schema、session append-only epoch ledger、Core work-state 投影、CLI/HTTP manual/automatic compaction 与恢复、兼容读取、golden 和架构文档；不实现 micro compact。
+- success_criteria: 新压缩不再写 free-form boundary；epoch 可校验、parent-linked、可枚举且事件脱敏；旧 transcript/metadata 可读；manual/automatic、restart/replay、loaded skill、CLI/HTTP、golden、全 workspace 测试与 strict clippy 通过；阶段提交已推送。
+- milestones: S1-S3 completed; S4-S7 pending.
 - last_receipts:
+  - 2026-07-22: changed: 新增 `openagent.context_epoch.v1`，统一 manual/automatic compaction 的身份、触发、原因、边界、parent、pack provenance 与 structured work state；SessionStore 只写 typed epoch、原始 ledger 可枚举完整 parent 链，Core 统一 typed/legacy metadata 投影，CLI/HTTP 共用恢复路径，旧 free-form transcript 保持只读兼容，事件只记录脱敏 diagnostics。verified: protocol/schema validation 与 golden、session parent chain/legacy boundary/loaded skill、Core provider projection、CLI 39 tests、HTTP manual/automatic + restart/replay、`cargo test --workspace --all-targets`、workspace strict clippy、format/diff/secret scan 全通过。next: S4 - micro compact，优先治理大 tool output，并保留可恢复的摘要、引用与截断 provenance。
   - 2026-07-22: changed: 新增 `openagent.context_item_taxonomy.v1`，按 category/origin/scope/compaction 四维分类全部内置来源；builder 升级旧 item，trace/receipt 与 HTTP diagnostics 暴露脱敏 taxonomy，provider payload 不携带 taxonomy；新增 source golden 与历史 trace 兼容测试。verified: `cargo test --workspace --all-targets`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`、新增行 secret scan 全通过。next: S3 - 将 compaction boundary 升级为 typed ContextEpoch。
 - blockers: none
 

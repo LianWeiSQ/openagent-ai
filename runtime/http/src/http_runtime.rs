@@ -22,9 +22,9 @@ use openagent_core::{
     ContextPackBuilder, ContextPackInput, ContextPackPerformance, ContextPackReceipt,
     ContextPackTraceEntry, ContextSystemDiagnostics, ContextSystemSources, ContextTodo,
     ContextWorkState, PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
-    context_pack_build_options_for_model, load_context_budget_options, materialize_context_history,
-    permission_rule, skill_document_model_invocable, skill_info_model_invocable,
-    tool_manifest_context_item,
+    context_pack_build_options_for_model, context_work_state_from_compact_metadata,
+    load_context_budget_options, materialize_context_history, permission_rule,
+    skill_document_model_invocable, skill_info_model_invocable, tool_manifest_context_item,
 };
 use openagent_lsp::{
     LspOperation, LspQuery, lsp_doctor, lsp_status, operation_from_str, query_workspace,
@@ -37,8 +37,8 @@ use openagent_mcp::{
     unavailable_tool_result,
 };
 use openagent_protocol::{
-    ChatMessage, Model, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema, Usage,
-    WorkState, render_work_state,
+    ChatMessage, ContextEpoch, Model, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema,
+    Usage, WorkState, render_work_state,
 };
 use openagent_provider::{
     OpenAiLanguageModelConfig, ProviderStreamEvent, build_openai_chat_payload,
@@ -2206,33 +2206,35 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
             .map(ToString::to_string)
             .unwrap_or_else(|| runtime_message_id(message_count.saturating_sub(1) as u64))
     });
-    let boundary_message_id = match compacted_until_message_id.as_deref() {
-        Some(message_id) => Some(
-            store
-                .append_compaction_boundary(&mut session, &run_id, &summary, message_id)
-                .map_err(|error| format!("failed to create compaction boundary: {error}"))?,
-        ),
-        None => None,
+    let mut epoch = ContextEpoch::manual(
+        new_id("epoch"),
+        session.id.clone(),
+        run_id.clone(),
+        now_ms(),
+        message_count as u64,
+        compacted_until_message_id,
+        summary,
+    );
+    epoch = if epoch.compacted_message_count > 0 {
+        store
+            .append_context_epoch(&mut session, epoch)
+            .map_err(|error| format!("failed to create context epoch: {error}"))?
+    } else {
+        epoch.validate().map_err(|error| error.to_string())?;
+        session.metadata.insert(
+            "compact".to_string(),
+            serde_json::to_value(&epoch).map_err(|error| error.to_string())?,
+        );
+        epoch
     };
     session.status = SessionStatus::Idle;
-    session.metadata.insert(
-        "compact".to_string(),
-        json!({
-            "compacted_at_ms": now_ms(),
-            "message_count": message_count,
-            "summary": summary,
-            "format": "session_summary_v1",
-            "compacted_until_message_id": compacted_until_message_id,
-            "boundary_message_id": boundary_message_id,
-        }),
-    );
     store
         .save_state(&session, Some(&run_id))
         .map_err(|error| error.to_string())?;
     Ok(json!({
         "session_id": session.id,
         "status": "compacted",
-        "summary": session.metadata.get("compact").cloned().unwrap_or(Value::Null),
+        "summary": epoch,
     }))
 }
 
@@ -7479,59 +7481,27 @@ fn runtime_auto_compact_context(
         return Ok(None);
     }
 
-    let source = "runtime_auto_compaction_v1";
-    let boundary_metadata = BTreeMap::from([
-        ("automatic".to_string(), json!(true)),
-        ("before_pack_hash".to_string(), json!(pack.pack_hash)),
-        (
-            "compacted_message_count".to_string(),
-            json!(compacted_message_count),
-        ),
-        ("format".to_string(), json!("structured_work_state")),
-        ("reason".to_string(), json!(reason)),
-        ("source".to_string(), json!(source)),
-        ("step".to_string(), json!(step)),
-    ]);
-    let boundary_message_id = store
-        .append_compaction_boundary_with_metadata(
-            session,
-            run_id,
-            &summary,
-            &compacted_until_message_id,
-            boundary_metadata,
-        )
-        .map_err(|error| format!("failed to create automatic compaction boundary: {error}"))?;
     let compacted_at_ms = now_ms();
-    session.metadata.insert(
-        "compact".to_string(),
-        json!({
-            "automatic": true,
-            "before_pack_hash": pack.pack_hash,
-            "boundary_message_id": boundary_message_id,
-            "compacted_at_ms": compacted_at_ms,
-            "compacted_message_count": compacted_message_count,
-            "compacted_until_message_id": compacted_until_message_id,
-            "format": "structured_work_state",
-            "message_count": session.messages.len(),
-            "reason": reason,
-            "run_id": run_id,
-            "source": source,
-            "state": state,
-            "step": step,
-            "summary": summary,
-        }),
+    let epoch = ContextEpoch::manual(
+        new_id("epoch"),
+        session.id.clone(),
+        run_id.to_string(),
+        compacted_at_ms,
+        compacted_message_count as u64,
+        Some(compacted_until_message_id),
+        summary,
+    )
+    .into_automatic(
+        reason,
+        pack.pack_hash.clone(),
+        step,
+        summary_token_budget,
+        state,
     );
-    let compaction = json!({
-        "automatic": true,
-        "before_pack_hash": pack.pack_hash,
-        "boundary_message_id": boundary_message_id,
-        "compacted_message_count": compacted_message_count,
-        "compacted_until_message_id": compacted_until_message_id,
-        "reason": reason,
-        "source": source,
-        "step": step,
-        "summary_tokens_estimate": summary_token_budget,
-    });
+    let epoch = store
+        .append_context_epoch(session, epoch)
+        .map_err(|error| format!("failed to create automatic context epoch: {error}"))?;
+    let compaction = json!(epoch.diagnostics());
     store
         .record_event(
             &session.id,
@@ -7539,12 +7509,7 @@ fn runtime_auto_compact_context(
             "context.auto_compacted",
             SessionEventOptions {
                 kind: "context".to_string(),
-                attributes: compaction
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect(),
+                attributes: epoch.diagnostics(),
                 ..SessionEventOptions::default()
             },
         )
@@ -7987,9 +7952,12 @@ fn runtime_materialized_provider_context_for_agent_bounded(
     let messages = history.messages;
     let mut system_sources = runtime_context_system_sources(session, profile);
     system_sources.legacy_system_sources = history.legacy_system_sources;
-    let work_state = history
-        .work_state
-        .or_else(|| runtime_legacy_context_work_state(session, messages.len()));
+    let work_state = history.work_state.or_else(|| {
+        session
+            .metadata
+            .get("compact")
+            .and_then(|compact| context_work_state_from_compact_metadata(compact, messages.len()))
+    });
     let attachments = runtime_context_attachments(&messages);
     RuntimeMaterializedProviderContext {
         messages,
@@ -7998,37 +7966,6 @@ fn runtime_materialized_provider_context_for_agent_bounded(
         system_sources,
         source_message_count,
     }
-}
-
-fn runtime_legacy_context_work_state(
-    session: &Session,
-    message_position: usize,
-) -> Option<ContextWorkState> {
-    let compact = session.metadata.get("compact")?.as_object()?;
-    let summary = compact.get("summary")?.as_str()?.trim();
-    if summary.is_empty() {
-        return None;
-    }
-    Some(ContextWorkState {
-        id: compact
-            .get("boundary_message_id")
-            .and_then(Value::as_str)
-            .unwrap_or("legacy_compact")
-            .to_string(),
-        summary: summary.to_string(),
-        format: compact
-            .get("format")
-            .and_then(Value::as_str)
-            .unwrap_or("session_summary_v1")
-            .to_string(),
-        source: "session.metadata.compact".to_string(),
-        message_position: Some(message_position),
-        compacted_until_message_id: compact
-            .get("compacted_until_message_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        metadata: BTreeMap::new(),
-    })
 }
 
 fn runtime_context_todos(todos: &[SessionTodoItem]) -> Vec<ContextTodo> {
@@ -13070,13 +13007,19 @@ fn escape_json_string(value: &str) -> String {
             .expect("append compacted user");
 
         store
-            .append_compaction_boundary(
+            .append_context_epoch(
                 &mut session,
-                "run_legacy",
-                "Resume the compacted implementation",
-                "compacted-user-0",
+                ContextEpoch::manual(
+                    "epoch_legacy",
+                    session_id,
+                    "run_legacy",
+                    now_ms(),
+                    1,
+                    Some("compacted-user-0".to_string()),
+                    "Resume the compacted implementation",
+                ),
             )
-            .expect("append compaction boundary");
+            .expect("append context epoch");
 
         let mut stale_profile =
             runtime_chat_message(Role::System, "STALE_PROFILE_SYSTEM".to_string());

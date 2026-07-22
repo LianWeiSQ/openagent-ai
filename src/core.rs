@@ -12,9 +12,9 @@ use std::{
 };
 
 use openagent_protocol::{
-    ChatMessage, MaterializedPayload, Model, PermissionAction, PermissionRule, PermissionRuleset,
-    Role, ToolSchema, Usage, WorkState, WorkStateFile, materialize_openai_compatible_payload,
-    render_work_state, ruleset,
+    ChatMessage, ContextEpoch, MaterializedPayload, Model, PermissionAction, PermissionRule,
+    PermissionRuleset, Role, ToolSchema, Usage, WorkState, WorkStateFile,
+    materialize_openai_compatible_payload, render_work_state, ruleset,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -2238,6 +2238,10 @@ pub fn materialize_context_history(messages: Vec<ChatMessage>) -> ContextHistory
                 .saturating_add(1);
             continue;
         }
+        if let Some(epoch) = context_epoch_from_boundary(&message) {
+            materialized.work_state = context_work_state_from_epoch(&epoch, 0);
+            continue;
+        }
         if message.metadata.get("kind").and_then(Value::as_str) == Some("compaction_boundary") {
             materialized.work_state = Some(context_work_state_from_boundary(message));
             continue;
@@ -2277,6 +2281,94 @@ pub fn materialize_context_history(messages: Vec<ChatMessage>) -> ContextHistory
         .message_position_map
         .push(materialized.messages.len());
     materialized
+}
+
+fn context_epoch_from_boundary(message: &ChatMessage) -> Option<ContextEpoch> {
+    message
+        .metadata
+        .get("context_epoch")
+        .and_then(|value| serde_json::from_value::<ContextEpoch>(value.clone()).ok())
+        .filter(|epoch| epoch.is_current() && epoch.validate_boundary().is_ok())
+        .filter(|epoch| {
+            message.metadata.get("message_id").and_then(Value::as_str)
+                == epoch.boundary_message_id.as_deref()
+        })
+}
+
+#[must_use]
+pub fn context_work_state_from_epoch(
+    epoch: &ContextEpoch,
+    message_position: usize,
+) -> Option<ContextWorkState> {
+    if epoch.validate().is_err() || epoch.summary.trim().is_empty() {
+        return None;
+    }
+    let mut metadata = BTreeMap::from([
+        ("schema_version".to_string(), json!(epoch.schema_version)),
+        ("epoch_id".to_string(), json!(epoch.epoch_id)),
+        ("parent_epoch_id".to_string(), json!(epoch.parent_epoch_id)),
+        ("trigger".to_string(), json!(epoch.trigger)),
+        ("reason".to_string(), json!(epoch.reason)),
+        ("created_at_ms".to_string(), json!(epoch.created_at_ms)),
+        (
+            "compacted_message_count".to_string(),
+            json!(epoch.compacted_message_count),
+        ),
+        (
+            "boundary_message_id".to_string(),
+            json!(epoch.boundary_message_id),
+        ),
+        (
+            "before_pack_hash".to_string(),
+            json!(epoch.before_pack_hash),
+        ),
+        ("step".to_string(), json!(epoch.step)),
+    ]);
+    metadata.retain(|_, value| !value.is_null());
+    Some(ContextWorkState {
+        id: epoch.epoch_id.clone(),
+        summary: epoch.summary.trim().to_string(),
+        format: epoch.format.as_str().to_string(),
+        source: epoch.source.clone(),
+        message_position: Some(message_position),
+        compacted_until_message_id: epoch.compacted_until_message_id.clone(),
+        metadata,
+    })
+}
+
+#[must_use]
+pub fn context_work_state_from_compact_metadata(
+    compact: &Value,
+    message_position: usize,
+) -> Option<ContextWorkState> {
+    if let Ok(epoch) = serde_json::from_value::<ContextEpoch>(compact.clone()) {
+        return context_work_state_from_epoch(&epoch, message_position);
+    }
+    let compact = compact.as_object()?;
+    let summary = compact.get("summary")?.as_str()?.trim();
+    if summary.is_empty() {
+        return None;
+    }
+    Some(ContextWorkState {
+        id: compact
+            .get("boundary_message_id")
+            .and_then(Value::as_str)
+            .unwrap_or("legacy_compact")
+            .to_string(),
+        summary: summary.to_string(),
+        format: compact
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("session_summary_v1")
+            .to_string(),
+        source: "session.metadata.compact".to_string(),
+        message_position: Some(message_position),
+        compacted_until_message_id: compact
+            .get("compacted_until_message_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        metadata: BTreeMap::new(),
+    })
 }
 
 fn context_work_state_from_boundary(message: ChatMessage) -> ContextWorkState {

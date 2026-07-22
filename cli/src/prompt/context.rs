@@ -42,9 +42,12 @@ pub(super) fn build_cli_context_pack(
         agent_profile.map_or("", |profile| profile.mode.as_str()),
     );
     system_sources.legacy_system_sources = history.legacy_system_sources;
-    let work_state = history
-        .work_state
-        .or_else(|| legacy_context_work_state(session, messages.len()));
+    let work_state = history.work_state.or_else(|| {
+        session
+            .metadata
+            .get("compact")
+            .and_then(|compact| context_work_state_from_compact_metadata(compact, messages.len()))
+    });
     let attachments = context_attachments_from_messages(&messages);
     let todos = context_todos(session);
     let checkpoints = context_checkpoints(store, session);
@@ -110,37 +113,6 @@ fn context_attachments_from_messages(messages: &[ChatMessage]) -> Vec<ContextAtt
                 })
         })
         .collect()
-}
-
-fn legacy_context_work_state(
-    session: &Session,
-    message_position: usize,
-) -> Option<ContextWorkState> {
-    let compact = session.metadata.get("compact")?.as_object()?;
-    let summary = compact.get("summary")?.as_str()?.trim();
-    if summary.is_empty() {
-        return None;
-    }
-    Some(ContextWorkState {
-        id: compact
-            .get("boundary_message_id")
-            .and_then(Value::as_str)
-            .unwrap_or("legacy_compact")
-            .to_string(),
-        summary: summary.to_string(),
-        format: compact
-            .get("format")
-            .and_then(Value::as_str)
-            .unwrap_or("session_summary_v1")
-            .to_string(),
-        source: "session.metadata.compact".to_string(),
-        message_position: Some(message_position),
-        compacted_until_message_id: compact
-            .get("compacted_until_message_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        metadata: BTreeMap::new(),
-    })
 }
 
 fn context_todos(session: &Session) -> Vec<ContextTodo> {

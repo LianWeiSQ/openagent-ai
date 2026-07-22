@@ -13,9 +13,10 @@ use openagent_bridge_server_client::{RemoteTurnAttachment, RemoteTurnRequest};
 use openagent_core::{
     ContextAttachment, ContextAttachmentKind, ContextCheckpoint, ContextItem, ContextPack,
     ContextPackBuilder, ContextPackInput, ContextSystemDiagnostics, ContextSystemSources,
-    ContextTodo, ContextWorkState, PermissionManager, SkillDocument, SkillRegistry,
-    SkillRegistryOptions, context_pack_build_options_for_model, materialize_context_history,
-    permission_rule, skill_document_model_invocable, tool_manifest_context_item,
+    ContextTodo, PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
+    context_pack_build_options_for_model, context_work_state_from_compact_metadata,
+    materialize_context_history, permission_rule, skill_document_model_invocable,
+    tool_manifest_context_item,
 };
 use openagent_mcp::{
     McpTransport, RemoteMcpManager, RemoteMcpToolDescriptor, bridge_tool_output,

@@ -19,6 +19,7 @@ use openagent_eval::{
     exploration_observation_from_bridge_turn, score_exploration_quality,
 };
 use openagent_http_runtime::http_runtime_fixture;
+use openagent_session::FileSessionStore;
 use serde_json::Value;
 
 type FakeProviderServer = (u16, thread::JoinHandle<()>, Arc<Mutex<Vec<String>>>);
@@ -551,6 +552,13 @@ fn remote_runtime_client_manages_session_lifecycle() -> Result<(), Box<dyn Error
     let compact = client.compact_session(&session_id)?;
     assert_eq!(compact["status"], "compacted");
     assert!(compact["summary"]["summary"].as_str().is_some());
+    assert_eq!(
+        compact["summary"]["schema_version"],
+        "openagent.context_epoch.v1"
+    );
+    assert_eq!(compact["summary"]["trigger"], "manual");
+    assert_eq!(compact["summary"]["compacted_message_count"], 0);
+    assert!(compact["summary"]["boundary_message_id"].is_null());
 
     let archived = client.update_session(&session_id, serde_json::json!({"archived": true}))?;
     assert_eq!(archived["session"]["archived"], true);
@@ -1469,18 +1477,29 @@ fn context_budget_auto_compacts_and_rebuilds_across_restart() -> Result<(), Box<
             .is_some_and(|count| count > 0)
     );
     assert_eq!(rebuild["after_receipt"]["budget"]["overflowed"], false);
-    assert_eq!(rebuild["compaction"]["automatic"], true);
+    assert_eq!(rebuild["compaction"]["trigger"], "automatic");
     assert_eq!(
         state["metadata"]["compact"]["format"],
         "structured_work_state"
     );
-    assert_eq!(state["metadata"]["compact"]["automatic"], true);
+    assert_eq!(
+        state["metadata"]["compact"]["schema_version"],
+        "openagent.context_epoch.v1"
+    );
+    assert_eq!(state["metadata"]["compact"]["trigger"], "automatic");
     let compact_run_id = compacted["turn"]["id"].as_str().expect("compact turn id");
     let context_events = read_session_event_records(&session_root, &session_id, compact_run_id)?;
     assert_eq!(
         context_events
             .iter()
             .filter(|event| event["event"] == "context.auto_compacted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        context_events
+            .iter()
+            .filter(|event| event["event"] == "context.epoch_created")
             .count(),
         1
     );
@@ -2323,11 +2342,22 @@ fn context_pack_recovers_todo_checkpoint_and_work_state_after_restart() -> Resul
 
     let compacted = client.compact_session(&session_id)?;
     assert_eq!(compacted["status"], "compacted");
+    assert_eq!(
+        compacted["summary"]["schema_version"],
+        "openagent.context_epoch.v1"
+    );
+    assert_eq!(compacted["summary"]["trigger"], "manual");
     assert!(
         compacted["summary"]["boundary_message_id"]
             .as_str()
             .is_some_and(|id| !id.is_empty())
     );
+    let epochs = FileSessionStore::new(&session_root)
+        .list_context_epochs(&session_id)
+        .expect("context epochs load after manual compaction");
+    assert_eq!(epochs.len(), 1);
+    assert_eq!(epochs[0].epoch_id, compacted["summary"]["epoch_id"]);
+    assert_eq!(epochs[0].compacted_message_count, 4);
 
     let _ = server.kill();
     let _ = server.wait();
