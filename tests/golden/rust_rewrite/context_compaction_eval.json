@@ -1,0 +1,207 @@
+{
+  "baseline_observation": {
+    "after_budget_limit_tokens": 2000,
+    "after_input_tokens": 1800,
+    "allocation_overflowed": false,
+    "before_input_tokens": 10000,
+    "case_id": "long-session-golden",
+    "schema_version": "openagent.eval.context_compaction.v1",
+    "continuity": {
+      "epoch_parent_chain_valid": true,
+      "ledger_preserved": true,
+      "replay_anchor_registry_match": true,
+      "replay_pack_hash_match": true,
+      "restart_anchor_registry_match": true,
+      "restart_pack_hash_match": true,
+      "typed_epoch_count": 2
+    },
+    "forbidden_terms_present": [],
+    "observed_anchor_ids": [
+      "anchor:constraint:0f9d2cef5e4bdc374ff8",
+      "anchor:goal:primary"
+    ],
+    "observed_anchor_kinds": [
+      "constraint",
+      "goal"
+    ],
+    "required_drop_count": 0,
+    "retained_terms": [
+      "budget allocator",
+      "contextpackbuilder",
+      "replay",
+      "src/core.rs"
+    ],
+    "split_tool_group_count": 0
+  },
+  "baseline_result": {
+    "allocation_overflowed": false,
+    "breakdown": {
+      "budget_fit": 1.0,
+      "durable_state": 1.0,
+      "noise_removal": 1.0,
+      "provider_integrity": 1.0,
+      "recovery_consistency": 1.0,
+      "semantic_anchor_recall": 1.0,
+      "semantic_term_recall": 1.0,
+      "token_reduction": 1.0
+    },
+    "case_id": "long-session-golden",
+    "failure_reasons": [],
+    "forbidden_terms_present": [],
+    "missing_anchor_ids": [],
+    "missing_anchor_kinds": [],
+    "missing_terms": [],
+    "passed": true,
+    "required_drop_count": 0,
+    "schema_version": "openagent.eval.context_compaction.v1",
+    "score": 100.0,
+    "split_tool_group_count": 0,
+    "token_savings": 8200,
+    "token_savings_ratio": 0.82
+  },
+  "comparison": {
+    "after_input_token_delta": 5200,
+    "baseline_score": 100.0,
+    "baseline_token_savings_ratio": 0.82,
+    "case_id": "long-session-golden",
+    "current_score": 40.67307692307692,
+    "current_token_savings_ratio": 0.3,
+    "passed": false,
+    "regressions": [
+      "score regressed by 59.327, allowed regression is 0.000",
+      "token savings ratio regressed by 0.520, allowed regression is 0.000",
+      "post-compaction tokens increased by 5200, allowed increase is 0",
+      "semantic_anchor_recall regressed: 0.750 < 1.000",
+      "semantic_term_recall regressed: 0.750 < 1.000",
+      "noise_removal regressed: 0.000 < 1.000",
+      "provider_integrity regressed: 0.000 < 1.000",
+      "recovery_consistency regressed: 0.000 < 1.000",
+      "durable_state regressed: 0.000 < 1.000",
+      "current compaction gate failed after a passing baseline"
+    ],
+    "schema_version": "openagent.eval.context_compaction.v1",
+    "score_delta": -59.32692307692308
+  },
+  "corpus": {
+    "cases": [
+      {
+        "case_id": "long-session-golden",
+        "description": "Long engineering session retains continuation semantics",
+        "forbidden_terms": [
+          "raw_tool_noise_sentinel"
+        ],
+        "maximum_after_input_tokens": 2048,
+        "minimum_score": 100.0,
+        "minimum_token_savings_ratio": 0.65,
+        "require_atomic_tool_groups": true,
+        "require_epoch_parent_chain": true,
+        "require_ledger_preserved": true,
+        "require_no_required_drop": true,
+        "require_replay_anchor_match": true,
+        "require_replay_pack_match": true,
+        "require_restart_anchor_match": true,
+        "require_restart_pack_match": true,
+        "require_typed_epoch": true,
+        "required_anchor_ids": [
+          "anchor:constraint:0f9d2cef5e4bdc374ff8",
+          "anchor:goal:primary"
+        ],
+        "required_anchor_kinds": [
+          "constraint",
+          "goal"
+        ],
+        "required_terms": [
+          "budget allocator",
+          "contextpackbuilder",
+          "replay",
+          "src/core.rs"
+        ]
+      }
+    ],
+    "schema_version": "openagent.eval.context_compaction_corpus.v1"
+  },
+  "degraded_observation": {
+    "after_budget_limit_tokens": 2000,
+    "after_input_tokens": 7000,
+    "allocation_overflowed": true,
+    "before_input_tokens": 10000,
+    "case_id": "long-session-golden",
+    "schema_version": "openagent.eval.context_compaction.v1",
+    "continuity": {
+      "epoch_parent_chain_valid": false,
+      "ledger_preserved": false,
+      "replay_anchor_registry_match": false,
+      "replay_pack_hash_match": false,
+      "restart_anchor_registry_match": false,
+      "restart_pack_hash_match": false,
+      "typed_epoch_count": 0
+    },
+    "forbidden_terms_present": [
+      "raw_tool_noise_sentinel"
+    ],
+    "observed_anchor_ids": [
+      "anchor:constraint:0f9d2cef5e4bdc374ff8",
+      "anchor:goal:primary"
+    ],
+    "observed_anchor_kinds": [
+      "goal"
+    ],
+    "required_drop_count": 1,
+    "retained_terms": [
+      "budget allocator",
+      "contextpackbuilder",
+      "src/core.rs"
+    ],
+    "split_tool_group_count": 1
+  },
+  "degraded_result": {
+    "allocation_overflowed": true,
+    "breakdown": {
+      "budget_fit": 0.0,
+      "durable_state": 0.0,
+      "noise_removal": 0.0,
+      "provider_integrity": 0.0,
+      "recovery_consistency": 0.0,
+      "semantic_anchor_recall": 0.75,
+      "semantic_term_recall": 0.75,
+      "token_reduction": 0.4615384615384615
+    },
+    "case_id": "long-session-golden",
+    "failure_reasons": [
+      "missing anchor kinds: constraint",
+      "missing semantic terms: replay",
+      "forbidden terms remained: raw_tool_noise_sentinel",
+      "token savings below minimum: 0.300 < 0.650",
+      "post-compaction tokens exceeded limit: 7000 > 2048",
+      "post-compaction input exceeded its model budget",
+      "post-compaction allocation still overflowed",
+      "required context was dropped: 1 item(s)",
+      "tool exchange groups were split: 1 group(s)",
+      "replay pack hash did not match",
+      "replay anchor registry did not match",
+      "restart pack hash did not match",
+      "restart anchor registry did not match",
+      "typed context epoch was not observed",
+      "context epoch parent chain was invalid",
+      "source session ledger was not preserved",
+      "compaction quality score below minimum: 40.673 < 100.000"
+    ],
+    "forbidden_terms_present": [
+      "raw_tool_noise_sentinel"
+    ],
+    "missing_anchor_ids": [],
+    "missing_anchor_kinds": [
+      "constraint"
+    ],
+    "missing_terms": [
+      "replay"
+    ],
+    "passed": false,
+    "required_drop_count": 1,
+    "schema_version": "openagent.eval.context_compaction.v1",
+    "score": 40.67307692307692,
+    "split_tool_group_count": 1,
+    "token_savings": 3000,
+    "token_savings_ratio": 0.3
+  }
+}

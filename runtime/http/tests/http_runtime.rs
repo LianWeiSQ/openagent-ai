@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     error::Error,
     fs,
     io::{ErrorKind, Read, Write},
@@ -15,8 +16,10 @@ use std::{
 
 use openagent_bridge_server_client::{RemoteAuth, RemoteRuntimeClient};
 use openagent_eval::{
-    ExplorationQualityResult, ExplorationQualityRubric, compare_exploration_quality,
-    exploration_observation_from_bridge_turn, score_exploration_quality,
+    ContextCompactionContinuity, ContextCompactionEvalRubric, ExplorationQualityResult,
+    ExplorationQualityRubric, compare_exploration_quality,
+    context_compaction_observation_from_bridge_context, exploration_observation_from_bridge_turn,
+    score_context_compaction, score_exploration_quality,
 };
 use openagent_http_runtime::http_runtime_fixture;
 use openagent_session::FileSessionStore;
@@ -1415,7 +1418,11 @@ fn context_budget_auto_compacts_and_rebuilds_across_restart() -> Result<(), Box<
     let responses = vec![
         serde_json::json!({
             "id": "resp_compact_history_1",
-            "output_text": format!("HISTORY_ONE {}", "alpha-history ".repeat(1_500)),
+            "output_text": format!(
+                "HISTORY_ONE {} AUTO_COMPACT_RAW_NOISE_SENTINEL {}",
+                "alpha-history ".repeat(750),
+                "alpha-history ".repeat(750)
+            ),
             "usage": {"input_tokens": 5, "output_tokens": 2_000}
         }),
         serde_json::json!({
@@ -1535,10 +1542,106 @@ fn context_budget_auto_compacts_and_rebuilds_across_restart() -> Result<(), Box<
         1
     );
 
+    let compact_context = client.session_context(&session_id, Some(16))?;
+    let compact_step = compact_context["latest"]["step"]
+        .as_u64()
+        .expect("compact context step");
+    let replay =
+        client.replay_session_context(&session_id, Some(compact_run_id), Some(compact_step))?;
+    assert_eq!(replay["status"], "verified");
+    let replay_pack_hash_match = replay["rebuilt"]["receipt"]["pack_hash"]
+        == compact_context["latest"]["receipt"]["pack_hash"];
+    let replay_anchor_registry_match = replay["rebuilt"]["receipt"]["semantic_anchor_registry"]["registry_hash"]
+        == compact_context["latest"]["receipt"]["semantic_anchor_registry"]["registry_hash"];
+    let epochs = FileSessionStore::new(&session_root)
+        .list_context_epochs(&session_id)
+        .expect("context epochs load for compaction eval");
+    let epoch_parent_chain_valid = epochs.iter().enumerate().all(|(index, epoch)| {
+        epoch.validate().is_ok()
+            && if index == 0 {
+                epoch.parent_epoch_id.is_none()
+            } else {
+                epoch.parent_epoch_id.as_deref() == Some(epochs[index - 1].epoch_id.as_str())
+            }
+    });
+    let transcript_before_restart =
+        fs::read_to_string(session_root.join(&session_id).join("transcript.jsonl"))?;
+    let ledger_message_count = transcript_before_restart
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["schema_version"] == "openagent.message.v2")
+        .count();
+    let ledger_preserved = ledger_message_count >= 8;
+    let compact_provider_request = provider_requests
+        .lock()
+        .expect("provider requests")
+        .get(3)
+        .cloned()
+        .ok_or("missing compact provider request")?;
+
     let _ = server.kill();
     let _ = server.wait();
     let mut restarted = spawn_runtime_with_env(port, &workspace, &session_root, &provider_env)?;
     wait_for_server(port)?;
+    let restart_context = client.session_context(&session_id, Some(16))?;
+    let restart_pack_hash_match = restart_context["latest"]["receipt"]["pack_hash"]
+        == compact_context["latest"]["receipt"]["pack_hash"];
+    let restart_anchor_registry_match = restart_context["latest"]["receipt"]["semantic_anchor_registry"]
+        ["registry_hash"]
+        == compact_context["latest"]["receipt"]["semantic_anchor_registry"]["registry_hash"];
+    let rubric = ContextCompactionEvalRubric {
+        case_id: "http-auto-compaction-recovery".to_string(),
+        description: "Automatic HTTP compaction preserves semantic continuation state".to_string(),
+        required_anchor_ids: BTreeSet::new(),
+        required_anchor_kinds: ["goal", "recovery_point"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        required_terms: ["auto_compact_latest_request", "structured work state"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        forbidden_terms: ["auto_compact_raw_noise_sentinel"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        minimum_token_savings_ratio: 0.5,
+        maximum_after_input_tokens: 7_000,
+        minimum_score: 100.0,
+        require_no_required_drop: true,
+        require_atomic_tool_groups: true,
+        require_typed_epoch: true,
+        require_epoch_parent_chain: true,
+        require_ledger_preserved: true,
+        require_replay_pack_match: true,
+        require_replay_anchor_match: true,
+        require_restart_pack_match: true,
+        require_restart_anchor_match: true,
+    };
+    let observation = context_compaction_observation_from_bridge_context(
+        &rubric.case_id,
+        &rebuild["before_receipt"],
+        &compact_context,
+        &compact_provider_request,
+        &rubric.required_terms,
+        &rubric.forbidden_terms,
+        ContextCompactionContinuity {
+            typed_epoch_count: epochs.len() as u64,
+            epoch_parent_chain_valid,
+            ledger_preserved,
+            replay_pack_hash_match,
+            replay_anchor_registry_match,
+            restart_pack_hash_match,
+            restart_anchor_registry_match,
+        },
+    );
+    let compaction_quality = score_context_compaction(&rubric, &observation);
+    assert!(
+        compaction_quality.passed,
+        "{}",
+        compaction_quality.failure_reasons.join("; ")
+    );
+    assert_eq!(compaction_quality.score, 100.0);
     let recovered = client.start_turn(
         &session_id,
         "AFTER_COMPACTION_RESTART_REQUEST",

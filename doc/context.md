@@ -236,6 +236,51 @@ initial context when trimming overflow. OpenHarness adds a typed allocator at
 the shared builder boundary so CLI, Bridge, replay, and restart all make the
 same selection and expose the same explanation.
 
+## Compaction Evaluation
+
+Compaction quality is a release contract, not an assertion that a smaller
+prompt is automatically better. The eval crate defines the versioned
+`openagent.eval.context_compaction_corpus.v1` corpus and
+`openagent.eval.context_compaction.v1` observation/result contracts. A rubric
+can require anchor IDs and kinds, continuation terms, removed noise markers,
+minimum token savings, a maximum post-compaction input size, intact tool
+exchange groups, typed epochs, a valid epoch parent chain, append-only ledger
+preservation, and replay/restart pack and registry parity.
+
+The scorer produces a 100-point breakdown:
+
+- semantic anchor recall: 25 points;
+- continuation-term recall: 20 points;
+- historical-noise removal: 10 points;
+- token reduction: 15 points;
+- model-budget fit: 10 points;
+- required-item and tool-group integrity: 5 points;
+- replay/restart consistency: 10 points;
+- typed epoch and ledger durability: 5 points.
+
+Rubric requirements remain hard gates even when the weighted score would be
+high enough. The regression comparison also rejects score loss, anchor or term
+recall loss, noise/integrity/recovery/durability loss, token-savings regression,
+post-compaction token growth beyond tolerance, and a passing baseline becoming
+a failure.
+
+For an overflowing pre-compaction receipt, source size is reconstructed from
+the allocator's candidate tokens plus fixed tool/model overhead. Using only the
+already-selected provider projection would undercount discarded history and
+could incorrectly report zero savings. The post-compaction side always uses
+the actual provider input estimate and its model limit.
+
+The checked-in golden at
+`tests/golden/rust_rewrite/context_compaction_eval.json` contains a passing
+baseline, a deliberately degraded counterexample, and the exact regression
+reasons. A Core integration builds a noisy multi-turn session, replaces old
+history with a typed epoch and semantic registry, and verifies deterministic
+replay/restart packs. The HTTP integration scores a real automatic compaction,
+public receipt/trace projection, zero-side-effect receipt replay, runtime
+restart, typed epoch chain, and durable transcript. Eval artifacts retain only
+expected synthetic terms, IDs, hashes, booleans, counts, ratios, and failure
+reasons; they do not persist provider prompts or user content.
+
 ## Invariants
 
 - One runtime path owns provider-message assembly.
@@ -248,6 +293,8 @@ same selection and expose the same explanation.
   compaction, restart, and receipt replay independently of summary wording.
 - Budget selection is layered, deterministic, dependency-aware, and replayed
   from a versioned policy; unused soft quota is always borrowable.
+- Compaction releases are gated by semantic fidelity, measured reduction,
+  provider integrity, and durable recovery rather than token reduction alone.
 - Persisted messages and events remain ordered and scoped to one session.
 - Attachments are persisted as metadata plus safe content references.
 - Secret values are redacted before persistence and diagnostics.

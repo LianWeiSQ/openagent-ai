@@ -9,6 +9,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use openagent_core::{ContextBudgetAllocationPhase, ContextDelivery, ContextPack};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const FIXTURE_ROOT: &str = "/tmp/openagent-rust-rewrite-fixture-goal13";
 
@@ -122,6 +124,9 @@ pub struct HarborSuccessSpec<'a> {
 }
 
 pub const EXPLORATION_QUALITY_SCHEMA_VERSION: &str = "openagent.eval.exploration_quality.v1";
+pub const CONTEXT_COMPACTION_EVAL_SCHEMA_VERSION: &str = "openagent.eval.context_compaction.v1";
+pub const CONTEXT_COMPACTION_CORPUS_SCHEMA_VERSION: &str =
+    "openagent.eval.context_compaction_corpus.v1";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExplorationQualityRubric {
@@ -193,6 +198,155 @@ pub struct ExplorationQualityComparison {
     pub baseline_score: f64,
     pub current_score: f64,
     pub score_delta: f64,
+    pub regressions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextCompactionEvalRubric {
+    pub case_id: String,
+    pub description: String,
+    pub required_anchor_ids: BTreeSet<String>,
+    pub required_anchor_kinds: BTreeSet<String>,
+    pub required_terms: BTreeSet<String>,
+    pub forbidden_terms: BTreeSet<String>,
+    pub minimum_token_savings_ratio: f64,
+    pub maximum_after_input_tokens: u64,
+    pub minimum_score: f64,
+    pub require_no_required_drop: bool,
+    pub require_atomic_tool_groups: bool,
+    pub require_typed_epoch: bool,
+    pub require_epoch_parent_chain: bool,
+    pub require_ledger_preserved: bool,
+    pub require_replay_pack_match: bool,
+    pub require_replay_anchor_match: bool,
+    pub require_restart_pack_match: bool,
+    pub require_restart_anchor_match: bool,
+}
+
+impl ContextCompactionEvalRubric {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.case_id.trim().is_empty() {
+            return Err("context compaction eval case_id must not be empty".to_string());
+        }
+        if !(0.0..=1.0).contains(&self.minimum_token_savings_ratio) {
+            return Err(
+                "context compaction minimum_token_savings_ratio must be between 0 and 1"
+                    .to_string(),
+            );
+        }
+        if self.maximum_after_input_tokens == 0 {
+            return Err(
+                "context compaction maximum_after_input_tokens must be positive".to_string(),
+            );
+        }
+        if !(0.0..=100.0).contains(&self.minimum_score) {
+            return Err("context compaction minimum_score must be between 0 and 100".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextCompactionEvalCorpus {
+    pub schema_version: String,
+    pub cases: Vec<ContextCompactionEvalRubric>,
+}
+
+impl ContextCompactionEvalCorpus {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != CONTEXT_COMPACTION_CORPUS_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported context compaction corpus schema: {}",
+                self.schema_version
+            ));
+        }
+        if self.cases.is_empty() {
+            return Err("context compaction corpus must contain at least one case".to_string());
+        }
+        let mut ids = BTreeSet::new();
+        for case in &self.cases {
+            case.validate()?;
+            if !ids.insert(case.case_id.clone()) {
+                return Err(format!(
+                    "duplicate context compaction eval case: {}",
+                    case.case_id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextCompactionContinuity {
+    pub typed_epoch_count: u64,
+    pub epoch_parent_chain_valid: bool,
+    pub ledger_preserved: bool,
+    pub replay_pack_hash_match: bool,
+    pub replay_anchor_registry_match: bool,
+    pub restart_pack_hash_match: bool,
+    pub restart_anchor_registry_match: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextCompactionEvalObservation {
+    pub schema_version: String,
+    pub case_id: String,
+    pub before_input_tokens: u64,
+    pub after_input_tokens: u64,
+    pub after_budget_limit_tokens: Option<u64>,
+    pub observed_anchor_ids: BTreeSet<String>,
+    pub observed_anchor_kinds: BTreeSet<String>,
+    pub retained_terms: BTreeSet<String>,
+    pub forbidden_terms_present: BTreeSet<String>,
+    pub required_drop_count: u64,
+    pub allocation_overflowed: bool,
+    pub split_tool_group_count: u64,
+    pub continuity: ContextCompactionContinuity,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextCompactionEvalBreakdown {
+    pub semantic_anchor_recall: f64,
+    pub semantic_term_recall: f64,
+    pub noise_removal: f64,
+    pub token_reduction: f64,
+    pub budget_fit: f64,
+    pub provider_integrity: f64,
+    pub recovery_consistency: f64,
+    pub durable_state: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextCompactionEvalResult {
+    pub schema_version: String,
+    pub case_id: String,
+    pub passed: bool,
+    pub score: f64,
+    pub token_savings: u64,
+    pub token_savings_ratio: f64,
+    pub breakdown: ContextCompactionEvalBreakdown,
+    pub missing_anchor_ids: Vec<String>,
+    pub missing_anchor_kinds: Vec<String>,
+    pub missing_terms: Vec<String>,
+    pub forbidden_terms_present: Vec<String>,
+    pub required_drop_count: u64,
+    pub allocation_overflowed: bool,
+    pub split_tool_group_count: u64,
+    pub failure_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextCompactionEvalComparison {
+    pub schema_version: String,
+    pub case_id: String,
+    pub passed: bool,
+    pub baseline_score: f64,
+    pub current_score: f64,
+    pub score_delta: f64,
+    pub baseline_token_savings_ratio: f64,
+    pub current_token_savings_ratio: f64,
+    pub after_input_token_delta: i64,
     pub regressions: Vec<String>,
 }
 
@@ -516,6 +670,440 @@ pub fn compare_exploration_quality(
         baseline_score: baseline.score,
         current_score: current.score,
         score_delta,
+        regressions,
+    }
+}
+
+#[must_use]
+pub fn context_compaction_observation_from_packs(
+    case_id: &str,
+    before: &ContextPack,
+    after: &ContextPack,
+    required_terms: &BTreeSet<String>,
+    forbidden_terms: &BTreeSet<String>,
+    continuity: ContextCompactionContinuity,
+) -> ContextCompactionEvalObservation {
+    let provider_text = after
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    let observed_anchor_ids = after
+        .semantic_anchor_registry
+        .anchors
+        .iter()
+        .map(|anchor| anchor.id.clone())
+        .collect();
+    let observed_anchor_kinds = after
+        .semantic_anchor_registry
+        .anchors
+        .iter()
+        .map(|anchor| anchor.kind.as_str().to_string())
+        .collect();
+    let retained_terms = observed_terms(required_terms, &provider_text);
+    let forbidden_terms_present = observed_terms(forbidden_terms, &provider_text);
+    let required_drop_count = after
+        .trace
+        .iter()
+        .filter(|entry| {
+            !entry.included && entry.drop_reason.as_deref() == Some("required_budget_exhausted")
+        })
+        .count() as u64;
+    let allocation_overflowed = after.budget.overflowed
+        || after
+            .budget
+            .allocation
+            .as_ref()
+            .is_some_and(|allocation| allocation.hard_overflow_tokens > 0);
+    let split_tool_group_count = split_tool_group_count(after);
+
+    ContextCompactionEvalObservation {
+        schema_version: CONTEXT_COMPACTION_EVAL_SCHEMA_VERSION.to_string(),
+        case_id: case_id.to_string(),
+        before_input_tokens: before.estimated_input_tokens,
+        after_input_tokens: after.estimated_input_tokens,
+        after_budget_limit_tokens: after.budget.input_limit_tokens,
+        observed_anchor_ids,
+        observed_anchor_kinds,
+        retained_terms,
+        forbidden_terms_present,
+        required_drop_count,
+        allocation_overflowed,
+        split_tool_group_count,
+        continuity,
+    }
+}
+
+#[must_use]
+pub fn context_compaction_observation_from_bridge_context(
+    case_id: &str,
+    before_receipt: &Value,
+    after_context: &Value,
+    provider_projection: &str,
+    required_terms: &BTreeSet<String>,
+    forbidden_terms: &BTreeSet<String>,
+    continuity: ContextCompactionContinuity,
+) -> ContextCompactionEvalObservation {
+    let latest = after_context.get("latest").unwrap_or(after_context);
+    let receipt = latest.get("receipt").unwrap_or(&Value::Null);
+    let trace = latest
+        .get("trace")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let provider_text = provider_projection.to_ascii_lowercase();
+    let observed_anchor_ids = trace
+        .iter()
+        .filter_map(|entry| entry.pointer("/semantic_anchor/id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let observed_anchor_kinds = receipt
+        .pointer("/semantic_anchor_registry/kind_counts")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, count)| count.as_u64().unwrap_or_default() > 0)
+        .map(|(kind, _)| kind.clone())
+        .collect::<BTreeSet<_>>();
+    let required_drop_count = receipt
+        .pointer("/drop_reason_counts/required_budget_exhausted")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let allocation_overflowed = receipt
+        .pointer("/budget/overflowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || receipt
+            .pointer("/budget/allocation/hard_overflow_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|tokens| tokens > 0);
+    let split_tool_group_count = split_public_tool_group_count(&trace);
+
+    ContextCompactionEvalObservation {
+        schema_version: CONTEXT_COMPACTION_EVAL_SCHEMA_VERSION.to_string(),
+        case_id: case_id.to_string(),
+        before_input_tokens: receipt_source_input_tokens(before_receipt),
+        after_input_tokens: receipt
+            .get("estimated_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        after_budget_limit_tokens: receipt
+            .pointer("/budget/input_limit_tokens")
+            .and_then(Value::as_u64),
+        observed_anchor_ids,
+        observed_anchor_kinds,
+        retained_terms: observed_terms(required_terms, &provider_text),
+        forbidden_terms_present: observed_terms(forbidden_terms, &provider_text),
+        required_drop_count,
+        allocation_overflowed,
+        split_tool_group_count,
+        continuity,
+    }
+}
+
+#[must_use]
+pub fn score_context_compaction(
+    rubric: &ContextCompactionEvalRubric,
+    observation: &ContextCompactionEvalObservation,
+) -> ContextCompactionEvalResult {
+    let missing_anchor_ids = missing_values(
+        &rubric.required_anchor_ids,
+        &observation.observed_anchor_ids,
+    );
+    let missing_anchor_kinds = missing_values(
+        &rubric.required_anchor_kinds,
+        &observation.observed_anchor_kinds,
+    );
+    let missing_terms = missing_values(&rubric.required_terms, &observation.retained_terms);
+    let forbidden_terms_present = rubric
+        .forbidden_terms
+        .intersection(&observation.forbidden_terms_present)
+        .cloned()
+        .collect::<Vec<_>>();
+    let token_savings = observation
+        .before_input_tokens
+        .saturating_sub(observation.after_input_tokens);
+    let token_savings_ratio = if observation.before_input_tokens == 0 {
+        0.0
+    } else {
+        token_savings as f64 / observation.before_input_tokens as f64
+    };
+    let expected_anchor_count = rubric
+        .required_anchor_ids
+        .len()
+        .saturating_add(rubric.required_anchor_kinds.len());
+    let missing_anchor_count = missing_anchor_ids
+        .len()
+        .saturating_add(missing_anchor_kinds.len());
+    let after_within_observed_budget = observation
+        .after_budget_limit_tokens
+        .is_none_or(|limit| observation.after_input_tokens <= limit);
+    let budget_fit = observation.after_input_tokens <= rubric.maximum_after_input_tokens
+        && after_within_observed_budget
+        && !observation.allocation_overflowed;
+    let provider_integrity = (!rubric.require_no_required_drop
+        || observation.required_drop_count == 0)
+        && (!rubric.require_atomic_tool_groups || observation.split_tool_group_count == 0);
+    let recovery_checks = [
+        (
+            rubric.require_replay_pack_match,
+            observation.continuity.replay_pack_hash_match,
+        ),
+        (
+            rubric.require_replay_anchor_match,
+            observation.continuity.replay_anchor_registry_match,
+        ),
+        (
+            rubric.require_restart_pack_match,
+            observation.continuity.restart_pack_hash_match,
+        ),
+        (
+            rubric.require_restart_anchor_match,
+            observation.continuity.restart_anchor_registry_match,
+        ),
+    ];
+    let durable_checks = [
+        (
+            rubric.require_typed_epoch,
+            observation.continuity.typed_epoch_count > 0,
+        ),
+        (
+            rubric.require_epoch_parent_chain,
+            observation.continuity.epoch_parent_chain_valid,
+        ),
+        (
+            rubric.require_ledger_preserved,
+            observation.continuity.ledger_preserved,
+        ),
+    ];
+    let breakdown = ContextCompactionEvalBreakdown {
+        semantic_anchor_recall: coverage(expected_anchor_count, missing_anchor_count),
+        semantic_term_recall: coverage(rubric.required_terms.len(), missing_terms.len()),
+        noise_removal: coverage(rubric.forbidden_terms.len(), forbidden_terms_present.len()),
+        token_reduction: threshold_progress(
+            token_savings_ratio,
+            rubric.minimum_token_savings_ratio,
+        ),
+        budget_fit: f64::from(budget_fit),
+        provider_integrity: f64::from(provider_integrity),
+        recovery_consistency: required_check_coverage(&recovery_checks),
+        durable_state: required_check_coverage(&durable_checks),
+    };
+    let score = breakdown.semantic_anchor_recall * 25.0
+        + breakdown.semantic_term_recall * 20.0
+        + breakdown.noise_removal * 10.0
+        + breakdown.token_reduction * 15.0
+        + breakdown.budget_fit * 10.0
+        + breakdown.provider_integrity * 5.0
+        + breakdown.recovery_consistency * 10.0
+        + breakdown.durable_state * 5.0;
+    let mut failure_reasons = Vec::new();
+    if let Err(error) = rubric.validate() {
+        failure_reasons.push(error);
+    }
+    if observation.schema_version != CONTEXT_COMPACTION_EVAL_SCHEMA_VERSION {
+        failure_reasons.push(format!(
+            "unsupported context compaction observation schema: {}",
+            observation.schema_version
+        ));
+    }
+    if !observation.case_id.trim().is_empty()
+        && !rubric.case_id.trim().is_empty()
+        && observation.case_id != rubric.case_id
+    {
+        failure_reasons.push(format!(
+            "context compaction case mismatch: observation={} rubric={}",
+            observation.case_id, rubric.case_id
+        ));
+    }
+    push_missing_reason(&mut failure_reasons, "anchor IDs", &missing_anchor_ids);
+    push_missing_reason(&mut failure_reasons, "anchor kinds", &missing_anchor_kinds);
+    push_missing_reason(&mut failure_reasons, "semantic terms", &missing_terms);
+    if !forbidden_terms_present.is_empty() {
+        failure_reasons.push(format!(
+            "forbidden terms remained: {}",
+            forbidden_terms_present.join(", ")
+        ));
+    }
+    if token_savings_ratio < rubric.minimum_token_savings_ratio {
+        failure_reasons.push(format!(
+            "token savings below minimum: {token_savings_ratio:.3} < {:.3}",
+            rubric.minimum_token_savings_ratio
+        ));
+    }
+    if observation.after_input_tokens > rubric.maximum_after_input_tokens {
+        failure_reasons.push(format!(
+            "post-compaction tokens exceeded limit: {} > {}",
+            observation.after_input_tokens, rubric.maximum_after_input_tokens
+        ));
+    }
+    if !after_within_observed_budget {
+        failure_reasons.push("post-compaction input exceeded its model budget".to_string());
+    }
+    if observation.allocation_overflowed {
+        failure_reasons.push("post-compaction allocation still overflowed".to_string());
+    }
+    if rubric.require_no_required_drop && observation.required_drop_count > 0 {
+        failure_reasons.push(format!(
+            "required context was dropped: {} item(s)",
+            observation.required_drop_count
+        ));
+    }
+    if rubric.require_atomic_tool_groups && observation.split_tool_group_count > 0 {
+        failure_reasons.push(format!(
+            "tool exchange groups were split: {} group(s)",
+            observation.split_tool_group_count
+        ));
+    }
+    push_required_check_failures(
+        &mut failure_reasons,
+        &recovery_checks,
+        &[
+            "replay pack hash did not match",
+            "replay anchor registry did not match",
+            "restart pack hash did not match",
+            "restart anchor registry did not match",
+        ],
+    );
+    push_required_check_failures(
+        &mut failure_reasons,
+        &durable_checks,
+        &[
+            "typed context epoch was not observed",
+            "context epoch parent chain was invalid",
+            "source session ledger was not preserved",
+        ],
+    );
+    if score < rubric.minimum_score {
+        failure_reasons.push(format!(
+            "compaction quality score below minimum: {score:.3} < {:.3}",
+            rubric.minimum_score
+        ));
+    }
+
+    ContextCompactionEvalResult {
+        schema_version: CONTEXT_COMPACTION_EVAL_SCHEMA_VERSION.to_string(),
+        case_id: if rubric.case_id.is_empty() {
+            observation.case_id.clone()
+        } else {
+            rubric.case_id.clone()
+        },
+        passed: failure_reasons.is_empty(),
+        score,
+        token_savings,
+        token_savings_ratio,
+        breakdown,
+        missing_anchor_ids,
+        missing_anchor_kinds,
+        missing_terms,
+        forbidden_terms_present,
+        required_drop_count: observation.required_drop_count,
+        allocation_overflowed: observation.allocation_overflowed,
+        split_tool_group_count: observation.split_tool_group_count,
+        failure_reasons,
+    }
+}
+
+#[must_use]
+pub fn compare_context_compaction(
+    baseline: &ContextCompactionEvalResult,
+    current: &ContextCompactionEvalResult,
+    maximum_score_regression: f64,
+    maximum_savings_ratio_regression: f64,
+    maximum_after_token_increase: u64,
+    baseline_after_input_tokens: u64,
+    current_after_input_tokens: u64,
+) -> ContextCompactionEvalComparison {
+    let mut regressions = Vec::new();
+    if baseline.schema_version != CONTEXT_COMPACTION_EVAL_SCHEMA_VERSION
+        || current.schema_version != CONTEXT_COMPACTION_EVAL_SCHEMA_VERSION
+    {
+        regressions.push("unsupported context compaction result schema".to_string());
+    }
+    if baseline.case_id != current.case_id {
+        regressions.push(format!(
+            "context compaction comparison case mismatch: {} != {}",
+            baseline.case_id, current.case_id
+        ));
+    }
+    let score_delta = current.score - baseline.score;
+    if score_delta < -maximum_score_regression.abs() {
+        regressions.push(format!(
+            "score regressed by {:.3}, allowed regression is {:.3}",
+            -score_delta,
+            maximum_score_regression.abs()
+        ));
+    }
+    let savings_delta = current.token_savings_ratio - baseline.token_savings_ratio;
+    if savings_delta < -maximum_savings_ratio_regression.abs() {
+        regressions.push(format!(
+            "token savings ratio regressed by {:.3}, allowed regression is {:.3}",
+            -savings_delta,
+            maximum_savings_ratio_regression.abs()
+        ));
+    }
+    let after_input_token_delta =
+        current_after_input_tokens as i128 - baseline_after_input_tokens as i128;
+    if after_input_token_delta > i128::from(maximum_after_token_increase) {
+        regressions.push(format!(
+            "post-compaction tokens increased by {after_input_token_delta}, allowed increase is {maximum_after_token_increase}"
+        ));
+    }
+    for (name, baseline_value, current_value) in [
+        (
+            "semantic_anchor_recall",
+            baseline.breakdown.semantic_anchor_recall,
+            current.breakdown.semantic_anchor_recall,
+        ),
+        (
+            "semantic_term_recall",
+            baseline.breakdown.semantic_term_recall,
+            current.breakdown.semantic_term_recall,
+        ),
+        (
+            "noise_removal",
+            baseline.breakdown.noise_removal,
+            current.breakdown.noise_removal,
+        ),
+        (
+            "provider_integrity",
+            baseline.breakdown.provider_integrity,
+            current.breakdown.provider_integrity,
+        ),
+        (
+            "recovery_consistency",
+            baseline.breakdown.recovery_consistency,
+            current.breakdown.recovery_consistency,
+        ),
+        (
+            "durable_state",
+            baseline.breakdown.durable_state,
+            current.breakdown.durable_state,
+        ),
+    ] {
+        if current_value < baseline_value {
+            regressions.push(format!(
+                "{name} regressed: {current_value:.3} < {baseline_value:.3}"
+            ));
+        }
+    }
+    if baseline.passed && !current.passed {
+        regressions.push("current compaction gate failed after a passing baseline".to_string());
+    }
+    ContextCompactionEvalComparison {
+        schema_version: CONTEXT_COMPACTION_EVAL_SCHEMA_VERSION.to_string(),
+        case_id: current.case_id.clone(),
+        passed: regressions.is_empty(),
+        baseline_score: baseline.score,
+        current_score: current.score,
+        score_delta,
+        baseline_token_savings_ratio: baseline.token_savings_ratio,
+        current_token_savings_ratio: current.token_savings_ratio,
+        after_input_token_delta: after_input_token_delta
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+            as i64,
         regressions,
     }
 }
@@ -1634,6 +2222,111 @@ fn normalize_exploration_path(path: &str) -> String {
         .unwrap_or(&normalized)
         .trim_end_matches('/')
         .to_string()
+}
+
+fn observed_terms(expected: &BTreeSet<String>, text: &str) -> BTreeSet<String> {
+    expected
+        .iter()
+        .filter(|term| text.contains(&term.to_ascii_lowercase()))
+        .cloned()
+        .collect()
+}
+
+fn receipt_source_input_tokens(receipt: &Value) -> u64 {
+    let selected = receipt
+        .get("estimated_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let candidate_items = receipt
+        .pointer("/budget/allocation/classes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|class| class.get("candidate_tokens").and_then(Value::as_u64))
+        .sum::<u64>();
+    let fixed_overhead = receipt
+        .pointer("/budget/fixed_overhead_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    selected.max(candidate_items.saturating_add(fixed_overhead))
+}
+
+fn split_tool_group_count(pack: &ContextPack) -> u64 {
+    let mut groups = BTreeMap::<String, BTreeSet<bool>>::new();
+    for entry in pack
+        .trace
+        .iter()
+        .filter(|entry| entry.delivery == ContextDelivery::Message)
+    {
+        let Some(decision) = entry.budget_allocation.as_ref().filter(|decision| {
+            decision.is_current() && decision.phase != ContextBudgetAllocationPhase::Duplicate
+        }) else {
+            continue;
+        };
+        groups
+            .entry(decision.group_id.clone())
+            .or_default()
+            .insert(entry.included);
+    }
+    groups.values().filter(|states| states.len() > 1).count() as u64
+}
+
+fn split_public_tool_group_count(trace: &[Value]) -> u64 {
+    let mut groups = BTreeMap::<String, BTreeSet<bool>>::new();
+    for entry in trace {
+        let Some(group_id) = entry
+            .pointer("/budget_allocation/group_id")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if entry
+            .pointer("/budget_allocation/phase")
+            .and_then(Value::as_str)
+            == Some("duplicate")
+        {
+            continue;
+        }
+        groups.entry(group_id.to_string()).or_default().insert(
+            entry
+                .get("included")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        );
+    }
+    groups.values().filter(|states| states.len() > 1).count() as u64
+}
+
+fn threshold_progress(actual: f64, required: f64) -> f64 {
+    if required <= 0.0 {
+        1.0
+    } else {
+        (actual / required).clamp(0.0, 1.0)
+    }
+}
+
+fn required_check_coverage(checks: &[(bool, bool)]) -> f64 {
+    let required = checks.iter().filter(|(required, _)| *required).count();
+    if required == 0 {
+        return 1.0;
+    }
+    let passed = checks
+        .iter()
+        .filter(|(required, passed)| *required && *passed)
+        .count();
+    passed as f64 / required as f64
+}
+
+fn push_required_check_failures(
+    reasons: &mut Vec<String>,
+    checks: &[(bool, bool)],
+    messages: &[&str],
+) {
+    for ((required, passed), message) in checks.iter().zip(messages) {
+        if *required && !*passed {
+            reasons.push((*message).to_string());
+        }
+    }
 }
 
 fn missing_values(expected: &BTreeSet<String>, actual: &BTreeSet<String>) -> Vec<String> {
