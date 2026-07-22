@@ -190,6 +190,13 @@
         "included": true,
         "item_id": "runtime:current",
         "kind": "runtime",
+        "taxonomy": {
+          "category": "runtime_state",
+          "compaction": "preserve",
+          "origin": "runtime",
+          "schema_version": "openagent.context_item_taxonomy.v1",
+          "scope": "turn"
+        },
         "pinned": true,
         "priority": 90,
         "source": "runtime",
@@ -201,6 +208,13 @@
         "included": true,
         "item_id": "sandbox:execution",
         "kind": "sandbox",
+        "taxonomy": {
+          "category": "runtime_state",
+          "compaction": "preserve",
+          "origin": "sandbox",
+          "schema_version": "openagent.context_item_taxonomy.v1",
+          "scope": "session"
+        },
         "pinned": true,
         "priority": 85,
         "source": "session.metadata.execution",
@@ -212,6 +226,13 @@
         "included": false,
         "item_id": "message:user:0",
         "kind": "message",
+        "taxonomy": {
+          "category": "conversation",
+          "compaction": "summarize",
+          "origin": "session_message",
+          "schema_version": "openagent.context_item_taxonomy.v1",
+          "scope": "session"
+        },
         "pinned": false,
         "priority": 40,
         "source": "session.messages[0]",
@@ -223,6 +244,13 @@
         "included": true,
         "item_id": "tool_result:call-grep",
         "kind": "tool_result",
+        "taxonomy": {
+          "category": "tool_observation",
+          "compaction": "summarize",
+          "origin": "session_message",
+          "schema_version": "openagent.context_item_taxonomy.v1",
+          "scope": "session"
+        },
         "pinned": false,
         "priority": 50,
         "source": "session.messages[1]",
@@ -234,6 +262,13 @@
         "included": true,
         "item_id": "todo:todo-context",
         "kind": "todo",
+        "taxonomy": {
+          "category": "session_state",
+          "compaction": "preserve",
+          "origin": "todo",
+          "schema_version": "openagent.context_item_taxonomy.v1",
+          "scope": "session"
+        },
         "pinned": true,
         "priority": 80,
         "source": "session.todos:todo-context",
@@ -245,6 +280,13 @@
         "included": true,
         "item_id": "message:user:2",
         "kind": "message",
+        "taxonomy": {
+          "category": "conversation",
+          "compaction": "summarize",
+          "origin": "session_message",
+          "schema_version": "openagent.context_item_taxonomy.v1",
+          "scope": "session"
+        },
         "pinned": true,
         "priority": 90,
         "source": "session.messages[2]",
@@ -256,6 +298,13 @@
         "included": true,
         "item_id": "work_state:context_compaction",
         "kind": "work_state",
+        "taxonomy": {
+          "category": "session_state",
+          "compaction": "preserve",
+          "origin": "work_state",
+          "schema_version": "openagent.context_item_taxonomy.v1",
+          "scope": "session"
+        },
         "pinned": true,
         "priority": 95,
         "source": "session.metadata.context_compaction",
@@ -267,6 +316,13 @@
         "included": false,
         "item_id": "diag",
         "kind": "diagnostic",
+        "taxonomy": {
+          "category": "extension",
+          "compaction": "drop",
+          "origin": "extension",
+          "schema_version": "openagent.context_item_taxonomy.v1",
+          "scope": "turn"
+        },
         "pinned": false,
         "priority": 9,
         "source": "fixture",

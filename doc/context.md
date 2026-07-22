@@ -24,6 +24,24 @@ provider messages or tool metadata.
 priority, estimated size, stability, and inclusion decision. This lets traces
 explain what was considered, retained, compacted, or dropped.
 
+Every item also carries the versioned `openagent.context_item_taxonomy.v1`
+contract. The taxonomy is intentionally separate from the compatibility
+`kind` and `source` labels and classifies four policy dimensions:
+
+- category: the semantic family, such as instruction, conversation, tool
+  observation, attachment, skill, tool manifest, runtime state, or session
+  state;
+- origin: the owning source, such as an agent profile, instruction file,
+  session message, turn attachment, registry, todo, checkpoint, or work state;
+- scope: whether the item is stable, session-scoped, or turn-scoped;
+- compaction: whether the item must be preserved, summarized, truncated,
+  rebuilt from its authority, or dropped.
+
+Builder normalization upgrades legacy items that do not yet carry taxonomy.
+Trace and receipt diagnostics expose taxonomy without copying item content into
+public diagnostics or provider payloads. Compaction and budget policy must use
+this taxonomy instead of matching free-form `kind` strings.
+
 Budget pressure is handled in stages:
 
 1. trim old or oversized tool output;

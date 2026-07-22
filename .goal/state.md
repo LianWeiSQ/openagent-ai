@@ -1,5 +1,19 @@
 # Goal State
 
+## Active Context Compression Goal
+
+- original_user_request: 收口 ContextPackBuilder 为唯一模型输入入口；补齐 ContextItem taxonomy；依次实现 typed ContextEpoch、micro compact、semantic anchor registry、budget allocator、compact eval/golden suite；每阶段完整测试并推送 GitHub。
+- objective_locked: 按上述顺序完成七个可独立验证、可独立推送的上下文压缩阶段。
+- current_slice: S2 completed - 全部 ContextItem 来源已使用版本化 typed taxonomy，旧 item/trace 可兼容升级，公开 diagnostics 与 receipt 可观测。
+- slice_boundary: `openagent-core` taxonomy/schema/builder/trace/receipt、HTTP public diagnostics、定向测试与架构文档；不修改 ContextEpoch 或压缩算法。
+- success_criteria: 每个 builder item 都有 current taxonomy；旧 item 自动升级；trace/receipt 可观测；provider payload 不泄漏 taxonomy；golden、Core、HTTP 测试通过；阶段提交已推送。
+- milestones: S1-S2 completed; S3-S7 pending.
+- last_receipts:
+  - 2026-07-22: changed: 新增 `openagent.context_item_taxonomy.v1`，按 category/origin/scope/compaction 四维分类全部内置来源；builder 升级旧 item，trace/receipt 与 HTTP diagnostics 暴露脱敏 taxonomy，provider payload 不携带 taxonomy；新增 source golden 与历史 trace 兼容测试。verified: `cargo test --workspace --all-targets`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`、新增行 secret scan 全通过。next: S3 - 将 compaction boundary 升级为 typed ContextEpoch。
+- blockers: none
+
+---
+
 - original_user_request: 持续推进统一 ContextPackBuilder；统一系统提示词、项目指令、会话历史、attachments、skills、MCP tool manifests、todo、checkpoint、模型参数，解决回答不够深入、探索度不够的问题。
 - objective_locked: 让 OpenHarness 的 `ContextPackBuilder` 成为 Rust Agent Runtime 唯一的 prompt/context 装配入口，并让 CLI/TUI/Bridge/Desktop 共享同一份可预算、可恢复、可观测的上下文契约。
 - product_boundary:

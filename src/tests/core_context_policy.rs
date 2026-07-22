@@ -7,10 +7,12 @@ use std::{
 };
 
 use openagent_core::{
-    CONTEXT_FAILURE_SCHEMA_VERSION, CONTEXT_PACK_RECEIPT_SCHEMA_VERSION,
-    CONTEXT_PACK_SCHEMA_VERSION, CONTEXT_PERFORMANCE_SCHEMA_VERSION, ContextAttachment,
-    ContextAttachmentKind, ContextCheckpoint, ContextDelivery, ContextFailure, ContextFailureCode,
-    ContextItem, ContextPackBuildOptions, ContextPackBuilder, ContextPackInput,
+    CONTEXT_FAILURE_SCHEMA_VERSION, CONTEXT_ITEM_TAXONOMY_SCHEMA_VERSION,
+    CONTEXT_PACK_RECEIPT_SCHEMA_VERSION, CONTEXT_PACK_SCHEMA_VERSION,
+    CONTEXT_PERFORMANCE_SCHEMA_VERSION, ContextAttachment, ContextAttachmentKind,
+    ContextCheckpoint, ContextCompactionPolicy, ContextDelivery, ContextFailure,
+    ContextFailureCode, ContextItem, ContextItemCategory, ContextItemOrigin, ContextItemScope,
+    ContextItemTaxonomy, ContextPackBuildOptions, ContextPackBuilder, ContextPackInput,
     ContextPackPerformance, ContextSystemSources, ContextTodo, ContextWorkState,
     InstructionContextLoader, InstructionLoadOptions, PermissionManager, SkillDocument, SkillInfo,
     SkillRegistry, SkillRegistryOptions, check_context_budget, context_provider_input_hash,
@@ -113,6 +115,113 @@ fn context_pack_contract_is_deterministic_and_receipt_is_redacted() -> Result<()
     assert!(!receipt.contains(secret));
     assert!(!receipt.contains("private description"));
     assert!(!receipt.contains("connection"));
+    Ok(())
+}
+
+#[test]
+fn context_item_taxonomy_matches_the_versioned_source_golden() -> Result<(), Box<dyn Error>> {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/golden/rust_rewrite/context_item_taxonomy.json"
+    ))?;
+    let cases = fixture["cases"]
+        .as_array()
+        .ok_or("cases must be an array")?;
+    let actual = cases
+        .iter()
+        .map(|case| {
+            let kind = case["kind"].as_str().unwrap_or_default();
+            let source = case["source"].as_str().unwrap_or_default();
+            json!({
+                "kind": kind,
+                "source": source,
+                "taxonomy": ContextItemTaxonomy::classify(kind, source),
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fixture,
+        json!({
+            "schema_version": CONTEXT_ITEM_TAXONOMY_SCHEMA_VERSION,
+            "cases": actual,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn context_pack_upgrades_legacy_items_and_exposes_taxonomy_without_provider_leakage()
+-> Result<(), Box<dyn Error>> {
+    let mut legacy = ContextItem::new(
+        "tool_result:legacy",
+        "tool_result",
+        "session.messages[2]",
+        "large historical output",
+        50,
+    );
+    legacy.taxonomy = ContextItemTaxonomy::default();
+    let pack = ContextPackBuilder::new(Some(ContextPackBuildOptions {
+        trace_only: false,
+        ..ContextPackBuildOptions::default()
+    }))
+    .build(ContextPackInput {
+        messages: vec![chat(Role::User, "continue")],
+        extra_items: vec![legacy],
+        ..ContextPackInput::default()
+    });
+
+    let upgraded = pack
+        .items
+        .iter()
+        .find(|item| item.id == "tool_result:legacy")
+        .ok_or("missing upgraded item")?;
+    assert_eq!(
+        upgraded.taxonomy.category,
+        ContextItemCategory::ToolObservation
+    );
+    assert_eq!(upgraded.taxonomy.origin, ContextItemOrigin::SessionMessage);
+    assert_eq!(upgraded.taxonomy.scope, ContextItemScope::Session);
+    assert_eq!(
+        upgraded.taxonomy.compaction,
+        ContextCompactionPolicy::Summarize
+    );
+    assert!(pack.items.iter().all(|item| item.taxonomy.is_current()));
+    assert!(pack.trace.iter().all(|entry| entry.taxonomy.is_current()));
+    assert_eq!(
+        pack.receipt.item_category_counts.get("tool_observation"),
+        Some(&1)
+    );
+    assert_eq!(
+        pack.receipt.item_origin_counts.get("session_message"),
+        Some(&2)
+    );
+    assert_eq!(pack.receipt.item_scope_counts.get("session"), Some(&2));
+    assert_eq!(
+        pack.receipt.item_compaction_policy_counts.get("summarize"),
+        Some(&2)
+    );
+    assert!(pack.validate_provider_input().is_ok());
+    let provider_messages = serde_json::to_string(&pack.messages)?;
+    assert!(!provider_messages.contains(CONTEXT_ITEM_TAXONOMY_SCHEMA_VERSION));
+
+    let mut tampered = pack;
+    tampered.items[0].taxonomy.schema_version = "unsupported".to_string();
+    assert_eq!(
+        tampered.validate_provider_input(),
+        Err("context pack contains an unsupported item taxonomy".to_string())
+    );
+
+    let legacy_trace = serde_json::from_value::<openagent_core::ContextPackTraceEntry>(json!({
+        "item_id": "tool_result:legacy",
+        "kind": "tool_result",
+        "source": "session.messages[2]",
+        "priority": 50,
+        "pinned": false,
+        "stable_prefix": false,
+        "token_estimate": 10,
+        "included": true,
+        "drop_reason": null
+    }))?;
+    assert!(!legacy_trace.taxonomy.is_current());
     Ok(())
 }
 

@@ -1,0 +1,85 @@
+{
+  "schema_version": "openagent.context_item_taxonomy.v1",
+  "cases": [
+    {
+      "kind": "profile_prompt",
+      "source": "agent.profile:build",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "instruction", "origin": "agent_profile", "scope": "stable", "compaction": "preserve"}
+    },
+    {
+      "kind": "instruction",
+      "source": "workspace:AGENTS.md",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "instruction", "origin": "instruction_file", "scope": "stable", "compaction": "preserve"}
+    },
+    {
+      "kind": "legacy_system",
+      "source": "session.messages[0]",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "instruction", "origin": "legacy_system", "scope": "stable", "compaction": "preserve"}
+    },
+    {
+      "kind": "message",
+      "source": "context.system_sources",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "instruction", "origin": "system_assembly", "scope": "stable", "compaction": "preserve"}
+    },
+    {
+      "kind": "message",
+      "source": "session.messages[1]",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "conversation", "origin": "session_message", "scope": "session", "compaction": "summarize"}
+    },
+    {
+      "kind": "tool_result",
+      "source": "session.messages[2]",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "tool_observation", "origin": "session_message", "scope": "session", "compaction": "summarize"}
+    },
+    {
+      "kind": "attachment_file",
+      "source": "session.messages[1].attachments[0]",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "attachment", "origin": "turn_attachment", "scope": "session", "compaction": "truncate"}
+    },
+    {
+      "kind": "skill_preloaded",
+      "source": "skill.document:review",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "skill", "origin": "skill_document", "scope": "stable", "compaction": "preserve"}
+    },
+    {
+      "kind": "skill_available",
+      "source": "skill.catalog:research",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "skill", "origin": "skill_catalog", "scope": "stable", "compaction": "rebuild"}
+    },
+    {
+      "kind": "mcp_tool_manifest",
+      "source": "mcp.server:docs",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "tool_manifest", "origin": "tool_registry", "scope": "stable", "compaction": "rebuild"}
+    },
+    {
+      "kind": "runtime",
+      "source": "runtime",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "runtime_state", "origin": "runtime", "scope": "turn", "compaction": "preserve"}
+    },
+    {
+      "kind": "sandbox",
+      "source": "session.metadata.execution",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "runtime_state", "origin": "sandbox", "scope": "session", "compaction": "preserve"}
+    },
+    {
+      "kind": "work_state",
+      "source": "session.metadata.context_compaction",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "session_state", "origin": "work_state", "scope": "session", "compaction": "preserve"}
+    },
+    {
+      "kind": "todo",
+      "source": "session.todos:active",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "session_state", "origin": "todo", "scope": "session", "compaction": "preserve"}
+    },
+    {
+      "kind": "checkpoint",
+      "source": "session.checkpoints:latest",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "session_state", "origin": "checkpoint", "scope": "session", "compaction": "summarize"}
+    },
+    {
+      "kind": "diagnostic",
+      "source": "extension.fixture",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "extension", "origin": "extension", "scope": "turn", "compaction": "drop"}
+    }
+  ]
+}

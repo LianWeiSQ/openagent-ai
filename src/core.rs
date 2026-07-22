@@ -1,5 +1,9 @@
 //! Core permission, context, instruction, and skill behavior for the Rust rewrite.
 
+mod context_taxonomy;
+
+pub use context_taxonomy::*;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -833,6 +837,8 @@ pub struct ContextItem {
     pub id: String,
     pub kind: String,
     pub source: String,
+    #[serde(default)]
+    pub taxonomy: ContextItemTaxonomy,
     pub content: String,
     pub priority: i64,
     pub token_estimate: u64,
@@ -853,10 +859,13 @@ impl ContextItem {
         content: impl Into<String>,
         priority: i64,
     ) -> Self {
+        let kind = kind.into();
+        let source = source.into();
         Self {
             id: id.into(),
-            kind: kind.into(),
-            source: source.into(),
+            taxonomy: ContextItemTaxonomy::classify(&kind, &source),
+            kind,
+            source,
             content: content.into(),
             priority,
             token_estimate: 0,
@@ -874,6 +883,8 @@ pub struct ContextPackTraceEntry {
     pub item_id: String,
     pub kind: String,
     pub source: String,
+    #[serde(default)]
+    pub taxonomy: ContextItemTaxonomy,
     pub priority: i64,
     pub pinned: bool,
     pub stable_prefix: bool,
@@ -920,6 +931,14 @@ pub struct ContextPackReceipt {
     pub included_item_count: u64,
     pub dropped_item_count: u64,
     pub item_kind_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub item_category_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub item_origin_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub item_scope_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub item_compaction_policy_counts: BTreeMap<String, u64>,
     pub item_delivery_counts: BTreeMap<String, u64>,
     pub drop_reason_counts: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
@@ -981,6 +1000,11 @@ impl ContextPack {
                 "unsupported context receipt schema: {}",
                 self.receipt.schema_version
             ));
+        }
+        if self.items.iter().any(|item| !item.taxonomy.is_current())
+            || self.trace.iter().any(|entry| !entry.taxonomy.is_current())
+        {
+            return Err("context pack contains an unsupported item taxonomy".to_string());
         }
         let provider_input_hash =
             context_provider_input_hash(&self.messages, &self.tools, &self.model_options);
@@ -1223,6 +1247,9 @@ impl ContextPackBuilder {
         items
             .into_iter()
             .map(|mut item| {
+                if !item.taxonomy.is_current() {
+                    item.taxonomy = ContextItemTaxonomy::classify(&item.kind, &item.source);
+                }
                 if item.token_estimate == 0 && item.delivery == ContextDelivery::Message {
                     item.token_estimate = estimate_context_message_tokens(
                         &item_to_message(&item),
@@ -1295,6 +1322,7 @@ impl ContextPackBuilder {
                     item_id: item.id.clone(),
                     kind: item.kind.clone(),
                     source: item.source.clone(),
+                    taxonomy: item.taxonomy.clone(),
                     priority: item.priority,
                     pinned: item.pinned,
                     stable_prefix: item.stable_prefix,
@@ -1923,9 +1951,20 @@ fn context_pack_receipt(
         .collect::<Vec<_>>();
     let model_option_keys = model_options.keys().cloned().collect::<Vec<_>>();
     let mut item_kind_counts = BTreeMap::new();
+    let mut item_category_counts = BTreeMap::new();
+    let mut item_origin_counts = BTreeMap::new();
+    let mut item_scope_counts = BTreeMap::new();
+    let mut item_compaction_policy_counts = BTreeMap::new();
     let mut item_delivery_counts = BTreeMap::new();
     for item in items {
         increment_count(&mut item_kind_counts, &item.kind);
+        increment_count(&mut item_category_counts, item.taxonomy.category.as_str());
+        increment_count(&mut item_origin_counts, item.taxonomy.origin.as_str());
+        increment_count(&mut item_scope_counts, item.taxonomy.scope.as_str());
+        increment_count(
+            &mut item_compaction_policy_counts,
+            item.taxonomy.compaction.as_str(),
+        );
         increment_count(
             &mut item_delivery_counts,
             context_delivery_name(item.delivery),
@@ -1973,6 +2012,10 @@ fn context_pack_receipt(
         included_item_count,
         dropped_item_count: trace.len() as u64 - included_item_count,
         item_kind_counts,
+        item_category_counts,
+        item_origin_counts,
+        item_scope_counts,
+        item_compaction_policy_counts,
         item_delivery_counts,
         drop_reason_counts,
         truncated_item_count,

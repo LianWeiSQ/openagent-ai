@@ -1102,6 +1102,14 @@ fn remote_runtime_client_uses_real_provider_endpoint_for_plain_turn() -> Result<
             .as_u64()
             .is_some_and(|count| count > 0)
     );
+    assert_eq!(
+        context_pack["receipt"]["item_category_counts"]["conversation"],
+        1
+    );
+    assert_eq!(
+        context_pack["receipt"]["item_origin_counts"]["session_message"],
+        1
+    );
     let receipts = state["metadata"]["context_pack_receipts"]
         .as_array()
         .expect("context pack receipts");
@@ -1123,6 +1131,18 @@ fn remote_runtime_client_uses_real_provider_endpoint_for_plain_turn() -> Result<
         context_events[0]["attributes"]["receipt"],
         context_pack["receipt"]
     );
+    let public_context = client.session_context(&session_id, Some(1))?;
+    let trace = public_context["latest"]["trace"]
+        .as_array()
+        .expect("public context trace");
+    assert!(trace.iter().all(|entry| {
+        entry["taxonomy"]["schema_version"] == "openagent.context_item_taxonomy.v1"
+    }));
+    assert!(trace.iter().any(|entry| {
+        entry["taxonomy"]["category"] == "conversation"
+            && entry["taxonomy"]["origin"] == "session_message"
+            && entry["taxonomy"]["compaction"] == "summarize"
+    }));
 
     let _ = server.kill();
     let _ = provider_thread.join();

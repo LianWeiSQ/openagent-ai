@@ -3449,9 +3449,15 @@ fn context_replay_failure(status: &str, reasons: &[String]) -> Option<ContextFai
 }
 
 fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
+    let taxonomy = if entry.taxonomy.is_current() {
+        entry.taxonomy.clone()
+    } else {
+        openagent_core::ContextItemTaxonomy::classify(&entry.kind, &entry.source)
+    };
     json!({
         "kind": sanitize_context_diagnostic_label(&entry.kind),
         "source": sanitize_context_diagnostic_source(&entry.source),
+        "taxonomy": taxonomy,
         "priority": entry.priority,
         "pinned": entry.pinned,
         "stable_prefix": entry.stable_prefix,
@@ -11341,6 +11347,29 @@ mod tests {
         assert_ne!(config.cors_origin, "*");
         assert!(config.cors_origin.contains("tauri://localhost"));
         assert!(config.cors_origin.contains("http://tauri.localhost"));
+    }
+
+    #[test]
+    fn public_context_trace_upgrades_legacy_taxonomy() {
+        let entry = serde_json::from_value::<ContextPackTraceEntry>(json!({
+            "item_id": "tool_result:legacy",
+            "kind": "tool_result",
+            "source": "session.messages[2]",
+            "priority": 50,
+            "pinned": false,
+            "stable_prefix": false,
+            "token_estimate": 10,
+            "included": true,
+            "drop_reason": null
+        }))
+        .expect("legacy trace");
+        let public = public_context_trace_entry(&entry);
+        assert_eq!(
+            public["taxonomy"]["schema_version"],
+            "openagent.context_item_taxonomy.v1"
+        );
+        assert_eq!(public["taxonomy"]["category"], "tool_observation");
+        assert_eq!(public["taxonomy"]["compaction"], "summarize");
     }
 
     #[test]
