@@ -1232,6 +1232,30 @@ fn active_context_budget_removes_oversized_history_from_provider_payload()
     assert_eq!(receipt["budget"]["context_window"], 30_000);
     assert_eq!(receipt["budget"]["reserved_output_tokens"], 4_000);
     assert_eq!(receipt["budget"]["input_limit_tokens"], 25_000);
+    assert_eq!(
+        receipt["budget"]["allocation"]["schema_version"],
+        "openagent.context_budget_allocation.v1"
+    );
+    assert_eq!(
+        receipt["budget"]["allocation"]["policy_schema_version"],
+        "openagent.context_budget_policy.v1"
+    );
+    assert_eq!(
+        receipt["budget"]["allocation"]["selected_tokens"],
+        receipt["budget"]["selected_item_tokens"]
+    );
+    assert!(
+        receipt["budget"]["allocation"]["classes"]
+            .as_array()
+            .is_some_and(|classes| classes.iter().any(|class| {
+                matches!(
+                    class["class"].as_str(),
+                    Some("recent_conversation" | "historical_conversation")
+                ) && class["dropped_item_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            }))
+    );
     assert_eq!(receipt["drop_reason_counts"]["model_context_budget"], 1);
     assert!(
         receipt["estimated_input_tokens"]
@@ -2080,6 +2104,25 @@ fn large_tool_output_is_micro_compacted_for_http_provider_and_replay() -> Result
             .to_string()
             .contains("HTTP_MIDDLE_SENTINEL_RAW_LEDGER_ONLY")
     );
+    let allocation_trace = latest["trace"]
+        .as_array()
+        .and_then(|trace| {
+            trace.iter().find_map(|entry| {
+                entry
+                    .get("budget_allocation")
+                    .filter(|value| !value.is_null())
+            })
+        })
+        .ok_or("missing public budget allocation trace")?;
+    assert_eq!(
+        allocation_trace["schema_version"],
+        "openagent.context_budget_allocation.v1"
+    );
+    assert!(
+        allocation_trace["group_id"]
+            .as_str()
+            .is_some_and(|group| group.starts_with("context-group:"))
+    );
 
     let run_id = started["turn"]["id"].as_str().expect("turn id");
     let step = latest["step"].as_u64().expect("context step");
@@ -2091,6 +2134,10 @@ fn large_tool_output_is_micro_compacted_for_http_provider_and_replay() -> Result
     );
     assert_eq!(replay["side_effects"]["provider_calls"], 0);
     assert_eq!(replay["side_effects"]["tool_calls"], 0);
+    assert_eq!(
+        replay["rebuilt"]["receipt"]["budget"]["allocation"],
+        latest["receipt"]["budget"]["allocation"]
+    );
 
     let _ = server.kill();
     let _ = server.wait();
@@ -2104,6 +2151,10 @@ fn large_tool_output_is_micro_compacted_for_http_provider_and_replay() -> Result
     assert_eq!(
         recovered["latest"]["receipt"]["micro_compacted_item_count"],
         1
+    );
+    assert_eq!(
+        recovered["latest"]["receipt"]["budget"]["allocation"]["policy_hash"],
+        latest["receipt"]["budget"]["allocation"]["policy_hash"]
     );
 
     let _ = restarted.kill();

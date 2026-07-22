@@ -1,0 +1,27 @@
+{
+  "schema_version": "openagent.context_budget_allocation.v1",
+  "policy_schema_version": "openagent.context_budget_policy.v1",
+  "policy_hash": "sha1:1b3f6f5b883626485e6ad01f73d5b8f60a5d17ce",
+  "item_budget_tokens": 80,
+  "hard_required_tokens": 20,
+  "hard_selected_tokens": 20,
+  "hard_overflow_tokens": 0,
+  "soft_budget_tokens": 60,
+  "soft_quota_selected_tokens": 20,
+  "borrowed_tokens": 40,
+  "selected_tokens": 80,
+  "dropped_tokens": 20,
+  "classes": [
+    {"class":"instruction","candidate_item_count":0,"candidate_tokens":0,"hard_item_count":0,"hard_tokens":0,"quota_tokens":0,"selected_item_count":0,"selected_tokens":0,"borrowed_tokens":0,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"latest_user","candidate_item_count":1,"candidate_tokens":20,"hard_item_count":1,"hard_tokens":20,"quota_tokens":0,"selected_item_count":1,"selected_tokens":20,"borrowed_tokens":0,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"critical_anchor","candidate_item_count":0,"candidate_tokens":0,"hard_item_count":0,"hard_tokens":0,"quota_tokens":0,"selected_item_count":0,"selected_tokens":0,"borrowed_tokens":0,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"continuation_anchor","candidate_item_count":0,"candidate_tokens":0,"hard_item_count":0,"hard_tokens":0,"quota_tokens":0,"selected_item_count":0,"selected_tokens":0,"borrowed_tokens":0,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"runtime_state","candidate_item_count":0,"candidate_tokens":0,"hard_item_count":0,"hard_tokens":0,"quota_tokens":0,"selected_item_count":0,"selected_tokens":0,"borrowed_tokens":0,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"session_state","candidate_item_count":0,"candidate_tokens":0,"hard_item_count":0,"hard_tokens":0,"quota_tokens":7,"selected_item_count":0,"selected_tokens":0,"borrowed_tokens":0,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"recent_conversation","candidate_item_count":1,"candidate_tokens":20,"hard_item_count":0,"hard_tokens":0,"quota_tokens":21,"selected_item_count":1,"selected_tokens":20,"borrowed_tokens":0,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"tool_observation","candidate_item_count":1,"candidate_tokens":30,"hard_item_count":0,"hard_tokens":0,"quota_tokens":13,"selected_item_count":1,"selected_tokens":30,"borrowed_tokens":30,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"attachment","candidate_item_count":0,"candidate_tokens":0,"hard_item_count":0,"hard_tokens":0,"quota_tokens":4,"selected_item_count":0,"selected_tokens":0,"borrowed_tokens":0,"dropped_item_count":0,"dropped_tokens":0},
+    {"class":"historical_conversation","candidate_item_count":1,"candidate_tokens":20,"hard_item_count":0,"hard_tokens":0,"quota_tokens":9,"selected_item_count":0,"selected_tokens":0,"borrowed_tokens":0,"dropped_item_count":1,"dropped_tokens":20},
+    {"class":"extension","candidate_item_count":1,"candidate_tokens":10,"hard_item_count":0,"hard_tokens":0,"quota_tokens":3,"selected_item_count":1,"selected_tokens":10,"borrowed_tokens":10,"dropped_item_count":0,"dropped_tokens":0}
+  ]
+}

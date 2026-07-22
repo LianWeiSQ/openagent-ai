@@ -167,13 +167,74 @@ state, and receipt replay rebuilds the same registry without calling a provider
 or executing a tool.
 
 `ContextPackBuilder` renders each registered anchor as an independent pinned
-`semantic_anchor` item. Keeping anchors independent is required for per-kind
-budget allocation in the next policy layer. Registry provenance and references
+`semantic_anchor` item. Keeping anchors independent allows per-kind budget
+allocation. Registry provenance and references
 stay in private trace metadata; provider input receives only XML-escaped ID,
 kind, and content. Public HTTP diagnostics expose safe hashes and counts, and
 sanitize the source. An unregistered anchor item, a missing registry item, or a
 metadata mismatch invalidates the pack. Empty registries are omitted from the
 pack hash payload so pre-anchor receipts retain their historical hash.
+
+## Layered Budget Allocation
+
+`openagent.context_budget_allocation.v1` replaces the former global
+`pinned/priority` greedy selector. The old selector could retain an older
+message before a newer one with the same priority and could split an assistant
+tool call from its result. It also provided no explanation for how different
+context families competed for the remaining window.
+
+The allocator consumes typed `ContextItem` records after semantic deduplication,
+token estimation, tool micro-compaction, and required-item fitting. Its policy
+is `openagent.context_budget_policy.v1`; the complete policy is part of
+`ContextPackBuildOptions`, so HTTP receipt replay and runtime restart use the
+same policy rather than reconstructing defaults at an entry point. The default
+recent-tail boundary is derived from `prune_keep_recent_user_turns`, matching
+the existing public context-budget configuration.
+
+Allocation has three phases:
+
+1. hard reserve selects pinned instructions, the latest user request,
+   semantic anchors, active session state, runtime state, and required
+   attachments;
+2. soft quota gives recent conversation, tool observations, session state,
+   attachments, historical conversation, and extension items independent
+   weighted opportunities to fit;
+3. borrowing returns every unused or rounding remainder to one shared pool and
+   makes a deterministic second pass, so an empty class never strands tokens.
+
+Ranking uses taxonomy category and scope, anchor kind, user-turn recency,
+recoverability, explicit priority, source sequence, and a stable group ID.
+Goal and constraint anchors are hard-required and rank ahead of continuation
+anchors; the full anchor tie-break order begins with goal, constraint, blocker,
+decision, and critical context. Current-turn and recent records rank ahead of
+historical records. Inline-only facts receive more protection than equivalent
+facts recoverable from the session ledger, a durable reference, or a rebuildable
+authority.
+
+Assistant messages carrying tool calls and their matching tool-result messages
+form an atomic allocation group. A group is either selected or dropped as a
+whole, preventing malformed provider history. Required fitting still runs
+before allocation and can shrink allowed source types; when required content
+cannot fit even at its hard minimum, the allocator reports
+`required_budget_exhausted` and exact hard overflow tokens instead of silently
+discarding the condition.
+
+Every budgeted message receives a `ContextBudgetItemDecision` in the shared
+trace. Decisions record class, phase (`hard_reserve`, `soft_quota`, `borrowed`,
+or dropped), recency, recoverability, group identity, group size, class quota,
+and deterministic rank. `ContextPackBudget` and the public redacted receipt
+carry aggregate class accounting, policy hash, selected, borrowed, dropped,
+and overflow token counts. The HTTP projection exposes the same fields after
+sanitizing the group label. They contain no item content, provider credentials,
+or model-option values. Pack validation checks schema versions, phase/inclusion
+agreement, class accounting, and total budget before a provider adapter accepts
+the pack.
+
+The design combines OpenCode's bounded recent tail and anchored older-state
+summary with Codex's preference for retaining recent history and canonical
+initial context when trimming overflow. OpenHarness adds a typed allocator at
+the shared builder boundary so CLI, Bridge, replay, and restart all make the
+same selection and expose the same explanation.
 
 ## Invariants
 
@@ -185,6 +246,8 @@ pack hash payload so pre-anchor receipts retain their historical hash.
   was removed.
 - Continuation-critical semantics are versioned, conflict-resolved, and survive
   compaction, restart, and receipt replay independently of summary wording.
+- Budget selection is layered, deterministic, dependency-aware, and replayed
+  from a versioned policy; unused soft quota is always borrowable.
 - Persisted messages and events remain ordered and scoped to one session.
 - Attachments are persisted as metadata plus safe content references.
 - Secret values are redacted before persistence and diagnostics.

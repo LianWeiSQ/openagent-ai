@@ -1,8 +1,10 @@
 //! Core permission, context, instruction, and skill behavior for the Rust rewrite.
 
+mod context_budget_allocator;
 mod context_micro_compaction;
 mod context_taxonomy;
 
+pub use context_budget_allocator::*;
 pub use context_micro_compaction::*;
 pub use context_taxonomy::*;
 
@@ -608,6 +610,10 @@ pub fn context_pack_build_options_for_model(
             tool_output_max_lines: budget.tool_context_preview_lines,
             tool_output_line_max_chars: budget.tool_context_line_max_chars,
         },
+        budget_allocation: ContextBudgetAllocationPolicy {
+            recent_user_turns: budget.prune_keep_recent_user_turns,
+            ..ContextBudgetAllocationPolicy::default()
+        },
     })
 }
 
@@ -918,6 +924,8 @@ pub struct ContextPackTraceEntry {
     pub micro_compaction: Option<ContextMicroCompaction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_anchor: Option<SemanticAnchorDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_allocation: Option<ContextBudgetItemDecision>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -990,6 +998,8 @@ pub struct ContextPackBudget {
     pub item_budget_tokens: Option<u64>,
     pub selected_item_tokens: u64,
     pub overflowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation: Option<ContextBudgetAllocation>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1065,6 +1075,42 @@ impl ContextPack {
         {
             return Err("context pack contains an unregistered semantic anchor item".to_string());
         }
+        if let Some(allocation) = &self.budget.allocation {
+            allocation.validate()?;
+            if allocation.selected_tokens != self.budget.selected_item_tokens
+                || Some(allocation.item_budget_tokens) != self.budget.item_budget_tokens
+            {
+                return Err("context pack budget allocation totals mismatch".to_string());
+            }
+            if self
+                .trace
+                .iter()
+                .filter(|entry| entry.delivery == ContextDelivery::Message)
+                .any(|entry| {
+                    let Some(decision) = entry.budget_allocation.as_ref() else {
+                        return true;
+                    };
+                    if !decision.is_current() {
+                        return true;
+                    }
+                    let decision_included = matches!(
+                        decision.phase,
+                        ContextBudgetAllocationPhase::HardReserve
+                            | ContextBudgetAllocationPhase::SoftQuota
+                            | ContextBudgetAllocationPhase::Borrowed
+                    );
+                    entry.included != decision_included
+                })
+            {
+                return Err("context pack budget allocation trace is incomplete".to_string());
+            }
+        } else if self
+            .trace
+            .iter()
+            .any(|entry| entry.budget_allocation.is_some())
+        {
+            return Err("context pack has allocation trace without an allocation".to_string());
+        }
         let provider_input_hash =
             context_provider_input_hash(&self.messages, &self.tools, &self.model_options);
         if self.provider_input_hash != provider_input_hash
@@ -1098,6 +1144,8 @@ pub struct ContextPackBuildOptions {
     pub fit_required_context: bool,
     #[serde(default)]
     pub micro_compaction: ContextMicroCompactionOptions,
+    #[serde(default)]
+    pub budget_allocation: ContextBudgetAllocationPolicy,
 }
 
 impl Default for ContextPackBuildOptions {
@@ -1111,6 +1159,7 @@ impl Default for ContextPackBuildOptions {
             reserved_output_tokens: 0,
             fit_required_context: true,
             micro_compaction: ContextMicroCompactionOptions::default(),
+            budget_allocation: ContextBudgetAllocationPolicy::default(),
         }
     }
 }
@@ -1155,7 +1204,7 @@ impl ContextPackBuilder {
         {
             items = self.fit_required_items(items, item_budget_tokens);
         }
-        let trace = self.project(&items, item_budget_tokens);
+        let (trace, allocation) = self.project(&items, item_budget_tokens);
         let included_ids = trace
             .iter()
             .filter(|entry| entry.included)
@@ -1185,6 +1234,7 @@ impl ContextPackBuilder {
             item_budget_tokens,
             selected_item_tokens,
             overflowed,
+            allocation,
         };
         let messages = if self.options.trace_only {
             let mut messages = input.messages;
@@ -1355,54 +1405,13 @@ impl ContextPackBuilder {
         &self,
         items: &[ContextItem],
         item_budget_tokens: Option<u64>,
-    ) -> Vec<ContextPackTraceEntry> {
-        let mut included = BTreeSet::new();
-        let mut dropped = BTreeMap::new();
-        let mut used = 0u64;
-        let mut ranked = items.iter().enumerate().collect::<Vec<_>>();
-        ranked.sort_by(|(left_index, left), (right_index, right)| {
-            (
-                !left.pinned,
-                -left.priority,
-                i64::try_from(*left_index).unwrap_or(i64::MAX),
-            )
-                .cmp(&(
-                    !right.pinned,
-                    -right.priority,
-                    i64::try_from(*right_index).unwrap_or(i64::MAX),
-                ))
-        });
-        for (_index, item) in ranked {
-            if let Some(duplicate_of) = item
-                .metadata
-                .get("context_semantic_duplicate_of")
-                .and_then(Value::as_str)
-            {
-                dropped.insert(item.id.clone(), "semantic_duplicate".to_string());
-                debug_assert!(!duplicate_of.is_empty());
-            } else if item.delivery != ContextDelivery::Message
-                || item_budget_tokens.is_none()
-                || used + item.token_estimate <= item_budget_tokens.unwrap_or(0)
-            {
-                included.insert(item.id.clone());
-                if item.delivery == ContextDelivery::Message {
-                    used += item.token_estimate;
-                }
-            } else {
-                dropped.insert(
-                    item.id.clone(),
-                    if item.pinned {
-                        "required_budget_exhausted".to_string()
-                    } else {
-                        "model_context_budget".to_string()
-                    },
-                );
-            }
-        }
-        items
+    ) -> (Vec<ContextPackTraceEntry>, Option<ContextBudgetAllocation>) {
+        let projection =
+            allocate_context_budget(items, item_budget_tokens, &self.options.budget_allocation);
+        let trace = items
             .iter()
             .map(|item| {
-                let is_included = included.contains(&item.id);
+                let is_included = projection.included.contains(&item.id);
                 let truncated = item
                     .metadata
                     .get("context_truncated")
@@ -1422,7 +1431,8 @@ impl ContextPackBuilder {
                         None
                     } else {
                         Some(
-                            dropped
+                            projection
+                                .dropped
                                 .get(&item.id)
                                 .cloned()
                                 .unwrap_or_else(|| "not_selected".to_string()),
@@ -1457,9 +1467,11 @@ impl ContextPackBuilder {
                         .map(ToString::to_string),
                     micro_compaction: micro_compaction_from_metadata(&item.metadata),
                     semantic_anchor: semantic_anchor_from_item_metadata(&item.metadata),
+                    budget_allocation: projection.decisions.get(&item.id).cloned(),
                 }
             })
-            .collect()
+            .collect();
+        (trace, projection.allocation)
     }
 
     fn fit_required_items(
@@ -4581,6 +4593,8 @@ fn message_context_item(index: usize, message: &ChatMessage, latest_user: bool) 
         .unwrap_or_else(|| format!("{}:{index}", role_str(&message.role)));
     let mut metadata = BTreeMap::new();
     metadata.insert("role".to_string(), json!(role_str(&message.role)));
+    metadata.insert("message_index".to_string(), json!(index));
+    metadata.insert("latest_user".to_string(), json!(latest_user));
     metadata.insert(
         "name".to_string(),
         message.name.clone().map_or(Value::Null, Value::String),

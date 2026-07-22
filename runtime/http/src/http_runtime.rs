@@ -3513,6 +3513,20 @@ fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
             "reference_count": anchor.reference_count,
         })
     });
+    let budget_allocation = entry.budget_allocation.as_ref().map(|decision| {
+        json!({
+            "schema_version": decision.schema_version,
+            "class": decision.class,
+            "phase": decision.phase,
+            "recency": decision.recency,
+            "recoverability": decision.recoverability,
+            "hard_required": decision.hard_required,
+            "group_id": sanitize_context_diagnostic_label(&decision.group_id),
+            "group_tokens": decision.group_tokens,
+            "class_quota_tokens": decision.class_quota_tokens,
+            "selection_rank": decision.selection_rank,
+        })
+    });
     json!({
         "kind": sanitize_context_diagnostic_label(&entry.kind),
         "source": sanitize_context_diagnostic_source(&entry.source),
@@ -3531,6 +3545,7 @@ fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
         "semantic_duplicate": entry.semantic_duplicate_of.is_some(),
         "micro_compaction": micro_compaction,
         "semantic_anchor": semantic_anchor,
+        "budget_allocation": budget_allocation,
     })
 }
 

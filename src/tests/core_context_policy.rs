@@ -1861,6 +1861,7 @@ fn core_context_policy_fixture() -> Result<Value, Box<dyn Error>> {
         reserved_output_tokens: 50,
         fit_required_context: true,
         micro_compaction: Default::default(),
+        budget_allocation: Default::default(),
     }))
     .build(ContextPackInput {
         system_sources: None,

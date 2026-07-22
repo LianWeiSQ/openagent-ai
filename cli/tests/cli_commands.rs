@@ -3067,6 +3067,24 @@ fn binary_continue_restores_semantic_anchors_without_provider_metadata_leakage()
         json!(expected_registry_hash)
     );
     assert_eq!(receipt["item_kind_counts"]["semantic_anchor"], 1);
+    assert_eq!(
+        receipt["budget"]["allocation"]["schema_version"],
+        "openagent.context_budget_allocation.v1"
+    );
+    assert_eq!(
+        receipt["budget"]["allocation"]["policy_schema_version"],
+        "openagent.context_budget_policy.v1"
+    );
+    let critical_anchor = receipt["budget"]["allocation"]["classes"]
+        .as_array()
+        .and_then(|classes| {
+            classes
+                .iter()
+                .find(|class| class["class"] == "critical_anchor")
+        })
+        .ok_or("missing CLI critical anchor allocation")?;
+    assert_eq!(critical_anchor["hard_item_count"], 1);
+    assert_eq!(critical_anchor["selected_item_count"], 1);
 
     let _ = fs::remove_dir_all(temp);
     Ok(())
@@ -3765,12 +3783,21 @@ fn binary_local_and_bridge_context_pack_receipts_have_surface_parity() -> Result
         "model_option_keys",
         "item_kind_counts",
         "item_delivery_counts",
+        "budget",
     ] {
         assert_eq!(
             local_receipt[field], remote_receipt[field],
             "context receipt field `{field}` differs across local CLI and Bridge"
         );
     }
+    assert_eq!(
+        local_receipt["budget"]["allocation"]["schema_version"],
+        "openagent.context_budget_allocation.v1"
+    );
+    assert_eq!(
+        local_receipt["budget"]["allocation"]["policy_hash"],
+        remote_receipt["budget"]["allocation"]["policy_hash"]
+    );
     assert_eq!(
         local_state["messages"][0]["content"],
         remote_state["messages"][0]["content"]
