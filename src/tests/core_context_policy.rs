@@ -24,7 +24,8 @@ use openagent_core::{
 };
 use openagent_protocol::{
     ChatMessage, ContextEpoch, Model, ModelCapabilities, ModelPricing, PermissionAction,
-    PermissionRuleset, Role, ToolSchema, WorkState,
+    PermissionRuleset, Role, SemanticAnchor, SemanticAnchorAuthority, SemanticAnchorKind,
+    SemanticAnchorScope, ToolSchema, WorkState, materialize_openai_compatible_payload,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -61,6 +62,7 @@ fn context_pack_contract_is_deterministic_and_receipt_is_redacted() -> Result<()
         attachments: Vec::new(),
         work_state: None,
         checkpoints: Vec::new(),
+        semantic_anchors: Vec::new(),
         skills: Vec::new(),
         tool_manifests: Vec::new(),
         metadata: BTreeMap::from([(
@@ -117,6 +119,142 @@ fn context_pack_contract_is_deterministic_and_receipt_is_redacted() -> Result<()
     assert!(!receipt.contains(secret));
     assert!(!receipt.contains("private description"));
     assert!(!receipt.contains("connection"));
+    Ok(())
+}
+
+#[test]
+fn semantic_anchor_registry_is_preserved_resolved_and_private_from_provider_metadata()
+-> Result<(), Box<dyn Error>> {
+    let private_source = "https://user:password@example.test/state?token=anchor-secret";
+    let private_reference = "workspace:/private/anchor-reference";
+    let old_goal = SemanticAnchor::new(
+        SemanticAnchorKind::Goal,
+        "primary",
+        "Old goal",
+        SemanticAnchorAuthority::StructuredWorkState,
+        SemanticAnchorScope::Session,
+        "context_epoch:old",
+    );
+    let explicit_goal = SemanticAnchor::new(
+        SemanticAnchorKind::Goal,
+        "primary",
+        "Ship <semantic> anchors & preserve intent",
+        SemanticAnchorAuthority::Explicit,
+        SemanticAnchorScope::Session,
+        private_source,
+    )
+    .with_references(vec![private_reference.to_string()]);
+    let decision = SemanticAnchor::new(
+        SemanticAnchorKind::Decision,
+        "registry-contract",
+        "Keep typed anchors independent from summary prose.",
+        SemanticAnchorAuthority::Explicit,
+        SemanticAnchorScope::Session,
+        private_source,
+    );
+    let work_state = ContextWorkState {
+        id: "epoch-old".to_string(),
+        summary: "Prior compacted state".to_string(),
+        format: "structured_work_state".to_string(),
+        source: "context_epoch:old".to_string(),
+        message_position: Some(0),
+        compacted_until_message_id: Some("msg-old".to_string()),
+        semantic_anchors: vec![old_goal],
+        metadata: BTreeMap::new(),
+    };
+    let pack = ContextPackBuilder::new(Some(ContextPackBuildOptions {
+        token_budget: Some(512),
+        trace_only: false,
+        ..ContextPackBuildOptions::default()
+    }))
+    .build(ContextPackInput {
+        messages: vec![chat(Role::User, "Continue")],
+        work_state: Some(work_state),
+        semantic_anchors: vec![explicit_goal.clone(), decision],
+        extra_items: vec![ContextItem::new(
+            "extension:large",
+            "extension",
+            "extension.fixture",
+            "ordinary context ".repeat(2_000),
+            1,
+        )],
+        ..ContextPackInput::default()
+    });
+
+    pack.validate_provider_input()?;
+    assert_eq!(pack.semantic_anchor_registry.anchors.len(), 2);
+    assert_eq!(pack.semantic_anchor_registry.superseded_count, 1);
+    assert_eq!(pack.semantic_anchor_registry.anchors[0], explicit_goal);
+    assert_eq!(
+        pack.receipt.item_category_counts.get("semantic_anchor"),
+        Some(&2)
+    );
+    assert!(
+        pack.trace
+            .iter()
+            .filter(|entry| entry.kind == "semantic_anchor")
+            .all(|entry| entry.included
+                && entry.pinned
+                && !entry.truncated
+                && entry.drop_reason.is_none())
+    );
+    assert!(pack.trace.iter().any(|entry| {
+        entry.item_id == "extension:large"
+            && entry.drop_reason.as_deref() == Some("model_context_budget")
+    }));
+    let rendered = pack
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Ship &lt;semantic&gt; anchors &amp; preserve intent"));
+
+    let provider_payload = materialize_openai_compatible_payload(
+        None,
+        &pack.messages,
+        &pack.tools,
+        None,
+        Some(&pack.model_options),
+    );
+    let provider_json = serde_json::to_string(&provider_payload)?;
+    assert!(!provider_json.contains(private_source));
+    assert!(!provider_json.contains(private_reference));
+    assert!(!provider_json.contains("anchor-secret"));
+    let receipt_json = serde_json::to_string(&pack.receipt)?;
+    assert!(!receipt_json.contains("Ship <semantic>"));
+    assert!(!receipt_json.contains(private_source));
+
+    let mut tampered = pack;
+    tampered
+        .items
+        .iter_mut()
+        .find(|item| item.kind == "semantic_anchor")
+        .expect("semantic anchor item")
+        .metadata
+        .remove("semantic_anchor");
+    assert!(
+        tampered
+            .validate_provider_input()
+            .expect_err("tampered anchor must fail")
+            .contains("semantic anchor item mismatch")
+    );
+    let orphan = ContextPackBuilder::default().build(ContextPackInput {
+        extra_items: vec![ContextItem::new(
+            "anchor:goal:primary",
+            "semantic_anchor",
+            "extension.fixture",
+            "Unregistered anchor",
+            94,
+        )],
+        ..ContextPackInput::default()
+    });
+    assert_eq!(
+        orphan
+            .validate_provider_input()
+            .expect_err("orphan anchor must fail"),
+        "context pack contains an unregistered semantic anchor item"
+    );
     Ok(())
 }
 
@@ -830,6 +968,7 @@ fn stable_prefix_partitions_messages_and_semantically_dedupes_static_context() {
             source: "session.compaction".to_string(),
             message_position: Some(0),
             compacted_until_message_id: Some("msg-1".to_string()),
+            semantic_anchors: Vec::new(),
             metadata: BTreeMap::new(),
         }),
         extra_items: vec![shared_instruction, duplicate_instruction],
@@ -1024,6 +1163,7 @@ fn typed_todo_checkpoint_and_work_state_preserve_order_and_redact_receipt()
         source: "session.transcript.compaction".to_string(),
         message_position: Some(1),
         compacted_until_message_id: Some("msg-6".to_string()),
+        semantic_anchors: Vec::new(),
         metadata: BTreeMap::new(),
     };
     let todo = ContextTodo::new(
@@ -1395,6 +1535,7 @@ fn required_context_is_source_aware_truncated_and_strict_error_remains_available
             source: "session.compaction".to_string(),
             message_position: Some(0),
             compacted_until_message_id: Some("msg-before-fit".to_string()),
+            semantic_anchors: Vec::new(),
             metadata: BTreeMap::new(),
         }),
         todos: vec![ContextTodo::new(
@@ -1739,6 +1880,7 @@ fn core_context_policy_fixture() -> Result<Value, Box<dyn Error>> {
         attachments: Vec::new(),
         work_state: None,
         checkpoints: Vec::new(),
+        semantic_anchors: Vec::new(),
         skills: Vec::new(),
         tool_manifests: Vec::new(),
         metadata: BTreeMap::from([

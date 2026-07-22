@@ -3,10 +3,11 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 use openagent_protocol::{
     AgentDescriptor, AgentResult, AgentSpec, ArtifactRef, ChatMessage, ContextEpoch, FanoutBudget,
     FinishReason, Model, ModelCapabilities, ModelPricing, PermissionMode, PermissionRuleset,
-    RUNTIME_OPTION_KEYS, Role, RunContext, RunLimits, RunStatus, StreamEvent, SwarmUsage, ToolCall,
-    ToolDefinitionSchemaFixture, ToolExecutionSchema, ToolExecutionScope, ToolResult, ToolSchema,
-    Usage, WorkState, WorkStateFile, materialize_openai_compatible_payload, render_work_state,
-    ruleset,
+    RUNTIME_OPTION_KEYS, Role, RunContext, RunLimits, RunStatus, SemanticAnchor,
+    SemanticAnchorAuthority, SemanticAnchorKind, SemanticAnchorRegistry, SemanticAnchorScope,
+    StreamEvent, SwarmUsage, ToolCall, ToolDefinitionSchemaFixture, ToolExecutionSchema,
+    ToolExecutionScope, ToolResult, ToolSchema, Usage, WorkState, WorkStateFile,
+    materialize_openai_compatible_payload, render_work_state, ruleset,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -53,6 +54,44 @@ fn tool_definition_schema_fixture_matches_legacy_oracle() {
 #[test]
 fn context_state_fixture_matches_legacy_oracle() {
     assert_fixture_eq("context_state.json", context_state_fixture());
+}
+
+#[test]
+fn semantic_anchor_registry_fixture_is_versioned_and_deterministic() {
+    let old_goal = SemanticAnchor::new(
+        SemanticAnchorKind::Goal,
+        "primary",
+        "Old goal.",
+        SemanticAnchorAuthority::StructuredWorkState,
+        SemanticAnchorScope::Session,
+        "context_epoch:old",
+    );
+    let goal = SemanticAnchor::new(
+        SemanticAnchorKind::Goal,
+        "primary",
+        "Ship semantic anchors.",
+        SemanticAnchorAuthority::Explicit,
+        SemanticAnchorScope::Session,
+        "api.context",
+    )
+    .with_references(vec!["goal:root".to_string()]);
+    let decision = SemanticAnchor::new(
+        SemanticAnchorKind::Decision,
+        "registry-contract",
+        "Use typed, versioned anchors.",
+        SemanticAnchorAuthority::Explicit,
+        SemanticAnchorScope::Session,
+        "api.context",
+    );
+    let registry = SemanticAnchorRegistry::build(vec![old_goal, goal, decision]);
+    assert_fixture_eq(
+        "semantic_anchor_registry.json",
+        json!({
+            "schema_version": 1,
+            "registry": registry,
+            "diagnostics": registry.diagnostics(),
+        }),
+    );
 }
 
 fn core_protocol_fixture() -> Value {
@@ -354,6 +393,7 @@ fn fixture_messages(tool_call: &ToolCall, tool_result: &ToolResult) -> Vec<ChatM
 fn fixture_work_state() -> WorkState {
     WorkState {
         task: "Freeze Python behavior for Rust rewrite.".to_string(),
+        constraints: Vec::new(),
         progress: vec!["Captured protocol fixtures.".to_string()],
         decisions: vec!["Fixtures must be deterministic.".to_string()],
         files: vec![WorkStateFile {
@@ -367,6 +407,7 @@ fn fixture_work_state() -> WorkState {
         blockers: Vec::new(),
         next_steps: vec!["Implement Rust protocol crate.".to_string()],
         risks: vec!["Later live-provider smoke tests need credentials.".to_string()],
+        critical_context: Vec::new(),
     }
 }
 

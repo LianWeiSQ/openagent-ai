@@ -1,8 +1,10 @@
 //! Shared protocol contracts for OpenAgent.
 
 mod context_epoch;
+mod semantic_anchor;
 
 pub use context_epoch::*;
+pub use semantic_anchor::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -959,6 +961,8 @@ pub struct ToolDefinitionSchemaFixture {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct WorkState {
     pub task: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
     pub progress: Vec<String>,
     pub decisions: Vec<String>,
     pub files: Vec<WorkStateFile>,
@@ -968,6 +972,8 @@ pub struct WorkState {
     pub blockers: Vec<String>,
     pub next_steps: Vec<String>,
     pub risks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub critical_context: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -989,6 +995,7 @@ pub fn render_work_state(state: &WorkState) -> String {
         },
     ];
 
+    append_text_section(&mut sections, "Constraints", &state.constraints);
     append_text_section(&mut sections, "Progress", &state.progress);
     append_text_section(&mut sections, "Decisions", &state.decisions);
     append_files_section(&mut sections, &state.files);
@@ -998,6 +1005,7 @@ pub fn render_work_state(state: &WorkState) -> String {
     append_text_section(&mut sections, "Blockers", &state.blockers);
     append_text_section(&mut sections, "Next steps", &state.next_steps);
     append_text_section(&mut sections, "Risks", &state.risks);
+    append_text_section(&mut sections, "Critical context", &state.critical_context);
 
     sections.join("\n").trim().to_string()
 }

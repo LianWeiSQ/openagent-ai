@@ -13,6 +13,7 @@ pub enum ContextItemCategory {
     ToolManifest,
     RuntimeState,
     SessionState,
+    SemanticAnchor,
     Extension,
 }
 
@@ -28,6 +29,7 @@ impl ContextItemCategory {
             Self::ToolManifest => "tool_manifest",
             Self::RuntimeState => "runtime_state",
             Self::SessionState => "session_state",
+            Self::SemanticAnchor => "semantic_anchor",
             Self::Extension => "extension",
         }
     }
@@ -50,6 +52,7 @@ pub enum ContextItemOrigin {
     WorkState,
     Todo,
     Checkpoint,
+    SemanticAnchorRegistry,
     Extension,
 }
 
@@ -71,6 +74,7 @@ impl ContextItemOrigin {
             Self::WorkState => "work_state",
             Self::Todo => "todo",
             Self::Checkpoint => "checkpoint",
+            Self::SemanticAnchorRegistry => "semantic_anchor_registry",
             Self::Extension => "extension",
         }
     }
@@ -144,13 +148,13 @@ impl ContextItemTaxonomy {
     pub fn classify(kind: &str, source: &str) -> Self {
         use ContextCompactionPolicy::{Drop, Preserve, Rebuild, Summarize, Truncate};
         use ContextItemCategory::{
-            Attachment, Conversation, Extension, Instruction, RuntimeState, SessionState, Skill,
-            ToolManifest, ToolObservation,
+            Attachment, Conversation, Extension, Instruction, RuntimeState, SemanticAnchor,
+            SessionState, Skill, ToolManifest, ToolObservation,
         };
         use ContextItemOrigin::{
             AgentProfile, Checkpoint, InstructionFile, LegacySystem, Runtime, Sandbox,
-            SessionMessage, SkillCatalog, SkillDocument, SystemAssembly, Todo, ToolRegistry,
-            TurnAttachment, WorkState,
+            SemanticAnchorRegistry, SessionMessage, SkillCatalog, SkillDocument, SystemAssembly,
+            Todo, ToolRegistry, TurnAttachment, WorkState,
         };
         use ContextItemScope::{Session, Stable, Turn};
 
@@ -171,6 +175,7 @@ impl ContextItemTaxonomy {
             "work_state" => (SessionState, WorkState, Session, Preserve),
             "todo" => (SessionState, Todo, Session, Preserve),
             "checkpoint" => (SessionState, Checkpoint, Session, Summarize),
+            "semantic_anchor" => (SemanticAnchor, SemanticAnchorRegistry, Session, Preserve),
             value if value.starts_with("attachment_") => {
                 (Attachment, TurnAttachment, Session, Truncate)
             }

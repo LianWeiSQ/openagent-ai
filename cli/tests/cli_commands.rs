@@ -14,7 +14,10 @@ use std::{
 
 use openagent_cli::cli_commands_fixture;
 use openagent_lsp::command_available;
-use openagent_protocol::{ChatMessage, Role};
+use openagent_protocol::{
+    ChatMessage, ContextEpoch, Role, SemanticAnchor, SemanticAnchorAuthority, SemanticAnchorKind,
+    SemanticAnchorRegistry, SemanticAnchorScope,
+};
 use openagent_session::{FileSessionStore, Session, StartRunOptions};
 use serde_json::{Value, json};
 
@@ -2951,6 +2954,119 @@ You are the dynamic profile.
     assert!(requests[1].contains("SECOND_TURN_INSTRUCTION"));
     assert!(!requests[1].contains("FIRST_TURN_INSTRUCTION"));
     assert!(requests[1].contains("You are the dynamic profile."));
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_continue_restores_semantic_anchors_without_provider_metadata_leakage()
+-> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-semantic-anchor")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let store = FileSessionStore::new(session_root.clone());
+    let mut session = Session::new("session_cli_anchor", workspace.clone());
+    let mut old = ChatMessage {
+        role: Role::User,
+        content: "Old request before restart".to_string(),
+        name: None,
+        tool_call_id: None,
+        metadata: BTreeMap::new(),
+    };
+    old.metadata
+        .insert("message_id".to_string(), json!("msg_cli_anchor_old"));
+    session.add(old.clone());
+    store
+        .append_message(&session, &old, "run_cli_anchor", 0)
+        .expect("old anchor message appends");
+    let private_source = "https://user:password@example.test/anchor?token=private";
+    let private_reference = "workspace:/private/cli-anchor";
+    let goal = SemanticAnchor::new(
+        SemanticAnchorKind::Goal,
+        "primary",
+        "Restore the CLI semantic anchor",
+        SemanticAnchorAuthority::Explicit,
+        SemanticAnchorScope::Session,
+        private_source,
+    )
+    .with_references(vec![private_reference.to_string()]);
+    store
+        .append_context_epoch(
+            &mut session,
+            ContextEpoch::manual(
+                "epoch_cli_anchor",
+                "session_cli_anchor",
+                "run_cli_anchor",
+                1,
+                1,
+                Some("msg_cli_anchor_old".to_string()),
+                "Resume the CLI anchor task.",
+            )
+            .with_anchor_registry(SemanticAnchorRegistry::build(vec![goal.clone()])),
+        )
+        .expect("CLI anchor epoch appends");
+    store
+        .save_state(&session, Some("run_cli_anchor"))
+        .expect("CLI anchor state saves");
+
+    let response = json!({
+        "id": "resp_cli_anchor",
+        "output_text": "anchor restored",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string();
+    let (port, server, requests) =
+        serve_http_capture_responses_on_free_port("application/json", vec![response])?;
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--continue",
+            "--workspace",
+            path_str(&workspace),
+            "--session-root",
+            path_str(&session_root),
+            "--format",
+            "json",
+            "continue",
+            "anchor",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
+        .env("OPENAI_WIRE_API", "responses")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server
+        .join()
+        .expect("semantic anchor provider thread")
+        .expect("semantic anchor provider response");
+    let requests = requests.lock().expect("captured provider requests");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("Restore the CLI semantic anchor"));
+    assert!(!requests[0].contains(private_source));
+    assert!(!requests[0].contains(private_reference));
+    assert!(!requests[0].contains("password"));
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root
+            .join("session_cli_anchor")
+            .join("state.latest.json"),
+    )?)?;
+    let receipt = &state["metadata"]["context_pack"]["receipt"];
+    assert_eq!(receipt["semantic_anchor_registry"]["anchor_count"], 1);
+    let expected_registry_hash = SemanticAnchorRegistry::build(vec![goal]).registry_hash;
+    assert_eq!(
+        receipt["semantic_anchor_registry"]["registry_hash"],
+        json!(expected_registry_hash)
+    );
+    assert_eq!(receipt["item_kind_counts"]["semantic_anchor"], 1);
 
     let _ = fs::remove_dir_all(temp);
     Ok(())

@@ -77,6 +77,11 @@
       "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "session_state", "origin": "checkpoint", "scope": "session", "compaction": "summarize"}
     },
     {
+      "kind": "semantic_anchor",
+      "source": "semantic_anchor.registry",
+      "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "semantic_anchor", "origin": "semantic_anchor_registry", "scope": "session", "compaction": "preserve"}
+    },
+    {
       "kind": "diagnostic",
       "source": "extension.fixture",
       "taxonomy": {"schema_version": "openagent.context_item_taxonomy.v1", "category": "extension", "origin": "extension", "scope": "turn", "compaction": "drop"}

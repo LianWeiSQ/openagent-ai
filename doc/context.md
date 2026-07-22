@@ -131,6 +131,50 @@ remain usable, but all new writes use `ContextEpoch` exclusively. A manual
 compaction of an empty session can update session metadata without inventing a
 message boundary.
 
+## Semantic Anchors
+
+`openagent.semantic_anchor.v1` separates continuation-critical facts from the
+summary prose that happens to describe them. This follows OpenCode's practice
+of carrying goal, constraints, progress, decisions, next steps, and critical
+context through compaction, together with Claude Code's emphasis on preserving
+user intent, edited files, errors, fixes, and the exact continuation point.
+OpenHarness turns those conventions into a typed runtime contract rather than
+depending on a model to reproduce section headings consistently.
+
+An anchor has a stable ID, kind, session or epoch scope, authority, source,
+content hash, priority, and optional durable references. Supported kinds are
+goal, constraint, decision, progress, file, critical context, blocker, next
+step, and recovery point. IDs are independent of storage location: the primary
+goal has a fixed ID, todo and checkpoint anchors use their durable business
+identity, files preserve case-sensitive paths, and content-addressed facts use
+a normalized key.
+
+`openagent.semantic_anchor_registry.v1` is the deterministic conflict resolver.
+It rejects malformed candidates, merges equal IDs by authority and priority,
+uses the latest candidate only as the final tie-breaker, sorts the resulting
+snapshot canonically, and hashes the full anchor set. Explicit input outranks a
+context epoch, which outranks structured work state, todos, checkpoints, and
+message-derived evidence. The original transcript and typed epoch remain the
+authority; the registry is a resumable semantic index over those records.
+
+At compaction time the HTTP runtime merges the previous registry with current
+structured work state, active todos, selected checkpoints, and a recovery
+anchor for the new boundary. Live todo and checkpoint items are not duplicated
+as anchor messages before compaction. Each completed epoch stores the complete
+registry, while event diagnostics expose only schema, hashes, counts, and kind
+distribution. Restart materialization copies the epoch anchors into typed work
+state, and receipt replay rebuilds the same registry without calling a provider
+or executing a tool.
+
+`ContextPackBuilder` renders each registered anchor as an independent pinned
+`semantic_anchor` item. Keeping anchors independent is required for per-kind
+budget allocation in the next policy layer. Registry provenance and references
+stay in private trace metadata; provider input receives only XML-escaped ID,
+kind, and content. Public HTTP diagnostics expose safe hashes and counts, and
+sanitize the source. An unregistered anchor item, a missing registry item, or a
+metadata mismatch invalidates the pack. Empty registries are omitted from the
+pack hash payload so pre-anchor receipts retain their historical hash.
+
 ## Invariants
 
 - One runtime path owns provider-message assembly.
@@ -139,6 +183,8 @@ message boundary.
   retains the complete source result and a typed recovery reference.
 - Compaction is resumable, typed, parent-linked, and records what information
   was removed.
+- Continuation-critical semantics are versioned, conflict-resolved, and survive
+  compaction, restart, and receipt replay independently of summary wording.
 - Persisted messages and events remain ordered and scoped to one session.
 - Attachments are persisted as metadata plus safe content references.
 - Secret values are redacted before persistence and diagnostics.

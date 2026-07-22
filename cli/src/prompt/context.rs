@@ -63,6 +63,7 @@ pub(super) fn build_cli_context_pack(
         work_state,
         todos,
         checkpoints,
+        semantic_anchors: Vec::new(),
         skills: Vec::new(),
         tool_manifests,
         metadata: BTreeMap::new(),

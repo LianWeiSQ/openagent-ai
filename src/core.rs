@@ -15,7 +15,8 @@ use std::{
 
 use openagent_protocol::{
     ChatMessage, ContextEpoch, MaterializedPayload, Model, PermissionAction, PermissionRule,
-    PermissionRuleset, Role, ToolSchema, Usage, WorkState, WorkStateFile,
+    PermissionRuleset, Role, SemanticAnchor, SemanticAnchorDiagnostics, SemanticAnchorRegistry,
+    SemanticAnchorRegistryDiagnostics, ToolSchema, Usage, WorkState, WorkStateFile,
     materialize_openai_compatible_payload, render_work_state, ruleset,
 };
 use regex::Regex;
@@ -836,6 +837,8 @@ pub struct ContextWorkState {
     pub source: String,
     pub message_position: Option<usize>,
     pub compacted_until_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_anchors: Vec<SemanticAnchor>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, Value>,
 }
@@ -913,6 +916,8 @@ pub struct ContextPackTraceEntry {
     pub semantic_duplicate_of: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub micro_compaction: Option<ContextMicroCompaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_anchor: Option<SemanticAnchorDiagnostics>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -963,6 +968,11 @@ pub struct ContextPackReceipt {
     pub micro_compacted_item_count: u64,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub micro_compaction_saved_tokens: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "SemanticAnchorRegistryDiagnostics::is_empty"
+    )]
+    pub semantic_anchor_registry: SemanticAnchorRegistryDiagnostics,
     #[serde(default)]
     pub stable_prefix: ContextStablePrefix,
     pub estimated_input_tokens: u64,
@@ -992,6 +1002,8 @@ pub struct ContextPack {
     pub model_options: BTreeMap<String, Value>,
     pub items: Vec<ContextItem>,
     pub trace: Vec<ContextPackTraceEntry>,
+    #[serde(default, skip_serializing_if = "SemanticAnchorRegistry::is_empty")]
+    pub semantic_anchor_registry: SemanticAnchorRegistry,
     #[serde(default)]
     pub stable_prefix: ContextStablePrefix,
     #[serde(default)]
@@ -1020,6 +1032,39 @@ impl ContextPack {
         {
             return Err("context pack contains an unsupported item taxonomy".to_string());
         }
+        self.semantic_anchor_registry.validate()?;
+        if self.receipt.semantic_anchor_registry != self.semantic_anchor_registry.diagnostics() {
+            return Err("context pack semantic anchor diagnostics mismatch".to_string());
+        }
+        for anchor in &self.semantic_anchor_registry.anchors {
+            let Some(item) = self
+                .items
+                .iter()
+                .find(|item| item.id == anchor.id && item.kind == "semantic_anchor")
+            else {
+                return Err(format!(
+                    "context pack is missing semantic anchor item: {}",
+                    anchor.id
+                ));
+            };
+            if semantic_anchor_from_item_metadata(&item.metadata).as_ref()
+                != Some(&anchor.diagnostics())
+            {
+                return Err(format!(
+                    "context pack semantic anchor item mismatch: {}",
+                    anchor.id
+                ));
+            }
+        }
+        if self
+            .items
+            .iter()
+            .filter(|item| item.kind == "semantic_anchor")
+            .count()
+            != self.semantic_anchor_registry.anchors.len()
+        {
+            return Err("context pack contains an unregistered semantic anchor item".to_string());
+        }
         let provider_input_hash =
             context_provider_input_hash(&self.messages, &self.tools, &self.model_options);
         if self.provider_input_hash != provider_input_hash
@@ -1033,6 +1078,7 @@ impl ContextPack {
             &self.model_options,
             &self.items,
             &self.trace,
+            &self.semantic_anchor_registry,
         );
         if self.pack_hash != pack_hash || self.receipt.pack_hash != pack_hash {
             return Err("context pack integrity hash mismatch".to_string());
@@ -1089,7 +1135,9 @@ impl ContextPackBuilder {
             .system_sources
             .as_ref()
             .and_then(materialize_context_system_sources);
-        let mut items = self.collect_items_with_system(&input, system.as_ref());
+        let semantic_anchor_registry = semantic_anchor_registry_for_input(&input);
+        let mut items =
+            self.collect_items_with_system(&input, system.as_ref(), &semantic_anchor_registry);
         items = self.semantic_dedupe_items(self.dedupe_items(items));
         items = self.with_estimates(items);
         items = self.micro_compact_items(items);
@@ -1167,7 +1215,14 @@ impl ContextPackBuilder {
             overflowed,
         );
         let provider_input_hash = context_provider_input_hash(&messages, &tools, &model_options);
-        let pack_hash = context_pack_hash(&messages, &tools, &model_options, &items, &trace);
+        let pack_hash = context_pack_hash(
+            &messages,
+            &tools,
+            &model_options,
+            &items,
+            &trace,
+            &semantic_anchor_registry,
+        );
         let receipt = context_pack_receipt(
             &pack_hash,
             &provider_input_hash,
@@ -1176,6 +1231,7 @@ impl ContextPackBuilder {
             &model_options,
             &items,
             &trace,
+            &semantic_anchor_registry,
             &stable_prefix,
             estimated_input_tokens,
             &budget,
@@ -1189,6 +1245,7 @@ impl ContextPackBuilder {
             model_options,
             items,
             trace,
+            semantic_anchor_registry,
             stable_prefix,
             system_diagnostics: system.map(|system| system.diagnostics),
             estimated_input_tokens,
@@ -1204,13 +1261,15 @@ impl ContextPackBuilder {
             .system_sources
             .as_ref()
             .and_then(materialize_context_system_sources);
-        self.collect_items_with_system(&input, system.as_ref())
+        let semantic_anchor_registry = semantic_anchor_registry_for_input(&input);
+        self.collect_items_with_system(&input, system.as_ref(), &semantic_anchor_registry)
     }
 
     fn collect_items_with_system(
         &self,
         input: &ContextPackInput,
         system: Option<&ContextSystemMaterialization>,
+        semantic_anchor_registry: &SemanticAnchorRegistry,
     ) -> Vec<ContextItem> {
         let mut items = Vec::new();
         if let Some(system) = system {
@@ -1243,6 +1302,7 @@ impl ContextPackBuilder {
         }
         let todos = todo_items(&input.todos);
         let checkpoints = checkpoint_items(&input.checkpoints);
+        let semantic_anchors = semantic_anchor_items(semantic_anchor_registry);
         let work_state = work_state_item(
             input.work_state.as_ref(),
             &input.metadata,
@@ -1252,6 +1312,7 @@ impl ContextPackBuilder {
             &input.messages,
             &input.attachments,
             work_state,
+            semantic_anchors,
             todos,
             checkpoints,
         ));
@@ -1395,6 +1456,7 @@ impl ContextPackBuilder {
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
                     micro_compaction: micro_compaction_from_metadata(&item.metadata),
+                    semantic_anchor: semantic_anchor_from_item_metadata(&item.metadata),
                 }
             })
             .collect()
@@ -1533,6 +1595,7 @@ pub struct ContextPackInput {
     pub work_state: Option<ContextWorkState>,
     pub todos: Vec<ContextTodo>,
     pub checkpoints: Vec<ContextCheckpoint>,
+    pub semantic_anchors: Vec<SemanticAnchor>,
     pub skills: Vec<ContextItem>,
     pub tool_manifests: Vec<ContextItem>,
     pub metadata: BTreeMap<String, Value>,
@@ -1720,6 +1783,8 @@ fn required_context_truncation_order(item: &ContextItem) -> u8 {
         30
     } else if item.kind == "work_state" {
         40
+    } else if item.kind == "semantic_anchor" {
+        70
     } else if item.metadata.get("role").and_then(Value::as_str) == Some("system") {
         50
     } else if item.metadata.get("role").and_then(Value::as_str) == Some("user") {
@@ -1738,6 +1803,8 @@ fn required_context_minimum_bytes(item: &ContextItem) -> usize {
         256
     } else if item.kind == "work_state" {
         512
+    } else if item.kind == "semantic_anchor" {
+        item.content.len()
     } else if item.metadata.get("role").and_then(Value::as_str) == Some("system") {
         768
     } else if item.metadata.get("role").and_then(Value::as_str) == Some("user") {
@@ -1946,13 +2013,17 @@ fn context_pack_hash(
     model_options: &BTreeMap<String, Value>,
     items: &[ContextItem],
     trace: &[ContextPackTraceEntry],
+    semantic_anchor_registry: &SemanticAnchorRegistry,
 ) -> String {
-    let payload = json!({
+    let mut payload = json!({
         "schema_version": CONTEXT_PACK_SCHEMA_VERSION,
         "provider_input_hash": context_provider_input_hash(messages, tools, model_options),
         "items": items,
         "trace": trace,
     });
+    if !semantic_anchor_registry.is_empty() {
+        payload["semantic_anchor_registry"] = json!(semantic_anchor_registry);
+    }
     format!("sha1:{}", sha1_hex(&stable_json_dumps(&payload)))
 }
 
@@ -1965,6 +2036,7 @@ fn context_pack_receipt(
     model_options: &BTreeMap<String, Value>,
     items: &[ContextItem],
     trace: &[ContextPackTraceEntry],
+    semantic_anchor_registry: &SemanticAnchorRegistry,
     stable_prefix: &ContextStablePrefix,
     estimated_input_tokens: u64,
     budget: &ContextPackBudget,
@@ -2063,6 +2135,7 @@ fn context_pack_receipt(
         semantic_duplicate_count,
         micro_compacted_item_count,
         micro_compaction_saved_tokens,
+        semantic_anchor_registry: semantic_anchor_registry.diagnostics(),
         stable_prefix: stable_prefix.clone(),
         estimated_input_tokens,
         budget: budget.clone(),
@@ -2373,6 +2446,7 @@ pub fn context_work_state_from_epoch(
         source: epoch.source.clone(),
         message_position: Some(message_position),
         compacted_until_message_id: epoch.compacted_until_message_id.clone(),
+        semantic_anchors: epoch.anchor_registry.anchors.clone(),
         metadata,
     })
 }
@@ -2408,6 +2482,7 @@ pub fn context_work_state_from_compact_metadata(
             .get("compacted_until_message_id")
             .and_then(Value::as_str)
             .map(ToString::to_string),
+        semantic_anchors: Vec::new(),
         metadata: BTreeMap::new(),
     })
 }
@@ -2449,6 +2524,7 @@ fn context_work_state_from_boundary(message: ChatMessage) -> ContextWorkState {
         source,
         message_position: Some(0),
         compacted_until_message_id,
+        semantic_anchors: Vec::new(),
         metadata,
     }
 }
@@ -4220,6 +4296,7 @@ fn render_compaction_summary(raw: &Map<String, Value>) -> Option<String> {
 fn work_state_from_map(state: &Map<String, Value>) -> WorkState {
     WorkState {
         task: string_field(state, "task"),
+        constraints: string_vec_field(state, "constraints"),
         progress: string_vec_field(state, "progress"),
         decisions: string_vec_field(state, "decisions"),
         files: state
@@ -4240,6 +4317,7 @@ fn work_state_from_map(state: &Map<String, Value>) -> WorkState {
         blockers: string_vec_field(state, "blockers"),
         next_steps: string_vec_field(state, "next_steps"),
         risks: string_vec_field(state, "risks"),
+        critical_context: string_vec_field(state, "critical_context"),
     }
 }
 
@@ -4359,10 +4437,62 @@ fn checkpoint_items(checkpoints: &[ContextCheckpoint]) -> Vec<ContextItem> {
         .collect()
 }
 
+fn semantic_anchor_registry_for_input(input: &ContextPackInput) -> SemanticAnchorRegistry {
+    let mut candidates = input
+        .work_state
+        .as_ref()
+        .map(|work_state| work_state.semantic_anchors.clone())
+        .unwrap_or_default();
+    candidates.extend(input.semantic_anchors.clone());
+    SemanticAnchorRegistry::build(candidates)
+}
+
+fn semantic_anchor_items(registry: &SemanticAnchorRegistry) -> Vec<ContextItem> {
+    registry
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let mut item = ContextItem::new(
+                anchor.id.clone(),
+                "semantic_anchor",
+                "semantic_anchor.registry",
+                format!(
+                    "<semantic_anchor id=\"{}\" kind=\"{}\">\n{}\n</semantic_anchor>",
+                    xml_escape(&anchor.id),
+                    anchor.kind.as_str(),
+                    xml_escape(&anchor.content),
+                ),
+                anchor.priority,
+            );
+            item.pinned = true;
+            item.metadata.insert(
+                "semantic_anchor".to_string(),
+                serde_json::to_value(anchor.diagnostics()).unwrap_or(Value::Null),
+            );
+            item
+        })
+        .collect()
+}
+
+fn semantic_anchor_from_item_metadata(
+    metadata: &BTreeMap<String, Value>,
+) -> Option<SemanticAnchorDiagnostics> {
+    metadata
+        .get("semantic_anchor")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .filter(|diagnostics: &SemanticAnchorDiagnostics| {
+            diagnostics.schema_version == openagent_protocol::SEMANTIC_ANCHOR_SCHEMA_VERSION
+                && !diagnostics.id.trim().is_empty()
+                && !diagnostics.content_hash.trim().is_empty()
+        })
+}
+
 fn message_and_session_context_items(
     messages: &[ChatMessage],
     attachments: &[ContextAttachment],
     work_state: Option<ContextItem>,
+    semantic_anchors: Vec<ContextItem>,
     todos: Vec<ContextItem>,
     checkpoints: Vec<ContextItem>,
 ) -> Vec<ContextItem> {
@@ -4381,7 +4511,13 @@ fn message_and_session_context_items(
         .rposition(|message| message.role == Role::User)
         .unwrap_or(messages.len());
     let mut work_state = work_state;
-    let mut session_items = Some(todos.into_iter().chain(checkpoints).collect::<Vec<_>>());
+    let mut session_items = Some(
+        semantic_anchors
+            .into_iter()
+            .chain(todos)
+            .chain(checkpoints)
+            .collect::<Vec<_>>(),
+    );
     for position in 0..=messages.len() {
         if work_state_position == Some(position)
             && let Some(item) = work_state.take()

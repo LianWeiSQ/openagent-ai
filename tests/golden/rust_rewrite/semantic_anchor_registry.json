@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "registry": {
+    "schema_version": "openagent.semantic_anchor_registry.v1",
+    "registry_hash": "sha1:a03cea891a6e7501161a20f9d0dd2590c68704b2",
+    "anchors": [
+      {
+        "schema_version": "openagent.semantic_anchor.v1",
+        "id": "anchor:goal:primary",
+        "kind": "goal",
+        "scope": "session",
+        "authority": "explicit",
+        "source": "api.context",
+        "content": "Ship semantic anchors.",
+        "content_hash": "sha1:0b483cd92525d3597612bff68dfda6eba1219a8e",
+        "priority": 94,
+        "references": ["goal:root"]
+      },
+      {
+        "schema_version": "openagent.semantic_anchor.v1",
+        "id": "anchor:decision:20397ea9ff95dcff60b4",
+        "kind": "decision",
+        "scope": "session",
+        "authority": "explicit",
+        "source": "api.context",
+        "content": "Use typed, versioned anchors.",
+        "content_hash": "sha1:be6bb9cfefe00929f073e4fb2ef07e73df680597",
+        "priority": 92
+      }
+    ],
+    "input_count": 3,
+    "duplicate_count": 0,
+    "superseded_count": 1,
+    "rejected_count": 0
+  },
+  "diagnostics": {
+    "schema_version": "openagent.semantic_anchor_registry.v1",
+    "registry_hash": "sha1:a03cea891a6e7501161a20f9d0dd2590c68704b2",
+    "anchor_count": 2,
+    "kind_counts": {"decision": 1, "goal": 1},
+    "authority_counts": {"explicit": 2},
+    "input_count": 3,
+    "duplicate_count": 0,
+    "superseded_count": 1,
+    "rejected_count": 0
+  }
+}

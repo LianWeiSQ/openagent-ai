@@ -5,7 +5,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use openagent_protocol::{ChatMessage, ContextEpoch, Role, Usage};
+use openagent_protocol::{
+    ChatMessage, ContextEpoch, Role, SemanticAnchor, SemanticAnchorAuthority, SemanticAnchorKind,
+    SemanticAnchorRegistry, SemanticAnchorScope, Usage,
+};
 use openagent_protocol::{MessagePartKind, MessageStatus, message_parts_to_chat_messages};
 use openagent_session::{
     AgentTraceRecorder, FileSessionStore, ObservationConfig, ObservationEvent,
@@ -842,6 +845,14 @@ fn file_session_store_context_epochs_form_a_durable_parent_chain() {
             .expect("message appends");
     }
 
+    let first_goal = SemanticAnchor::new(
+        SemanticAnchorKind::Goal,
+        "primary",
+        "First private goal.",
+        SemanticAnchorAuthority::StructuredWorkState,
+        SemanticAnchorScope::Session,
+        "context_epoch:epoch_first",
+    );
     let first = store
         .append_context_epoch(
             &mut session,
@@ -853,7 +864,8 @@ fn file_session_store_context_epochs_form_a_durable_parent_chain() {
                 2,
                 Some("msg_epoch_2".to_string()),
                 "First summary.",
-            ),
+            )
+            .with_anchor_registry(SemanticAnchorRegistry::build(vec![first_goal.clone()])),
         )
         .expect("first epoch appends");
     let next = ChatMessage {
@@ -867,6 +879,23 @@ fn file_session_store_context_epochs_form_a_durable_parent_chain() {
     store
         .append_message(&session, &next, "run_epoch_chain", 3)
         .expect("new message appends");
+    let current_goal = SemanticAnchor::new(
+        SemanticAnchorKind::Goal,
+        "primary",
+        "Second private goal.",
+        SemanticAnchorAuthority::StructuredWorkState,
+        SemanticAnchorScope::Session,
+        "context_epoch:epoch_second",
+    );
+    let decision = SemanticAnchor::new(
+        SemanticAnchorKind::Decision,
+        "typed-registry",
+        "Persist anchors in the typed epoch.",
+        SemanticAnchorAuthority::StructuredWorkState,
+        SemanticAnchorScope::Session,
+        "context_epoch:epoch_second",
+    );
+    let second_registry = SemanticAnchorRegistry::build(vec![first_goal, current_goal, decision]);
     let second = store
         .append_context_epoch(
             &mut session,
@@ -878,7 +907,8 @@ fn file_session_store_context_epochs_form_a_durable_parent_chain() {
                 2,
                 Some("msg_epoch_3".to_string()),
                 "Second summary.",
-            ),
+            )
+            .with_anchor_registry(second_registry),
         )
         .expect("second epoch appends");
     store
@@ -886,6 +916,15 @@ fn file_session_store_context_epochs_form_a_durable_parent_chain() {
         .expect("epoch metadata persists");
 
     assert_eq!(second.parent_epoch_id.as_deref(), Some("epoch_first"));
+    assert_eq!(first.anchor_registry.anchors.len(), 1);
+    assert_eq!(second.anchor_registry.anchors.len(), 2);
+    assert_eq!(second.anchor_registry.superseded_count, 1);
+    assert_eq!(
+        second.anchor_registry.anchors[0].content,
+        "Second private goal."
+    );
+    let event_diagnostics = serde_json::to_string(&second.diagnostics()).expect("diagnostics");
+    assert!(!event_diagnostics.contains("Second private goal"));
     assert_eq!(
         store
             .list_context_epochs("session_epoch_chain")
@@ -899,6 +938,10 @@ fn file_session_store_context_epochs_form_a_durable_parent_chain() {
     assert_eq!(
         reloaded.metadata["compact"]["parent_epoch_id"],
         "epoch_first"
+    );
+    assert_eq!(
+        reloaded.metadata["compact"]["anchor_registry"]["anchors"][0]["content"],
+        "Second private goal."
     );
 
     fs::remove_dir_all(root).expect("temporary session store is removed");

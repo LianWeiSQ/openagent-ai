@@ -37,8 +37,10 @@ use openagent_mcp::{
     unavailable_tool_result,
 };
 use openagent_protocol::{
-    ChatMessage, ContextEpoch, Model, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema,
-    Usage, WorkState, render_work_state,
+    ChatMessage, ContextEpoch, Model, PermissionRuleset, Role, SemanticAnchor,
+    SemanticAnchorAuthority, SemanticAnchorKind, SemanticAnchorRegistry, SemanticAnchorScope,
+    ToolCall, ToolResult, ToolSchema, Usage, WorkState, render_work_state,
+    semantic_anchors_from_work_state,
 };
 use openagent_provider::{
     OpenAiLanguageModelConfig, ProviderStreamEvent, build_openai_chat_payload,
@@ -2198,6 +2200,7 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
     let summary = summarize_session_messages(&session);
     let message_count = session.messages.len();
     let run_id = new_id("compact");
+    let epoch_id = new_id("epoch");
     let compacted_until_message_id = session.messages.last().map(|message| {
         message
             .metadata
@@ -2206,15 +2209,30 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
             .map(ToString::to_string)
             .unwrap_or_else(|| runtime_message_id(message_count.saturating_sub(1) as u64))
     });
+    let anchor_registry = if message_count == 0 {
+        runtime_previous_semantic_anchor_registry(&session)
+    } else {
+        let state = runtime_compaction_work_state(&session, &session.messages);
+        let checkpoints = runtime_context_checkpoints(&store, &session);
+        runtime_semantic_anchor_registry(
+            &session,
+            &state,
+            &checkpoints,
+            &epoch_id,
+            message_count as u64,
+            compacted_until_message_id.as_deref(),
+        )
+    };
     let mut epoch = ContextEpoch::manual(
-        new_id("epoch"),
+        epoch_id,
         session.id.clone(),
         run_id.clone(),
         now_ms(),
         message_count as u64,
         compacted_until_message_id,
         summary,
-    );
+    )
+    .with_anchor_registry(anchor_registry);
     epoch = if epoch.compacted_message_count > 0 {
         store
             .append_context_epoch(&mut session, epoch)
@@ -3047,6 +3065,9 @@ fn context_replay_drift_reasons(
     if target.item_kind_counts != rebuilt.item_kind_counts {
         reasons.push("context_sources_changed".to_string());
     }
+    if target.semantic_anchor_registry != rebuilt.semantic_anchor_registry {
+        reasons.push("semantic_anchors_changed".to_string());
+    }
     if target.drop_reason_counts != rebuilt.drop_reason_counts
         || target.truncation_reason_counts != rebuilt.truncation_reason_counts
     {
@@ -3479,6 +3500,19 @@ fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
             },
         })
     });
+    let semantic_anchor = entry.semantic_anchor.as_ref().map(|anchor| {
+        json!({
+            "schema_version": anchor.schema_version,
+            "id": sanitize_context_diagnostic_label(&anchor.id),
+            "kind": anchor.kind,
+            "scope": anchor.scope,
+            "authority": anchor.authority,
+            "source": sanitize_context_diagnostic_source(&anchor.source),
+            "content_hash": anchor.content_hash,
+            "priority": anchor.priority,
+            "reference_count": anchor.reference_count,
+        })
+    });
     json!({
         "kind": sanitize_context_diagnostic_label(&entry.kind),
         "source": sanitize_context_diagnostic_source(&entry.source),
@@ -3496,6 +3530,7 @@ fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
         "truncation_strategy": entry.truncation_strategy.as_deref().map(sanitize_context_diagnostic_label),
         "semantic_duplicate": entry.semantic_duplicate_of.is_some(),
         "micro_compaction": micro_compaction,
+        "semantic_anchor": semantic_anchor,
     })
 }
 
@@ -7335,6 +7370,7 @@ fn runtime_context_pack_for_agent_timed(
         work_state: materialized.work_state,
         todos,
         checkpoints,
+        semantic_anchors: Vec::new(),
         skills: Vec::new(),
         tool_manifests,
         metadata: BTreeMap::new(),
@@ -7437,6 +7473,7 @@ fn runtime_context_pack_from_replay_spec(
         work_state: spec.work_state.clone(),
         todos: spec.todos.clone(),
         checkpoints: spec.checkpoints.clone(),
+        semantic_anchors: Vec::new(),
         skills: Vec::new(),
         tool_manifests: spec.tool_manifests.clone(),
         metadata: BTreeMap::new(),
@@ -7506,8 +7543,18 @@ fn runtime_auto_compact_context(
     }
 
     let compacted_at_ms = now_ms();
+    let epoch_id = new_id("epoch");
+    let checkpoints = runtime_context_checkpoints(store, session);
+    let anchor_registry = runtime_semantic_anchor_registry(
+        session,
+        &state,
+        &checkpoints,
+        &epoch_id,
+        compacted_message_count as u64,
+        Some(&compacted_until_message_id),
+    );
     let epoch = ContextEpoch::manual(
-        new_id("epoch"),
+        epoch_id,
         session.id.clone(),
         run_id.to_string(),
         compacted_at_ms,
@@ -7521,7 +7568,8 @@ fn runtime_auto_compact_context(
         step,
         summary_token_budget,
         state,
-    );
+    )
+    .with_anchor_registry(anchor_registry);
     let epoch = store
         .append_context_epoch(session, epoch)
         .map_err(|error| format!("failed to create automatic context epoch: {error}"))?;
@@ -7625,6 +7673,125 @@ fn runtime_compaction_work_state(session: &Session, messages: &[ChatMessage]) ->
         next_steps: todos,
         ..WorkState::default()
     }
+}
+
+fn runtime_previous_semantic_anchor_registry(session: &Session) -> SemanticAnchorRegistry {
+    session
+        .metadata
+        .get("compact")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ContextEpoch>(value).ok())
+        .filter(|epoch| epoch.validate().is_ok())
+        .map(|epoch| epoch.anchor_registry)
+        .unwrap_or_default()
+}
+
+fn runtime_semantic_anchor_registry(
+    session: &Session,
+    state: &WorkState,
+    checkpoints: &[ContextCheckpoint],
+    epoch_id: &str,
+    compacted_message_count: u64,
+    compacted_until_message_id: Option<&str>,
+) -> SemanticAnchorRegistry {
+    let previous = runtime_previous_semantic_anchor_registry(session);
+    let mut candidates = previous
+        .anchors
+        .into_iter()
+        .filter(|anchor| {
+            !matches!(
+                anchor.authority,
+                SemanticAnchorAuthority::Todo | SemanticAnchorAuthority::Checkpoint
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut structural_state = state.clone();
+    structural_state.todos.clear();
+    structural_state.next_steps.clear();
+    candidates.extend(semantic_anchors_from_work_state(
+        &structural_state,
+        &format!("context_epoch:{epoch_id}:work_state"),
+    ));
+
+    candidates.extend(session.todos.iter().filter_map(|todo| {
+        let id = todo.id.trim();
+        let content = todo.content.trim();
+        let status = todo.status.trim().to_ascii_lowercase();
+        let active = !matches!(status.as_str(), "completed" | "cancelled" | "canceled");
+        (active && !id.is_empty() && !content.is_empty()).then(|| {
+            SemanticAnchor::new(
+                SemanticAnchorKind::NextStep,
+                format!("todo:{id}"),
+                content,
+                SemanticAnchorAuthority::Todo,
+                SemanticAnchorScope::Session,
+                format!("session.todos:{id}"),
+            )
+            .with_references(vec![format!("todo:{id}")])
+        })
+    }));
+
+    candidates.extend(checkpoints.iter().filter_map(|checkpoint| {
+        let id = checkpoint.id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let mut references = vec![format!("checkpoint:{id}")];
+        references.extend(
+            checkpoint
+                .message_id
+                .iter()
+                .map(|message_id| format!("message:{message_id}")),
+        );
+        references.extend(
+            checkpoint
+                .part_id
+                .iter()
+                .map(|part_id| format!("part:{part_id}")),
+        );
+        Some(
+            SemanticAnchor::new(
+                SemanticAnchorKind::RecoveryPoint,
+                format!("checkpoint:{id}"),
+                format!(
+                    "Checkpoint {id}: kind={}, step={}, files={}, bytes={}, restored={}",
+                    checkpoint.kind.trim(),
+                    checkpoint
+                        .step_index
+                        .map_or_else(|| "unknown".to_string(), |step| step.to_string()),
+                    checkpoint.file_count,
+                    checkpoint.total_bytes,
+                    checkpoint.restored,
+                ),
+                SemanticAnchorAuthority::Checkpoint,
+                SemanticAnchorScope::Session,
+                format!("session.checkpoints:{id}"),
+            )
+            .with_references(references),
+        )
+    }));
+
+    let boundary = compacted_until_message_id.unwrap_or("none");
+    candidates.push(
+        SemanticAnchor::new(
+            SemanticAnchorKind::RecoveryPoint,
+            "current",
+            format!(
+                "Latest context epoch {epoch_id}: compacted_messages={compacted_message_count}, boundary={boundary}"
+            ),
+            SemanticAnchorAuthority::ContextEpoch,
+            SemanticAnchorScope::Epoch,
+            format!("context_epoch:{epoch_id}"),
+        )
+        .with_references(
+            compacted_until_message_id
+                .map(|message_id| vec![format!("message:{message_id}")])
+                .unwrap_or_default(),
+        ),
+    );
+
+    SemanticAnchorRegistry::build(candidates)
 }
 
 fn compacted_message_line(message: &ChatMessage, max_chars: usize) -> String {
@@ -11334,6 +11501,49 @@ mod tests {
     }
 
     #[test]
+    fn public_context_trace_redacts_semantic_anchor_provenance_and_body() {
+        let anchor = SemanticAnchor::new(
+            SemanticAnchorKind::Decision,
+            "public-diagnostics",
+            "PRIVATE ANCHOR BODY",
+            SemanticAnchorAuthority::Explicit,
+            SemanticAnchorScope::Session,
+            "https://user:password@example.test/private?token=anchor-secret",
+        )
+        .with_references(vec!["workspace:/private/reference".to_string()]);
+        let pack = ContextPackBuilder::new(Some(ContextPackBuildOptions {
+            trace_only: false,
+            ..ContextPackBuildOptions::default()
+        }))
+        .build(ContextPackInput {
+            semantic_anchors: vec![anchor],
+            ..ContextPackInput::default()
+        });
+        let entry = pack
+            .trace
+            .iter()
+            .find(|entry| entry.kind == "semantic_anchor")
+            .expect("semantic anchor trace");
+        let public = public_context_trace_entry(entry);
+
+        assert_eq!(
+            public["semantic_anchor"]["source"],
+            "https://example.test/private"
+        );
+        assert!(public["semantic_anchor"].get("content").is_none());
+        assert!(public["semantic_anchor"].get("references").is_none());
+        let serialized = stable_json_dumps(&public);
+        for private in [
+            "PRIVATE ANCHOR BODY",
+            "password",
+            "anchor-secret",
+            "workspace:/private/reference",
+        ] {
+            assert!(!serialized.contains(private));
+        }
+    }
+
+    #[test]
     fn bridge_auth_token_can_be_loaded_from_file_without_cli_secret() {
         let path = std::env::temp_dir().join(format!(
             "openagent-bridge-auth-{}-{}.token",
@@ -13143,6 +13353,210 @@ fn escape_json_string(value: &str) -> String {
             Some(&spec),
         )
         .expect("persist replay receipt");
+        let replay = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/api/sessions/{session_id}/context/replay"),
+                headers: BTreeMap::new(),
+                body: "{}".to_string(),
+            },
+            &config,
+        );
+        assert_eq!(replay.status, 200);
+        let replay = replay.body.expect("replay body");
+        assert_eq!(replay["status"], "verified");
+        assert_eq!(
+            replay["rebuilt"]["receipt"]["pack_hash"],
+            json!(pack.pack_hash)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn semantic_anchors_survive_repeated_compaction_restart_and_context_replay() {
+        let root =
+            std::env::temp_dir().join(format!("openagent-http-semantic-anchors-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        );
+        let session_id = created["session_id"].as_str().expect("session id");
+        let store = FileSessionStore::new(session_root.clone());
+        let mut session = store.load_session(session_id).expect("session");
+        session.todos.push(SessionTodoItem::new(
+            "Run semantic anchor replay tests",
+            "in_progress",
+            "high",
+            "todo-anchor-tests",
+        ));
+        for (index, (role, content, message_id)) in [
+            (
+                Role::User,
+                "Implement the first semantic anchor contract",
+                "msg_anchor_1",
+            ),
+            (
+                Role::Assistant,
+                "The typed registry is now wired into ContextPack.",
+                "msg_anchor_2",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut message = runtime_chat_message(role, content.to_string());
+            message
+                .metadata
+                .insert("message_id".to_string(), json!(message_id));
+            session.add(message.clone());
+            store
+                .append_message(&session, &message, "run_anchor_first", index as u64)
+                .expect("message appends");
+        }
+        store
+            .save_state(&session, Some("run_anchor_first"))
+            .expect("first state saves");
+
+        let first = compact_session_payload(&config, session_id).expect("first compaction");
+        let first_epoch =
+            serde_json::from_value::<ContextEpoch>(first["summary"].clone()).expect("first epoch");
+        first_epoch.validate().expect("first epoch validates");
+        assert!(first_epoch.anchor_registry.anchors.iter().any(|anchor| {
+            anchor.kind == SemanticAnchorKind::Goal
+                && anchor.content == "Implement the first semantic anchor contract"
+        }));
+        let first_todo = first_epoch
+            .anchor_registry
+            .anchors
+            .iter()
+            .find(|anchor| anchor.authority == SemanticAnchorAuthority::Todo)
+            .expect("todo anchor")
+            .clone();
+
+        let mut continued = store.load_session(session_id).expect("continued session");
+        let mut next = runtime_chat_message(
+            Role::User,
+            "Finish the second semantic anchor contract".to_string(),
+        );
+        next.metadata
+            .insert("message_id".to_string(), json!("msg_anchor_3"));
+        let next_index = continued.messages.len() as u64;
+        continued.add(next.clone());
+        store
+            .append_message(&continued, &next, "run_anchor_second", next_index)
+            .expect("continued message appends");
+        store
+            .save_state(&continued, Some("run_anchor_second"))
+            .expect("continued state saves");
+
+        let second = compact_session_payload(&config, session_id).expect("second compaction");
+        let second_epoch = serde_json::from_value::<ContextEpoch>(second["summary"].clone())
+            .expect("second epoch");
+        second_epoch.validate().expect("second epoch validates");
+        assert_eq!(
+            second_epoch.parent_epoch_id.as_deref(),
+            Some(first_epoch.epoch_id.as_str())
+        );
+        let second_goal = second_epoch
+            .anchor_registry
+            .anchors
+            .iter()
+            .find(|anchor| anchor.kind == SemanticAnchorKind::Goal)
+            .expect("second goal");
+        assert_eq!(
+            second_goal.content,
+            "Finish the second semantic anchor contract"
+        );
+        let second_todo = second_epoch
+            .anchor_registry
+            .anchors
+            .iter()
+            .find(|anchor| anchor.authority == SemanticAnchorAuthority::Todo)
+            .expect("second todo");
+        assert_eq!(second_todo.id, first_todo.id);
+        assert_eq!(second_todo.content_hash, first_todo.content_hash);
+        assert!(second_epoch.anchor_registry.anchors.iter().any(|anchor| {
+            anchor.kind == SemanticAnchorKind::RecoveryPoint
+                && anchor.authority == SemanticAnchorAuthority::ContextEpoch
+                && anchor.source == format!("context_epoch:{}", second_epoch.epoch_id)
+        }));
+
+        let restarted_store = FileSessionStore::new(session_root);
+        let mut restarted = restarted_store
+            .load_session(session_id)
+            .expect("session restarts");
+        let build_options = ContextPackBuildOptions {
+            trace_only: false,
+            ..ContextPackBuildOptions::default()
+        };
+        let pack = runtime_context_pack_for_agent(
+            &restarted_store,
+            &mut restarted,
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            build_options.clone(),
+        );
+        pack.validate_provider_input().expect("provider input");
+        assert_eq!(
+            pack.semantic_anchor_registry.registry_hash,
+            second_epoch.anchor_registry.registry_hash
+        );
+        assert_eq!(
+            pack.receipt.semantic_anchor_registry.anchor_count,
+            second_epoch.anchor_registry.anchors.len() as u64
+        );
+        assert!(pack.trace.iter().any(|entry| {
+            entry.kind == "semantic_anchor" && entry.included && entry.semantic_anchor.is_some()
+        }));
+
+        let spec = runtime_context_replay_spec(
+            &restarted_store,
+            &mut restarted,
+            &pack,
+            None,
+            None,
+            build_options,
+        );
+        runtime_persist_context_pack_receipt_with_replay(
+            &restarted_store,
+            &mut restarted,
+            "run_anchor_replay",
+            1,
+            &pack,
+            None,
+            Some(&spec),
+        )
+        .expect("replayable receipt persists");
+
+        let diagnostics = context_diagnostics_payload_for_session(&restarted, 4);
+        assert_eq!(
+            diagnostics["latest"]["receipt"]["semantic_anchor_registry"]["anchor_count"],
+            second_epoch.anchor_registry.anchors.len() as u64
+        );
+        let public_anchor = diagnostics["latest"]["trace"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry["kind"] == "semantic_anchor")
+            })
+            .expect("public semantic anchor trace");
+        assert!(public_anchor["semantic_anchor"]["content_hash"].is_string());
+        assert!(public_anchor["semantic_anchor"].get("content").is_none());
+        assert!(public_anchor["semantic_anchor"].get("references").is_none());
+        assert!(!stable_json_dumps(&diagnostics).contains(second_goal.content.as_str()));
+
         let replay = route_http_request(
             &HttpRequest {
                 method: "POST".to_string(),

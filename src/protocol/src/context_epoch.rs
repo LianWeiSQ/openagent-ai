@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::WorkState;
+use crate::{SemanticAnchorRegistry, WorkState};
 
 pub const CONTEXT_EPOCH_SCHEMA_VERSION: &str = "openagent.context_epoch.v1";
 
@@ -68,6 +68,8 @@ pub struct ContextEpoch {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<WorkState>,
+    #[serde(default, skip_serializing_if = "SemanticAnchorRegistry::is_empty")]
+    pub anchor_registry: SemanticAnchorRegistry,
 }
 
 impl ContextEpoch {
@@ -100,6 +102,7 @@ impl ContextEpoch {
             summary_token_estimate: None,
             summary: summary.into(),
             state: None,
+            anchor_registry: SemanticAnchorRegistry::default(),
         }
     }
 
@@ -120,6 +123,12 @@ impl ContextEpoch {
         self.step = Some(step);
         self.summary_token_estimate = Some(summary_token_estimate);
         self.state = Some(state);
+        self
+    }
+
+    #[must_use]
+    pub fn with_anchor_registry(mut self, anchor_registry: SemanticAnchorRegistry) -> Self {
+        self.anchor_registry = anchor_registry;
         self
     }
 
@@ -165,6 +174,7 @@ impl ContextEpoch {
         if self.format == ContextEpochFormat::StructuredWorkState && self.state.is_none() {
             return Err("structured context epoch requires work state".to_string());
         }
+        self.anchor_registry.validate()?;
         if self.trigger == ContextEpochTrigger::Automatic {
             if self.format != ContextEpochFormat::StructuredWorkState {
                 return Err("automatic context epoch requires structured work state".to_string());
@@ -237,6 +247,23 @@ impl ContextEpoch {
                 diagnostics.insert(key.to_string(), value);
             }
         }
+        let anchor_diagnostics = self.anchor_registry.diagnostics();
+        diagnostics.insert(
+            "semantic_anchor_registry_schema_version".to_string(),
+            json!(anchor_diagnostics.schema_version),
+        );
+        diagnostics.insert(
+            "semantic_anchor_registry_hash".to_string(),
+            json!(anchor_diagnostics.registry_hash),
+        );
+        diagnostics.insert(
+            "semantic_anchor_count".to_string(),
+            json!(anchor_diagnostics.anchor_count),
+        );
+        diagnostics.insert(
+            "semantic_anchor_kind_counts".to_string(),
+            json!(anchor_diagnostics.kind_counts),
+        );
         diagnostics
     }
 }
