@@ -304,6 +304,33 @@ fn file_session_store_writes_message_v2_parts_and_attaches_tool_results() {
     assert_eq!(projected[1].role, Role::Tool);
     assert_eq!(projected[1].tool_call_id.as_deref(), Some("call_read"));
     assert_eq!(projected[1].content, "[workspace]");
+    let completed_part = messages[0]
+        .parts
+        .iter()
+        .find(|part| part.kind == MessagePartKind::Tool && part.status == MessageStatus::Completed)
+        .expect("completed tool part");
+    assert_eq!(
+        projected[1]
+            .metadata
+            .get("session_message_id")
+            .and_then(Value::as_str),
+        Some(messages[0].info.id.as_str())
+    );
+    assert_eq!(
+        projected[1]
+            .metadata
+            .get("session_part_id")
+            .and_then(Value::as_str),
+        Some(completed_part.id.as_str())
+    );
+    assert_eq!(
+        projected[1]
+            .metadata
+            .get("tool_result")
+            .and_then(|result| result.get("output"))
+            .and_then(Value::as_str),
+        Some("[workspace]")
+    );
 
     fs::remove_dir_all(root).expect("temporary session store is removed");
 }

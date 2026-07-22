@@ -1,7 +1,9 @@
 //! Core permission, context, instruction, and skill behavior for the Rust rewrite.
 
+mod context_micro_compaction;
 mod context_taxonomy;
 
+pub use context_micro_compaction::*;
 pub use context_taxonomy::*;
 
 use std::{
@@ -599,6 +601,12 @@ pub fn context_pack_build_options_for_model(
         context_window: Some(model.context_window),
         reserved_output_tokens: budget.reserve_output_tokens,
         fit_required_context: budget.strategy != "error",
+        micro_compaction: ContextMicroCompactionOptions {
+            enabled: budget.prune_old_tool_outputs,
+            tool_output_max_bytes: budget.tool_context_preview_bytes,
+            tool_output_max_lines: budget.tool_context_preview_lines,
+            tool_output_line_max_chars: budget.tool_context_line_max_chars,
+        },
     })
 }
 
@@ -903,6 +911,8 @@ pub struct ContextPackTraceEntry {
     pub truncation_strategy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_duplicate_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_compaction: Option<ContextMicroCompaction>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -949,6 +959,10 @@ pub struct ContextPackReceipt {
     pub truncation_strategy_counts: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub semantic_duplicate_count: u64,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub micro_compacted_item_count: u64,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub micro_compaction_saved_tokens: u64,
     #[serde(default)]
     pub stable_prefix: ContextStablePrefix,
     pub estimated_input_tokens: u64,
@@ -1036,6 +1050,8 @@ pub struct ContextPackBuildOptions {
     pub context_window: Option<u64>,
     pub reserved_output_tokens: u64,
     pub fit_required_context: bool,
+    #[serde(default)]
+    pub micro_compaction: ContextMicroCompactionOptions,
 }
 
 impl Default for ContextPackBuildOptions {
@@ -1048,6 +1064,7 @@ impl Default for ContextPackBuildOptions {
             context_window: None,
             reserved_output_tokens: 0,
             fit_required_context: true,
+            micro_compaction: ContextMicroCompactionOptions::default(),
         }
     }
 }
@@ -1075,6 +1092,7 @@ impl ContextPackBuilder {
         let mut items = self.collect_items_with_system(&input, system.as_ref());
         items = self.semantic_dedupe_items(self.dedupe_items(items));
         items = self.with_estimates(items);
+        items = self.micro_compact_items(items);
         let fixed_overhead_tokens = estimate_context_pack_fixed_overhead(
             &input.tools,
             &input.model_options,
@@ -1261,6 +1279,17 @@ impl ContextPackBuilder {
             .collect()
     }
 
+    fn micro_compact_items(&self, mut items: Vec<ContextItem>) -> Vec<ContextItem> {
+        for item in &mut items {
+            compact_large_tool_result(
+                item,
+                &self.options.micro_compaction,
+                self.options.bytes_per_token,
+            );
+        }
+        items
+    }
+
     fn project(
         &self,
         items: &[ContextItem],
@@ -1365,6 +1394,7 @@ impl ContextPackBuilder {
                         .get("context_semantic_duplicate_of")
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
+                    micro_compaction: micro_compaction_from_metadata(&item.metadata),
                 }
             })
             .collect()
@@ -1984,6 +2014,15 @@ fn context_pack_receipt(
         .iter()
         .filter(|entry| entry.semantic_duplicate_of.is_some())
         .count() as u64;
+    let micro_compacted_item_count = trace
+        .iter()
+        .filter(|entry| entry.micro_compaction.is_some())
+        .count() as u64;
+    let micro_compaction_saved_tokens = trace
+        .iter()
+        .filter_map(|entry| entry.micro_compaction.as_ref())
+        .map(|compaction| compaction.saved_token_estimate)
+        .sum();
     for entry in trace.iter().filter(|entry| entry.truncated) {
         increment_count(
             &mut truncation_reason_counts,
@@ -2022,6 +2061,8 @@ fn context_pack_receipt(
         truncation_reason_counts,
         truncation_strategy_counts,
         semantic_duplicate_count,
+        micro_compacted_item_count,
+        micro_compaction_saved_tokens,
         stable_prefix: stable_prefix.clone(),
         estimated_input_tokens,
         budget: budget.clone(),
@@ -4522,6 +4563,9 @@ fn item_to_message(item: &ContextItem) -> ChatMessage {
     };
     if let Some(attachment) = item.metadata.get("context_attachment") {
         metadata.insert("context_attachment".to_string(), attachment.clone());
+    }
+    if let Some(compaction) = item.metadata.get("context_micro_compaction") {
+        metadata.insert("context_micro_compaction".to_string(), compaction.clone());
     }
     ChatMessage {
         role,

@@ -278,6 +278,7 @@ fn persist_context_pack_receipt(
         "run_id": run_id,
         "step": step,
         "receipt": pack.receipt,
+        "trace": pack.trace,
         "system_diagnostics": pack.system_diagnostics,
         "prefix_cache": prefix_cache,
     });
@@ -316,6 +317,7 @@ fn persist_context_pack_receipt(
                         ("surface".to_string(), json!("cli")),
                         ("step".to_string(), json!(step)),
                         ("receipt".to_string(), json!(pack.receipt)),
+                        ("trace".to_string(), json!(pack.trace)),
                         ("prefix_cache".to_string(), prefix_cache),
                     ]),
                     ..SessionEventOptions::default()

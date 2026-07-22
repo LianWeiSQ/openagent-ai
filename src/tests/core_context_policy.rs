@@ -8,14 +8,16 @@ use std::{
 
 use openagent_core::{
     CONTEXT_FAILURE_SCHEMA_VERSION, CONTEXT_ITEM_TAXONOMY_SCHEMA_VERSION,
-    CONTEXT_PACK_RECEIPT_SCHEMA_VERSION, CONTEXT_PACK_SCHEMA_VERSION,
-    CONTEXT_PERFORMANCE_SCHEMA_VERSION, ContextAttachment, ContextAttachmentKind,
-    ContextCheckpoint, ContextCompactionPolicy, ContextDelivery, ContextFailure,
-    ContextFailureCode, ContextItem, ContextItemCategory, ContextItemOrigin, ContextItemScope,
-    ContextItemTaxonomy, ContextPackBuildOptions, ContextPackBuilder, ContextPackInput,
-    ContextPackPerformance, ContextSystemSources, ContextTodo, ContextWorkState,
-    InstructionContextLoader, InstructionLoadOptions, PermissionManager, SkillDocument, SkillInfo,
-    SkillRegistry, SkillRegistryOptions, check_context_budget, context_provider_input_hash,
+    CONTEXT_MICRO_COMPACTION_SCHEMA_VERSION, CONTEXT_PACK_RECEIPT_SCHEMA_VERSION,
+    CONTEXT_PACK_SCHEMA_VERSION, CONTEXT_PERFORMANCE_SCHEMA_VERSION, ContextAttachment,
+    ContextAttachmentKind, ContextCheckpoint, ContextCompactionPolicy, ContextDelivery,
+    ContextFailure, ContextFailureCode, ContextItem, ContextItemCategory, ContextItemOrigin,
+    ContextItemScope, ContextItemTaxonomy, ContextMicroCompaction, ContextMicroCompactionOptions,
+    ContextMicroCompactionStrategy, ContextPackBuildOptions, ContextPackBuilder, ContextPackInput,
+    ContextPackPerformance, ContextRecoveryReference, ContextRecoveryReferenceKind,
+    ContextSystemSources, ContextTodo, ContextWorkState, InstructionContextLoader,
+    InstructionLoadOptions, PermissionManager, SkillDocument, SkillInfo, SkillRegistry,
+    SkillRegistryOptions, check_context_budget, context_provider_input_hash,
     context_work_state_from_compact_metadata, estimate_text_tokens, format_context_budget_error,
     load_context_budget_options, materialize_context_history, pattern_for, permission_rule,
     skill_context_items, tool_manifest_context_item,
@@ -143,6 +145,54 @@ fn context_item_taxonomy_matches_the_versioned_source_golden() -> Result<(), Box
         json!({
             "schema_version": CONTEXT_ITEM_TAXONOMY_SCHEMA_VERSION,
             "cases": actual,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn context_micro_compaction_contract_matches_versioned_golden() -> Result<(), Box<dyn Error>> {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/golden/rust_rewrite/context_micro_compaction.json"
+    ))?;
+    let contract = ContextMicroCompaction {
+        schema_version: CONTEXT_MICRO_COMPACTION_SCHEMA_VERSION.to_string(),
+        reason: "large_tool_output".to_string(),
+        strategy: ContextMicroCompactionStrategy::ToolOutputHeadTailV1,
+        original_content_hash: format!("sha1:{}", "0".repeat(40)),
+        original_bytes: 4_096,
+        original_lines: 40,
+        preview_bytes: 512,
+        preview_lines: 6,
+        projected_bytes: 768,
+        omitted_bytes: 3_584,
+        omitted_lines: 34,
+        original_token_estimate: 1_400,
+        projected_token_estimate: 300,
+        saved_token_estimate: 1_100,
+        recovery: ContextRecoveryReference {
+            kind: ContextRecoveryReferenceKind::SessionMessagePart,
+            reference: "session_message:msg-1#part:part-1".to_string(),
+            durable: true,
+            message_id: Some("msg-1".to_string()),
+            part_id: Some("part-1".to_string()),
+            tool_call_id: Some("call-1".to_string()),
+        },
+    };
+    assert!(contract.validate().is_ok());
+    let recovery_kinds = [
+        ContextRecoveryReferenceKind::SessionMessagePart,
+        ContextRecoveryReferenceKind::SessionMessage,
+        ContextRecoveryReferenceKind::ToolCall,
+        ContextRecoveryReferenceKind::Unavailable,
+    ];
+    assert_eq!(
+        fixture,
+        json!({
+            "schema_version": CONTEXT_MICRO_COMPACTION_SCHEMA_VERSION,
+            "contract": contract,
+            "default_options": ContextMicroCompactionOptions::default(),
+            "recovery_kinds": recovery_kinds,
         })
     );
     Ok(())
@@ -1113,6 +1163,175 @@ fn model_aware_context_budget_drops_old_tool_output_and_is_deterministic()
 }
 
 #[test]
+fn large_tool_output_micro_compacts_only_the_provider_projection() -> Result<(), Box<dyn Error>> {
+    let model = Model {
+        id: "large-context-model".to_string(),
+        provider_id: "openai".to_string(),
+        name: "Large context model".to_string(),
+        context_window: 64_000,
+        max_output: 2_000,
+        capabilities: ModelCapabilities::default(),
+        pricing: ModelPricing::default(),
+    };
+    let configured = json!({
+        "context_budget": {
+            "input_safety_margin_tokens": 0,
+            "bytes_per_token": 3,
+            "prune_old_tool_outputs": true,
+            "tool_context_preview_bytes": 512,
+            "tool_context_preview_lines": 6,
+            "tool_context_line_max_chars": 80
+        }
+    });
+    let options =
+        openagent_core::context_pack_build_options_for_model(Some(&configured), &model, false)?;
+    let long_line = format!("LONG_LINE_HEAD{}LONG_LINE_TAIL", "x".repeat(2_000));
+    let original = [
+        "TOOL_OUTPUT_HEAD".to_string(),
+        long_line,
+        "EARLY_CONTEXT".to_string(),
+        "middle filler ".repeat(220),
+        "MIDDLE_SENTINEL_MUST_NOT_REACH_PROVIDER".to_string(),
+        "more middle filler ".repeat(220),
+        "LATE_CONTEXT".to_string(),
+        "TOOL_OUTPUT_TAIL".to_string(),
+    ]
+    .join("\n");
+    let tool_message = ChatMessage {
+        role: Role::Tool,
+        content: original.clone(),
+        name: Some("read".to_string()),
+        tool_call_id: Some("call-large-read".to_string()),
+        metadata: BTreeMap::from([
+            ("session_message_id".to_string(), json!("msg-large-read")),
+            ("session_part_id".to_string(), json!("part-large-read")),
+            (
+                "tool_result".to_string(),
+                json!({
+                    "call_id": "call-large-read",
+                    "output": original,
+                    "error": null,
+                    "metadata": {
+                        "context_preview": original,
+                        "title": "Read"
+                    }
+                }),
+            ),
+        ]),
+    };
+    let input = ContextPackInput {
+        messages: vec![
+            chat(Role::System, "Keep tool evidence bounded and recoverable."),
+            chat(Role::User, "Inspect the large result."),
+            tool_message.clone(),
+            chat(Role::User, "Continue from the result."),
+        ],
+        ..ContextPackInput::default()
+    };
+    let first = ContextPackBuilder::new(Some(options.clone())).build(input.clone());
+    let second = ContextPackBuilder::new(Some(options.clone())).build(input.clone());
+
+    assert_eq!(first.pack_hash, second.pack_hash);
+    assert_eq!(first.provider_input_hash, second.provider_input_hash);
+    assert!(first.validate_provider_input().is_ok());
+    let projected = first
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("call-large-read"))
+        .ok_or("missing projected tool result")?;
+    assert!(projected.content.contains("[Tool output micro-compacted]"));
+    assert!(projected.content.contains("TOOL_OUTPUT_HEAD"));
+    assert!(projected.content.contains("TOOL_OUTPUT_TAIL"));
+    assert!(projected.content.contains("LONG_LINE_HEAD"));
+    assert!(projected.content.contains("LONG_LINE_TAIL"));
+    assert!(
+        projected
+            .content
+            .contains("full_output_ref=session_message:msg-large-read#part:part-large-read")
+    );
+    assert!(
+        !projected
+            .content
+            .contains("MIDDLE_SENTINEL_MUST_NOT_REACH_PROVIDER")
+    );
+    let serialized_pack_items = serde_json::to_string(&first.items)?;
+    assert!(!serialized_pack_items.contains("MIDDLE_SENTINEL_MUST_NOT_REACH_PROVIDER"));
+
+    let trace = first
+        .trace
+        .iter()
+        .find(|entry| entry.item_id == "tool_result:call-large-read")
+        .ok_or("missing tool result trace")?;
+    let compaction = trace
+        .micro_compaction
+        .as_ref()
+        .ok_or("missing typed micro-compaction trace")?;
+    assert_eq!(
+        compaction.schema_version,
+        CONTEXT_MICRO_COMPACTION_SCHEMA_VERSION
+    );
+    assert_eq!(
+        compaction.strategy,
+        ContextMicroCompactionStrategy::ToolOutputHeadTailV1
+    );
+    assert!(compaction.validate().is_ok());
+    assert_eq!(compaction.original_bytes, original.len() as u64);
+    assert!(compaction.omitted_bytes > 0);
+    assert!(compaction.saved_token_estimate > 0);
+    assert_eq!(
+        compaction.recovery.kind,
+        ContextRecoveryReferenceKind::SessionMessagePart
+    );
+    assert!(compaction.recovery.durable);
+    assert_eq!(first.receipt.micro_compacted_item_count, 1);
+    assert_eq!(
+        first.receipt.micro_compaction_saved_tokens,
+        compaction.saved_token_estimate
+    );
+    assert_eq!(
+        trace.taxonomy.category,
+        ContextItemCategory::ToolObservation
+    );
+    assert_eq!(
+        trace.taxonomy.compaction,
+        ContextCompactionPolicy::Summarize
+    );
+
+    let mut disabled_options = options.clone();
+    disabled_options.micro_compaction.enabled = false;
+    let disabled = ContextPackBuilder::new(Some(disabled_options)).build(input.clone());
+    let unmodified = disabled
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("call-large-read"))
+        .ok_or("missing unmodified tool result")?;
+    assert_eq!(unmodified.content, original);
+    assert_eq!(disabled.receipt.micro_compacted_item_count, 0);
+
+    let mut skill_message = tool_message;
+    skill_message.name = Some("skill".to_string());
+    skill_message.tool_call_id = Some("call-large-skill".to_string());
+    skill_message.content = format!("<skill_content>{}</skill_content>", "S".repeat(8_000));
+    skill_message.metadata.insert(
+        "skill_name".to_string(),
+        json!("protected-context-guidance"),
+    );
+    let skill_content = skill_message.content.clone();
+    let protected = ContextPackBuilder::new(Some(options)).build(ContextPackInput {
+        messages: vec![chat(Role::User, "Load guidance"), skill_message],
+        ..ContextPackInput::default()
+    });
+    let protected_skill = protected
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("call-large-skill"))
+        .ok_or("missing protected skill result")?;
+    assert_eq!(protected_skill.content, skill_content);
+    assert_eq!(protected.receipt.micro_compacted_item_count, 0);
+    Ok(())
+}
+
+#[test]
 fn required_context_is_source_aware_truncated_and_strict_error_remains_available()
 -> Result<(), Box<dyn Error>> {
     let model = Model {
@@ -1500,6 +1719,7 @@ fn core_context_policy_fixture() -> Result<Value, Box<dyn Error>> {
         context_window: Some(200),
         reserved_output_tokens: 50,
         fit_required_context: true,
+        micro_compaction: Default::default(),
     }))
     .build(ContextPackInput {
         system_sources: None,

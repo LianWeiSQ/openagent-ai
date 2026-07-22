@@ -3456,6 +3456,29 @@ fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
     } else {
         openagent_core::ContextItemTaxonomy::classify(&entry.kind, &entry.source)
     };
+    let micro_compaction = entry.micro_compaction.as_ref().map(|compaction| {
+        json!({
+            "schema_version": compaction.schema_version,
+            "reason": sanitize_context_diagnostic_label(&compaction.reason),
+            "strategy": compaction.strategy,
+            "original_content_hash": compaction.original_content_hash,
+            "original_bytes": compaction.original_bytes,
+            "original_lines": compaction.original_lines,
+            "preview_bytes": compaction.preview_bytes,
+            "preview_lines": compaction.preview_lines,
+            "projected_bytes": compaction.projected_bytes,
+            "omitted_bytes": compaction.omitted_bytes,
+            "omitted_lines": compaction.omitted_lines,
+            "original_token_estimate": compaction.original_token_estimate,
+            "projected_token_estimate": compaction.projected_token_estimate,
+            "saved_token_estimate": compaction.saved_token_estimate,
+            "recovery": {
+                "kind": compaction.recovery.kind,
+                "reference": sanitize_context_diagnostic_label(&compaction.recovery.reference),
+                "durable": compaction.recovery.durable,
+            },
+        })
+    });
     json!({
         "kind": sanitize_context_diagnostic_label(&entry.kind),
         "source": sanitize_context_diagnostic_source(&entry.source),
@@ -3472,6 +3495,7 @@ fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
         "truncation_reason": entry.truncation_reason.as_deref().map(sanitize_context_diagnostic_label),
         "truncation_strategy": entry.truncation_strategy.as_deref().map(sanitize_context_diagnostic_label),
         "semantic_duplicate": entry.semantic_duplicate_of.is_some(),
+        "micro_compaction": micro_compaction,
     })
 }
 

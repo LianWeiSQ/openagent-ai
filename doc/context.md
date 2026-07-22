@@ -44,11 +44,50 @@ this taxonomy instead of matching free-form `kind` strings.
 
 Budget pressure is handled in stages:
 
-1. trim old or oversized tool output;
+1. project oversized tool output through typed micro-compaction;
 2. compact older conversation into structured work state;
 3. reduce nonessential context detail;
 4. preserve task intent, decisions, changed files, blockers, and next steps;
 5. fail explicitly when a safe request still cannot fit.
+
+## Tool Output Micro-Compaction
+
+Large tool results use `openagent.context_micro_compaction.v1`. This is a
+lossy provider projection over durable source data, not a transcript rewrite
+and not a context epoch. The session message part remains the authority and
+keeps the complete result. `ContextPackBuilder` derives a bounded head/tail
+preview immediately before budget selection and provider projection.
+
+The v1 contract records:
+
+- the deterministic `tool_output_head_tail_v1` strategy and content hash;
+- original, preview, projected, omitted, and estimated token sizes;
+- the reason for projection and the estimated tokens saved;
+- a durable session message/part reference when one is available;
+- a non-durable tool-call reference only for legacy or in-memory input.
+
+The projection is applied when either the configured byte or line threshold is
+exceeded and only when the projected item is smaller by token estimate. It
+preserves sampled leading and trailing lines, preserves both ends of an
+oversized single line, and is UTF-8 safe. The original result is removed from
+the projected item's nested metadata so a provider adapter cannot recover the
+dropped middle through a second field. Loaded skill results are protected
+because their complete instructions are active model context rather than
+diagnostic tool output.
+
+Configuration continues to use the existing context-budget fields:
+`prune_old_tool_outputs`, `tool_context_preview_bytes`,
+`tool_context_preview_lines`, and `tool_context_line_max_chars`. These values
+are converted into `ContextPackBuildOptions`, persisted in the private replay
+specification, and never sent to the provider.
+
+The design follows the same authority/view split used by OpenCode and Claude
+Code: retain recoverable tool state while reducing the model-visible result.
+OpenHarness places the operation at the shared `ContextPackBuilder` boundary so
+CLI and HTTP runtimes cannot implement different truncation rules. Receipt and
+trace data expose only hashes, counts, strategy, savings, and recovery
+references. Retry and receipt replay rebuild the same pack without executing a
+tool or calling a provider.
 
 ## Durable State
 
@@ -96,6 +135,8 @@ message boundary.
 
 - One runtime path owns provider-message assembly.
 - New context sources are explicit typed items, not hidden string appendices.
+- Tool micro-compaction changes only the model projection; the session ledger
+  retains the complete source result and a typed recovery reference.
 - Compaction is resumable, typed, parent-linked, and records what information
   was removed.
 - Persisted messages and events remain ordered and scoped to one session.

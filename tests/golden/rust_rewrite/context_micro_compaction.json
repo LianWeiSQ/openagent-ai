@@ -1,0 +1,39 @@
+{
+  "contract": {
+    "omitted_bytes": 3584,
+    "omitted_lines": 34,
+    "original_bytes": 4096,
+    "original_content_hash": "sha1:0000000000000000000000000000000000000000",
+    "original_lines": 40,
+    "original_token_estimate": 1400,
+    "preview_bytes": 512,
+    "preview_lines": 6,
+    "projected_bytes": 768,
+    "projected_token_estimate": 300,
+    "reason": "large_tool_output",
+    "recovery": {
+      "durable": true,
+      "kind": "session_message_part",
+      "message_id": "msg-1",
+      "part_id": "part-1",
+      "reference": "session_message:msg-1#part:part-1",
+      "tool_call_id": "call-1"
+    },
+    "saved_token_estimate": 1100,
+    "schema_version": "openagent.context_micro_compaction.v1",
+    "strategy": "tool_output_head_tail_v1"
+  },
+  "default_options": {
+    "enabled": true,
+    "tool_output_line_max_chars": 240,
+    "tool_output_max_bytes": 4096,
+    "tool_output_max_lines": 40
+  },
+  "recovery_kinds": [
+    "session_message_part",
+    "session_message",
+    "tool_call",
+    "unavailable"
+  ],
+  "schema_version": "openagent.context_micro_compaction.v1"
+}

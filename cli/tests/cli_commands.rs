@@ -1313,6 +1313,196 @@ fn binary_run_executes_mock_tool_loop() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn binary_run_micro_compacts_large_tool_output_for_provider_context() -> Result<(), Box<dyn Error>>
+{
+    let temp = temp_dir("openagent-cli-tool-micro-compaction")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(workspace.join(".openagent/agents"))?;
+    let lines = (0..80)
+        .map(|index| match index {
+            0 => "CLI_TOOL_OUTPUT_HEAD".to_string(),
+            40 => "CLI_MIDDLE_SENTINEL_RAW_LEDGER_ONLY".to_string(),
+            79 => "CLI_TOOL_OUTPUT_TAIL".to_string(),
+            _ => format!("line-{index:03} {}", "large cli evidence ".repeat(8)),
+        })
+        .collect::<Vec<_>>();
+    fs::write(workspace.join("large-notes.txt"), lines.join("\n"))?;
+    fs::write(
+        workspace.join(".openagent/agents/micro.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "micro",
+            "name": "Micro Compact",
+            "mode": "primary",
+            "prompt": "Keep large tool evidence bounded and recoverable.",
+            "tools": ["read"],
+            "model_options": {
+                "context_budget": {
+                    "context_window": 64_000,
+                    "reserve_output_tokens": 2_000,
+                    "input_safety_margin_tokens": 0,
+                    "bytes_per_token": 3,
+                    "prune_old_tool_outputs": true,
+                    "tool_context_preview_bytes": 512,
+                    "tool_context_preview_lines": 12,
+                    "tool_context_line_max_chars": 80
+                }
+            }
+        }))?,
+    )?;
+    let first = json!({
+        "id": "resp_cli_large_tool_call",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_cli_read_large_notes",
+            "name": "read",
+            "arguments": "{\"file_path\":\"large-notes.txt\",\"limit\":200}"
+        }],
+        "usage": {"input_tokens": 5, "output_tokens": 1}
+    })
+    .to_string();
+    let second = json!({
+        "id": "resp_cli_large_tool_final",
+        "output_text": "CLI large output was bounded",
+        "usage": {"input_tokens": 9, "output_tokens": 4}
+    })
+    .to_string();
+    let (provider_port, provider_server, provider_requests) =
+        serve_http_capture_responses_on_free_port("application/json", vec![first, second])?;
+    let provider_url = format!("http://127.0.0.1:{provider_port}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&workspace),
+            "--session-root",
+            path_str(&session_root),
+            "--agent",
+            "micro",
+            "--model",
+            "fake-model",
+            "--format",
+            "json",
+            "read",
+            "the",
+            "large",
+            "notes",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", provider_url)
+        .env("OPENAI_WIRE_API", "responses")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .ok_or("missing CLI completion")?;
+    assert_eq!(
+        completed["params"]["final_answer"],
+        "CLI large output was bounded"
+    );
+    let session_id = completed["params"]["session_id"]
+        .as_str()
+        .ok_or("missing CLI session id")?;
+    let run_id = completed["params"]["run_id"]
+        .as_str()
+        .ok_or("missing CLI turn id")?;
+
+    provider_server
+        .join()
+        .expect("CLI micro-compaction provider server")
+        .expect("CLI micro-compaction provider responses");
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("Tool output micro-compacted"));
+    assert!(requests[1].contains("CLI_TOOL_OUTPUT_HEAD"));
+    assert!(requests[1].contains("CLI_TOOL_OUTPUT_TAIL"));
+    assert!(!requests[1].contains("CLI_MIDDLE_SENTINEL_RAW_LEDGER_ONLY"));
+    assert!(!requests[1].contains("context_budget"));
+    drop(requests);
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(session_id).join("state.latest.json"),
+    )?)?;
+    assert!(
+        state["messages"]
+            .to_string()
+            .contains("CLI_MIDDLE_SENTINEL_RAW_LEDGER_ONLY")
+    );
+    let context = &state["metadata"]["context_pack"];
+    assert_eq!(context["receipt"]["micro_compacted_item_count"], 1);
+    assert!(
+        context["receipt"]["micro_compaction_saved_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0)
+    );
+    let micro = context["trace"]
+        .as_array()
+        .and_then(|trace| {
+            trace.iter().find_map(|entry| {
+                entry
+                    .get("micro_compaction")
+                    .filter(|value| !value.is_null())
+            })
+        })
+        .ok_or("missing CLI micro-compaction trace")?;
+    assert_eq!(
+        micro["schema_version"],
+        "openagent.context_micro_compaction.v1"
+    );
+    assert_eq!(micro["recovery"]["kind"], "session_message_part");
+    assert_eq!(micro["recovery"]["durable"], true);
+    assert!(
+        !context
+            .to_string()
+            .contains("CLI_MIDDLE_SENTINEL_RAW_LEDGER_ONLY")
+    );
+
+    let run_events = fs::read_to_string(
+        session_root
+            .join(session_id)
+            .join("runs")
+            .join(run_id)
+            .join("events.jsonl"),
+    )?;
+    let context_events = run_events
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|event| event["event"] == "context.pack_built")
+        .collect::<Vec<_>>();
+    assert_eq!(context_events.len(), 2);
+    assert_eq!(
+        context_events[1]["attributes"]["receipt"]["micro_compacted_item_count"],
+        1
+    );
+    assert!(
+        context_events[1]["attributes"]["trace"]
+            .as_array()
+            .and_then(|trace| trace.iter().find(|entry| {
+                entry["micro_compaction"]["schema_version"]
+                    == "openagent.context_micro_compaction.v1"
+            }))
+            .is_some()
+    );
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn binary_local_run_builds_structured_context_pack_for_every_source() -> Result<(), Box<dyn Error>>
 {
     let temp = temp_dir("openagent-cli-context-pack")?;

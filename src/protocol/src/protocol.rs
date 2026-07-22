@@ -517,6 +517,8 @@ pub fn materialize_openai_compatible_messages(
 struct ToolPartProjection {
     call_id: String,
     name: String,
+    message_id: String,
+    part_id: String,
     input: Value,
     output: Option<String>,
     error: Option<String>,
@@ -527,6 +529,8 @@ struct ToolPartProjection {
 impl ToolPartProjection {
     fn merge_part(&mut self, part: &MessagePart) {
         self.status = part.status.clone();
+        self.message_id = part.message_id.clone();
+        self.part_id = part.id.clone();
         if let Some(value) =
             string_from_part(part, "call_id").or_else(|| string_from_part(part, "id"))
         {
@@ -588,6 +592,18 @@ impl ToolPartProjection {
             |error| format!("Tool failed: {error}"),
         );
         let mut metadata = self.metadata.clone();
+        if !self.message_id.is_empty() {
+            metadata.insert(
+                "session_message_id".to_string(),
+                Value::String(self.message_id.clone()),
+            );
+        }
+        if !self.part_id.is_empty() {
+            metadata.insert(
+                "session_part_id".to_string(),
+                Value::String(self.part_id.clone()),
+            );
+        }
         metadata.insert(
             "tool_result".to_string(),
             json_object([

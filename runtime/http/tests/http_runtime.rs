@@ -1961,6 +1961,163 @@ fn remote_runtime_client_continues_provider_after_tool_call() -> Result<(), Box<
 }
 
 #[test]
+fn large_tool_output_is_micro_compacted_for_http_provider_and_replay() -> Result<(), Box<dyn Error>>
+{
+    let first = serde_json::json!({
+        "id": "resp_large_tool_call",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_read_large_notes",
+            "name": "read",
+            "arguments": "{\"file_path\":\"large-notes.txt\",\"limit\":200}"
+        }],
+        "usage": {"input_tokens": 5, "output_tokens": 1}
+    });
+    let second = serde_json::json!({
+        "id": "resp_large_tool_final",
+        "output_text": "large tool output was bounded",
+        "usage": {"input_tokens": 9, "output_tokens": 4}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![first, second])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-tool-micro-compaction")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let lines = (0..80)
+        .map(|index| match index {
+            0 => "HTTP_TOOL_OUTPUT_HEAD".to_string(),
+            40 => "HTTP_MIDDLE_SENTINEL_RAW_LEDGER_ONLY".to_string(),
+            79 => "HTTP_TOOL_OUTPUT_TAIL".to_string(),
+            _ => format!("line-{index:03} {}", "large tool evidence ".repeat(8)),
+        })
+        .collect::<Vec<_>>();
+    fs::write(workspace.join("large-notes.txt"), lines.join("\n"))?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let runtime_env = [
+        ("OPENAI_API_KEY", "test-key"),
+        ("OPENAI_BASE_URL", provider_base_url.as_str()),
+        ("OPENAI_WIRE_API", "responses"),
+        ("OPENAI_MODEL", "fake-model"),
+    ];
+    let mut server = spawn_runtime_with_env(port, &workspace, &session_root, &runtime_env)?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let started = client.start_turn(
+        &session_id,
+        "read the large notes",
+        serde_json::json!({
+            "context_budget": {
+                "context_window": 64_000,
+                "reserve_output_tokens": 2_000,
+                "input_safety_margin_tokens": 0,
+                "bytes_per_token": 3,
+                "prune_old_tool_outputs": true,
+                "tool_context_preview_bytes": 512,
+                "tool_context_preview_lines": 12,
+                "tool_context_line_max_chars": 80
+            }
+        }),
+    )?;
+    assert_eq!(started["status"], "completed");
+    assert_eq!(
+        started["turn"]["final_answer"],
+        "large tool output was bounded"
+    );
+
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 2);
+    let projected_request = &requests[1];
+    assert!(projected_request.contains("Tool output micro-compacted"));
+    assert!(projected_request.contains("HTTP_TOOL_OUTPUT_HEAD"));
+    assert!(projected_request.contains("HTTP_TOOL_OUTPUT_TAIL"));
+    assert!(!projected_request.contains("HTTP_MIDDLE_SENTINEL_RAW_LEDGER_ONLY"));
+    assert!(!projected_request.contains("context_budget"));
+    drop(requests);
+
+    let transcript = client.session_messages(&session_id, None)?;
+    assert!(
+        transcript
+            .to_string()
+            .contains("HTTP_MIDDLE_SENTINEL_RAW_LEDGER_ONLY")
+    );
+    let context = client.session_context(&session_id, Some(4))?;
+    let latest = &context["latest"];
+    assert_eq!(latest["receipt"]["micro_compacted_item_count"], 1);
+    assert!(
+        latest["receipt"]["micro_compaction_saved_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0)
+    );
+    let micro = latest["trace"]
+        .as_array()
+        .and_then(|trace| {
+            trace.iter().find_map(|entry| {
+                entry
+                    .get("micro_compaction")
+                    .filter(|value| !value.is_null())
+            })
+        })
+        .ok_or("missing public micro-compaction trace")?;
+    assert_eq!(
+        micro["schema_version"],
+        "openagent.context_micro_compaction.v1"
+    );
+    assert_eq!(micro["strategy"], "tool_output_head_tail_v1");
+    assert_eq!(micro["recovery"]["kind"], "session_message_part");
+    assert_eq!(micro["recovery"]["durable"], true);
+    assert!(
+        micro["recovery"]["reference"]
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("session_message:"))
+    );
+    assert!(
+        !latest
+            .to_string()
+            .contains("HTTP_MIDDLE_SENTINEL_RAW_LEDGER_ONLY")
+    );
+
+    let run_id = started["turn"]["id"].as_str().expect("turn id");
+    let step = latest["step"].as_u64().expect("context step");
+    let replay = client.replay_session_context(&session_id, Some(run_id), Some(step))?;
+    assert_eq!(replay["status"], "verified");
+    assert_eq!(
+        replay["rebuilt"]["receipt"]["pack_hash"],
+        latest["receipt"]["pack_hash"]
+    );
+    assert_eq!(replay["side_effects"]["provider_calls"], 0);
+    assert_eq!(replay["side_effects"]["tool_calls"], 0);
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let mut restarted = spawn_runtime_with_env(port, &workspace, &session_root, &runtime_env)?;
+    wait_for_server(port)?;
+    let recovered = client.session_context(&session_id, Some(4))?;
+    assert_eq!(
+        recovered["latest"]["receipt"]["pack_hash"],
+        latest["receipt"]["pack_hash"]
+    );
+    assert_eq!(
+        recovered["latest"]["receipt"]["micro_compacted_item_count"],
+        1
+    );
+
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    let _ = provider_thread.join();
+    assert_eq!(
+        provider_requests.lock().expect("provider requests").len(),
+        2
+    );
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn context_pack_representative_repository_exploration_meets_quality_baseline()
 -> Result<(), Box<dyn Error>> {
     let prepare_todo = serde_json::json!({
