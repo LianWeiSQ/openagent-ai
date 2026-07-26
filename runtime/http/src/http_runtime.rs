@@ -21,7 +21,8 @@ use openagent_core::{
     ContextFailure, ContextFailureCode, ContextItem, ContextPack, ContextPackBuildOptions,
     ContextPackBuilder, ContextPackInput, ContextPackPerformance, ContextPackReceipt,
     ContextPackTraceEntry, ContextSystemDiagnostics, ContextSystemSources, ContextTodo,
-    ContextWorkState, PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
+    ContextWorkState, DurableGoal, DurableGoalStatus, DurablePlan, DurablePlanStatus,
+    PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
     context_pack_build_options_for_model, load_context_budget_options, materialize_context_history,
     permission_rule, skill_document_model_invocable, skill_info_model_invocable,
     tool_manifest_context_item,
@@ -37,8 +38,8 @@ use openagent_mcp::{
     unavailable_tool_result,
 };
 use openagent_protocol::{
-    ChatMessage, Model, PermissionRuleset, Role, ToolCall, ToolResult, ToolSchema, Usage,
-    WorkState, render_work_state,
+    ChatMessage, MessagePartKind, MessageStatus, Model, PermissionRuleset, Role, ToolCall,
+    ToolResult, ToolSchema, Usage, WorkState, render_work_state,
 };
 use openagent_provider::{
     OpenAiLanguageModelConfig, ProviderStreamEvent, build_openai_chat_payload,
@@ -63,7 +64,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 mod bridge_routes;
+mod capability_runtime;
+mod git_runtime;
 mod mcp_runtime;
+mod performance_runtime;
+mod plugin_runtime;
+mod provider_runtime;
+mod storage_runtime;
+mod terminal_runtime;
 mod turn_runtime;
 
 use bridge_routes::*;
@@ -73,7 +81,14 @@ pub use bridge_routes::{
     parse_sse_response_lines, route_health, route_options, route_unauthorized, route_unknown,
     run_cli,
 };
+use capability_runtime::*;
+use git_runtime::*;
 use mcp_runtime::*;
+use performance_runtime::*;
+use plugin_runtime::*;
+use provider_runtime::*;
+use storage_runtime::*;
+use terminal_runtime::*;
 use turn_runtime::*;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -90,6 +105,8 @@ const TUI_CONTROL_RESPONSES_FILE: &str = "tui_control_responses.jsonl";
 const FILE_CHANGE_UNDO_STACK_KEY: &str = "file_change_undo_stack";
 const FILE_CHANGE_REDO_STACK_KEY: &str = "file_change_redo_stack";
 const FILE_CHANGE_LATEST_KEY: &str = "latest_file_change";
+const FINAL_RESULT_METADATA_KEY: &str = "latest_final_result";
+const FINAL_RESULT_SCHEMA_VERSION: &str = "openagent.final_result.v1";
 const MAX_FILE_CHANGE_STACK: usize = 50;
 const MAX_RENDERED_DIFF_LINES: usize = 400;
 const MAX_FILE_TREE_ENTRIES: usize = 300;
@@ -109,6 +126,12 @@ const TURN_JOB_INDEX_SCHEMA_VERSION: u64 = 1;
 const TURN_QUEUE_PAYLOAD_SCHEMA_VERSION: u64 = 1;
 const TURN_QUEUE_LEASE_SCHEMA_VERSION: u64 = 1;
 const TURN_RETRY_PAYLOAD_SCHEMA_VERSION: u64 = 1;
+const INTERNAL_TURN_RETRY_KEY: &str = "_openagent_retry";
+const DEFAULT_PROVIDER_REQUEST_RETRIES: u64 = 1;
+const MAX_PROVIDER_REQUEST_RETRIES: u64 = 3;
+const MAX_PROVIDER_FALLBACK_MODELS: usize = 3;
+const DEFAULT_MANUAL_TURN_RETRIES: u64 = 3;
+const MAX_MANUAL_TURN_RETRIES: u64 = 5;
 const CONTEXT_DIAGNOSTICS_SCHEMA_VERSION: &str = "openagent.context_diagnostics.v1";
 const TURN_JOB_TERMINAL_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_TURN_JOB_INDEX_ENTRIES: usize = 200;
@@ -234,104 +257,7 @@ fn list_sessions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Valu
     json!({"session_root": root.to_string_lossy(), "query": query, "sessions": sessions})
 }
 
-fn models_payload(request_path: &str) -> Value {
-    let provider =
-        query_param(request_path, "provider").unwrap_or_else(|| active_provider_id(None));
-    let runtime_config = runtime_provider_config(Some(&provider), None, None)
-        .unwrap_or_else(|_| RuntimeProviderConfig::fallback(&provider));
-    let live_check = query_flag(request_path, "check") || query_flag(request_path, "refresh");
-    let probe = if live_check {
-        probe_runtime_models_endpoint(&runtime_config)
-    } else {
-        RuntimeModelProbe::not_checked(&runtime_config)
-    };
-    let models = model_records_for_runtime(&runtime_config, &probe);
-    json!({
-        "provider": runtime_config.provider,
-        "provider_label": runtime_config.provider_label,
-        "base_url": runtime_config.base_url,
-        "base_url_source": runtime_config.base_url_source,
-        "model": runtime_config.model,
-        "model_source": runtime_config.model_source,
-        "wire_api": runtime_config.wire_api,
-        "wire_api_source": runtime_config.wire_api_source,
-        "api_key": if runtime_config.api_key.is_some() { "set" } else { "missing" },
-        "api_key_env": runtime_config.api_key_env,
-        "api_key_source": runtime_config.api_key_source,
-        "healthy": probe.ok,
-        "model_endpoint_checked": probe.checked,
-        "model_endpoint_ok": probe.ok,
-        "model_endpoint": probe.endpoint,
-        "model_endpoint_message": probe.message,
-        "model_count": probe.model_ids.len(),
-        "configured_model_available": probe.configured_model_available,
-        "models": models,
-        "variants": ["default", "fast", "balanced", "deep"],
-        "thinking": ["off", "low", "medium", "high"],
-    })
-}
-
 // mcp_runtime implementation lives in `mcp_runtime.rs`.
-fn model_records_for_runtime(
-    config: &RuntimeProviderConfig,
-    probe: &RuntimeModelProbe,
-) -> Vec<Value> {
-    let mut models = if probe.model_ids.is_empty() {
-        supported_runtime_models()
-    } else {
-        probe.model_ids.clone()
-    }
-    .into_iter()
-    .filter(|model| runtime_model_supported(model))
-    .collect::<Vec<_>>();
-    let configured_model = config.model.trim().to_string();
-    if !configured_model.is_empty()
-        && configured_model != "gpt-5.6"
-        && !runtime_image_model_supported(&configured_model)
-        && !models.iter().any(|model| model == &configured_model)
-    {
-        models.insert(0, configured_model.clone());
-    }
-    models.sort_by(|left, right| right.cmp(left));
-    models.dedup();
-    models
-        .into_iter()
-        .map(|model| {
-            let provider_id = config.provider.clone();
-            let name = model.clone();
-            let default = model == configured_model;
-            json!({
-                "id": model,
-                "provider_id": provider_id,
-                "name": name,
-                "capabilities": {"tools": true, "streaming": true, "reasoning": true},
-                "catalog_supported": runtime_model_supported(&model),
-                "default": default,
-            })
-        })
-        .collect()
-}
-
-fn supported_runtime_models() -> Vec<String> {
-    [
-        "gpt-5.6-terra",
-        "gpt-5.6-sol",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.4",
-    ]
-    .iter()
-    .map(|model| (*model).to_string())
-    .collect()
-}
-
-fn runtime_model_supported(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-5.4" | "gpt-5.6-terra" | "gpt-5.6-sol" | "gpt-5.6-luna" | "gpt-5.5"
-    )
-}
-
 fn runtime_text_model_supported(model: &str) -> bool {
     openagent_text_model_supported(model)
 }
@@ -391,7 +317,16 @@ struct RuntimeProviderField {
     source: String,
 }
 
+#[derive(Clone, Copy)]
+struct RuntimeProviderSources<'a> {
+    payload: Option<&'a Value>,
+    session: Option<&'a Session>,
+    managed_record: Option<&'a Value>,
+    auth_record: Option<&'a Value>,
+}
+
 fn runtime_provider_config(
+    managed_state_path: Option<&Path>,
     provider: Option<&str>,
     payload: Option<&Value>,
     session: Option<&Session>,
@@ -399,6 +334,13 @@ fn runtime_provider_config(
     let provider = normalize_provider(Some(&active_provider_id(provider)))?;
     let env = default_env_mapping(&provider)?;
     let auth_record = runtime_auth_record(&provider);
+    let managed_record = managed_provider_record(managed_state_path);
+    let sources = RuntimeProviderSources {
+        payload,
+        session,
+        managed_record: managed_record.as_ref(),
+        auth_record: auth_record.as_ref(),
+    };
     let api_key_env = env
         .get("api_key")
         .cloned()
@@ -408,9 +350,7 @@ fn runtime_provider_config(
         &api_key_env,
         &["OPENAGENT_API_KEY"],
         None,
-        payload,
-        session,
-        auth_record.as_ref(),
+        sources,
     );
     let base_url = runtime_provider_field(
         "base_url",
@@ -422,9 +362,7 @@ fn runtime_provider_config(
             .ok()
             .flatten()
             .or_else(|| Some("https://api.openai.com/v1".to_string())),
-        payload,
-        session,
-        auth_record.as_ref(),
+        sources,
     )
     .expect("base_url has default");
     let model = runtime_provider_field(
@@ -437,9 +375,7 @@ fn runtime_provider_config(
             .ok()
             .flatten()
             .or_else(|| Some(default_model_id())),
-        payload,
-        session,
-        auth_record.as_ref(),
+        sources,
     )
     .expect("model has default");
     let model = if model.source == "session" && model.value == default_model_id() {
@@ -453,9 +389,10 @@ fn runtime_provider_config(
                 .ok()
                 .flatten()
                 .or_else(|| Some(default_model_id())),
-            payload,
-            None,
-            auth_record.as_ref(),
+            RuntimeProviderSources {
+                session: None,
+                ..sources
+            },
         )
         .expect("model has default")
     } else {
@@ -468,9 +405,7 @@ fn runtime_provider_config(
             .unwrap_or("OPENAI_WIRE_API"),
         &["OPENAGENT_WIRE_API"],
         Some("responses".to_string()),
-        payload,
-        session,
-        auth_record.as_ref(),
+        sources,
     )
     .expect("wire_api has default");
     Ok(RuntimeProviderConfig {
@@ -503,11 +438,10 @@ fn runtime_provider_field(
     provider_env_name: &str,
     generic_env_names: &[&str],
     default: Option<String>,
-    payload: Option<&Value>,
-    session: Option<&Session>,
-    auth_record: Option<&Value>,
+    sources: RuntimeProviderSources<'_>,
 ) -> Option<RuntimeProviderField> {
-    payload
+    sources
+        .payload
         .and_then(|payload| payload.get(field))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
@@ -516,13 +450,25 @@ fn runtime_provider_field(
             source: "payload".to_string(),
         })
         .or_else(|| {
-            session
+            sources
+                .session
                 .and_then(|session| session.metadata.get(field))
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(|value| RuntimeProviderField {
                     value: value.to_string(),
                     source: "session".to_string(),
+                })
+        })
+        .or_else(|| {
+            sources
+                .managed_record
+                .and_then(|record| record.get(field))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| RuntimeProviderField {
+                    value: value.to_string(),
+                    source: "bridge_private_state".to_string(),
                 })
         })
         .or_else(|| env_field(provider_env_name, "env"))
@@ -532,7 +478,8 @@ fn runtime_provider_field(
                 .find_map(|name| env_field(name, "env"))
         })
         .or_else(|| {
-            auth_record
+            sources
+                .auth_record
                 .and_then(|record| record.get(field))
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
@@ -1005,6 +952,7 @@ fn skills_payload(config: &HttpRuntimeConfig) -> Value {
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    let runtime = plugin_runtime_options(config);
     let registry = SkillRegistry::new_with_options(
         Some(workspace),
         Option::<Vec<String>>::None,
@@ -1012,7 +960,9 @@ fn skills_payload(config: &HttpRuntimeConfig) -> Value {
         SkillRegistryOptions {
             include_builtin_skills: true,
         },
-    );
+    )
+    .with_extra_roots(runtime.extra_skill_roots)
+    .with_disabled_names(runtime.disabled_skills);
     let mut report = registry.report(None, None);
     report.skills.retain(skill_info_model_invocable);
     json!({
@@ -1095,7 +1045,24 @@ fn filter_runtime_tools_for_profile(
         .collect()
 }
 
-fn runtime_agent_tool_options(profile: Option<&RuntimeSubagentProfile>) -> BTreeMap<String, Value> {
+fn session_metadata_string_list(session: &Session, key: &str) -> Vec<String> {
+    session
+        .metadata
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn runtime_agent_tool_options(
+    session: &Session,
+    profile: Option<&RuntimeSubagentProfile>,
+) -> BTreeMap<String, Value> {
     let mut options = BTreeMap::new();
     if let Some(profile) = profile {
         options.insert("agent_id".to_string(), json!(profile.id.clone()));
@@ -1115,6 +1082,14 @@ fn runtime_agent_tool_options(profile: Option<&RuntimeSubagentProfile>) -> BTree
                 json!(profile.skill_permissions.clone()),
             );
         }
+    }
+    let extra_skill_roots = session_metadata_string_list(session, "extra_skill_roots");
+    if !extra_skill_roots.is_empty() {
+        options.insert("extra_skill_roots".to_string(), json!(extra_skill_roots));
+    }
+    let disabled_skills = session_metadata_string_list(session, "disabled_skills");
+    if !disabled_skills.is_empty() {
+        options.insert("disabled_skills".to_string(), json!(disabled_skills));
     }
     options
 }
@@ -1167,7 +1142,7 @@ fn register_runtime_mcp_tools(
 ) -> Option<RuntimeMcpRuntime> {
     let env = std::env::vars().collect::<BTreeMap<_, _>>();
     let source = mcp_config_source_for_workspace(config, &env, workspace);
-    let mcp_config = match source
+    let mut mcp_config = match source
         .read_source
         .as_deref()
         .map(load_mcp_config)
@@ -1176,6 +1151,7 @@ fn register_runtime_mcp_tools(
         Ok(Some(config)) if config.enabled() => config,
         _ => return None,
     };
+    apply_mcp_oauth_credentials(config, &mut mcp_config);
     let mut manager = RemoteMcpManager::new(mcp_config.clone());
     let mut descriptors_by_name = BTreeMap::new();
     for server in mcp_config.servers.iter().filter(|server| server.enabled) {
@@ -1394,7 +1370,7 @@ fn runtime_session_runner_facade(
     skip_permissions: bool,
 ) -> SessionRunnerFacade {
     SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
-        .with_agent_options(runtime_agent_tool_options(agent_profile))
+        .with_agent_options(runtime_agent_tool_options(session, agent_profile))
         .with_permission_manager(runtime_permission_manager_for_agent(
             permission_ruleset,
             agent_profile,
@@ -1442,7 +1418,7 @@ fn mdns_payload(config: &HttpRuntimeConfig) -> Value {
     })
 }
 
-fn create_session_payload(config: &HttpRuntimeConfig, body: &str) -> Value {
+fn create_session_payload(config: &HttpRuntimeConfig, body: &str) -> Result<Value, String> {
     let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let workspace = payload
         .get("cwd")
@@ -1478,8 +1454,13 @@ fn create_session_payload(config: &HttpRuntimeConfig, body: &str) -> Value {
             .metadata
             .insert("title".to_string(), json!(title.trim()));
     }
-    let _ = store.save_state(&session, None);
-    json!({
+    store
+        .save_state(&session, None)
+        .map_err(|error| format!("Failed to persist session {session_id}: {error}"))?;
+    let persisted = store
+        .load_session(&session_id)
+        .map_err(|error| format!("Failed to verify session {session_id}: {error}"))?;
+    Ok(json!({
         "session_id": session_id,
         "status": "created",
         "session": {
@@ -1487,9 +1468,9 @@ fn create_session_payload(config: &HttpRuntimeConfig, body: &str) -> Value {
             "session_id": session_id,
             "status": "idle",
             "message_count": 0,
-            "workspace": workspace.to_string_lossy(),
+            "workspace": persisted.directory.to_string_lossy(),
         }
-    })
+    }))
 }
 
 fn get_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Value {
@@ -1591,6 +1572,38 @@ fn update_session_payload(
             session.metadata.remove("archived_at_ms");
         }
     }
+    if let Some(change_review) = payload.get("change_review") {
+        let review = change_review
+            .as_object()
+            .ok_or_else(|| "change_review must be an object".to_string())?;
+        let status = review
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| matches!(*value, "accepted" | "changes_requested"))
+            .ok_or_else(|| {
+                "change_review.status must be accepted or changes_requested".to_string()
+            })?;
+        let bounded_text = |key: &str| {
+            review
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.chars().take(512).collect::<String>())
+                .unwrap_or_default()
+        };
+        session.metadata.insert(
+            "change_review".to_string(),
+            json!({
+                "status": status,
+                "patch_id": bounded_text("patch_id"),
+                "path": bounded_text("path"),
+                "run_id": bounded_text("run_id"),
+                "updated_at_ms": now_ms(),
+            }),
+        );
+    }
     set_session_text_metadata(&mut session, &payload, "agent");
     set_session_text_metadata(&mut session, &payload, "model");
     set_session_text_metadata(&mut session, &payload, "variant");
@@ -1602,6 +1615,326 @@ fn update_session_payload(
         "session_id": session.id,
         "updated": true,
         "session": session_summary_from_session(&session),
+    }))
+}
+
+fn session_goal(session: &Session) -> Result<Option<DurableGoal>, String> {
+    session
+        .metadata
+        .get("durable_goal")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| format!("stored durable goal is invalid: {error}"))
+        })
+        .transpose()
+}
+
+fn session_goal_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let session = FileSessionStore::new(session_root(config))
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "schema_version": "openagent.session_goal_response.v1",
+        "session_id": session.id,
+        "goal": session_goal(&session)?,
+    }))
+}
+
+fn goal_text(payload: &Value, key: &str, max_chars: usize) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(max_chars).collect())
+}
+
+fn goal_acceptance_criteria(payload: &Value) -> Result<Option<Vec<String>>, String> {
+    let Some(criteria) = payload.get("acceptance_criteria") else {
+        return Ok(None);
+    };
+    let criteria = criteria
+        .as_array()
+        .ok_or_else(|| "acceptance_criteria must be an array of strings".to_string())?;
+    if criteria.iter().any(|value| !value.is_string()) {
+        return Err("acceptance_criteria must contain only strings".to_string());
+    }
+    Ok(Some(
+        criteria
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .take(20)
+            .map(|value| value.chars().take(512).collect::<String>())
+            .collect(),
+    ))
+}
+
+fn mutate_session_goal_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let payload: Value = serde_json::from_str(body).map_err(|_| "invalid JSON body".to_string())?;
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("update");
+    let store = FileSessionStore::new(session_root(config));
+    let mut session = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let existing = session_goal(&session)?;
+    let timestamp_ms = now_ms();
+    let mut goal = match action {
+        "create" => {
+            if existing
+                .as_ref()
+                .is_some_and(|goal| goal.status != DurableGoalStatus::Completed)
+            {
+                return Err("an active or paused durable goal already exists".to_string());
+            }
+            let objective = goal_text(&payload, "objective", 8_000)
+                .ok_or_else(|| "objective is required".to_string())?;
+            let title = goal_text(&payload, "title", 160)
+                .unwrap_or_else(|| objective.chars().take(80).collect::<String>());
+            DurableGoal::new(
+                new_id("goal"),
+                title,
+                objective,
+                goal_acceptance_criteria(&payload)?.unwrap_or_default(),
+                timestamp_ms,
+            )
+        }
+        "update" => {
+            let mut goal = existing.ok_or_else(|| "durable goal not found".to_string())?;
+            if goal.status == DurableGoalStatus::Completed {
+                return Err("completed durable goals cannot be edited".to_string());
+            }
+            if let Some(title) = goal_text(&payload, "title", 160) {
+                goal.title = title;
+            }
+            if let Some(objective) = goal_text(&payload, "objective", 8_000) {
+                goal.objective = objective;
+            }
+            if let Some(criteria) = goal_acceptance_criteria(&payload)? {
+                goal.acceptance_criteria = criteria;
+            }
+            goal.revision = goal.revision.saturating_add(1);
+            goal.updated_at_ms = timestamp_ms;
+            goal
+        }
+        "pause" => {
+            let mut goal = existing.ok_or_else(|| "durable goal not found".to_string())?;
+            if goal.status != DurableGoalStatus::Active {
+                return Err("only an active durable goal can be paused".to_string());
+            }
+            goal.status = DurableGoalStatus::Paused;
+            goal.revision = goal.revision.saturating_add(1);
+            goal.updated_at_ms = timestamp_ms;
+            goal
+        }
+        "resume" => {
+            let mut goal = existing.ok_or_else(|| "durable goal not found".to_string())?;
+            if goal.status != DurableGoalStatus::Paused {
+                return Err("only a paused durable goal can be resumed".to_string());
+            }
+            goal.status = DurableGoalStatus::Active;
+            goal.revision = goal.revision.saturating_add(1);
+            goal.updated_at_ms = timestamp_ms;
+            goal
+        }
+        "complete" => {
+            let mut goal = existing.ok_or_else(|| "durable goal not found".to_string())?;
+            if goal.status == DurableGoalStatus::Completed {
+                return Err("durable goal is already completed".to_string());
+            }
+            goal.status = DurableGoalStatus::Completed;
+            goal.revision = goal.revision.saturating_add(1);
+            goal.updated_at_ms = timestamp_ms;
+            goal.completed_at_ms = Some(timestamp_ms);
+            goal
+        }
+        _ => return Err("action must be create, update, pause, resume, or complete".to_string()),
+    };
+    if goal.title.trim().is_empty() || goal.objective.trim().is_empty() {
+        return Err("durable goal title and objective cannot be empty".to_string());
+    }
+    goal.schema_version = openagent_core::DURABLE_GOAL_SCHEMA_VERSION.to_string();
+    session.metadata.insert(
+        "durable_goal".to_string(),
+        serde_json::to_value(&goal).map_err(|error| error.to_string())?,
+    );
+    store
+        .save_state(&session, None)
+        .map_err(|error| error.to_string())?;
+    let persisted = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "schema_version": "openagent.session_goal_response.v1",
+        "session_id": persisted.id,
+        "goal": session_goal(&persisted)?,
+    }))
+}
+
+fn session_plan(session: &Session) -> Result<Option<DurablePlan>, String> {
+    session
+        .metadata
+        .get("durable_plan")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| format!("stored durable plan is invalid: {error}"))
+        })
+        .transpose()
+}
+
+fn session_plan_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let session = FileSessionStore::new(session_root(config))
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "schema_version": "openagent.session_plan_response.v1",
+        "session_id": session.id,
+        "plan": session_plan(&session)?,
+    }))
+}
+
+fn plan_steps(payload: &Value) -> Result<Option<Vec<String>>, String> {
+    let Some(steps) = payload.get("steps") else {
+        return Ok(None);
+    };
+    let steps = steps
+        .as_array()
+        .ok_or_else(|| "steps must be an array of strings".to_string())?;
+    if steps.iter().any(|value| !value.is_string()) {
+        return Err("steps must contain only strings".to_string());
+    }
+    Ok(Some(
+        steps
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .take(40)
+            .map(|value| value.chars().take(1_000).collect::<String>())
+            .collect(),
+    ))
+}
+
+fn mutate_session_plan_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let payload: Value = serde_json::from_str(body).map_err(|_| "invalid JSON body".to_string())?;
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("update");
+    let store = FileSessionStore::new(session_root(config));
+    let mut session = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let existing = session_plan(&session)?;
+    let timestamp_ms = now_ms();
+    let mut plan = match action {
+        "create" => {
+            if existing
+                .as_ref()
+                .is_some_and(|plan| plan.status != DurablePlanStatus::Completed)
+            {
+                return Err("an active durable plan already exists".to_string());
+            }
+            let objective = goal_text(&payload, "objective", 12_000)
+                .ok_or_else(|| "objective is required".to_string())?;
+            let title = goal_text(&payload, "title", 160)
+                .unwrap_or_else(|| objective.chars().take(80).collect::<String>());
+            DurablePlan::new(
+                new_id("plan"),
+                title,
+                objective,
+                plan_steps(&payload)?.unwrap_or_default(),
+                timestamp_ms,
+            )
+        }
+        "update" => {
+            let mut plan = existing.ok_or_else(|| "durable plan not found".to_string())?;
+            if plan.status != DurablePlanStatus::Planning {
+                return Err("only a planning durable plan can be edited".to_string());
+            }
+            if let Some(title) = goal_text(&payload, "title", 160) {
+                plan.title = title;
+            }
+            if let Some(objective) = goal_text(&payload, "objective", 12_000) {
+                plan.objective = objective;
+            }
+            if let Some(steps) = plan_steps(&payload)? {
+                plan.steps = steps;
+            }
+            plan.revision = plan.revision.saturating_add(1);
+            plan.updated_at_ms = timestamp_ms;
+            plan
+        }
+        "execute" => {
+            let mut plan = existing.ok_or_else(|| "durable plan not found".to_string())?;
+            if plan.status != DurablePlanStatus::Planning {
+                return Err("only a planning durable plan can enter execution".to_string());
+            }
+            plan.status = DurablePlanStatus::Executing;
+            plan.revision = plan.revision.saturating_add(1);
+            plan.updated_at_ms = timestamp_ms;
+            plan.execution_started_at_ms = Some(timestamp_ms);
+            plan
+        }
+        "complete" => {
+            let mut plan = existing.ok_or_else(|| "durable plan not found".to_string())?;
+            if plan.status == DurablePlanStatus::Completed {
+                return Err("durable plan is already completed".to_string());
+            }
+            plan.status = DurablePlanStatus::Completed;
+            plan.revision = plan.revision.saturating_add(1);
+            plan.updated_at_ms = timestamp_ms;
+            plan.completed_at_ms = Some(timestamp_ms);
+            plan
+        }
+        _ => return Err("action must be create, update, execute, or complete".to_string()),
+    };
+    if plan.title.trim().is_empty() || plan.objective.trim().is_empty() {
+        return Err("durable plan title and objective cannot be empty".to_string());
+    }
+    plan.schema_version = openagent_core::DURABLE_PLAN_SCHEMA_VERSION.to_string();
+    session.metadata.insert(
+        "durable_plan".to_string(),
+        serde_json::to_value(&plan).map_err(|error| error.to_string())?,
+    );
+    store
+        .save_state(&session, None)
+        .map_err(|error| error.to_string())?;
+    let persisted = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "schema_version": "openagent.session_plan_response.v1",
+        "session_id": persisted.id,
+        "plan": session_plan(&persisted)?,
     }))
 }
 
@@ -1704,8 +2037,20 @@ fn session_tasks_payload(config: &HttpRuntimeConfig, session_id: &str) -> Value 
     });
     let tree = task_tree_for_parent(&all_tasks, session_id);
     let flat_tasks = flatten_task_tree(&tree);
+    let mut status_counts = BTreeMap::<String, u64>::new();
+    for task in &flat_tasks {
+        let status = task
+            .get("canonical_status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        *status_counts.entry(status).or_default() += 1;
+    }
     json!({
+        "schema_version": "openagent.session_task_tree.v2",
         "session_id": session_id,
+        "count": flat_tasks.len(),
+        "status_counts": status_counts,
         "tasks": tasks,
         "flat_tasks": flat_tasks,
         "tree": tree,
@@ -1772,69 +2117,95 @@ fn flatten_task_tree(tree: &[Value]) -> Vec<Value> {
     flat
 }
 
+fn load_owned_session_task(
+    store: &FileSessionStore,
+    parent_session_id: &str,
+    task_id: &str,
+) -> Result<Session, String> {
+    if !valid_session_id(parent_session_id) || !valid_session_id(task_id) {
+        return Err("invalid session id".to_string());
+    }
+    let child_session = store
+        .load_session(task_id)
+        .map_err(|error| error.to_string())?;
+    let parent = child_session
+        .metadata
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if parent != parent_session_id {
+        return Err("task does not belong to parent session".to_string());
+    }
+    if !child_session
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("session is not a subagent task".to_string());
+    }
+    Ok(child_session)
+}
+
+fn task_status_value(session: &Session) -> &str {
+    session
+        .metadata
+        .get("task_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn session_task_cancel_marker_path(root: &Path, task_id: &str) -> PathBuf {
+    root.join(task_id).join("task.cancel.json")
+}
+
+fn session_task_cancel_requested(root: &Path, task_id: &str, run_id: &str) -> bool {
+    let marker_path = session_task_cancel_marker_path(root, task_id);
+    if !marker_path.is_file() {
+        return false;
+    }
+    let marker = read_json_file(&marker_path);
+    marker
+        .get("run_id")
+        .and_then(Value::as_str)
+        .is_none_or(|marked_run_id| marked_run_id.is_empty() || marked_run_id == run_id)
+}
+
+fn write_session_task_cancel_marker(
+    root: &Path,
+    task_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    write_json_value(
+        &session_task_cancel_marker_path(root, task_id),
+        &json!({
+            "task_id": task_id,
+            "run_id": run_id,
+            "requested_at_ms": now_ms(),
+        }),
+    )
+}
+
+fn clear_session_task_cancel_marker(root: &Path, task_id: &str) {
+    let _ = fs::remove_file(session_task_cancel_marker_path(root, task_id));
+}
+
 fn run_session_task_payload(
     config: &HttpRuntimeConfig,
     parent_session_id: &str,
     task_id: &str,
     body: &str,
 ) -> Result<Value, String> {
-    if !valid_session_id(parent_session_id) || !valid_session_id(task_id) {
-        return Err("invalid session id".to_string());
-    }
     let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let store = FileSessionStore::new(session_root(config));
-    let mut child_session = store
-        .load_session(task_id)
-        .map_err(|error| error.to_string())?;
-    let parent = child_session
-        .metadata
-        .get("parent_session_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if parent != parent_session_id {
-        return Err("task does not belong to parent session".to_string());
-    }
-    if !child_session
-        .metadata
-        .get("subagent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err("session is not a subagent task".to_string());
-    }
-    let task_status = child_session
-        .metadata
-        .get("task_status")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let mut child_session = load_owned_session_task(&store, parent_session_id, task_id)?;
+    let task_status = task_status_value(&child_session);
     if task_status != "queued" {
         return Err(format!("task is not queued: {task_status}"));
     }
     let _task_run_lock = claim_session_task_run_lock(config, task_id)?;
-    child_session = store
-        .load_session(task_id)
-        .map_err(|error| error.to_string())?;
-    let parent = child_session
-        .metadata
-        .get("parent_session_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if parent != parent_session_id {
-        return Err("task does not belong to parent session".to_string());
-    }
-    if !child_session
-        .metadata
-        .get("subagent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err("session is not a subagent task".to_string());
-    }
-    let task_status = child_session
-        .metadata
-        .get("task_status")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    child_session = load_owned_session_task(&store, parent_session_id, task_id)?;
+    let task_status = task_status_value(&child_session);
     if task_status != "queued" {
         return Err(format!("task is not queued: {task_status}"));
     }
@@ -1884,6 +2255,18 @@ fn run_session_task_payload(
     child_session.metadata.insert(
         "run_started_by".to_string(),
         json!(if payload
+            .get("promoted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "foreground_promote"
+        } else if payload
+            .get("background_start")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "background_start"
+        } else if payload
             .get("background_worker")
             .and_then(Value::as_bool)
             .unwrap_or(false)
@@ -1896,6 +2279,19 @@ fn run_session_task_payload(
     child_session
         .metadata
         .insert("run_claimed_at_ms".to_string(), json!(now_ms()));
+    child_session.metadata.insert(
+        "execution_mode".to_string(),
+        json!(if payload
+            .get("promoted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "foreground"
+        } else {
+            "background"
+        }),
+    );
+    child_session.metadata.remove("cancel_requested_at_ms");
     store
         .start_run(
             &mut child_session,
@@ -1938,7 +2334,31 @@ fn run_session_task_payload(
         carry: RuntimeProviderLoopCarry::default(),
     });
 
+    let cancel_requested = session_task_cancel_requested(&store.root, task_id, &run_id);
     let (status, output) = match loop_result {
+        Ok(value)
+            if cancel_requested
+                || value.get("status").and_then(Value::as_str) == Some("interrupted") =>
+        {
+            child_session.status = SessionStatus::Idle;
+            child_session
+                .metadata
+                .insert("task_status".to_string(), json!("canceled"));
+            child_session
+                .metadata
+                .insert("canceled_at_ms".to_string(), json!(now_ms()));
+            child_session.metadata.remove("cancel_requested_at_ms");
+            let _ = store.finish_run(
+                &child_session,
+                &run_id,
+                "interrupted",
+                0,
+                Some("canceled"),
+                Some("task canceled"),
+            );
+            let _ = store.save_state(&child_session, Some(&run_id));
+            ("canceled".to_string(), value)
+        }
         Ok(value) => {
             let status = value
                 .get("status")
@@ -1950,6 +2370,29 @@ fn run_session_task_payload(
                 .insert("task_status".to_string(), json!(status.clone()));
             let _ = store.save_state(&child_session, Some(&run_id));
             (status, value)
+        }
+        Err(error) if cancel_requested => {
+            child_session.status = SessionStatus::Idle;
+            child_session
+                .metadata
+                .insert("task_status".to_string(), json!("canceled"));
+            child_session
+                .metadata
+                .insert("canceled_at_ms".to_string(), json!(now_ms()));
+            child_session.metadata.remove("cancel_requested_at_ms");
+            let _ = store.finish_run(
+                &child_session,
+                &run_id,
+                "interrupted",
+                0,
+                Some("canceled"),
+                Some("task canceled"),
+            );
+            let _ = store.save_state(&child_session, Some(&run_id));
+            (
+                "canceled".to_string(),
+                json!({"status": "interrupted", "error": error}),
+            )
         }
         Err(error) => {
             child_session.status = SessionStatus::Idle;
@@ -1971,6 +2414,7 @@ fn run_session_task_payload(
             )
         }
     };
+    clear_session_task_cancel_marker(&store.root, task_id);
     let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
     let task = session_task_summary_from_state(&session_root(config), &state, task_id);
     Ok(json!({
@@ -1980,6 +2424,188 @@ fn run_session_task_payload(
         "status": status,
         "task": task,
         "result": output,
+    }))
+}
+
+fn dispatch_session_task_payload(
+    config: &HttpRuntimeConfig,
+    parent_session_id: &str,
+    task_id: &str,
+    promoted: bool,
+) -> Result<Value, String> {
+    let store = FileSessionStore::new(session_root(config));
+    let mut child_session = load_owned_session_task(&store, parent_session_id, task_id)?;
+    let task_status = task_status_value(&child_session);
+    if task_status != "queued" {
+        return Err(format!("task is not queued: {task_status}"));
+    }
+    let lock_path = task_run_lock_path(config, task_id);
+    if lock_path.exists() && !remove_stale_task_run_lock(&lock_path)? {
+        return Err("task is already running".to_string());
+    }
+    child_session.metadata.insert(
+        "execution_mode".to_string(),
+        json!(if promoted { "foreground" } else { "background" }),
+    );
+    child_session
+        .metadata
+        .insert("background".to_string(), json!(!promoted));
+    child_session.metadata.insert(
+        if promoted {
+            "promoted_at_ms".to_string()
+        } else {
+            "start_requested_at_ms".to_string()
+        },
+        json!(now_ms()),
+    );
+    store
+        .save_state(&child_session, None)
+        .map_err(|error| format!("failed to dispatch task: {error}"))?;
+
+    let thread_config = config.clone();
+    let thread_parent_session_id = parent_session_id.to_string();
+    let thread_task_id = task_id.to_string();
+    thread::Builder::new()
+        .name(format!("openagent-task-{thread_task_id}"))
+        .spawn(move || {
+            let payload = if promoted {
+                json!({"promoted": true})
+            } else {
+                json!({"background_start": true})
+            };
+            if let Err(error) = run_session_task_payload(
+                &thread_config,
+                &thread_parent_session_id,
+                &thread_task_id,
+                &payload.to_string(),
+            ) {
+                eprintln!(
+                    "openagent task {} dispatch failed: {}",
+                    thread_task_id, error
+                );
+            }
+        })
+        .map_err(|error| format!("failed to start task worker: {error}"))?;
+
+    let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+    let task = session_task_summary_from_state(&session_root(config), &state, task_id);
+    Ok(json!({
+        "accepted": true,
+        "session_id": parent_session_id,
+        "task_id": task_id,
+        "status": "queued",
+        "execution_mode": if promoted { "foreground" } else { "background" },
+        "task": task,
+    }))
+}
+
+fn wait_session_task_payload(
+    config: &HttpRuntimeConfig,
+    parent_session_id: &str,
+    task_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    let timeout_ms = payload
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(5_000)
+        .clamp(10, 30_000);
+    let store = FileSessionStore::new(session_root(config));
+    load_owned_session_task(&store, parent_session_id, task_id)?;
+    let started = Instant::now();
+    loop {
+        let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+        let task = session_task_summary_from_state(&session_root(config), &state, task_id);
+        let status = task
+            .get("canonical_status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let terminal = matches!(status, "completed" | "failed" | "cancelled");
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if terminal || elapsed_ms >= timeout_ms {
+            return Ok(json!({
+                "session_id": parent_session_id,
+                "task_id": task_id,
+                "status": status,
+                "completed": terminal,
+                "timed_out": !terminal,
+                "elapsed_ms": elapsed_ms,
+                "task": task,
+            }));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn resume_session_task_payload(
+    config: &HttpRuntimeConfig,
+    parent_session_id: &str,
+    task_id: &str,
+) -> Result<Value, String> {
+    let store = FileSessionStore::new(session_root(config));
+    let mut child_session = load_owned_session_task(&store, parent_session_id, task_id)?;
+    let task_status = canonical_task_status(task_status_value(&child_session));
+    if !matches!(task_status, "failed" | "cancelled") {
+        return Err(format!("task cannot be resumed from status: {task_status}"));
+    }
+    if task_run_lock_path(config, task_id).exists()
+        && !remove_stale_task_run_lock(&task_run_lock_path(config, task_id))?
+    {
+        return Err("task is still stopping".to_string());
+    }
+    let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+    if let Some(previous_run_id) = state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        child_session
+            .metadata
+            .insert("previous_run_id".to_string(), json!(previous_run_id));
+    }
+    let resume_count = child_session
+        .metadata
+        .get("resume_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(1);
+    child_session.status = SessionStatus::Idle;
+    child_session
+        .metadata
+        .insert("task_status".to_string(), json!("queued"));
+    child_session
+        .metadata
+        .insert("background".to_string(), json!(true));
+    child_session
+        .metadata
+        .insert("execution_mode".to_string(), json!("background"));
+    child_session
+        .metadata
+        .insert("resume_count".to_string(), json!(resume_count));
+    child_session
+        .metadata
+        .insert("resumed_at_ms".to_string(), json!(now_ms()));
+    for key in [
+        "canceled_at_ms",
+        "cancel_requested_at_ms",
+        "run_claimed_at_ms",
+    ] {
+        child_session.metadata.remove(key);
+    }
+    clear_session_task_cancel_marker(&store.root, task_id);
+    store
+        .save_state(&child_session, None)
+        .map_err(|error| format!("failed to resume task: {error}"))?;
+    let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+    let task = session_task_summary_from_state(&session_root(config), &state, task_id);
+    Ok(json!({
+        "session_id": parent_session_id,
+        "task_id": task_id,
+        "status": "queued",
+        "resumed": true,
+        "resume_count": resume_count,
+        "task": task,
     }))
 }
 
@@ -2071,41 +2697,15 @@ fn cancel_session_task_payload(
     parent_session_id: &str,
     task_id: &str,
 ) -> Result<Value, String> {
-    if !valid_session_id(parent_session_id) || !valid_session_id(task_id) {
-        return Err("invalid session id".to_string());
-    }
     let store = FileSessionStore::new(session_root(config));
-    let mut child_session = store
-        .load_session(task_id)
-        .map_err(|error| error.to_string())?;
-    let parent = child_session
-        .metadata
-        .get("parent_session_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if parent != parent_session_id {
-        return Err("task does not belong to parent session".to_string());
-    }
-    if !child_session
-        .metadata
-        .get("subagent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err("session is not a subagent task".to_string());
-    }
-    let task_status = child_session
-        .metadata
-        .get("task_status")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if task_status != "queued" {
-        return Err(format!("task is not queued: {task_status}"));
+    let mut child_session = load_owned_session_task(&store, parent_session_id, task_id)?;
+    let task_status = canonical_task_status(task_status_value(&child_session));
+    if matches!(task_status, "completed" | "failed" | "cancelled") {
+        return Err(format!(
+            "task cannot be canceled from status: {task_status}"
+        ));
     }
     let lock_path = task_run_lock_path(config, task_id);
-    if lock_path.exists() && !remove_stale_task_run_lock(&lock_path)? {
-        return Err("task is already running".to_string());
-    }
     let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
     let run_id = state
         .get("run_id")
@@ -2113,6 +2713,22 @@ fn cancel_session_task_payload(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| new_id("turn"));
+    if lock_path.exists() && !remove_stale_task_run_lock(&lock_path)? {
+        write_session_task_cancel_marker(&store.root, task_id, &run_id)?;
+        child_session
+            .metadata
+            .insert("cancel_requested_at_ms".to_string(), json!(now_ms()));
+        let _ = store.save_state(&child_session, Some(&run_id));
+        let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
+        let task = session_task_summary_from_state(&session_root(config), &state, task_id);
+        return Ok(json!({
+            "session_id": parent_session_id,
+            "task_id": task_id,
+            "run_id": run_id,
+            "status": "cancel_requested",
+            "task": task,
+        }));
+    }
     child_session.status = SessionStatus::Idle;
     child_session
         .metadata
@@ -2387,8 +3003,25 @@ fn find_pending_interaction_turn(
     Err("pending interaction not found".to_string())
 }
 
+fn workspace_for_session(
+    config: &HttpRuntimeConfig,
+    session_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(workspace(config));
+    };
+    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+        return Err("invalid session id".to_string());
+    }
+    FileSessionStore::new(session_root(config))
+        .load_session(session_id)
+        .map(|session| session.directory)
+        .map_err(|error| error.to_string())
+}
+
 fn files_payload(config: &HttpRuntimeConfig, request_path: &str) -> Result<Value, String> {
-    let root = workspace(config);
+    let scoped_session_id = query_param(request_path, "session_id");
+    let root = workspace_for_session(config, scoped_session_id.as_deref())?;
     let requested = query_param(request_path, "path").unwrap_or_default();
     let include_content = query_flag(request_path, "content");
     let depth = query_param(request_path, "depth")
@@ -2399,6 +3032,7 @@ fn files_payload(config: &HttpRuntimeConfig, request_path: &str) -> Result<Value
     let relative = workspace_relative_path(&root, &target);
     if !target.exists() {
         return Ok(json!({
+            "session_id": scoped_session_id,
             "workspace": root.to_string_lossy(),
             "path": relative,
             "absolute_path": target.to_string_lossy(),
@@ -2422,6 +3056,7 @@ fn files_payload(config: &HttpRuntimeConfig, request_path: &str) -> Result<Value
     let entry_count = entries.len();
     let truncated = entry_count >= MAX_FILE_TREE_ENTRIES;
     Ok(json!({
+        "session_id": scoped_session_id,
         "workspace": root.to_string_lossy(),
         "path": relative,
         "absolute_path": target.to_string_lossy(),
@@ -2435,8 +3070,9 @@ fn files_payload(config: &HttpRuntimeConfig, request_path: &str) -> Result<Value
     }))
 }
 
-fn git_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
-    let root = workspace(config);
+fn git_payload(config: &HttpRuntimeConfig, request_path: &str) -> Result<Value, String> {
+    let scoped_session_id = query_param(request_path, "session_id");
+    let root = workspace_for_session(config, scoped_session_id.as_deref())?;
     let output = Command::new("git")
         .arg("-C")
         .arg(&root)
@@ -2448,6 +3084,7 @@ fn git_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Ok(json!({
+            "session_id": scoped_session_id,
             "workspace": root.to_string_lossy(),
             "is_repo": false,
             "branch": "",
@@ -2462,6 +3099,7 @@ fn git_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
     let mut branch = String::new();
     let mut ahead = 0_i64;
     let mut behind = 0_i64;
+    let numstat = git_numstat(&root);
     let mut changes = Vec::new();
     for line in stdout.lines() {
         if let Some(raw) = line.strip_prefix("## ") {
@@ -2476,15 +3114,32 @@ fn git_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
         }
         let xy = &line[..2];
         let path = line[3..].to_string();
+        let (additions, deletions, binary) = git_change_counts(&root, &path, xy, &numstat);
         changes.push(json!({
             "status": xy.trim(),
             "index": xy.chars().next().unwrap_or(' '),
             "worktree": xy.chars().nth(1).unwrap_or(' '),
             "path": path,
+            "additions": additions,
+            "deletions": deletions,
+            "binary": binary,
         }));
     }
     let change_count = changes.len();
+    let selected_diff = query_param(request_path, "path")
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            let status = changes
+                .iter()
+                .find(|change| change.get("path").and_then(Value::as_str) == Some(path.as_str()))
+                .and_then(|change| change.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            git_file_diff_payload(&root, &path, status, &numstat)
+        })
+        .transpose()?;
     Ok(json!({
+        "session_id": scoped_session_id,
         "workspace": root.to_string_lossy(),
         "is_repo": true,
         "branch": branch,
@@ -2492,10 +3147,117 @@ fn git_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
         "behind": behind,
         "changes": changes,
         "change_count": change_count,
+        "selected_diff": selected_diff,
+    }))
+}
+
+fn git_numstat(root: &Path) -> BTreeMap<String, (Option<u64>, Option<u64>)> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--numstat", "HEAD", "--"])
+        .output();
+    let Ok(output) = output else {
+        return BTreeMap::new();
+    };
+    if !output.status.success() {
+        return BTreeMap::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let additions = fields.next()?;
+            let deletions = fields.next()?;
+            let path = fields.next()?.to_string();
+            Some((
+                path,
+                (additions.parse::<u64>().ok(), deletions.parse::<u64>().ok()),
+            ))
+        })
+        .collect()
+}
+
+fn git_change_counts(
+    root: &Path,
+    path: &str,
+    status: &str,
+    numstat: &BTreeMap<String, (Option<u64>, Option<u64>)>,
+) -> (u64, u64, bool) {
+    if let Some((additions, deletions)) = numstat.get(path) {
+        return (
+            additions.unwrap_or_default(),
+            deletions.unwrap_or_default(),
+            additions.is_none() || deletions.is_none(),
+        );
+    }
+    if status == "??" {
+        let target = root.join(path);
+        if file_is_text_like(&target) {
+            let additions = fs::read_to_string(target)
+                .map(|content| content.lines().count() as u64)
+                .unwrap_or_default();
+            return (additions, 0, false);
+        }
+        return (0, 0, true);
+    }
+    (0, 0, false)
+}
+
+fn git_file_diff_payload(
+    root: &Path,
+    requested_path: &str,
+    status: &str,
+    numstat: &BTreeMap<String, (Option<u64>, Option<u64>)>,
+) -> Result<Value, String> {
+    let target = resolve_path_in_root(root, requested_path)?;
+    let path = workspace_relative_path(root, &target);
+    let (additions, deletions, binary) = git_change_counts(root, &path, status, numstat);
+    let mut source = "git";
+    let diff = if status == "??" {
+        source = "untracked";
+        if target.is_file() && file_is_text_like(&target) {
+            let content = fs::read_to_string(&target).map_err(|error| error.to_string())?;
+            render_unified_diff(&path, None, Some(&content))
+        } else {
+            String::new()
+        }
+    } else {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["diff", "--no-color", "--no-ext-diff", "HEAD", "--"])
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("failed to run git diff: {error}"))?;
+        if output.status.success() {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                format!("git diff failed for {path}")
+            } else {
+                stderr
+            });
+        }
+    };
+    let lines = diff.lines().map(str::to_string).collect::<Vec<_>>();
+    let truncated = lines.len() > MAX_RENDERED_DIFF_LINES;
+    let diff = truncate_diff_lines(lines).join("\n");
+    Ok(json!({
+        "path": path,
+        "status": status.trim(),
+        "source": source,
+        "diff": diff,
+        "additions": additions,
+        "deletions": deletions,
+        "binary": binary,
+        "truncated": truncated,
     }))
 }
 
 fn terminal_run_payload(config: &HttpRuntimeConfig, body: &str) -> Result<Value, String> {
+    ensure_direct_capability_allowed(config, "terminal")?;
     let payload = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
     let command_text = payload
         .get("command")
@@ -2512,7 +3274,12 @@ fn terminal_run_payload(config: &HttpRuntimeConfig, body: &str) -> Result<Value,
         ));
     }
 
-    let root = workspace(config);
+    let scoped_session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let root = workspace_for_session(config, scoped_session_id)?;
     let requested_cwd = payload
         .get("cwd")
         .and_then(Value::as_str)
@@ -2538,7 +3305,11 @@ fn terminal_run_payload(config: &HttpRuntimeConfig, body: &str) -> Result<Value,
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TERMINAL_TIMEOUT_MS)
         .clamp(250, MAX_TERMINAL_TIMEOUT_MS);
-    run_terminal_command(&command_text, &root, &cwd, timeout_ms)
+    let mut result = run_terminal_command(&command_text, &root, &cwd, timeout_ms)?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("session_id".to_string(), json!(scoped_session_id));
+    }
+    Ok(result)
 }
 
 fn run_terminal_command(
@@ -3068,7 +3839,13 @@ fn runtime_current_context_recovery_pack(
 ) -> Result<(ContextPack, RuntimeContextReplaySpec), String> {
     let payload = json!({});
     let provider = session.metadata.get("provider").and_then(Value::as_str);
-    let provider_config = runtime_provider_config(provider, Some(&payload), Some(session))?;
+    let provider_state = provider_state_for_root(&store.root);
+    let provider_config = runtime_provider_config(
+        Some(&provider_state),
+        provider,
+        Some(&payload),
+        Some(session),
+    )?;
     let model_options = runtime_provider_model_options(session, &payload);
     let context_model = runtime_context_model(&provider_config, session, &payload);
     let context_budget_options = runtime_context_budget_options(session, &payload);
@@ -3076,8 +3853,10 @@ fn runtime_current_context_recovery_pack(
         context_pack_build_options_for_model(Some(&context_budget_options), &context_model, false)?;
     let agent_profile = runtime_agent_profile_for_session(session);
     let toolkit = toolkit_with_runtime_task_tool(session, agent_profile.as_ref());
-    let tools =
-        filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref());
+    let tools = filter_runtime_tools_for_capabilities(
+        &store.root,
+        filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref()),
+    );
     let pack = runtime_context_pack_for_agent(
         store,
         session,
@@ -3464,6 +4243,25 @@ fn public_context_trace_entry(entry: &ContextPackTraceEntry) -> Value {
         "truncation_reason": entry.truncation_reason.as_deref().map(sanitize_context_diagnostic_label),
         "truncation_strategy": entry.truncation_strategy.as_deref().map(sanitize_context_diagnostic_label),
         "semantic_duplicate": entry.semantic_duplicate_of.is_some(),
+        "attachment": entry.attachment.as_ref().map(|attachment| json!({
+            "id": attachment.id,
+            "kind": attachment.kind,
+            "name": attachment.name,
+            "content_type": attachment.content_type,
+            "size_bytes": attachment.size_bytes,
+            "source": attachment.source.as_deref().map(sanitize_context_diagnostic_label),
+            "page_count": attachment.page_count,
+            "media_metadata": attachment.media_metadata.iter().filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "width_px" | "height_px" | "duration_ms" | "frame_count" | "dpi" | "orientation" | "extension"
+                )
+            }).map(|(key, value)| (key.clone(), value.clone())).collect::<BTreeMap<_, _>>(),
+            "source_truncated": attachment.source_truncated,
+            "source_truncation_reason": attachment.source_truncation_reason.as_deref().map(sanitize_context_diagnostic_label),
+            "original_content_bytes": attachment.original_content_bytes,
+            "included_content_bytes": attachment.included_content_bytes,
+        })),
     })
 }
 
@@ -3724,6 +4522,113 @@ fn undo_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<
     }))
 }
 
+fn undo_session_file_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    body: &str,
+) -> Result<Value, String> {
+    let payload = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
+    let requested_path = payload
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "path is required".to_string())?;
+    let store = FileSessionStore::new(session_root(config));
+    let mut session = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let target = resolve_path_in_root(&session.directory, requested_path)?;
+    let path = session_display_path(&session, &target);
+    let mut undo_stack = file_change_stack(&session, FILE_CHANGE_UNDO_STACK_KEY);
+    let requested_run_id = payload
+        .get("run_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let target_run_id = requested_run_id
+        .map(str::to_string)
+        .or_else(|| {
+            undo_stack
+                .iter()
+                .rev()
+                .find(|change| change.get("path").and_then(Value::as_str) == Some(path.as_str()))
+                .map(file_change_run_id)
+        })
+        .ok_or_else(|| format!("no agent file change found for {path}"))?;
+    let matches_target = |change: &Value| {
+        change.get("path").and_then(Value::as_str) == Some(path.as_str())
+            && file_change_run_id(change) == target_run_id
+    };
+    let matching = undo_stack
+        .iter()
+        .filter(|change| matches_target(change))
+        .cloned()
+        .collect::<Vec<_>>();
+    let first = matching
+        .first()
+        .ok_or_else(|| format!("no agent file change found for {path}"))?;
+    let latest = matching
+        .last()
+        .ok_or_else(|| format!("no agent file change found for {path}"))?;
+    if !file_change_matches_state(&session, latest, FileChangeState::After)? {
+        return Err(format!(
+            "{path} changed after the agent edit; refusing to overwrite newer workspace content"
+        ));
+    }
+
+    apply_file_change_state(&session, first, FileChangeState::Before)?;
+    let matching_ids = matching
+        .iter()
+        .filter_map(|change| change.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    undo_stack.retain(|change| !matches_target(change));
+
+    let mut grouped = latest.clone();
+    if let (Some(grouped), Some(first)) = (grouped.as_object_mut(), first.as_object()) {
+        grouped.insert("id".to_string(), json!(new_id("patch_file_undo")));
+        grouped.insert(
+            "existed_before".to_string(),
+            first["existed_before"].clone(),
+        );
+        grouped.insert("before".to_string(), first["before"].clone());
+        grouped.insert(
+            "grouped_patch_ids".to_string(),
+            Value::Array(matching_ids.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    let reverted = mark_file_change(grouped, "undone");
+    let mut redo_stack = file_change_stack(&session, FILE_CHANGE_REDO_STACK_KEY);
+    push_stack_entry(&mut redo_stack, reverted.clone());
+    set_file_change_stack(&mut session, FILE_CHANGE_UNDO_STACK_KEY, undo_stack.clone());
+    set_file_change_stack(&mut session, FILE_CHANGE_REDO_STACK_KEY, redo_stack.clone());
+    if let Some(latest) = undo_stack.last() {
+        session.metadata.insert(
+            FILE_CHANGE_LATEST_KEY.to_string(),
+            public_file_change(latest),
+        );
+    } else {
+        session.metadata.remove(FILE_CHANGE_LATEST_KEY);
+    }
+    let turn_id = file_change_run_id(latest);
+    let public = public_file_change(&reverted);
+    let event = append_patch_stack_event(&store, &session, &turn_id, "patch/file_undone", &public);
+    store
+        .save_state(&session, Some(&turn_id))
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "session_id": session.id,
+        "status": "file_undone",
+        "path": path,
+        "run_id": target_run_id,
+        "undo_count": undo_stack.len(),
+        "redo_count": redo_stack.len(),
+        "patch": public,
+        "events": [event],
+    }))
+}
+
 fn redo_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Result<Value, String> {
     let store = FileSessionStore::new(session_root(config));
     let mut session = store
@@ -3917,6 +4822,7 @@ fn append_patch_stack_event(
 ) -> Value {
     let event_name = match method {
         "patch/undone" => "patch.undone",
+        "patch/file_undone" => "patch.file_undone",
         "patch/redone" => "patch.redone",
         _ => "patch.changed",
     };
@@ -4019,6 +4925,39 @@ fn apply_file_change_state(
     } else {
         Ok(())
     }
+}
+
+fn file_change_matches_state(
+    session: &Session,
+    change: &Value,
+    state: FileChangeState,
+) -> Result<bool, String> {
+    let path = change
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| change.get("absolute_path").and_then(Value::as_str))
+        .ok_or_else(|| "patch is missing path".to_string())?;
+    let target = resolve_path_in_root(&session.directory, path)?;
+    let (exists_key, content_key) = match state {
+        FileChangeState::Before => ("existed_before", "before"),
+        FileChangeState::After => ("existed_after", "after"),
+    };
+    let should_exist = change
+        .get(exists_key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !should_exist {
+        return Ok(!target.exists());
+    }
+    if !target.is_file() {
+        return Ok(false);
+    }
+    let expected = change
+        .get(content_key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("patch is missing {content_key} content"))?;
+    Ok(fs::read_to_string(target).is_ok_and(|content| content == expected))
 }
 
 fn mark_file_change(mut change: Value, status: &str) -> Value {
@@ -4446,7 +5385,7 @@ fn session_task_summary_from_state(root: &Path, state: &Value, fallback_id: &str
     } else {
         read_json_file(&run_dir.join("run.json"))
     };
-    let status = metadata
+    let mut status = metadata
         .get("task_status")
         .and_then(Value::as_str)
         .or_else(|| {
@@ -4460,6 +5399,16 @@ fn session_task_summary_from_state(root: &Path, state: &Value, fallback_id: &str
         .or_else(|| state.get("status").and_then(Value::as_str))
         .unwrap_or("unknown")
         .to_string();
+    let cancel_requested = session_task_cancel_requested(root, &session_id, &run_id);
+    if cancel_requested
+        && matches!(
+            canonical_task_status(&status),
+            "queued" | "running" | "waiting"
+        )
+    {
+        status = "cancel_requested".to_string();
+    }
+    let canonical_status = canonical_task_status(&status);
     let run_status = run_summary
         .get("status")
         .or_else(|| run_record.get("status"))
@@ -4483,19 +5432,48 @@ fn session_task_summary_from_state(root: &Path, state: &Value, fallback_id: &str
                 .unwrap_or(subagent_type.as_str())
         })
         .to_string();
-    json!({
+    let agent_profile = metadata
+        .get("agent_profile")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let final_result = metadata
+        .get(FINAL_RESULT_METADATA_KEY)
+        .filter(|result| {
+            result
+                .get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == run_id)
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    let progress = session_task_progress(&run_dir, &run_summary, &run_record, canonical_status);
+    let failure = if canonical_status == "failed" {
+        json!({
+            "message": run_record.get("error").cloned().unwrap_or(Value::Null),
+            "finish_reason": run_record.get("finish_reason").cloned().unwrap_or(Value::Null),
+            "phase": progress.get("last_event").cloned().unwrap_or(Value::Null),
+        })
+    } else {
+        Value::Null
+    };
+    let mut summary = json!({
         "id": session_id,
         "task_id": session_id,
         "session_id": session_id,
         "run_id": run_id,
         "status": status,
+        "canonical_status": canonical_status,
         "session_status": state.get("status").cloned().unwrap_or_else(|| json!("idle")),
         "title": title,
         "description": metadata.get("task_description").cloned().unwrap_or(Value::Null),
         "subagent_type": subagent_type,
         "agent": metadata.get("agent").cloned().unwrap_or(Value::Null),
-        "agent_profile": metadata.get("agent_profile").cloned().unwrap_or(Value::Null),
+        "agent_profile": agent_profile,
         "background": metadata.get("background").cloned().unwrap_or(Value::Bool(false)),
+        "execution_mode": metadata.get("execution_mode").cloned().unwrap_or_else(|| json!(if metadata.get("background").and_then(Value::as_bool).unwrap_or(false) { "background" } else { "foreground" })),
+        "resume_count": metadata.get("resume_count").cloned().unwrap_or_else(|| json!(0)),
+        "cancel_requested": cancel_requested,
         "provider": metadata.get("provider").cloned().unwrap_or(Value::Null),
         "model": metadata.get("model").cloned().unwrap_or(Value::Null),
         "permission": metadata.get("permission").cloned().unwrap_or(Value::Null),
@@ -4512,11 +5490,95 @@ fn session_task_summary_from_state(root: &Path, state: &Value, fallback_id: &str
         "updated_at_ms": state.get("updated_at_ms").cloned().unwrap_or_else(|| json!(0)),
         "message_count": state.get("messages").and_then(Value::as_array).map_or(0, Vec::len),
         "finish_reason": run_record.get("finish_reason").cloned().unwrap_or(Value::Null),
-        "error": run_record.get("error").cloned().unwrap_or(Value::Null),
+        "error": if canonical_status == "failed" { run_record.get("error").cloned().unwrap_or(Value::Null) } else { Value::Null },
         "run_status": if run_status.is_empty() { Value::Null } else { json!(run_status) },
         "run": run_summary,
         "metadata": metadata,
+    });
+    if let Some(object) = summary.as_object_mut() {
+        object.insert(
+            "role".to_string(),
+            json!({
+                "id": subagent_type,
+                "name": agent_profile.get("name").cloned().unwrap_or_else(|| json!(subagent_type)),
+                "description": agent_profile.get("description").cloned().unwrap_or(Value::Null),
+                "permission": agent_profile.get("permission").cloned().or_else(|| metadata.get("permission").cloned()).unwrap_or(Value::Null),
+            }),
+        );
+        object.insert(
+            "input".to_string(),
+            json!({
+                "summary": metadata.get("task_description").cloned().unwrap_or(Value::Null),
+                "redacted": true,
+            }),
+        );
+        object.insert(
+            "allowed_tools".to_string(),
+            agent_profile
+                .get("tools")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        );
+        object.insert("progress".to_string(), progress);
+        object.insert("result".to_string(), final_result);
+        object.insert("failure".to_string(), failure);
+    }
+    summary
+}
+
+fn session_task_progress(
+    run_dir: &Path,
+    run_summary: &Value,
+    run_record: &Value,
+    canonical_status: &str,
+) -> Value {
+    let events = read_jsonl_values(&run_dir.join("events.jsonl"));
+    let completed_tool_calls = events
+        .iter()
+        .filter(|event| event.get("event").and_then(Value::as_str) == Some("tool.call.finished"))
+        .count() as u64;
+    let failed_tool_calls = events
+        .iter()
+        .filter(|event| event.get("event").and_then(Value::as_str) == Some("tool.call.failed"))
+        .count() as u64;
+    let last_event = events.last();
+    let completed_steps = run_summary
+        .get("step_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .max(
+            run_record
+                .get("steps")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        );
+
+    json!({
+        "status": canonical_status,
+        "completed_steps": completed_steps,
+        "tool_call_count": run_summary.get("tool_call_count").cloned().unwrap_or_else(|| json!(completed_tool_calls + failed_tool_calls)),
+        "completed_tool_calls": completed_tool_calls,
+        "failed_tool_calls": failed_tool_calls,
+        "event_count": run_summary.get("event_count").cloned().unwrap_or_else(|| json!(events.len())),
+        "last_event": last_event.and_then(|event| event.get("event")).cloned().unwrap_or(Value::Null),
+        "last_event_at_ms": last_event.and_then(|event| event.get("timestamp_ms")).cloned().unwrap_or(Value::Null),
+        "started_at_ms": run_record.get("started_at_ms").cloned().unwrap_or(Value::Null),
+        "ended_at_ms": run_record.get("ended_at_ms").cloned().unwrap_or(Value::Null),
+        "duration_ms": run_record.get("duration_ms").cloned().unwrap_or(Value::Null),
     })
+}
+
+fn canonical_task_status(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "queued" | "pending" => "queued",
+        "running" | "in_progress" | "streaming" | "retrying" => "running",
+        "waiting" | "waiting_approval" | "waiting_question" | "pending_approval"
+        | "pending_question" | "blocked" | "cancel_requested" => "waiting",
+        "completed" | "complete" | "success" | "succeeded" => "completed",
+        "failed" | "error" | "expired" => "failed",
+        "canceled" | "cancelled" | "interrupted" => "cancelled",
+        _ => "unknown",
+    }
 }
 
 fn session_matches_query(summary: &Value, query: &str) -> bool {
@@ -4835,7 +5897,13 @@ fn provider_turn_result(
         .get("provider")
         .and_then(Value::as_str)
         .or_else(|| session.metadata.get("provider").and_then(Value::as_str));
-    let provider_config = runtime_provider_config(provider, Some(payload), Some(session))?;
+    let provider_state = provider_state_for_root(&store.root);
+    let provider_config = runtime_provider_config(
+        Some(&provider_state),
+        provider,
+        Some(payload),
+        Some(session),
+    )?;
     let model_options = runtime_provider_model_options(session, payload);
     let context_model = runtime_context_model(&provider_config, session, payload);
     let context_budget_options = runtime_context_budget_options(session, payload);
@@ -5237,6 +6305,10 @@ fn call_openai_compatible_provider_for_runtime(
             Err(error) => {
                 let can_try_next = error.retryable && index + 1 < models.len();
                 if can_try_next && let Some(sink) = stream_sink.as_deref_mut() {
+                    sink(&ProviderStreamEvent::Reset {
+                        model: candidate_model.clone(),
+                        reason: error.message.clone(),
+                    });
                     sink(&ProviderStreamEvent::Fallback {
                         from_model: candidate_model.clone(),
                         to_model: models[index + 1].clone(),
@@ -5444,6 +6516,9 @@ fn runtime_provider_model_candidates_with_fallback(
         if !models.iter().any(|existing| existing == &model) {
             models.push(model);
         }
+        if models.len() > MAX_PROVIDER_FALLBACK_MODELS {
+            break;
+        }
     }
     models
 }
@@ -5462,7 +6537,9 @@ fn provider_http_error(status: u16, raw: &str, content_type: &str) -> RuntimePro
 fn provider_read_error(error: reqwest::Error, status: Option<u16>) -> RuntimeProviderCallError {
     RuntimeProviderCallError {
         message: format!("provider response read failed: {error}"),
-        retryable: status.is_some_and(runtime_provider_status_retryable),
+        retryable: status.is_none_or(|status| {
+            (200..=299).contains(&status) || runtime_provider_status_retryable(status)
+        }),
     }
 }
 
@@ -5472,7 +6549,10 @@ fn provider_stream_error(error: String) -> RuntimeProviderCallError {
         && (error.contains("timed out")
             || error.contains("connection")
             || error.contains("reset")
-            || error.contains("closed"));
+            || error.contains("closed")
+            || error.contains("SSE read failed")
+            || error.contains("unexpected EOF")
+            || error.contains("end of file"));
     RuntimeProviderCallError {
         message: error,
         retryable,
@@ -5536,7 +6616,7 @@ fn send_runtime_provider_request(
             Err(error) => {
                 return Err(RuntimeProviderCallError {
                     message: format!("provider request failed: {error}"),
-                    retryable: false,
+                    retryable: true,
                 });
             }
         }
@@ -5555,7 +6635,16 @@ fn runtime_provider_request_retries() -> u64 {
     std::env::var("OPENAGENT_PROVIDER_RETRIES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(6)
+        .unwrap_or(DEFAULT_PROVIDER_REQUEST_RETRIES)
+        .min(MAX_PROVIDER_REQUEST_RETRIES)
+}
+
+fn runtime_manual_turn_retries() -> u64 {
+    std::env::var("OPENAGENT_MANUAL_TURN_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MANUAL_TURN_RETRIES)
+        .clamp(1, MAX_MANUAL_TURN_RETRIES)
 }
 
 fn read_sse_json_values_stream<R, F>(mut reader: R, mut on_value: F) -> Result<(), String>
@@ -5805,7 +6894,9 @@ fn provider_events_to_runtime_result(
         match event {
             ProviderStreamEvent::TextDelta { text } => answer.push_str(text),
             ProviderStreamEvent::ReasoningDelta { .. } => {}
-            ProviderStreamEvent::Retry { .. } | ProviderStreamEvent::Fallback { .. } => {}
+            ProviderStreamEvent::Retry { .. }
+            | ProviderStreamEvent::Reset { .. }
+            | ProviderStreamEvent::Fallback { .. } => {}
             ProviderStreamEvent::ToolCall {
                 call_id,
                 name,
@@ -6077,12 +7168,15 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         mut events,
         mut carry,
     } = input;
+    sync_plugin_runtime_metadata(config, session);
     let max_steps = provider_max_steps(payload);
     let agent_profile = runtime_agent_profile_for_session(session);
     let mut toolkit = toolkit_with_runtime_task_tool(session, agent_profile.as_ref());
     let mcp_runtime = register_runtime_mcp_tools(config, &session.directory, &mut toolkit);
-    let visible_tools =
-        filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref());
+    let visible_tools = filter_runtime_tools_for_capabilities(
+        &store.root,
+        filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref()),
+    );
     let visible_tool_names = visible_tools
         .iter()
         .map(|tool| tool.name.clone())
@@ -6109,7 +7203,9 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         &mut persisted_events,
     );
     while carry.next_step <= max_steps {
-        if turn_cancel_requested(run_id) {
+        if turn_cancel_requested(run_id)
+            || session_task_cancel_requested(&store.root, &session.id, run_id)
+        {
             return finish_provider_loop_interrupted(
                 store,
                 session,
@@ -6203,6 +7299,29 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                     &mut persisted_events,
                 );
             }
+            ProviderStreamEvent::Reset { model, reason } => {
+                streamed_text = false;
+                events.push(json!({
+                    "method": "item/agentMessage/reset",
+                    "params": {
+                        "thread_id": session_id.clone(),
+                        "session_id": session_id.clone(),
+                        "turn_id": run_id,
+                        "run_id": run_id,
+                        "step": step,
+                        "status": "running",
+                        "model": model,
+                        "reason": reason,
+                    }
+                }));
+                append_unpersisted_bridge_events(
+                    &root,
+                    &session_id,
+                    run_id,
+                    &mut events,
+                    &mut persisted_events,
+                );
+            }
             ProviderStreamEvent::Fallback {
                 from_model,
                 to_model,
@@ -6233,7 +7352,10 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             }
             _ => {}
         };
-        let should_cancel = || turn_cancel_requested(run_id);
+        let should_cancel = || {
+            turn_cancel_requested(run_id)
+                || session_task_cancel_requested(&store.root, &session_id, run_id)
+        };
         let provider_result = match provider_turn_result(
             RuntimeProviderTurnInput {
                 store,
@@ -6459,6 +7581,9 @@ fn execute_runtime_tool_call(
     ctx: &mut ToolContext,
     task_context: RuntimeTaskExecutionContext<'_>,
 ) -> ToolResult {
+    if let Some(result) = capability_gate_for_tool(task_context.config, tool_call, ctx) {
+        return result;
+    }
     if tool_call.name == "skill" {
         if let Some(result) =
             toolkit.permission_result_for_tool("skill", &tool_call.input, &tool_call.call_id, ctx)
@@ -7253,6 +8378,24 @@ struct RuntimeContextReplaySpec {
     checkpoints: Vec<ContextCheckpoint>,
     tool_manifests: Vec<ContextItem>,
     work_state: Option<ContextWorkState>,
+    #[serde(default)]
+    goal: Option<DurableGoal>,
+    #[serde(default)]
+    plan: Option<DurablePlan>,
+}
+
+fn runtime_context_metadata(
+    goal: Option<&DurableGoal>,
+    plan: Option<&DurablePlan>,
+) -> BTreeMap<String, Value> {
+    let mut metadata = BTreeMap::new();
+    if let Some(value) = goal.and_then(|goal| serde_json::to_value(goal).ok()) {
+        metadata.insert("durable_goal".to_string(), value);
+    }
+    if let Some(value) = plan.and_then(|plan| serde_json::to_value(plan).ok()) {
+        metadata.insert("durable_plan".to_string(), value);
+    }
+    metadata
 }
 
 fn runtime_context_pack_for_agent(
@@ -7291,6 +8434,8 @@ fn runtime_context_pack_for_agent_timed(
     let tool_manifests = runtime_mcp_tool_manifest_items(mcp_runtime, tools);
     let todos = runtime_context_todos(&session.todos);
     let checkpoints = runtime_context_checkpoints(store, session);
+    let goal = session_goal(session).ok().flatten();
+    let plan = session_plan(session).ok().flatten();
     let materialize_us = elapsed_micros(materialize_started);
     let source_message_count = materialized.source_message_count as u64;
     let build_started = Instant::now();
@@ -7305,7 +8450,7 @@ fn runtime_context_pack_for_agent_timed(
         checkpoints,
         skills: Vec::new(),
         tool_manifests,
-        metadata: BTreeMap::new(),
+        metadata: runtime_context_metadata(goal.as_ref(), plan.as_ref()),
         runtime_context: None,
         sandbox_metadata: None,
         extra_items: Vec::new(),
@@ -7348,6 +8493,8 @@ fn runtime_context_replay_spec(
         checkpoints: runtime_context_checkpoints(store, session),
         tool_manifests: runtime_mcp_tool_manifest_items(mcp_runtime, &pack.tools),
         work_state: materialized.work_state,
+        goal: session_goal(session).ok().flatten(),
+        plan: session_plan(session).ok().flatten(),
     }
 }
 
@@ -7407,7 +8554,7 @@ fn runtime_context_pack_from_replay_spec(
         checkpoints: spec.checkpoints.clone(),
         skills: Vec::new(),
         tool_manifests: spec.tool_manifests.clone(),
-        metadata: BTreeMap::new(),
+        metadata: runtime_context_metadata(spec.goal.as_ref(), spec.plan.as_ref()),
         runtime_context: None,
         sandbox_metadata: None,
         extra_items: Vec::new(),
@@ -8782,6 +9929,191 @@ fn runtime_finalize_step_checkpoint(
     }
 }
 
+fn runtime_file_change_status(change: &Value) -> &'static str {
+    match (
+        change
+            .get("existed_before")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        change
+            .get("existed_after")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    ) {
+        (false, true) => "added",
+        (true, false) => "deleted",
+        _ => "modified",
+    }
+}
+
+fn bounded_result_label(value: &str) -> String {
+    value.trim().chars().take(160).collect()
+}
+
+fn runtime_final_result(
+    store: &FileSessionStore,
+    session: &Session,
+    run_id: &str,
+    answer: &str,
+) -> Value {
+    let mut changed_by_path = BTreeMap::new();
+    for change in file_change_stack(session, FILE_CHANGE_UNDO_STACK_KEY) {
+        if change.get("run_id").and_then(Value::as_str) != Some(run_id) {
+            continue;
+        }
+        let Some(path) = change
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let status = runtime_file_change_status(&change);
+        changed_by_path.insert(
+            path.to_string(),
+            json!({
+                "kind": "file",
+                "label": format!("{status} {path}"),
+                "path": path,
+                "status": status,
+            }),
+        );
+    }
+
+    let mut latest_tools = BTreeMap::new();
+    if let Ok(messages) = store.list_messages_with_parts(&session.id, None, None) {
+        for message in messages {
+            if message.info.run_id.as_deref() != Some(run_id) {
+                continue;
+            }
+            for part in message.parts {
+                if part.kind != MessagePartKind::Tool {
+                    continue;
+                }
+                let call_id = part
+                    .content
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&part.id)
+                    .to_string();
+                let tool = part
+                    .content
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.attributes.get("name").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("tool")
+                    .to_string();
+                latest_tools.insert(call_id, (tool, part.status));
+            }
+        }
+    }
+
+    let mut verified = Vec::new();
+    let mut remaining = Vec::new();
+    for (_, (tool, status)) in latest_tools {
+        match status {
+            MessageStatus::Completed => verified.push(json!({
+                "kind": "tool",
+                "label": format!("{tool} completed"),
+                "tool": tool,
+                "status": "completed",
+            })),
+            MessageStatus::Error | MessageStatus::Interrupted => remaining.push(json!({
+                "kind": "tool",
+                "label": format!("{tool} failed"),
+                "tool": tool,
+                "status": "failed",
+            })),
+            MessageStatus::Pending | MessageStatus::Running => remaining.push(json!({
+                "kind": "tool",
+                "label": format!("{tool} pending"),
+                "tool": tool,
+                "status": "pending",
+            })),
+        }
+    }
+    for todo in &session.todos {
+        let status = todo.status.trim().to_ascii_lowercase();
+        if matches!(
+            status.as_str(),
+            "completed" | "done" | "cancelled" | "canceled"
+        ) {
+            continue;
+        }
+        let label = bounded_result_label(&todo.content);
+        if label.is_empty() {
+            continue;
+        }
+        remaining.push(json!({
+            "kind": "todo",
+            "label": label,
+            "todo_id": todo.id,
+            "status": if status.is_empty() { "pending" } else { status.as_str() },
+        }));
+    }
+
+    json!({
+        "schema_version": FINAL_RESULT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "summary": answer,
+        "changed": changed_by_path.into_values().collect::<Vec<_>>(),
+        "verified": verified,
+        "remaining": remaining,
+    })
+}
+
+fn persist_runtime_final_result(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    message_id: &str,
+    answer: &str,
+    step: u64,
+) -> Value {
+    if let Ok(Some(message)) = store.get_message_with_parts(&session.id, message_id)
+        && let Some(existing) = message
+            .parts
+            .iter()
+            .find(|part| part.kind == MessagePartKind::Result)
+            .map(|part| part.content.clone())
+    {
+        session
+            .metadata
+            .insert(FINAL_RESULT_METADATA_KEY.to_string(), existing.clone());
+        return existing;
+    }
+
+    let result = runtime_final_result(store, session, run_id, answer);
+    let _ = store.append_part(
+        &session.id,
+        run_id,
+        "result",
+        SessionPartOptions {
+            message_id: Some(message_id.to_string()),
+            content: Some(result.clone()),
+            attributes: BTreeMap::from([
+                (
+                    "schema_version".to_string(),
+                    json!(FINAL_RESULT_SCHEMA_VERSION),
+                ),
+                ("run_id".to_string(), json!(run_id)),
+            ]),
+            step_index: Some(step),
+            status: "completed".to_string(),
+            ..SessionPartOptions::default()
+        },
+    );
+    session
+        .metadata
+        .insert(FINAL_RESULT_METADATA_KEY.to_string(), result.clone());
+    let _ = store.save_state(session, Some(run_id));
+    result
+}
+
 fn append_runtime_completion_assistant(
     store: &FileSessionStore,
     session: &mut Session,
@@ -8790,7 +10122,7 @@ fn append_runtime_completion_assistant(
     step: u64,
     assistant_message_id: &str,
     start_checkpoint_id: Option<&str>,
-) {
+) -> Value {
     let assistant = ChatMessage {
         role: Role::Assistant,
         content: answer.to_string(),
@@ -8817,6 +10149,7 @@ fn append_runtime_completion_assistant(
         assistant_message_id,
         start_checkpoint_id,
     );
+    persist_runtime_final_result(store, session, run_id, assistant_message_id, answer, step)
 }
 
 fn append_interaction_resolution_part(
@@ -8989,6 +10322,14 @@ fn finish_provider_loop(
     session.status = SessionStatus::Idle;
     session.metadata.remove("pending_provider_turn");
     let outcome = SessionRunnerFacade::completed_turn_outcome(carry.next_step, finish_reason);
+    let final_result = persist_runtime_final_result(
+        store,
+        session,
+        run_id,
+        &runtime_turn_message_id(run_id, "assistant", carry.next_step),
+        &carry.answer,
+        carry.next_step,
+    );
     let _ = store.finish_run(
         session,
         run_id,
@@ -9016,6 +10357,7 @@ fn finish_provider_loop(
                 false,
                 BTreeMap::from([
                     ("final_answer".to_string(), json!(carry.answer.clone())),
+                    ("final_result".to_string(), final_result.clone()),
                     ("usage".to_string(), usage.clone()),
                     ("trace".to_string(), trace.clone()),
                     (
@@ -9041,6 +10383,7 @@ fn finish_provider_loop(
             "session_id": session.id,
             "status": outcome.event_status.clone(),
             "final_answer": events.last().and_then(|event| event.get("params")).and_then(|params| params.get("final_answer")).cloned().unwrap_or_else(|| json!("")),
+            "final_result": final_result,
             "agent": session_text_metadata(session, "agent", "server"),
             "model": session_text_metadata(session, "model", &default_model_id()),
             "variant": session_text_metadata(session, "variant", "default"),
@@ -9097,10 +10440,13 @@ fn start_turn_response(
     request_path: &str,
     body: &str,
 ) -> HttpResponseSpec {
-    let payload: Value = match serde_json::from_str(body) {
+    let mut payload: Value = match serde_json::from_str(body) {
         Ok(payload) => payload,
         Err(error) => return json_response(400, json!({"error": error.to_string()})),
     };
+    if let Some(object) = payload.as_object_mut() {
+        object.remove(INTERNAL_TURN_RETRY_KEY);
+    }
     if turn_async_requested(request_path, &payload) {
         match start_turn_async_payload(config, session_id, payload) {
             Ok((status, payload)) => json_response(status, payload),
@@ -9115,6 +10461,17 @@ fn start_turn_response(
 }
 
 fn start_turn_async_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    mut payload: Value,
+) -> Result<(u16, Value), String> {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove(INTERNAL_TURN_RETRY_KEY);
+    }
+    start_turn_async_payload_trusted(config, session_id, payload)
+}
+
+fn start_turn_async_payload_trusted(
     config: &HttpRuntimeConfig,
     session_id: &str,
     payload: Value,
@@ -9298,14 +10655,18 @@ fn start_turn_payload_inner(
     run_id_override: Option<String>,
 ) -> Result<Value, String> {
     validate_start_turn_payload(&payload)?;
+    let retry_metadata = payload
+        .get(INTERNAL_TURN_RETRY_KEY)
+        .and_then(Value::as_object)
+        .cloned();
     let input = payload
         .get("input")
         .or_else(|| payload.get("message"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     let attachments = turn_attachments_from_payload(&payload)?;
-    let permission_ruleset = permission_ruleset_for_turn(&payload)?;
-    let skip_permissions = skip_permissions_for_turn(&payload);
+    let mut permission_ruleset = permission_ruleset_for_turn(&payload)?;
+    let mut skip_permissions = skip_permissions_for_turn(&payload);
     let store = FileSessionStore::new(session_root(config));
     if !session_state_exists(config, session_id) {
         return Err("session_not_found".to_string());
@@ -9313,6 +10674,22 @@ fn start_turn_payload_inner(
     let mut session = store
         .load_session(session_id)
         .map_err(|error| error.to_string())?;
+    let plan_mode_enforced =
+        session_plan(&session)?.is_some_and(|plan| plan.status == DurablePlanStatus::Planning);
+    if plan_mode_enforced {
+        permission_ruleset = PermissionRuleset::Readonly;
+        skip_permissions = false;
+        session.metadata.insert(
+            "latest_plan_enforcement".to_string(),
+            json!({
+                "schema_version": "openagent.plan_enforcement.v1",
+                "mode": "planning",
+                "permission": "READONLY",
+                "skip_permissions": false,
+                "enforced_at_ms": now_ms(),
+            }),
+        );
+    }
     let runtime_profile = apply_turn_runtime_profile(&mut session, &payload);
     let run_id = run_id_override.unwrap_or_else(|| new_id("turn"));
     let max_steps = provider_max_steps(&payload);
@@ -9334,46 +10711,54 @@ fn start_turn_payload_inner(
             started_at_ms: None,
         },
     );
-    let mut user_metadata = BTreeMap::new();
-    if !attachments.is_empty() {
+    if retry_metadata.is_none() {
+        let mut user_metadata = BTreeMap::new();
+        if !attachments.is_empty() {
+            user_metadata.insert(
+                "display_content".to_string(),
+                json!(input.trim().to_string()),
+            );
+            user_metadata.insert(
+                "attachments".to_string(),
+                Value::Array(
+                    attachments
+                        .iter()
+                        .map(|attachment| attachment.metadata.clone())
+                        .collect(),
+                ),
+            );
+            user_metadata.insert(
+                "context_attachments".to_string(),
+                Value::Array(
+                    attachments
+                        .iter()
+                        .map(|attachment| {
+                            serde_json::to_value(&attachment.context).unwrap_or_default()
+                        })
+                        .collect(),
+                ),
+            );
+            user_metadata.insert("attachment_count".to_string(), json!(attachments.len()));
+        }
         user_metadata.insert(
-            "display_content".to_string(),
-            json!(input.trim().to_string()),
+            "message_id".to_string(),
+            json!(runtime_turn_message_id(&run_id, "user", 0)),
         );
-        user_metadata.insert(
-            "attachments".to_string(),
-            Value::Array(
-                attachments
-                    .iter()
-                    .map(|attachment| attachment.metadata.clone())
-                    .collect(),
-            ),
-        );
-        user_metadata.insert(
-            "context_attachments".to_string(),
-            Value::Array(
-                attachments
-                    .iter()
-                    .map(|attachment| serde_json::to_value(&attachment.context).unwrap_or_default())
-                    .collect(),
-            ),
-        );
-        user_metadata.insert("attachment_count".to_string(), json!(attachments.len()));
+        if plan_mode_enforced {
+            user_metadata.insert("plan_mode".to_string(), json!("planning"));
+            user_metadata.insert("plan_read_only_enforced".to_string(), json!(true));
+        }
+        let user = ChatMessage {
+            role: Role::User,
+            content: input.to_string(),
+            name: None,
+            tool_call_id: None,
+            metadata: user_metadata,
+        };
+        let user_index = session.messages.len() as u64;
+        session.add(user.clone());
+        let _ = store.append_message(&session, &user, &run_id, user_index);
     }
-    user_metadata.insert(
-        "message_id".to_string(),
-        json!(runtime_turn_message_id(&run_id, "user", 0)),
-    );
-    let user = ChatMessage {
-        role: Role::User,
-        content: input.to_string(),
-        name: None,
-        tool_call_id: None,
-        metadata: user_metadata,
-    };
-    let user_index = session.messages.len() as u64;
-    session.add(user.clone());
-    let _ = store.append_message(&session, &user, &run_id, user_index);
     let mut tool_calls = tool_calls_from_turn_payload(&payload)?;
     if tool_calls.is_empty()
         && let Some(call) = manual_runtime_subagent_tool_call(input)
@@ -9407,7 +10792,39 @@ fn start_turn_payload_inner(
         );
     }
     let _ = runtime_profile;
-    let initial_events = vec![turn_started_event(&session, &run_id)];
+    let mut initial_events = vec![turn_started_event(&session, &run_id)];
+    if let Some(retry) = retry_metadata {
+        let retry_of_turn_id = retry
+            .get("retry_of_turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let retry_root_turn_id = retry
+            .get("retry_root_turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or(retry_of_turn_id);
+        let retry_count = retry
+            .get("retry_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let max_retries = retry
+            .get("max_retries")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(runtime_manual_turn_retries);
+        initial_events.push(json!({
+            "method": "turn/retried",
+            "params": {
+                "thread_id": session.id.clone(),
+                "session_id": session.id.clone(),
+                "turn_id": run_id,
+                "run_id": run_id,
+                "status": "running",
+                "retry_of_turn_id": retry_of_turn_id,
+                "retry_root_turn_id": retry_root_turn_id,
+                "retry_count": retry_count,
+                "max_retries": max_retries,
+            }
+        }));
+    }
     run_provider_loop(RuntimeProviderLoopInput {
         config,
         store: &store,
@@ -9502,6 +10919,65 @@ fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>,
                 .or_else(|| object.get("contentType"))
                 .and_then(Value::as_str)
                 .unwrap_or("text/plain");
+            let source = object
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            let page_count = object
+                .get("page_count")
+                .or_else(|| object.get("pageCount"))
+                .and_then(Value::as_u64);
+            let media_metadata = object
+                .get("media_metadata")
+                .or_else(|| object.get("mediaMetadata"))
+                .or_else(|| object.get("media"))
+                .and_then(Value::as_object)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter(|(key, value)| {
+                            matches!(
+                                key.as_str(),
+                                "width_px"
+                                    | "height_px"
+                                    | "duration_ms"
+                                    | "frame_count"
+                                    | "dpi"
+                                    | "orientation"
+                                    | "extension"
+                            ) && (value.is_number() || value.is_boolean() || value.is_string())
+                        })
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            let included_content_bytes = object
+                .get("included_content_bytes")
+                .or_else(|| object.get("includedContentBytes"))
+                .and_then(Value::as_u64)
+                .or(Some(content.len() as u64));
+            let original_content_bytes = object
+                .get("original_content_bytes")
+                .or_else(|| object.get("originalContentBytes"))
+                .and_then(Value::as_u64)
+                .or_else(|| (size_bytes > content.len() as u64).then_some(size_bytes));
+            let truncated = object
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    original_content_bytes.is_some_and(|original| {
+                        original > included_content_bytes.unwrap_or_default()
+                    })
+                });
+            let truncation_reason = object
+                .get("truncation_reason")
+                .or_else(|| object.get("truncationReason"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
             let content_chars = content.chars().count();
             let content_lines = content.lines().count();
             let mut context = ContextAttachment::new(
@@ -9512,6 +10988,13 @@ fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>,
                 size_bytes,
                 content,
             );
+            context.source = source.clone();
+            context.page_count = page_count;
+            context.media_metadata = media_metadata.clone();
+            context.truncated = truncated;
+            context.truncation_reason = truncation_reason.clone();
+            context.original_content_bytes = original_content_bytes;
+            context.included_content_bytes = included_content_bytes;
             if let Some(external_id) = object
                 .get("id")
                 .and_then(Value::as_str)
@@ -9531,6 +11014,13 @@ fn turn_attachments_from_payload(payload: &Value) -> Result<Vec<TurnAttachment>,
                     "content_type": content_type,
                     "content_chars": content_chars,
                     "content_lines": content_lines,
+                    "source": source,
+                    "page_count": page_count,
+                    "media_metadata": media_metadata,
+                    "truncated": truncated,
+                    "truncation_reason": truncation_reason,
+                    "original_content_bytes": original_content_bytes,
+                    "included_content_bytes": included_content_bytes,
                 }),
                 context,
             })
@@ -9636,7 +11126,16 @@ fn record_async_turn_failure(
     session.metadata.remove("pending_provider_turn");
     let outcome = SessionRunnerFacade::failed_turn_outcome(1, "async_turn_error", error);
     let retryable = runtime_provider_error_retryable(error);
-    let resumable = read_turn_retry_payload(&store.root, run_id).is_some();
+    let saved_retry = read_turn_retry_payload(&store.root, run_id);
+    let retry_count = saved_retry
+        .as_ref()
+        .and_then(|saved| saved.get("payload"))
+        .and_then(|payload| payload.get(INTERNAL_TURN_RETRY_KEY))
+        .and_then(|metadata| metadata.get("retry_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let max_retries = runtime_manual_turn_retries();
+    let resumable = retryable && saved_retry.is_some() && retry_count < max_retries;
     let _ = store.finish_run(
         &session,
         run_id,
@@ -9659,6 +11158,8 @@ fn record_async_turn_failure(
                     ("error".to_string(), json!(error)),
                     ("retryable".to_string(), json!(retryable)),
                     ("resumable".to_string(), json!(resumable)),
+                    ("retry_count".to_string(), json!(retry_count)),
+                    ("max_retries".to_string(), json!(max_retries)),
                     (
                         "retry_url".to_string(),
                         json!(format!("/api/turns/{run_id}/retry")),
@@ -9715,15 +11216,59 @@ fn retry_turn_response(config: &HttpRuntimeConfig, turn_id: &str) -> HttpRespons
         return json_response(500, json!({"error": "turn retry payload is invalid"}));
     };
     let mut payload = saved.get("payload").cloned().unwrap_or_else(|| json!({}));
+    let prior_retry = payload
+        .get(INTERNAL_TURN_RETRY_KEY)
+        .and_then(Value::as_object);
+    let retry_count = prior_retry
+        .and_then(|metadata| metadata.get("retry_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let max_retries = runtime_manual_turn_retries();
+    if retry_count > max_retries {
+        return json_response(
+            429,
+            json!({
+                "error": "turn retry limit reached",
+                "error_code": "turn_retry_limit_reached",
+                "turn_id": turn_id,
+                "retry_count": retry_count.saturating_sub(1),
+                "max_retries": max_retries,
+            }),
+        );
+    }
+    let retry_root_turn_id = prior_retry
+        .and_then(|metadata| metadata.get("retry_root_turn_id"))
+        .and_then(Value::as_str)
+        .unwrap_or(turn_id)
+        .to_string();
     if let Some(object) = payload.as_object_mut() {
         object.insert("async".to_string(), json!(true));
-        object.insert("retry_of_turn_id".to_string(), json!(turn_id));
+        object.remove("retry_of_turn_id");
+        object.insert(
+            INTERNAL_TURN_RETRY_KEY.to_string(),
+            json!({
+                "retry_of_turn_id": turn_id,
+                "retry_root_turn_id": retry_root_turn_id,
+                "retry_count": retry_count,
+                "max_retries": max_retries,
+            }),
+        );
     }
-    match start_turn_async_payload(config, session_id, payload) {
+    match start_turn_async_payload_trusted(config, session_id, payload) {
         Ok((status, mut response)) => {
-            remove_turn_retry_payload(&root, turn_id);
+            if response
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                remove_turn_retry_payload(&root, turn_id);
+            }
             if let Some(object) = response.as_object_mut() {
                 object.insert("retry_of_turn_id".to_string(), json!(turn_id));
+                object.insert("retry_root_turn_id".to_string(), json!(retry_root_turn_id));
+                object.insert("retry_count".to_string(), json!(retry_count));
+                object.insert("max_retries".to_string(), json!(max_retries));
             }
             json_response(status, response)
         }
@@ -9901,7 +11446,7 @@ fn run_http_tool_turn(
     } else {
         "tool execution failed".to_string()
     };
-    append_runtime_completion_assistant(
+    let final_result = append_runtime_completion_assistant(
         store,
         session,
         run_id,
@@ -9927,6 +11472,7 @@ fn run_http_tool_turn(
                 false,
                 BTreeMap::from([
                     ("final_answer".to_string(), json!(answer.clone())),
+                    ("final_result".to_string(), final_result.clone()),
                     ("usage".to_string(), usage.clone()),
                     ("trace".to_string(), trace.clone()),
                 ]),
@@ -9937,6 +11483,7 @@ fn run_http_tool_turn(
         "session_id": session.id,
         "turn_id": run_id,
         "status": "completed",
+        "final_result": final_result,
         "events": events,
     }))
 }
@@ -9960,6 +11507,9 @@ fn respond_approval_payload(
         .get("pending_approval")
         .cloned()
         .ok_or_else(|| "pending approval not found".to_string())?;
+    if approval.get("source").and_then(Value::as_str) == Some("git_workflow") {
+        return resolve_git_workflow_approval(&store, session, approval, &response);
+    }
     let run_id = approval
         .get("run_id")
         .or_else(|| approval.get("turn_id"))
@@ -10108,7 +11658,7 @@ fn respond_approval_payload(
         } else {
             "approval resolved".to_string()
         };
-        append_runtime_completion_assistant(
+        let final_result = append_runtime_completion_assistant(
             &store,
             &mut session,
             &run_id,
@@ -10144,6 +11694,7 @@ fn respond_approval_payload(
                     false,
                     BTreeMap::from([
                         ("final_answer".to_string(), json!(answer.clone())),
+                        ("final_result".to_string(), final_result),
                         ("usage".to_string(), usage.clone()),
                         ("trace".to_string(), trace.clone()),
                     ]),
@@ -10296,8 +11847,9 @@ fn respond_question_payload(
 
     let tool_call = pending_question_tool_call(&question)?;
     let agent_profile = runtime_agent_profile_for_session(&session);
+    sync_plugin_runtime_metadata(config, &mut session);
     let mut runner_facade = SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
-        .with_agent_options(runtime_agent_tool_options(agent_profile.as_ref()));
+        .with_agent_options(runtime_agent_tool_options(&session, agent_profile.as_ref()));
     if let Some(value) = response.get("answers") {
         runner_facade = runner_facade.with_question_answers_value(value);
     }
@@ -11532,52 +13084,6 @@ while True:
     }
 
     #[test]
-    fn runtime_model_catalog_filters_unsupported_models() {
-        let config = RuntimeProviderConfig {
-            provider: "openai".to_string(),
-            provider_label: "OpenAI".to_string(),
-            api_key_env: "OPENAI_API_KEY".to_string(),
-            api_key: Some("test-key".to_string()),
-            api_key_source: Some("test".to_string()),
-            base_url: "https://example.test/v1".to_string(),
-            base_url_source: "test".to_string(),
-            model: "gpt-5.5".to_string(),
-            model_source: "test".to_string(),
-            wire_api: "responses".to_string(),
-            wire_api_source: "test".to_string(),
-            requires_api_key: true,
-        };
-        let probe = RuntimeModelProbe {
-            checked: true,
-            ok: true,
-            message: "ok".to_string(),
-            endpoint: Some("https://example.test/v1/models".to_string()),
-            model_ids: vec![
-                "gpt-5.4".to_string(),
-                "gpt-5.3".to_string(),
-                "gpt-5.5".to_string(),
-                "gpt-5.6-sol".to_string(),
-                "gpt-5.6-terra".to_string(),
-                "gpt-5.6".to_string(),
-                "gpt-image-1.5".to_string(),
-                "gpt-image-2".to_string(),
-                "server-local".to_string(),
-            ],
-            configured_model_available: Some(true),
-        };
-
-        let ids = model_records_for_runtime(&config, &probe)
-            .into_iter()
-            .map(|model| model["id"].as_str().unwrap_or_default().to_string())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            ids,
-            vec!["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4"]
-        );
-    }
-
-    #[test]
     fn runtime_provider_fallback_candidates_filter_unsupported_models() {
         assert_eq!(
             runtime_provider_model_candidates_with_fallback(
@@ -11655,6 +13161,105 @@ while True:
     }
 
     #[test]
+    fn bridge_persistent_terminal_routes_complete_the_session_lifecycle() {
+        let root =
+            std::env::temp_dir().join(format!("openagent-http-terminal-session-{}", now_ms()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(root.join("sessions").to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+
+        let started = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/terminal/sessions".to_string(),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({})),
+            },
+            &config,
+        );
+        assert_eq!(started.status, 201);
+        let started = started.body.expect("started body");
+        let terminal_id = started["terminal_id"].as_str().expect("terminal id");
+
+        let input = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/api/terminal/sessions/{terminal_id}/input"),
+                headers: BTreeMap::new(),
+                body: stable_json_dumps(&json!({"input": "echo route-ok"})),
+            },
+            &config,
+        );
+        assert_eq!(input.status, 200);
+        thread::sleep(Duration::from_millis(100));
+
+        let snapshot = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: format!("/api/terminal/sessions/{terminal_id}?after=0"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(snapshot.status, 200);
+        let output = snapshot.body.expect("snapshot body")["chunks"]
+            .as_array()
+            .expect("chunks")
+            .iter()
+            .filter_map(|chunk| chunk["text"].as_str())
+            .collect::<String>();
+        assert!(output.contains("route-ok"));
+
+        let listed = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/terminal/sessions".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(listed.status, 200);
+        assert_eq!(
+            listed.body.expect("list body")["terminals"][0]["terminal_id"],
+            terminal_id
+        );
+
+        let interrupted = route_http_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: format!("/api/terminal/sessions/{terminal_id}/interrupt"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(interrupted.status, 200);
+        assert_eq!(
+            interrupted.body.expect("interrupt body")["status"],
+            "interrupted"
+        );
+
+        let closed = route_http_request(
+            &HttpRequest {
+                method: "DELETE".to_string(),
+                path: format!("/api/terminal/sessions/{terminal_id}"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(closed.status, 200);
+        assert_eq!(closed.body.expect("close body")["closed"], true);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn bridge_mcp_status_sanitizes_config() {
         let config = HttpRuntimeConfig {
             mcp_config: Some(stable_json_dumps(&json!({
@@ -11680,7 +13285,7 @@ while True:
         let protocol = bridge_protocol_payload();
         assert_eq!(
             protocol["endpoints"]["mcp"],
-            "GET /api/mcp; POST /api/mcp/servers; PATCH|DELETE /api/mcp/servers/{name}; POST /api/mcp/servers/{name}/test|start|stop|restart"
+            "GET /api/mcp; POST /api/mcp/servers; PATCH|DELETE /api/mcp/servers/{name}; POST /api/mcp/servers/{name}/test|start|stop|restart; GET /api/mcp/servers/{name}/oauth; POST /api/mcp/servers/{name}/oauth/login|refresh|revoke; GET /api/mcp/oauth/callback"
         );
 
         let response = route_http_request(
@@ -12129,7 +13734,8 @@ while True:
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created
             .get("session_id")
             .and_then(Value::as_str)
@@ -12330,7 +13936,8 @@ while True:
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created
             .get("session_id")
             .and_then(Value::as_str)
@@ -12834,7 +14441,8 @@ fn escape_json_string(value: &str) -> String {
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created
             .get("session_id")
             .and_then(Value::as_str)
@@ -12888,7 +14496,361 @@ fn escape_json_string(value: &str) -> String {
     }
 
     #[test]
-    fn bridge_turn_persists_text_attachment_metadata() {
+    fn durable_goal_lifecycle_persists_and_enters_context_pack() {
+        let root = std::env::temp_dir().join(format!("openagent-http-goal-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        )
+        .expect("create session");
+        let session_id = created["session_id"].as_str().expect("session id");
+        let goal_path = format!("/api/sessions/{session_id}/goal");
+        let mutate = |body: Value| {
+            route_http_request(
+                &HttpRequest {
+                    method: "PUT".to_string(),
+                    path: goal_path.clone(),
+                    headers: BTreeMap::new(),
+                    body: stable_json_dumps(&body),
+                },
+                &config,
+            )
+        };
+        let created_goal = mutate(json!({
+            "action": "create",
+            "title": "Ship durable goal",
+            "objective": "Keep the desktop goal across reloads and Bridge restarts.",
+            "acceptance_criteria": ["Create and edit", "Pause and resume", "Complete"]
+        }));
+        assert_eq!(created_goal.status, 200);
+        let created_body = created_goal.body.expect("created goal body");
+        assert_eq!(created_body["goal"]["status"], "active");
+        assert_eq!(created_body["goal"]["revision"], 1);
+
+        let store = FileSessionStore::new(session_root.clone());
+        let mut session = store.load_session(session_id).expect("load session");
+        let pack = runtime_context_pack_for_agent(
+            &store,
+            &mut session,
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            ContextPackBuildOptions {
+                trace_only: false,
+                ..ContextPackBuildOptions::default()
+            },
+        );
+        let goal_trace = pack
+            .trace
+            .iter()
+            .find(|entry| entry.kind == "goal")
+            .expect("goal context trace");
+        assert!(goal_trace.included);
+        assert!(goal_trace.pinned);
+        assert!(pack.messages.iter().any(|message| {
+            message.content.contains("[Durable goal]")
+                && message.content.contains("Keep the desktop goal")
+        }));
+
+        let updated = mutate(json!({
+            "action": "update",
+            "objective": "Persist and explain the goal through ContextPack."
+        }));
+        assert_eq!(updated.body.expect("updated body")["goal"]["revision"], 2);
+        assert_eq!(
+            mutate(json!({"action": "pause"})).body.expect("pause body")["goal"]["status"],
+            "paused"
+        );
+
+        let restarted_config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let restored = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: goal_path.clone(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &restarted_config,
+        );
+        assert_eq!(restored.status, 200);
+        assert_eq!(
+            restored.body.expect("restored body")["goal"]["status"],
+            "paused"
+        );
+        assert_eq!(
+            mutate(json!({"action": "resume"}))
+                .body
+                .expect("resume body")["goal"]["status"],
+            "active"
+        );
+        let completed = mutate(json!({"action": "complete"}))
+            .body
+            .expect("complete body");
+        assert_eq!(completed["goal"]["status"], "completed");
+        assert!(completed["goal"]["completed_at_ms"].as_u64().is_some());
+        let invalid_resume = mutate(json!({"action": "resume"}));
+        assert_eq!(invalid_resume.status, 400);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_plan_enforces_read_only_until_explicit_execution() {
+        let root = std::env::temp_dir().join(format!("openagent-http-plan-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        )
+        .expect("create session");
+        let session_id = created["session_id"].as_str().expect("session id");
+        let plan_path = format!("/api/sessions/{session_id}/plan");
+        let mutate = |body: Value| {
+            route_http_request(
+                &HttpRequest {
+                    method: "PUT".to_string(),
+                    path: plan_path.clone(),
+                    headers: BTreeMap::new(),
+                    body: stable_json_dumps(&body),
+                },
+                &config,
+            )
+        };
+        let created_plan = mutate(json!({
+            "action": "create",
+            "title": "Plan a safe change",
+            "objective": "Inspect first, then explicitly execute.",
+            "steps": ["Read the workspace", "Write only after conversion"]
+        }));
+        assert_eq!(created_plan.status, 200);
+        assert_eq!(
+            created_plan.body.expect("created plan")["plan"]["status"],
+            "planning"
+        );
+
+        let store = FileSessionStore::new(session_root.clone());
+        let mut session = store.load_session(session_id).expect("load session");
+        let pack = runtime_context_pack_for_agent(
+            &store,
+            &mut session,
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            ContextPackBuildOptions {
+                trace_only: false,
+                ..ContextPackBuildOptions::default()
+            },
+        );
+        let plan_trace = pack
+            .trace
+            .iter()
+            .find(|entry| entry.kind == "plan")
+            .expect("plan trace");
+        assert!(plan_trace.included);
+        assert!(plan_trace.pinned);
+        assert!(pack.messages.iter().any(|message| {
+            message.content.contains("[Durable plan]")
+                && message.content.contains("inspect and plan only")
+        }));
+
+        let blocked_path = workspace.join("blocked.txt");
+        let blocked = start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "try to write while planning",
+                "permission": "FULL",
+                "dangerously_skip_permissions": true,
+                "tool_call": {
+                    "call_id": "call_plan_blocked",
+                    "name": "write",
+                    "input": {"file_path": "blocked.txt", "content": "must not exist\n"}
+                }
+            })),
+        )
+        .expect("planning turn");
+        assert!(
+            !blocked_path.exists(),
+            "plan mode allowed a write despite FULL + skip"
+        );
+        assert!(stable_json_dumps(&blocked).contains("permission_denied"));
+        let enforced_session = store.load_session(session_id).expect("enforced session");
+        assert_eq!(
+            enforced_session.metadata["latest_plan_enforcement"]["permission"],
+            "READONLY"
+        );
+        assert_eq!(
+            enforced_session.metadata["latest_plan_enforcement"]["skip_permissions"],
+            false
+        );
+
+        let restarted_config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let restored = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: plan_path.clone(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &restarted_config,
+        );
+        assert_eq!(
+            restored.body.expect("restored plan")["plan"]["status"],
+            "planning"
+        );
+
+        let executing = mutate(json!({"action": "execute"}));
+        assert_eq!(
+            executing.body.expect("executing plan")["plan"]["status"],
+            "executing"
+        );
+        let allowed_path = workspace.join("allowed.txt");
+        start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "execute the approved plan",
+                "permission": "FULL",
+                "dangerously_skip_permissions": true,
+                "tool_call": {
+                    "call_id": "call_plan_allowed",
+                    "name": "write",
+                    "input": {"file_path": "allowed.txt", "content": "executed\n"}
+                }
+            })),
+        )
+        .expect("execution turn");
+        assert_eq!(
+            fs::read_to_string(allowed_path).expect("allowed write"),
+            "executed\n"
+        );
+        let completed = mutate(json!({"action": "complete"}));
+        assert_eq!(
+            completed.body.expect("completed plan")["plan"]["status"],
+            "completed"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_task_tree_preserves_parent_child_statuses_across_restart() {
+        let root = std::env::temp_dir().join(format!("openagent-http-task-tree-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let store = FileSessionStore::new(session_root.clone());
+        let parent_id = "session_task_tree_parent";
+        let parent = Session::new(parent_id, workspace.clone());
+        store.save_state(&parent, None).expect("save parent");
+
+        let task = |id: &str, parent: &str, title: &str, status: &str, depth: u64| {
+            let mut session = Session::new(id, workspace.clone());
+            session.metadata.extend(BTreeMap::from([
+                ("subagent".to_string(), json!(true)),
+                ("parent_session_id".to_string(), json!(parent)),
+                ("task_description".to_string(), json!(title)),
+                ("task_status".to_string(), json!(status)),
+                ("task_depth".to_string(), json!(depth)),
+                ("agent".to_string(), json!("explorer")),
+            ]));
+            store.save_state(&session, None).expect("save task");
+        };
+        task(
+            "session_task_tree_running",
+            parent_id,
+            "Inspect runtime",
+            "running",
+            1,
+        );
+        task(
+            "session_task_tree_waiting",
+            "session_task_tree_running",
+            "Wait for approval",
+            "waiting_approval",
+            2,
+        );
+        task(
+            "session_task_tree_cancelled",
+            parent_id,
+            "Discard stale branch",
+            "canceled",
+            1,
+        );
+
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: format!("/api/sessions/{parent_id}/tasks"),
+            headers: BTreeMap::new(),
+            body: String::new(),
+        };
+        let response = route_http_request(&request, &config);
+        assert_eq!(response.status, 200);
+        let payload = response.body.expect("task tree payload");
+        assert_eq!(payload["schema_version"], "openagent.session_task_tree.v2");
+        assert_eq!(payload["count"], 3);
+        assert_eq!(payload["status_counts"]["running"], 1);
+        assert_eq!(payload["status_counts"]["waiting"], 1);
+        assert_eq!(payload["status_counts"]["cancelled"], 1);
+        let tree = payload["tree"].as_array().expect("task tree");
+        let running = tree
+            .iter()
+            .find(|task| task["title"] == "Inspect runtime")
+            .expect("running root task");
+        assert_eq!(running["canonical_status"], "running");
+        let waiting = running["children"]
+            .as_array()
+            .and_then(|children| children.first())
+            .expect("nested waiting task");
+        assert_eq!(waiting["title"], "Wait for approval");
+        assert_eq!(waiting["canonical_status"], "waiting");
+
+        let restarted_config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let restored = route_http_request(&request, &restarted_config)
+            .body
+            .expect("restored task tree");
+        assert_eq!(restored["tree"], payload["tree"]);
+        assert_eq!(restored["status_counts"], payload["status_counts"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bridge_turn_persists_rich_attachment_metadata_and_context_decisions() {
         let root = std::env::temp_dir().join(format!("openagent-http-attachment-{}", now_ms()));
         let workspace = root.join("workspace");
         let session_root = root.join("sessions");
@@ -12901,7 +14863,8 @@ fn escape_json_string(value: &str) -> String {
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created
             .get("session_id")
             .and_then(Value::as_str)
@@ -12914,12 +14877,45 @@ fn escape_json_string(value: &str) -> String {
                 "permission": "FULL",
                 "attachments": [
                     {
-                        "kind": "file",
+                        "kind": "document",
                         "path": "/tmp/openagent-note.md",
                         "name": "openagent-note.md",
-                        "size_bytes": 13,
+                        "size_bytes": 900000,
                         "content_type": "text/markdown",
-                        "content": "hello attached\n"
+                        "content": "hello attached\n",
+                        "source": "desktop_file_picker",
+                        "truncated": true,
+                        "truncation_reason": "desktop_attachment_content_limit",
+                        "original_content_bytes": 900000,
+                        "included_content_bytes": 15
+                    },
+                    {
+                        "kind": "pdf",
+                        "path": "/tmp/spec.pdf",
+                        "name": "spec.pdf",
+                        "size_bytes": 1200000,
+                        "content_type": "application/pdf",
+                        "content": "",
+                        "source": "desktop_file_picker",
+                        "page_count": 9,
+                        "truncated": true,
+                        "truncation_reason": "pdf_binary_metadata_only",
+                        "original_content_bytes": 1200000,
+                        "included_content_bytes": 0
+                    },
+                    {
+                        "kind": "image",
+                        "path": "/tmp/design.png",
+                        "name": "design.png",
+                        "size_bytes": 64000,
+                        "content_type": "image/png",
+                        "content": "",
+                        "source": "desktop_file_picker",
+                        "media_metadata": {"width_px": 1440, "height_px": 900},
+                        "truncated": true,
+                        "truncation_reason": "image_binary_metadata_only",
+                        "original_content_bytes": 64000,
+                        "included_content_bytes": 0
                     }
                 ],
                 "tool_call": {
@@ -12951,6 +14947,14 @@ fn escape_json_string(value: &str) -> String {
             user["info"]["metadata"]["attachments"][0]["name"],
             json!("openagent-note.md")
         );
+        assert_eq!(
+            user["info"]["metadata"]["attachments"][1]["page_count"],
+            json!(9)
+        );
+        assert_eq!(
+            user["info"]["metadata"]["attachments"][2]["media_metadata"]["width_px"],
+            json!(1440)
+        );
         let attachment_id = user["info"]["metadata"]["attachments"][0]["id"]
             .as_str()
             .expect("attachment id");
@@ -12966,7 +14970,7 @@ fn escape_json_string(value: &str) -> String {
             .find(|part| part["kind"] == "file")
             .expect("file part");
         assert_eq!(file["content"]["id"], json!(attachment_id));
-        assert_eq!(file["content"]["kind"], json!("file"));
+        assert_eq!(file["content"]["kind"], json!("document"));
         assert_eq!(file["content"]["path"], json!("/tmp/openagent-note.md"));
         assert_eq!(file["content"]["content"], json!("hello attached\n"));
 
@@ -12974,9 +14978,15 @@ fn escape_json_string(value: &str) -> String {
         let mut restored = store.load_session(session_id).expect("restored session");
         let materialized =
             runtime_materialized_provider_context_for_agent(&store, &mut restored, None);
-        assert_eq!(materialized.attachments.len(), 1);
+        assert_eq!(materialized.attachments.len(), 3);
         assert_eq!(materialized.attachments[0].id, attachment_id);
         assert_eq!(materialized.attachments[0].source_message_index, Some(0));
+        assert_eq!(materialized.attachments[1].kind, ContextAttachmentKind::Pdf);
+        assert_eq!(materialized.attachments[1].page_count, Some(9));
+        assert_eq!(
+            materialized.attachments[2].media_metadata["height_px"],
+            json!(900)
+        );
         let pack = runtime_context_pack_for_agent(
             &store,
             &mut restored,
@@ -13003,9 +15013,34 @@ fn escape_json_string(value: &str) -> String {
                 .contains("hello attached")
         );
         assert_eq!(
-            pack.receipt.item_kind_counts.get("attachment_file"),
+            pack.receipt.item_kind_counts.get("attachment_document"),
             Some(&1)
         );
+        assert_eq!(
+            pack.receipt.item_kind_counts.get("attachment_pdf"),
+            Some(&1)
+        );
+        assert_eq!(
+            pack.receipt.item_kind_counts.get("attachment_image"),
+            Some(&1)
+        );
+        let attachment_trace = pack
+            .trace
+            .iter()
+            .filter_map(|entry| entry.attachment.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(attachment_trace.len(), 3);
+        assert!(attachment_trace.iter().all(|entry| entry.source_truncated));
+        assert_eq!(attachment_trace[1].page_count, Some(9));
+        let public = public_context_trace_entry(
+            pack.trace
+                .iter()
+                .find(|entry| entry.kind == "attachment_pdf")
+                .expect("pdf trace"),
+        );
+        assert_eq!(public["attachment"]["name"], json!("spec.pdf"));
+        assert_eq!(public["attachment"]["page_count"], json!(9));
+        assert!(public["attachment"].get("content").is_none());
         assert_eq!(pack.receipt.item_kind_counts.get("checkpoint"), Some(&1));
 
         let _ = fs::remove_dir_all(root);
@@ -13025,7 +15060,8 @@ fn escape_json_string(value: &str) -> String {
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created["session_id"].as_str().expect("session id");
         let store = FileSessionStore::new(session_root);
         let mut session = store.load_session(session_id).expect("session");
@@ -13181,7 +15217,8 @@ fn escape_json_string(value: &str) -> String {
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created["session_id"].as_str().expect("session id");
         let store = FileSessionStore::new(session_root.clone());
         let mut session = store.load_session(session_id).expect("session");
@@ -13317,7 +15354,8 @@ fn escape_json_string(value: &str) -> String {
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created["session_id"].as_str().expect("session id");
         let store = FileSessionStore::new(session_root);
         let mut session = store.load_session(session_id).expect("session");
@@ -13384,7 +15422,8 @@ fn escape_json_string(value: &str) -> String {
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created["session_id"].as_str().expect("session id");
         let store = FileSessionStore::new(session_root);
         let mut session = store.load_session(session_id).expect("session");
@@ -13547,7 +15586,8 @@ fn escape_json_string(value: &str) -> String {
         let created = create_session_payload(
             &config,
             &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
-        );
+        )
+        .expect("create session");
         let session_id = created
             .get("session_id")
             .and_then(Value::as_str)

@@ -44,6 +44,10 @@ pub enum ProviderStreamEvent {
         model: String,
         reason: String,
     },
+    Reset {
+        model: String,
+        reason: String,
+    },
     Fallback {
         from_model: String,
         to_model: String,

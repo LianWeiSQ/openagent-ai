@@ -531,6 +531,12 @@ fn provider_events_to_run_result(
                     call_id: call_id.clone(),
                 });
             }
+            ProviderStreamEvent::Reset { .. } => {
+                answer.clear();
+                tool_calls.clear();
+                usage = Usage::default();
+                finish_reason = "stop".to_string();
+            }
             ProviderStreamEvent::Retry { .. } | ProviderStreamEvent::Fallback { .. } => {}
         }
     }
@@ -973,4 +979,47 @@ fn provider_wire_api(provider: &str, args: &[String]) -> String {
     resolve_provider_config(provider, args)
         .map(|config| config.wire_api)
         .unwrap_or_else(|_| DEFAULT_WIRE_API.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_stream_reset_discards_partial_attempt() {
+        let result = provider_events_to_run_result(
+            &[
+                ProviderStreamEvent::TextDelta {
+                    text: "discarded partial".to_string(),
+                },
+                ProviderStreamEvent::ToolCall {
+                    call_id: "discarded_call".to_string(),
+                    name: "read".to_string(),
+                    input: json!({"file_path": "old.txt"}),
+                },
+                ProviderStreamEvent::Reset {
+                    model: "primary".to_string(),
+                    reason: "fallback".to_string(),
+                },
+                ProviderStreamEvent::TextDelta {
+                    text: "clean fallback".to_string(),
+                },
+                ProviderStreamEvent::Finish {
+                    finish_reason: "stop".to_string(),
+                    usage: Usage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                        cost: 0.0,
+                    },
+                },
+            ],
+            "test".to_string(),
+            None,
+        );
+
+        assert_eq!(result.answer, "clean fallback");
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.usage.input_tokens, 3);
+        assert_eq!(result.usage.output_tokens, 2);
+    }
 }

@@ -81,7 +81,7 @@ pub fn route_options() -> HttpResponseSpec {
     let mut headers = Map::new();
     headers.insert(
         "Access-Control-Allow-Methods".to_string(),
-        Value::String("GET, POST, PATCH, DELETE, OPTIONS".to_string()),
+        Value::String("GET, POST, PUT, PATCH, DELETE, OPTIONS".to_string()),
     );
     headers.insert(
         "Access-Control-Allow-Headers".to_string(),
@@ -150,6 +150,9 @@ pub fn bridge_protocol_payload() -> Value {
             "protocol": "GET /api/protocol",
             "sessions": "GET|POST /api/sessions",
             "session": "GET|PATCH|DELETE /api/sessions/{session_id}",
+            "goal": "GET|PUT /api/sessions/{session_id}/goal",
+            "plan": "GET|PUT /api/sessions/{session_id}/plan",
+            "tasks": "GET /api/sessions/{session_id}/tasks; POST /api/sessions/{session_id}/tasks/{task_id}/start|wait|promote|cancel|resume (run remains a synchronous compatibility route)",
             "messages": "GET /api/sessions/{session_id}/messages",
             "context": "GET /api/sessions/{session_id}/context; POST /api/sessions/{session_id}/context/replay",
             "turns": "GET /api/turns; POST /api/sessions/{session_id}/turns; set body async=true or query ?async=true for 202 accepted background run",
@@ -161,22 +164,28 @@ pub fn bridge_protocol_payload() -> Value {
             "approvals": "GET /api/approvals; POST /api/approvals/{request_id}; POST /api/turns/{turn_id}/approvals/{request_id}",
             "questions": "GET /api/questions; POST /api/questions/{request_id}/reply; POST /api/turns/{turn_id}/questions/{request_id}/reply",
             "diff": "GET /api/sessions/{session_id}/diff",
-            "undo": "POST /api/sessions/{session_id}/undo",
+            "undo": "POST /api/sessions/{session_id}/undo; POST /api/sessions/{session_id}/files/undo with body path and optional run_id for a conflict-protected single-file rollback within one turn",
             "redo": "POST /api/sessions/{session_id}/redo",
             "checkpoints": "GET /api/sessions/{session_id}/checkpoints; POST /api/sessions/{session_id}/checkpoints/{checkpoint_id}/restore",
-            "files": "GET /api/files?path={path}&depth={depth}&content=true",
-            "git": "GET /api/git",
+            "files": "GET /api/files?session_id={session_id}&path={path}&depth={depth}&content=true",
+            "git": "GET /api/git?session_id={session_id}; GET /api/git/workflow?session_id={session_id}; POST /api/git/workflow/summary; POST /api/git/workflow/actions (all Git/GitHub writes require approval)",
             "lsp": "GET /api/lsp; GET /lsp; GET /api/lsp/doctor; POST /api/lsp/query",
-            "terminal_run": "POST /api/terminal/run",
-            "mcp": "GET /api/mcp; POST /api/mcp/servers; PATCH|DELETE /api/mcp/servers/{name}; POST /api/mcp/servers/{name}/test|start|stop|restart",
-            "models": "GET /api/models",
+            "terminal": "POST /api/terminal/run for one-shot compatibility; GET|POST /api/terminal/sessions; GET|DELETE /api/terminal/sessions/{terminal_id}; POST /api/terminal/sessions/{terminal_id}/input|interrupt",
+            "capabilities": "GET /api/capabilities; PUT /api/capabilities/{browser|computer|terminal}; POST /api/capabilities/{id}/diagnose",
+            "mcp": "GET /api/mcp; POST /api/mcp/servers; PATCH|DELETE /api/mcp/servers/{name}; POST /api/mcp/servers/{name}/test|start|stop|restart; GET /api/mcp/servers/{name}/oauth; POST /api/mcp/servers/{name}/oauth/login|refresh|revoke; GET /api/mcp/oauth/callback",
+            "plugins": "GET|POST /api/plugins; PATCH|DELETE /api/plugins/{plugin_id}; POST /api/plugins/{plugin_id}/update; PATCH /api/skills/{skill_name}",
+            "providers": "GET /api/providers; PUT /api/providers/config; POST /api/providers/validate; GET /api/models (catalog alias)",
+            "performance": "GET /api/performance?session_id={session_id}; POST /api/performance/probe?session_id={session_id}",
+            "storage": "GET /api/storage; POST /api/storage/audit|migrate|rollback",
             "agents": "GET /api/agents",
             "tui_control": "GET /tui/control/next; POST /tui/control/response; POST /tui/*",
         },
         "event_methods": [
             "turn/started",
+            "turn/retried",
             "turn/retrying",
             "turn/fallback",
+            "item/agentMessage/reset",
             "item/agentMessage/delta",
             "item/toolCall/started",
             "item/toolCall/completed",
@@ -192,6 +201,7 @@ pub fn bridge_protocol_payload() -> Value {
             "checkpoint/created",
             "lsp.updated",
             "patch/detected",
+            "git/workflow_updated",
             "turn/completed",
             "turn/failed",
             "turn/interrupted",
@@ -637,6 +647,11 @@ pub(super) fn queued_background_task_ids(
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             && metadata
+                .get("execution_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("background")
+                != "foreground"
+            && metadata
                 .get("task_status")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
@@ -762,15 +777,35 @@ pub(super) fn route_http_request(
     if request.method == "OPTIONS" {
         return route_options();
     }
+    let path = request.path.split('?').next().unwrap_or("/");
+    if request.method == "GET" && path == "/api/mcp/oauth/callback" {
+        return mcp_oauth_callback_response(config, &request.path);
+    }
     if !authorized(request, config) {
         return route_unauthorized();
     }
-    let path = request.path.split('?').next().unwrap_or("/");
     match (request.method.as_str(), path) {
         ("GET", "/api/health") => json_response(200, health_payload(config)),
         ("GET", "/api/protocol") => json_response(200, bridge_protocol_payload()),
-        ("GET", "/api/models") => json_response(200, models_payload(&request.path)),
+        ("GET", "/api/models") | ("GET", "/api/providers") => {
+            json_response(200, providers_payload(config, &request.path))
+        }
+        ("PUT", "/api/providers/config") => match apply_provider_payload(config, &request.body) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        },
+        ("POST", "/api/providers/validate") => {
+            match validate_provider_payload(config, &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            }
+        }
         ("GET", "/api/mcp") => json_response(200, mcp_payload(config, &request.path)),
+        ("GET", "/api/plugins") => json_response(200, plugins_payload(config)),
+        ("POST", "/api/plugins") => match install_plugin_payload(config, &request.body) {
+            Ok(payload) => json_response(201, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        },
         ("GET", "/api/lsp") | ("GET", "/lsp") => match lsp_status_payload(config) {
             Ok(payload) => json_response(200, payload),
             Err(error) => json_response(400, json!({"error": error})),
@@ -789,14 +824,69 @@ pub(super) fn route_http_request(
             Ok(payload) => json_response(200, payload),
             Err(error) => json_response(400, json!({"error": error})),
         },
-        ("GET", "/api/git") => match git_payload(config) {
+        ("GET", "/api/git") => match git_payload(config, &request.path) {
             Ok(payload) => json_response(200, payload),
             Err(error) => json_response(400, json!({"error": error})),
         },
+        ("GET", "/api/git/workflow") => match git_workflow_payload(config, &request.path) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        },
+        ("POST", "/api/git/workflow/summary") => {
+            match generate_git_workflow_summary(config, &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            }
+        }
+        ("POST", "/api/git/workflow/actions") => {
+            match request_git_workflow_action(config, &request.body) {
+                Ok(payload) => json_response(202, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            }
+        }
         ("POST", "/api/terminal/run") => match terminal_run_payload(config, &request.body) {
             Ok(payload) => json_response(200, payload),
             Err(error) => json_response(400, json!({"error": error})),
         },
+        ("GET", "/api/terminal/sessions") => {
+            match list_terminal_sessions_payload(config, &request.path) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            }
+        }
+        ("POST", "/api/terminal/sessions") => {
+            match start_terminal_session_payload(config, &request.body) {
+                Ok(payload) => json_response(201, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            }
+        }
+        ("GET", "/api/capabilities") => json_response(200, capabilities_payload(config)),
+        ("GET", "/api/performance") => match performance_status_payload(config, &request.path) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => session_error_response(error),
+        },
+        ("POST", "/api/performance/probe") => {
+            match run_performance_probe_payload(config, &request.path) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => session_error_response(error),
+            }
+        }
+        ("GET", "/api/storage") | ("POST", "/api/storage/audit") => {
+            match storage_status_payload(config) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(500, json!({"error": error})),
+            }
+        }
+        ("POST", "/api/storage/migrate") => match storage_migrate_payload(config) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(409, json!({"error": error})),
+        },
+        ("POST", "/api/storage/rollback") => {
+            match storage_rollback_payload(config, &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(409, json!({"error": error})),
+            }
+        }
         ("GET", "/api/events") => sse_response(global_sse_frames(config, &request.path)),
         ("GET", "/api/approvals") => {
             json_response(200, pending_approvals_payload(config, &request.path))
@@ -808,9 +898,16 @@ pub(super) fn route_http_request(
         ("GET", "/api/sessions") => {
             json_response(200, list_sessions_payload(config, &request.path))
         }
-        ("POST", "/api/sessions") => {
-            json_response(200, create_session_payload(config, &request.body))
-        }
+        ("POST", "/api/sessions") => match create_session_payload(config, &request.body) {
+            Ok(payload) => json_response(201, payload),
+            Err(error) => json_response(
+                500,
+                json!({
+                    "error": error,
+                    "status": "failed",
+                }),
+            ),
+        },
         _ => route_dynamic_request(request, config, path),
     }
 }
@@ -821,6 +918,57 @@ pub(super) fn route_dynamic_request(
     path: &str,
 ) -> HttpResponseSpec {
     let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if parts.len() == 4 && parts[0] == "api" && parts[1] == "terminal" && parts[2] == "sessions" {
+        return match request.method.as_str() {
+            "GET" => match terminal_session_snapshot_payload(config, parts[3], &request.path) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            "DELETE" => match close_terminal_session_payload(config, parts[3]) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            _ => route_unknown(),
+        };
+    }
+    if parts.len() == 5
+        && parts[0] == "api"
+        && parts[1] == "terminal"
+        && parts[2] == "sessions"
+        && request.method == "POST"
+    {
+        return match parts[4] {
+            "input" => match terminal_session_input_payload(config, parts[3], &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            "interrupt" => match interrupt_terminal_session_payload(config, parts[3]) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            _ => route_unknown(),
+        };
+    }
+    if parts.len() == 3 && parts[0] == "api" && parts[1] == "capabilities" {
+        return match request.method.as_str() {
+            "PUT" => match mutate_capability_payload(config, parts[2], &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            _ => route_unknown(),
+        };
+    }
+    if parts.len() == 4
+        && parts[0] == "api"
+        && parts[1] == "capabilities"
+        && parts[3] == "diagnose"
+        && request.method == "POST"
+    {
+        return match diagnose_capability_payload(config, parts[2]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
     if parts.len() == 3 && parts[0] == "api" && parts[1] == "sessions" {
         return match request.method.as_str() {
             "GET" => json_response(200, get_session_payload(config, parts[2])),
@@ -831,6 +979,32 @@ pub(super) fn route_dynamic_request(
             "DELETE" => match delete_session_payload(config, parts[2]) {
                 Ok(payload) => json_response(200, payload),
                 Err(error) => json_response(400, json!({"error": error})),
+            },
+            _ => route_unknown(),
+        };
+    }
+    if parts.len() == 4 && parts[0] == "api" && parts[1] == "sessions" && parts[3] == "goal" {
+        return match request.method.as_str() {
+            "GET" => match session_goal_payload(config, parts[2]) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => session_error_response(error),
+            },
+            "PUT" => match mutate_session_goal_payload(config, parts[2], &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => session_error_response(error),
+            },
+            _ => route_unknown(),
+        };
+    }
+    if parts.len() == 4 && parts[0] == "api" && parts[1] == "sessions" && parts[3] == "plan" {
+        return match request.method.as_str() {
+            "GET" => match session_plan_payload(config, parts[2]) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => session_error_response(error),
+            },
+            "PUT" => match mutate_session_plan_payload(config, parts[2], &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => session_error_response(error),
             },
             _ => route_unknown(),
         };
@@ -872,6 +1046,36 @@ pub(super) fn route_dynamic_request(
     if parts.len() == 2 && parts[0] == "api" && parts[1] == "skills" && request.method == "GET" {
         return json_response(200, skills_payload(config));
     }
+    if parts.len() == 3 && parts[0] == "api" && parts[1] == "plugins" {
+        return match request.method.as_str() {
+            "PATCH" => match mutate_plugin_payload(config, parts[2], &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            "DELETE" => match delete_plugin_payload(config, parts[2]) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            _ => route_unknown(),
+        };
+    }
+    if parts.len() == 4
+        && parts[0] == "api"
+        && parts[1] == "plugins"
+        && parts[3] == "update"
+        && request.method == "POST"
+    {
+        return match update_plugin_payload(config, parts[2]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
+    if parts.len() == 3 && parts[0] == "api" && parts[1] == "skills" && request.method == "PATCH" {
+        return match mutate_skill_payload(config, &percent_decode(parts[2]), &request.body) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
     if parts.len() == 3
         && parts[0] == "api"
         && parts[1] == "mcp"
@@ -879,6 +1083,32 @@ pub(super) fn route_dynamic_request(
         && request.method == "POST"
     {
         return mcp_config_response(mcp_add_server_payload(config, &request.body));
+    }
+    if parts.len() == 5
+        && parts[0] == "api"
+        && parts[1] == "mcp"
+        && parts[2] == "servers"
+        && parts[4] == "oauth"
+        && request.method == "GET"
+    {
+        return mcp_config_response(mcp_oauth_status_payload(config, parts[3]));
+    }
+    if parts.len() == 6
+        && parts[0] == "api"
+        && parts[1] == "mcp"
+        && parts[2] == "servers"
+        && parts[4] == "oauth"
+        && matches!(parts[5], "login" | "refresh" | "revoke")
+        && request.method == "POST"
+    {
+        return match parts[5] {
+            "login" => {
+                mcp_config_response(mcp_oauth_login_payload(config, parts[3], &request.body))
+            }
+            "refresh" => mcp_config_response(mcp_oauth_refresh_payload(config, parts[3])),
+            "revoke" => mcp_config_response(mcp_oauth_revoke_payload(config, parts[3])),
+            _ => route_unknown(),
+        };
     }
     if parts.len() == 5
         && parts[0] == "api"
@@ -938,10 +1168,58 @@ pub(super) fn route_dynamic_request(
         && parts[0] == "api"
         && parts[1] == "sessions"
         && parts[3] == "tasks"
+        && parts[5] == "start"
+        && request.method == "POST"
+    {
+        return match dispatch_session_task_payload(config, parts[2], parts[4], false) {
+            Ok(payload) => json_response(202, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
+    if parts.len() == 6
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "tasks"
+        && parts[5] == "wait"
+        && request.method == "POST"
+    {
+        return match wait_session_task_payload(config, parts[2], parts[4], &request.body) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
+    if parts.len() == 6
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "tasks"
+        && parts[5] == "promote"
+        && request.method == "POST"
+    {
+        return match dispatch_session_task_payload(config, parts[2], parts[4], true) {
+            Ok(payload) => json_response(202, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
+    if parts.len() == 6
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "tasks"
         && parts[5] == "cancel"
         && request.method == "POST"
     {
         return match cancel_session_task_payload(config, parts[2], parts[4]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
+    if parts.len() == 6
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "tasks"
+        && parts[5] == "resume"
+        && request.method == "POST"
+    {
+        return match resume_session_task_payload(config, parts[2], parts[4]) {
             Ok(payload) => json_response(200, payload),
             Err(error) => json_response(400, json!({"error": error})),
         };
@@ -977,6 +1255,18 @@ pub(super) fn route_dynamic_request(
                 Err(error) => session_error_response(error),
             },
             _ => route_unknown(),
+        };
+    }
+    if parts.len() == 5
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "files"
+        && parts[4] == "undo"
+        && request.method == "POST"
+    {
+        return match undo_session_file_payload(config, parts[2], &request.body) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
         };
     }
     if parts.len() == 4
@@ -1319,7 +1609,7 @@ pub(super) fn with_runtime_headers(
     );
     response.headers.insert(
         "Access-Control-Allow-Methods".to_string(),
-        json!("GET, POST, PATCH, DELETE, OPTIONS"),
+        json!("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
     );
     response
 }

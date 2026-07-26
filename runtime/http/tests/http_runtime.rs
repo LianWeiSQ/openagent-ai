@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -298,6 +298,153 @@ fn files_route_uses_source_only_scan_profile() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn workspace_routes_follow_the_scoped_session_directory() -> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-session-workspaces")?;
+    let workspace_a = temp.join("workspace-alpha");
+    let workspace_b = temp.join("workspace-beta");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace_a)?;
+    fs::create_dir_all(&workspace_b)?;
+    let init_git = |root: &Path| -> Result<(), Box<dyn Error>> {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "openagent-test@example.invalid"],
+            vec!["config", "user.name", "OpenAgent Test"],
+            vec!["commit", "--allow-empty", "-q", "-m", "baseline"],
+        ] {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(&args)
+                .output()?;
+            if !output.status.success() {
+                return Err(format!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
+        }
+        Ok(())
+    };
+    init_git(&workspace_a)?;
+    init_git(&workspace_b)?;
+    let canonical_workspace_a = fs::canonicalize(&workspace_a)?;
+    let canonical_workspace_b = fs::canonicalize(&workspace_b)?;
+    fs::write(workspace_a.join("alpha-only.txt"), "alpha workspace\n")?;
+    fs::write(workspace_b.join("beta-only.txt"), "beta workspace\n")?;
+
+    let mut server = spawn_runtime(port, &workspace_a, &session_root)?;
+    wait_for_server(port)?;
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let alpha_session = client.create_session(&workspace_a, None)?;
+    let beta_session = client.create_session(&workspace_b, None)?;
+
+    let beta_files = json_body(&authorized_request(
+        port,
+        "GET",
+        &format!("/api/files?session_id={beta_session}&path=beta-only.txt&content=true"),
+        "",
+        false,
+    )?)?;
+    assert_eq!(beta_files["session_id"], beta_session);
+    assert_eq!(
+        fs::canonicalize(
+            beta_files["workspace"]
+                .as_str()
+                .expect("beta files workspace")
+        )?,
+        canonical_workspace_b
+    );
+    assert_eq!(beta_files["content"], "beta workspace\n");
+
+    let beta_git = json_body(&authorized_request(
+        port,
+        "GET",
+        &format!("/api/git?session_id={beta_session}&path=beta-only.txt"),
+        "",
+        false,
+    )?)?;
+    assert_eq!(beta_git["session_id"], beta_session);
+    assert_eq!(
+        fs::canonicalize(beta_git["workspace"].as_str().expect("beta git workspace"))?,
+        canonical_workspace_b
+    );
+    assert!(
+        beta_git["changes"]
+            .as_array()
+            .expect("beta git changes")
+            .iter()
+            .any(|change| change["path"] == "beta-only.txt")
+    );
+    assert!(
+        beta_git["changes"]
+            .as_array()
+            .expect("beta git changes")
+            .iter()
+            .all(|change| change["path"] != "alpha-only.txt")
+    );
+
+    let beta_terminal = json_body(&authorized_request(
+        port,
+        "POST",
+        "/api/terminal/run",
+        &serde_json::json!({
+            "session_id": beta_session,
+            "command": "pwd"
+        })
+        .to_string(),
+        false,
+    )?)?;
+    assert_eq!(beta_terminal["session_id"], beta_session);
+    assert_eq!(
+        fs::canonicalize(
+            beta_terminal["workspace"]
+                .as_str()
+                .expect("beta terminal workspace")
+        )?,
+        canonical_workspace_b
+    );
+    assert_eq!(
+        fs::canonicalize(beta_terminal["cwd"].as_str().expect("beta terminal cwd"))?,
+        canonical_workspace_b
+    );
+    assert_eq!(
+        fs::canonicalize(
+            beta_terminal["stdout"]
+                .as_str()
+                .expect("beta terminal stdout")
+                .trim()
+        )?,
+        canonical_workspace_b
+    );
+
+    let alpha_files = json_body(&authorized_request(
+        port,
+        "GET",
+        &format!("/api/files?session_id={alpha_session}&path=alpha-only.txt&content=true"),
+        "",
+        false,
+    )?)?;
+    assert_eq!(
+        fs::canonicalize(
+            alpha_files["workspace"]
+                .as_str()
+                .expect("alpha files workspace")
+        )?,
+        canonical_workspace_a
+    );
+    assert_eq!(alpha_files["content"], "alpha workspace\n");
+
+    let _ = server.kill();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn remote_runtime_client_round_trips_tui_approval() -> Result<(), Box<dyn Error>> {
     let port = free_port()?;
     let temp = temp_dir("openagent-http-runtime-client-approval")?;
@@ -509,6 +656,40 @@ fn bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box<dyn
 }
 
 #[test]
+fn session_creation_does_not_succeed_without_persisted_state() -> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-session-persistence")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions-as-file");
+    fs::create_dir_all(&workspace)?;
+    fs::write(&session_root, "not a directory")?;
+    let mut server = spawn_runtime(port, &workspace, &session_root)?;
+    wait_for_server(port)?;
+
+    let response = authorized_request(
+        port,
+        "POST",
+        "/api/sessions",
+        &format!("{{\"cwd\":\"{}\"}}", workspace.to_string_lossy()),
+        true,
+    )?;
+    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+    let payload = json_body(&response)?;
+    assert_eq!(payload["status"], "failed");
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Failed to persist session")
+    );
+    assert!(payload.get("session_id").is_none());
+
+    let _ = server.kill();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn remote_runtime_client_manages_session_lifecycle() -> Result<(), Box<dyn Error>> {
     let port = free_port()?;
     let temp = temp_dir("openagent-http-runtime-session-lifecycle")?;
@@ -524,6 +705,26 @@ fn remote_runtime_client_manages_session_lifecycle() -> Result<(), Box<dyn Error
     let renamed =
         client.update_session(&session_id, serde_json::json!({"title": "Alpha Session"}))?;
     assert_eq!(renamed["session"]["title"], "Alpha Session");
+
+    let reviewed = client.update_session(
+        &session_id,
+        serde_json::json!({
+            "change_review": {
+                "status": "accepted",
+                "patch_id": "patch_alpha",
+                "path": "src/main.rs",
+                "run_id": "turn_alpha"
+            }
+        }),
+    )?;
+    assert_eq!(
+        reviewed["session"]["metadata"]["change_review"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        reviewed["session"]["metadata"]["change_review"]["patch_id"],
+        "patch_alpha"
+    );
 
     let search = client.search_sessions("Alpha")?;
     assert_eq!(search.len(), 1);
@@ -601,6 +802,19 @@ fn remote_runtime_client_reads_session_transcript() -> Result<(), Box<dyn Error>
     assert_eq!(messages[1]["role"], "assistant");
     assert_eq!(messages_v2[1]["info"]["role"], "assistant");
     assert_eq!(messages_v2[1]["parts"][0]["kind"], "text");
+    let result_part = messages_v2[1]["parts"]
+        .as_array()
+        .expect("assistant parts")
+        .iter()
+        .find(|part| part["kind"] == "result")
+        .expect("persisted final result");
+    assert_eq!(
+        result_part["content"]["schema_version"],
+        "openagent.final_result.v1"
+    );
+    assert_eq!(result_part["content"]["changed"], serde_json::json!([]));
+    assert_eq!(result_part["content"]["verified"], serde_json::json!([]));
+    assert_eq!(result_part["content"]["remaining"], serde_json::json!([]));
     assert!(
         !messages[1]["content"]
             .as_str()
@@ -621,6 +835,26 @@ fn remote_runtime_client_tracks_file_diff_undo_and_redo() -> Result<(), Box<dyn 
     let workspace = temp.join("workspace");
     let session_root = temp.join("sessions");
     fs::create_dir_all(&workspace)?;
+    let git = |args: &[&str]| -> Result<(), Box<dyn Error>> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    };
+    git(&["init", "-q"])?;
+    git(&["config", "user.email", "openagent-test@example.invalid"])?;
+    git(&["config", "user.name", "OpenAgent Test"])?;
+    git(&["commit", "--allow-empty", "-q", "-m", "baseline"])?;
     let mut server = spawn_runtime(port, &workspace, &session_root)?;
     wait_for_server(port)?;
 
@@ -642,7 +876,35 @@ fn remote_runtime_client_tracks_file_diff_undo_and_redo() -> Result<(), Box<dyn 
         }),
     )?;
     assert_eq!(write["status"], "completed");
+    assert_eq!(write["final_result"]["changed"][0]["path"], "notes.txt");
+    assert_eq!(write["final_result"]["changed"][0]["status"], "added");
+    assert_eq!(write["final_result"]["verified"][0]["tool"], "write");
+    assert_eq!(write["final_result"]["remaining"], serde_json::json!([]));
     assert_eq!(fs::read_to_string(&file_path)?, "alpha\n");
+
+    let write_transcript = client.session_messages(&session_id, Some(2))?;
+    let persisted_result = write_transcript["messages_v2"][1]["parts"]
+        .as_array()
+        .expect("write assistant parts")
+        .iter()
+        .find(|part| part["kind"] == "result")
+        .expect("write final result part");
+    assert_eq!(persisted_result["content"]["run_id"], write["turn_id"]);
+    assert_eq!(
+        persisted_result["content"]["changed"][0]["path"],
+        "notes.txt"
+    );
+
+    let untracked = client.git_status(Some("notes.txt"))?;
+    assert_eq!(untracked["changes"][0]["path"], "notes.txt");
+    assert_eq!(untracked["changes"][0]["additions"], 1);
+    assert_eq!(untracked["selected_diff"]["source"], "untracked");
+    assert!(
+        untracked["selected_diff"]["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("+alpha")
+    );
 
     let diff = client.session_diff(&session_id)?;
     assert_eq!(diff["undo_count"], 1);
@@ -673,6 +935,8 @@ fn remote_runtime_client_tracks_file_diff_undo_and_redo() -> Result<(), Box<dyn 
     assert_eq!(redo["status"], "redone");
     assert_eq!(fs::read_to_string(&file_path)?, "alpha\n");
     assert_eq!(redo["undo_count"], 1);
+    git(&["add", "notes.txt"])?;
+    git(&["commit", "-q", "-m", "track notes"])?;
 
     let edited = client.start_turn(
         &session_id,
@@ -722,6 +986,97 @@ fn remote_runtime_client_tracks_file_diff_undo_and_redo() -> Result<(), Box<dyn 
     let edit_redo = client.redo_session(&session_id)?;
     assert_eq!(edit_redo["status"], "redone");
     assert_eq!(fs::read_to_string(&file_path)?, "beta\n");
+
+    let tracked = client.git_status(Some("notes.txt"))?;
+    assert_eq!(tracked["selected_diff"]["source"], "git");
+    assert_eq!(tracked["selected_diff"]["additions"], 1);
+    assert_eq!(tracked["selected_diff"]["deletions"], 1);
+    assert!(
+        tracked["selected_diff"]["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("-alpha")
+    );
+    assert!(
+        tracked["selected_diff"]["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("+beta")
+    );
+
+    let other_path = workspace.join("other.txt");
+    let other = client.start_turn(
+        &session_id,
+        "write another file",
+        serde_json::json!({
+            "permission": "FULL",
+            "tool_call": {
+                "call_id": "call_write_other",
+                "name": "write",
+                "input": {"file_path": "other.txt", "content": "keep me\n"}
+            }
+        }),
+    )?;
+    assert_eq!(other["status"], "completed");
+    assert_eq!(fs::read_to_string(&other_path)?, "keep me\n");
+
+    let file_undo = client.undo_session_file(&session_id, "notes.txt")?;
+    assert_eq!(file_undo["status"], "file_undone");
+    assert_eq!(file_undo["path"], "notes.txt");
+    assert_eq!(fs::read_to_string(&file_path)?, "alpha\n");
+    assert_eq!(fs::read_to_string(&other_path)?, "keep me\n");
+    let after_file_undo = client.session_diff(&session_id)?;
+    let undone_run_id = file_undo["run_id"].as_str().expect("undone run id");
+    assert!(
+        after_file_undo["patches"]
+            .as_array()
+            .expect("patches")
+            .iter()
+            .all(|patch| patch["path"] != "notes.txt" || patch["run_id"] != undone_run_id)
+    );
+    assert!(
+        after_file_undo["patches"]
+            .as_array()
+            .expect("patches")
+            .iter()
+            .any(|patch| patch["path"] == "notes.txt")
+    );
+    assert!(
+        after_file_undo["patches"]
+            .as_array()
+            .expect("patches")
+            .iter()
+            .any(|patch| patch["path"] == "other.txt")
+    );
+
+    let file_redo = client.redo_session(&session_id)?;
+    assert_eq!(file_redo["status"], "redone");
+    assert_eq!(fs::read_to_string(&file_path)?, "beta\n");
+    assert_eq!(fs::read_to_string(&other_path)?, "keep me\n");
+
+    let conflicting_edit = client.start_turn(
+        &session_id,
+        "edit notes again",
+        serde_json::json!({
+            "permission": "FULL",
+            "tool_call": {
+                "call_id": "call_edit_notes_again",
+                "name": "edit",
+                "input": {
+                    "file_path": "notes.txt",
+                    "old_string": "beta",
+                    "new_string": "gamma"
+                }
+            }
+        }),
+    )?;
+    assert_eq!(conflicting_edit["status"], "completed");
+    fs::write(&file_path, "user override\n")?;
+    let conflict = client
+        .undo_session_file(&session_id, "notes.txt")
+        .expect_err("newer workspace content must block rollback");
+    assert!(conflict.contains("refusing to overwrite newer workspace content"));
+    assert_eq!(fs::read_to_string(&file_path)?, "user override\n");
 
     let _ = server.kill();
     let _ = fs::remove_dir_all(temp);
@@ -1725,6 +2080,94 @@ fn remote_runtime_client_falls_back_from_retryable_provider_502() -> Result<(), 
 }
 
 #[test]
+fn remote_runtime_stream_fallback_resets_partial_answer() -> Result<(), Box<dyn Error>> {
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_partial_stream_then_fallback_provider()?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-provider-stream-reset")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAI_API_KEY", "test-key"),
+            ("OPENAI_BASE_URL", provider_base_url.as_str()),
+            ("OPENAI_WIRE_API", "responses"),
+            ("OPENAI_MODEL", "gpt-5.5"),
+            ("OPENAGENT_PROVIDER_RETRIES", "0"),
+            ("OPENAGENT_PROVIDER_FALLBACK_MODELS", "gpt-5.4"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let started = client.start_turn(
+        &session_id,
+        "stream fallback",
+        serde_json::json!({"stream": true}),
+    )?;
+
+    assert_eq!(started["status"], "completed");
+    assert_eq!(started["turn"]["final_answer"], "clean fallback answer");
+    let events = started["events"].as_array().expect("events");
+    let partial_index = events
+        .iter()
+        .position(|event| {
+            event["method"] == "item/agentMessage/delta"
+                && event["params"]["delta"] == "discarded partial"
+        })
+        .expect("partial delta");
+    let reset_index = events
+        .iter()
+        .position(|event| event["method"] == "item/agentMessage/reset")
+        .expect("stream reset");
+    let fallback_index = events
+        .iter()
+        .position(|event| event["method"] == "turn/fallback")
+        .expect("fallback event");
+    let clean_index = events
+        .iter()
+        .position(|event| {
+            event["method"] == "item/agentMessage/delta"
+                && event["params"]["delta"] == "clean fallback answer"
+        })
+        .expect("clean delta");
+    assert!(partial_index < reset_index);
+    assert!(reset_index < fallback_index);
+    assert!(fallback_index < clean_index);
+
+    let transcript = client.session_messages(&session_id, Some(10))?;
+    let assistant = transcript["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant message");
+    assert_eq!(assistant["content"], "clean fallback answer");
+    assert!(
+        !assistant["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("discarded partial")
+    );
+    assert_eq!(
+        provider_requests.lock().expect("provider requests").len(),
+        2
+    );
+
+    let _ = server.kill();
+    let _ = provider_thread.join();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn failed_async_provider_turn_can_be_retried_from_persisted_payload() -> Result<(), Box<dyn Error>>
 {
     let (provider_port, provider_thread, provider_requests) =
@@ -1822,13 +2265,35 @@ fn failed_async_provider_turn_can_be_retried_from_persisted_payload() -> Result<
     assert!(completed, "retried async turn should complete");
     let retried_events = client.turn_events_live(retried_turn_id, 0, Duration::from_millis(50))?;
     assert!(retried_events.iter().any(|event| {
+        event["method"] == "turn/retried"
+            && event["params"]["retry_of_turn_id"] == failed_turn_id
+            && event["params"]["retry_count"] == 1
+            && event["params"]["max_retries"] == 3
+    }));
+    assert!(retried_events.iter().any(|event| {
         event["method"] == "turn/completed"
             && event["params"]["final_answer"] == "manual retry answer"
     }));
-    assert_eq!(
-        provider_requests.lock().expect("provider requests").len(),
-        2
-    );
+    let requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(requests.len(), 2);
+    let retried_request: Value = serde_json::from_str(&requests[1])?;
+    let duplicate_user_messages = retried_request["input"]
+        .as_array()
+        .expect("responses input")
+        .iter()
+        .filter(|item| item["role"] == "user" && item["content"] == "retry this provider request")
+        .count();
+    assert_eq!(duplicate_user_messages, 1);
+    drop(requests);
+    let transcript = fs::read_to_string(session_root.join(&session_id).join("transcript.jsonl"))?;
+    let user_message_count = transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| {
+            record["schema_version"] == "openagent.message.v2" && record["info"]["role"] == "user"
+        })
+        .count();
+    assert_eq!(user_message_count, 1);
 
     let _ = server.kill();
     let _ = provider_thread.join();
@@ -4609,6 +5074,14 @@ fn task_subagent_profile_max_steps_failure_propagates_to_parent() -> Result<(), 
     assert_eq!(task["parent_tool_call_id"], "call_task");
     assert_eq!(task["max_steps"], 1);
     assert_eq!(task["run"]["status"], "failed");
+    assert_eq!(task["progress"]["status"], "failed");
+    assert_eq!(task["progress"]["failed_tool_calls"], 0);
+    assert!(
+        task["failure"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.trim().is_empty())
+    );
+    assert_eq!(task["result"], Value::Null);
     let child_state: Value = serde_json::from_str(&fs::read_to_string(
         session_root
             .join(child_session_id)
@@ -4728,6 +5201,13 @@ fn task_subagent_background_true_queues_queryable_task() -> Result<(), Box<dyn E
     assert_eq!(task["background"], true);
     assert_eq!(task["title"], "Queue background research");
     assert_eq!(task["subagent_type"], "background-research");
+    assert_eq!(task["role"]["name"], "Background Research");
+    assert_eq!(task["role"]["permission"], "READONLY");
+    assert_eq!(task["input"]["summary"], "Queue background research");
+    assert_eq!(task["input"]["redacted"], true);
+    assert_eq!(task["allowed_tools"], serde_json::json!(["read"]));
+    assert_eq!(task["progress"]["status"], "queued");
+    assert_eq!(task["result"], Value::Null);
     assert_eq!(task["parent_tool_call_id"], "call_task_background");
     assert_eq!(task["max_steps"], 2);
     assert_eq!(task["run_status"], Value::Null);
@@ -4756,15 +5236,15 @@ fn task_subagent_background_true_queues_queryable_task() -> Result<(), Box<dyn E
         provider_requests.lock().expect("provider requests").len(),
         0
     );
-    let ran = client.run_task(&session_id, child_session_id, serde_json::json!({}))?;
-    assert_eq!(ran["status"], "completed");
-    assert_eq!(ran["task"]["status"], "completed");
-    assert_eq!(ran["task"]["run_status"], "completed");
-    assert_eq!(ran["task"]["background"], true);
-    assert_eq!(
-        ran["result"]["turn"]["final_answer"],
-        "background child answer"
-    );
+    let accepted = client.start_task(&session_id, child_session_id)?;
+    assert_eq!(accepted["accepted"], true);
+    assert_eq!(accepted["execution_mode"], "background");
+    let waited = client.wait_task(&session_id, child_session_id, 5_000)?;
+    assert_eq!(waited["completed"], true);
+    assert_eq!(waited["timed_out"], false);
+    assert_eq!(waited["status"], "completed");
+    assert_eq!(waited["task"]["run_status"], "completed");
+    assert_eq!(waited["task"]["background"], true);
     let tasks = client.tasks(&session_id)?;
     let task = tasks
         .iter()
@@ -4772,6 +5252,15 @@ fn task_subagent_background_true_queues_queryable_task() -> Result<(), Box<dyn E
         .ok_or("missing completed background task lifecycle summary")?;
     assert_eq!(task["status"], "completed");
     assert_eq!(task["run_status"], "completed");
+    assert_eq!(task["progress"]["status"], "completed");
+    assert!(
+        task["progress"]["completed_steps"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1
+    );
+    assert_eq!(task["result"]["summary"], "background child answer");
+    assert_eq!(task["failure"], Value::Null);
     let child_state: Value = serde_json::from_str(&fs::read_to_string(
         session_root
             .join(child_session_id)
@@ -4894,7 +5383,8 @@ fn task_subagent_background_worker_auto_runs_queued_task() -> Result<(), Box<dyn
 }
 
 #[test]
-fn task_subagent_run_rejects_duplicate_consumer() -> Result<(), Box<dyn Error>> {
+fn task_subagent_run_rejects_duplicate_consumer_and_cancels_running_task()
+-> Result<(), Box<dyn Error>> {
     let child_final = serde_json::json!({
         "id": "resp_child_duplicate",
         "output_text": "duplicate guarded answer",
@@ -4985,22 +5475,22 @@ fn task_subagent_run_rejects_duplicate_consumer() -> Result<(), Box<dyn Error>> 
         duplicate_error.contains("task is already running")
             || duplicate_error.contains("task is not queued: running")
     );
+    let cancel_requested = client.cancel_task(&session_id, &child_session_id)?;
+    assert_eq!(cancel_requested["status"], "cancel_requested");
+    assert_eq!(cancel_requested["task"]["cancel_requested"], true);
     let first_result = first
         .join()
         .map_err(|_| "first task run thread panicked".to_string())?
         .map_err(|error| format!("first task run failed: {error}"))?;
-    assert_eq!(first_result["status"], "completed");
-    assert_eq!(
-        first_result["result"]["turn"]["final_answer"],
-        "duplicate guarded answer"
-    );
+    assert_eq!(first_result["status"], "canceled");
     let tasks = client.tasks(&session_id)?;
     let task = tasks
         .iter()
         .find(|task| task["session_id"] == child_session_id)
-        .ok_or("missing completed duplicate-guarded task")?;
-    assert_eq!(task["status"], "completed");
-    assert_eq!(task["run_status"], "completed");
+        .ok_or("missing canceled duplicate-guarded task")?;
+    assert_eq!(task["status"], "canceled");
+    assert_eq!(task["canonical_status"], "cancelled");
+    assert_eq!(task["run_status"], "interrupted");
 
     let _ = server.kill();
     let _ = provider_thread.join();
@@ -5098,13 +5588,14 @@ fn task_subagent_run_recovers_stale_lock() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
 
-    let ran = client.run_task(&session_id, &child_session_id, serde_json::json!({}))?;
-    assert_eq!(ran["status"], "completed");
-    assert_eq!(ran["task"]["status"], "completed");
-    assert_eq!(
-        ran["result"]["turn"]["final_answer"],
-        "stale lock recovered answer"
-    );
+    let promoted = client.promote_task(&session_id, &child_session_id)?;
+    assert_eq!(promoted["accepted"], true);
+    assert_eq!(promoted["execution_mode"], "foreground");
+    let waited = client.wait_task(&session_id, &child_session_id, 5_000)?;
+    assert_eq!(waited["status"], "completed");
+    assert_eq!(waited["task"]["status"], "completed");
+    assert_eq!(waited["task"]["execution_mode"], "foreground");
+    assert_eq!(waited["task"]["background"], false);
     assert!(!stale_lock_path.exists());
     let tasks = client.tasks(&session_id)?;
     let task = tasks
@@ -5213,6 +5704,13 @@ fn task_subagent_cancel_rejects_later_run() -> Result<(), Box<dyn Error>> {
         .run_task(&session_id, child_session_id, serde_json::json!({}))
         .expect_err("canceled task run should fail");
     assert!(run_error.contains("task is not queued: canceled"));
+    let resumed = client.resume_task(&session_id, child_session_id)?;
+    assert_eq!(resumed["status"], "queued");
+    assert_eq!(resumed["resume_count"], 1);
+    assert_eq!(resumed["task"]["canonical_status"], "queued");
+    assert_eq!(resumed["task"]["execution_mode"], "background");
+    let canceled_again = client.cancel_task(&session_id, child_session_id)?;
+    assert_eq!(canceled_again["status"], "canceled");
     let child_state: Value = serde_json::from_str(&fs::read_to_string(
         session_root
             .join(child_session_id)
@@ -7488,6 +7986,52 @@ fn spawn_fake_openai_responses_streaming_provider() -> Result<FakeProviderServer
                 );
                 let _ = stream.write_all(
                     b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":2}}}\n\n",
+                );
+                let _ = stream.write_all(b"data: [DONE]\n\n");
+                let _ = stream.flush();
+            }
+        }),
+        requests,
+    ))
+}
+
+fn spawn_fake_openai_partial_stream_then_fallback_provider()
+-> Result<FakeProviderServer, Box<dyn Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    Ok((
+        port,
+        thread::spawn(move || {
+            if let Ok((mut stream, _addr)) = listener.accept() {
+                if let Ok(body) = read_http_request_body(&mut stream)
+                    && let Ok(mut items) = captured.lock()
+                {
+                    items.push(body);
+                }
+                let partial = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"discarded partial\"}\n\n";
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    partial.len() + 128
+                );
+                let _ = stream.write_all(headers.as_bytes());
+                let _ = stream.write_all(partial);
+                let _ = stream.flush();
+            }
+            if let Ok((mut stream, _addr)) = listener.accept() {
+                if let Ok(body) = read_http_request_body(&mut stream)
+                    && let Ok(mut items) = captured.lock()
+                {
+                    items.push(body);
+                }
+                let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\nconnection: close\r\n\r\n";
+                let _ = stream.write_all(headers.as_bytes());
+                let _ = stream.write_all(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"clean fallback answer\"}\n\n",
+                );
+                let _ = stream.write_all(
+                    b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n",
                 );
                 let _ = stream.write_all(b"data: [DONE]\n\n");
                 let _ = stream.flush();

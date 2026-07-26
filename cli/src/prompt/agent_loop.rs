@@ -410,6 +410,20 @@ pub(super) fn run_agent_loop(
                 }),
                 event_sink,
             ),
+            ProviderStreamEvent::Reset { model, reason } => emit_run_event(
+                &mut streamed_events,
+                json!({
+                    "method": "item/agentMessage/reset",
+                    "params": {
+                        "model": model,
+                        "reason": reason,
+                        "session_id": session.id.clone(),
+                        "run_id": run_id,
+                        "step": step,
+                    }
+                }),
+                event_sink,
+            ),
             _ => {}
         };
         let provider_result = call_provider_for_run(
