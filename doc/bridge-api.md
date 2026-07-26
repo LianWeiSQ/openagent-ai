@@ -29,31 +29,49 @@ OpenAgent keeps the Rust runtime as the source of truth. The bridge adapts
 runtime sessions, turns, events, approvals, questions, MCP, diff, and
 checkpoint APIs for clients.
 
-## First Version Scope
+## Current Contract
 
-Implemented endpoints:
+`GET /api/protocol` is the machine-readable source for endpoint and event
+discovery. The stable route groups are:
 
-| Endpoint | Purpose |
+| Area | Endpoints |
 | --- | --- |
-| `GET /api/health` | Service health |
-| `GET /api/models` | Current OpenAI-compatible model catalog |
-| `GET /api/sessions` | List known sessions |
-| `POST /api/sessions` | Create a new session |
-| `GET /api/sessions/{session_id}` | Read a session snapshot |
-| `POST /api/sessions/{session_id}/turns` | Start a turn |
-| `GET /api/turns/{turn_id}/events` | Stream turn events through SSE |
-| `POST /api/turns/{turn_id}/interrupt` | Request cooperative turn interruption |
-| `POST /api/turns/{turn_id}/approvals/{approval_id}` | Resolve a pending tool approval with `{"action":"allow"}` or `{"action":"deny"}` |
+| Discovery | `GET /api/health`, `GET /api/protocol` |
+| Providers | `GET /api/providers`, `PUT /api/providers/config`, `POST /api/providers/validate`, `GET /api/models` |
+| Sessions | `GET\|POST /api/sessions`, `GET\|PATCH\|DELETE /api/sessions/{session_id}` |
+| Goal and plan | `GET\|PUT /api/sessions/{session_id}/goal`, `GET\|PUT /api/sessions/{session_id}/plan` |
+| Turns | `GET /api/turns`, `POST /api/sessions/{session_id}/turns`, `GET /api/turns/{turn_id}`, `POST /api/turns/{turn_id}/retry\|interrupt` |
+| Tasks | `GET /api/sessions/{session_id}/tasks`, task `start\|wait\|promote\|cancel\|resume` actions |
+| Interactions | global and turn-scoped approval/question list and response routes |
+| Context | session messages, context inspection/replay, compact, diff, undo/redo, and checkpoints |
+| Workspace | files, Git status, Git workflow summary, and approved Git actions |
+| Terminal and LSP | persistent terminal sessions, one-shot terminal compatibility, LSP status/doctor/query |
+| MCP | server lifecycle, discovery, remote OAuth login/refresh/revoke/callback |
+| Extensions | agents, capabilities, plugins, skills, performance, and storage migration |
 
 The event stream uses Codex-like method names:
 
 - `turn/started`
+- `turn/retried`
+- `turn/retrying`
+- `turn/fallback`
 - `item/step/started`
+- `item/agentMessage/reset`
 - `item/agentMessage/delta`
 - `item/toolCall/started`
 - `item/toolCall/completed`
+- `item/toolCall/failed`
+- `item/question/requested`
+- `item/question/resolved`
+- `context/updated`
+- `context/replayed`
+- `context/performance`
+- `context/failed`
 - `runtime/warning`
-- `item/patch/detected`
+- `checkpoint/created`
+- `lsp.updated`
+- `patch/detected`
+- `git/workflow_updated`
 - `turn/completed`
 - `turn/failed`
 - `turn/interrupt_requested`
@@ -162,25 +180,17 @@ The bridge reads:
 | `openagent client` | Send a turn to an already running Bridge API service |
 | `openagent client --server-token ...` | Connect to a token-protected Bridge API service |
 
-## Non-goals
+## Compatibility Boundary
 
-First version deliberately does not implement:
+The Bridge is not a byte-for-byte implementation of Codex app-server. Voice,
+remote pairing, hosted marketplace UI, and client view lifecycle remain outside
+the core contract. Compatibility is defined by stronger runtime invariants:
 
-- full Codex runtime protocol compatibility;
-- marketplace/plugin UI;
-- remote control pairing;
-- complex permission approval UI;
-- WebRTC/realtime voice;
-- a redesigned product UI.
-
-## Next Steps
-
-1. Add `turn/interrupt` and cooperative cancellation.
-2. Make session listing read run summaries and trace links more directly.
-3. Add a thin CLI client that talks to the same bridge.
-4. Connect sandbox binding state to the right-side inspector.
-5. Expose context pack, tool batch, and trace panes through product clients
-   outside the core runtime.
+- the Rust runtime remains the source of truth;
+- SSE envelopes are versioned, ordered, resumable, and deduplicable;
+- credentials stay private while public summaries use explicit allowlists;
+- recovery and write actions use durable, idempotent contracts;
+- Desktop, CLI, TUI, and future IDE clients observe the same session state.
 
 ## TUI Client
 

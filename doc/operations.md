@@ -46,9 +46,17 @@ an authenticated local runtime.
 
 ## Runtime State
 
-The configured session root contains session ledgers, turn jobs, queued turn
-payloads, events, messages, checkpoints, and trace evidence. Treat it as local
-application data:
+The configured session root contains the append-only session ledgers, turn
+jobs, queued turn payloads, events, messages, checkpoints, and trace evidence.
+The ledger remains authoritative.
+
+Runtime service state lives under `<session-root>/.openagent-runtime/`. It
+contains rebuildable turn indexes, queue leases, provider configuration,
+capability state, plugin metadata, OAuth records, performance samples, and
+storage migration receipts. Public API summaries are constructed from
+allowlisted fields and never expose stored credentials.
+
+Treat both areas as local application data:
 
 - do not commit it;
 - do not edit it while the Bridge is running;
@@ -57,10 +65,15 @@ application data:
 
 ## Failure Semantics
 
-Provider retries and fallback emit durable `turn/retrying` and
-`turn/fallback` events. Exhausted failures become terminal failed turns with a
-user-facing error and resumability metadata. A retryable failed turn can be
-resubmitted with `POST /api/turns/{turn_id}/retry`.
+Queued turns run through bounded workers and filesystem leases. On restart the
+runtime reclaims stale leases and reconciles queued or interrupted work from
+the persisted turn records. Approval and question waits are durable waiting
+states, so reconnecting clients can discover and resolve them.
+
+Provider retries and fallback emit durable `turn/retrying` and `turn/fallback`
+events. Exhausted failures become terminal failed turns with a user-facing
+error and resumability metadata. A retryable failed turn can be resubmitted
+with `POST /api/turns/{turn_id}/retry`.
 
 Interrupted, failed, expired, and completed are distinct terminal states.
 Clients should render those states directly instead of inferring completion

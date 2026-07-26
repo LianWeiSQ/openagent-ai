@@ -37,6 +37,25 @@ User task
 | `runtime/bridge-server-client` | Bridge API client helpers |
 | `runtime/http` | HTTP runtime binary and API contracts |
 
+The HTTP runtime is split by service ownership:
+
+| Module | Responsibility |
+| --- | --- |
+| `bridge_routes` | HTTP routing, protocol discovery, JSON/SSE transport |
+| `turn_runtime` | turn queue, workers, leases, and restart recovery |
+| `provider_runtime` | provider catalog, configuration, validation, retry/fallback |
+| `mcp_runtime` | MCP server lifecycle, OAuth, discovery, and execution |
+| `capability_runtime` | browser, computer, and terminal capability policy |
+| `terminal_runtime` | persistent and one-shot terminal sessions |
+| `git_runtime` | Git state, workflow summaries, and approved write actions |
+| `plugin_runtime` | plugin and skill discovery, installation, and updates |
+| `storage_runtime` | runtime-state audit, migration, and rollback |
+| `performance_runtime` | source-only workspace probes and runtime metrics |
+
+`http_runtime.rs` remains the composition boundary. It binds these services to
+the shared session, context, provider, and tool contracts; it must not become a
+second implementation of those subsystems.
+
 ## Tool Flow
 
 The model receives tool schemas through the provider boundary. If it emits a
@@ -51,6 +70,9 @@ tool call, OpenAgent:
 Workspace tools are responsible for file, shell, search, and edit operations.
 MCP and skill tools are bridged through their own contracts while preserving a
 common tool-call shape for permission checks, trace records, and eval replay.
+Provider adapters are the only layer allowed to interpret provider-specific
+tool-call wire formats. The agent loop consumes normalized calls and never
+scans ordinary assistant text globally for tool syntax.
 
 ## Context Runtime
 
@@ -65,11 +87,15 @@ See [`context.md`](context.md) for the current context and persistence model.
 
 ## Session And Trace
 
-The session layer stores restorable state, append-only events, durable parts,
-trace summaries, usage, warnings, and replay/eval evidence. This layer is the
-bridge between raw model messages and product/runtime observability: product
-surfaces can inspect the session, while eval tooling can replay or score the
-same run evidence.
+The append-only file ledger is the authoritative record for messages, parts,
+events, and recovery evidence. Runtime-owned state also covers turn jobs,
+queues and leases, task trees, approval/question waits, checkpoints, and
+context receipts. Product surfaces project that state; they do not recreate a
+parallel session state machine.
+
+This layer is the bridge between raw model messages and product/runtime
+observability: product surfaces can inspect the session, while eval tooling can
+replay or score the same run evidence.
 
 See [`operations.md`](operations.md) for runtime events and operational data.
 
