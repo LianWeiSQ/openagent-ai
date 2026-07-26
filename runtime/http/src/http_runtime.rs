@@ -42,12 +42,17 @@ use openagent_protocol::{
     ToolResult, ToolSchema, Usage, WorkState, render_work_state,
 };
 use openagent_provider::{
-    OpenAiLanguageModelConfig, ProviderStreamEvent, build_openai_chat_payload,
-    build_openai_responses_payload, default_env_mapping, normalize_openai_chat_sse_chunks,
-    normalize_openai_responses_response, normalize_openai_responses_stream_events,
-    normalize_provider, openagent_context_model, openagent_text_model_supported,
-    parse_tool_arguments, provider_default_base_url, provider_default_model, provider_label,
-    provider_requires_api_key, summarize_http_error_body,
+    AnthropicLanguageModelConfig, GeminiLanguageModelConfig, OpenAiLanguageModelConfig,
+    ProviderCapability, ProviderStreamEvent, ToolCallDialect, apply_tool_call_dialect,
+    build_anthropic_payload_with_policy, build_gemini_payload,
+    build_openai_chat_payload_with_policy, build_openai_responses_payload_with_policy,
+    default_env_mapping, negotiate_tool_call_policy, normalize_anthropic_events,
+    normalize_anthropic_response, normalize_gemini_events, normalize_openai_chat_response,
+    normalize_openai_chat_sse_chunks, normalize_openai_responses_response,
+    normalize_openai_responses_stream_events, normalize_provider, openagent_context_model,
+    openagent_text_model_supported, provider_capabilities, provider_default_base_url,
+    provider_default_model, provider_label, provider_requires_api_key, summarize_http_error_body,
+    tool_call_dialect_from_options, tool_call_policy_from_options,
 };
 use openagent_session::{
     FileSessionStore, Session, SessionCheckpointRecord, SessionEventOptions, SessionPartOptions,
@@ -404,7 +409,11 @@ fn runtime_provider_config(
             .map(String::as_str)
             .unwrap_or("OPENAI_WIRE_API"),
         &["OPENAGENT_WIRE_API"],
-        Some("responses".to_string()),
+        Some(match provider.as_str() {
+            "anthropic" => "messages".to_string(),
+            "gemini" | "google" => "generate_content".to_string(),
+            _ => "responses".to_string(),
+        }),
         sources,
     )
     .expect("wire_api has default");
@@ -5822,6 +5831,16 @@ struct OpenAiRuntimeProviderRequest<'a> {
     context_pack: &'a ContextPack,
 }
 
+struct NativeRuntimeProviderRequest<'a> {
+    provider: &'a str,
+    model: &'a str,
+    api_key: &'a str,
+    base_url: &'a str,
+    timeout_s: u64,
+    stream: bool,
+    context_pack: &'a ContextPack,
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeProviderCallError {
     message: String,
@@ -6046,20 +6065,50 @@ fn provider_turn_result(
         .and_then(Value::as_u64)
         .unwrap_or(60);
     let stream = provider_streaming_enabled_for_turn(payload);
-    let result = call_openai_compatible_provider_for_runtime(
-        OpenAiRuntimeProviderRequest {
-            provider: &provider_config.provider,
-            model: &provider_config.model,
-            api_key: &api_key,
-            base_url: &provider_config.base_url,
-            wire_api: &provider_config.wire_api,
-            timeout_s: timeout,
-            stream,
-            context_pack: &context_pack,
-        },
-        stream_sink,
-        should_cancel,
-    )?;
+    let result = match provider_config.provider.as_str() {
+        "anthropic" => call_anthropic_provider_for_runtime(
+            NativeRuntimeProviderRequest {
+                provider: &provider_config.provider,
+                model: &provider_config.model,
+                api_key: &api_key,
+                base_url: &provider_config.base_url,
+                timeout_s: timeout,
+                stream,
+                context_pack: &context_pack,
+            },
+            stream_sink,
+            should_cancel,
+        )
+        .map_err(|error| error.message),
+        "gemini" | "google" => call_gemini_provider_for_runtime(
+            NativeRuntimeProviderRequest {
+                provider: &provider_config.provider,
+                model: &provider_config.model,
+                api_key: &api_key,
+                base_url: &provider_config.base_url,
+                timeout_s: timeout,
+                stream,
+                context_pack: &context_pack,
+            },
+            stream_sink,
+            should_cancel,
+        )
+        .map_err(|error| error.message),
+        _ => call_openai_compatible_provider_for_runtime(
+            OpenAiRuntimeProviderRequest {
+                provider: &provider_config.provider,
+                model: &provider_config.model,
+                api_key: &api_key,
+                base_url: &provider_config.base_url,
+                wire_api: &provider_config.wire_api,
+                timeout_s: timeout,
+                stream,
+                context_pack: &context_pack,
+            },
+            stream_sink,
+            should_cancel,
+        ),
+    }?;
     context_performance.provider_payload_build_us = result.payload_performance.build_us;
     context_performance.provider_payload_serialize_us = result.payload_performance.serialize_us;
     context_performance.provider_payload_bytes = result.payload_performance.bytes;
@@ -6168,12 +6217,12 @@ fn merge_model_options_from_value(value: Option<&Value>, options: &mut BTreeMap<
             if key == "model_options" || key == "options" {
                 if let Some(nested) = item.as_object() {
                     for (nested_key, nested_value) in nested {
-                        if runtime_provider_option_allowed(nested_key) {
+                        if runtime_model_option_allowed(nested_key) {
                             options.insert(nested_key.clone(), nested_value.clone());
                         }
                     }
                 }
-            } else if runtime_provider_option_allowed(key) {
+            } else if runtime_model_option_allowed(key) {
                 options.insert(key.clone(), item.clone());
             }
         }
@@ -6184,7 +6233,7 @@ fn merge_explicit_model_options_from_value(value: &Value, options: &mut BTreeMap
     for key in ["model_options", "options"] {
         if let Some(object) = value.get(key).and_then(Value::as_object) {
             for (option_key, option_value) in object {
-                if runtime_provider_option_allowed(option_key) {
+                if runtime_model_option_allowed(option_key) {
                     options.insert(option_key.clone(), option_value.clone());
                 }
             }
@@ -6227,6 +6276,26 @@ fn runtime_provider_option_allowed(key: &str) -> bool {
             | "input"
             | "tools"
             | "tool_choice"
+            | "parallel_tool_calls"
+            | "tool_call_dialect"
+            | "stream"
+            | "skill"
+            | "skills"
+            | "skill_roots"
+            | "skill_permissions"
+            | "skill_permission"
+            | "context_budget"
+            | "context_window"
+    )
+}
+
+fn runtime_model_option_allowed(key: &str) -> bool {
+    !matches!(
+        key,
+        "model"
+            | "messages"
+            | "input"
+            | "tools"
             | "stream"
             | "skill"
             | "skills"
@@ -6247,6 +6316,277 @@ fn runtime_system_prompt_from_messages(messages: &[ChatMessage]) -> Option<Strin
         .collect::<Vec<_>>()
         .join("\n\n");
     (!prompt.is_empty()).then_some(prompt)
+}
+
+#[derive(Clone, Copy)]
+enum NativeProviderAuth {
+    Anthropic,
+    Gemini,
+}
+
+fn call_anthropic_provider_for_runtime(
+    request: NativeRuntimeProviderRequest<'_>,
+    mut stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<RuntimeProviderResult, RuntimeProviderCallError> {
+    let NativeRuntimeProviderRequest {
+        provider,
+        model,
+        api_key,
+        base_url,
+        timeout_s,
+        stream,
+        context_pack,
+    } = request;
+    context_pack
+        .validate_provider_input()
+        .map_err(|message| RuntimeProviderCallError {
+            message,
+            retryable: false,
+        })?;
+    let messages = context_pack.messages.as_slice();
+    let tools = context_pack.tools.as_slice();
+    let model_options = &context_pack.model_options;
+    let dialect = tool_call_dialect_from_options(provider, "messages", model_options)
+        .map_err(non_retryable_provider_error)?;
+    let tool_policy = negotiate_tool_call_policy(
+        tool_call_policy_from_options(model_options),
+        provider_capabilities(provider, dialect),
+        tools,
+    )
+    .map_err(non_retryable_provider_error)?
+    .effective;
+    let payload_build_started = Instant::now();
+    let mut config = AnthropicLanguageModelConfig::new(api_key, model);
+    config.base_url = Some(base_url.to_string());
+    let mut payload = build_anthropic_payload_with_policy(
+        &config,
+        runtime_system_prompt_from_messages(messages).as_deref(),
+        messages,
+        tools,
+        None,
+        None,
+        Some(model_options),
+        &tool_policy,
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("stream".to_string(), json!(stream));
+    }
+    let payload_performance = provider_payload_performance(payload_build_started, &payload)?;
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(timeout_s.max(1)))
+        .build()
+        .map_err(|error| non_retryable_provider_error(error.to_string()))?;
+    let endpoint = join_url(base_url, "messages");
+    let response = send_runtime_native_provider_request(
+        &client,
+        &endpoint,
+        api_key,
+        &payload,
+        stream,
+        runtime_provider_request_retries(),
+        model,
+        NativeProviderAuth::Anthropic,
+        &mut stream_sink,
+    )?;
+    let status = response.status();
+    let content_type = response_content_type(&response);
+    let events = if stream && content_type.contains("text/event-stream") {
+        if !status.is_success() {
+            let raw = response
+                .text()
+                .map_err(|error| provider_read_error(error, Some(status.as_u16())))?;
+            return Err(provider_http_error(status.as_u16(), &raw, &content_type));
+        }
+        let mut chunks = Vec::new();
+        read_sse_json_values_stream(response, |chunk| {
+            if should_cancel.is_some_and(|cancelled| cancelled()) {
+                return Err(TURN_INTERRUPTED_ERROR.to_string());
+            }
+            if let Some(event) = anthropic_stream_text_delta(&chunk)
+                && let Some(sink) = stream_sink.as_deref_mut()
+            {
+                sink(&event);
+            }
+            chunks.push(chunk);
+            Ok(())
+        })
+        .map_err(provider_stream_error)?;
+        normalize_anthropic_events(&chunks)
+    } else {
+        let raw = response
+            .text()
+            .map_err(|error| provider_read_error(error, Some(status.as_u16())))?;
+        if !status.is_success() {
+            return Err(provider_http_error(status.as_u16(), &raw, &content_type));
+        }
+        let value: Value = serde_json::from_str(&raw).map_err(|error| {
+            non_retryable_provider_error(format!("anthropic response was not JSON: {error}"))
+        })?;
+        normalize_anthropic_response(&value)
+    };
+    let events = apply_tool_call_dialect(events, dialect);
+    Ok(runtime_result_with_payload_performance(
+        provider_events_to_runtime_result(
+            &events,
+            if stream {
+                "anthropic:messages:stream".to_string()
+            } else {
+                "anthropic:messages".to_string()
+            },
+            None,
+        )?,
+        payload_performance,
+    ))
+}
+
+fn call_gemini_provider_for_runtime(
+    request: NativeRuntimeProviderRequest<'_>,
+    mut stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<RuntimeProviderResult, RuntimeProviderCallError> {
+    let NativeRuntimeProviderRequest {
+        provider,
+        model,
+        api_key,
+        base_url,
+        timeout_s,
+        stream,
+        context_pack,
+    } = request;
+    context_pack
+        .validate_provider_input()
+        .map_err(non_retryable_provider_error)?;
+    let messages = context_pack.messages.as_slice();
+    let tools = context_pack.tools.as_slice();
+    let model_options = &context_pack.model_options;
+    let dialect = tool_call_dialect_from_options(provider, "generate_content", model_options)
+        .map_err(non_retryable_provider_error)?;
+    let tool_policy = negotiate_tool_call_policy(
+        tool_call_policy_from_options(model_options),
+        provider_capabilities(provider, dialect),
+        tools,
+    )
+    .map_err(non_retryable_provider_error)?
+    .effective;
+    let payload_build_started = Instant::now();
+    let mut config = GeminiLanguageModelConfig::new(api_key, model);
+    config.base_url = base_url.to_string();
+    let payload = build_gemini_payload(
+        runtime_system_prompt_from_messages(messages).as_deref(),
+        messages,
+        tools,
+        Some(model_options),
+        &tool_policy,
+    );
+    let payload_performance = provider_payload_performance(payload_build_started, &payload)?;
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(timeout_s.max(1)))
+        .build()
+        .map_err(|error| non_retryable_provider_error(error.to_string()))?;
+    let response = send_runtime_native_provider_request(
+        &client,
+        &config.endpoint(stream),
+        api_key,
+        &payload,
+        stream,
+        runtime_provider_request_retries(),
+        model,
+        NativeProviderAuth::Gemini,
+        &mut stream_sink,
+    )?;
+    let status = response.status();
+    let content_type = response_content_type(&response);
+    let events = if stream && content_type.contains("text/event-stream") {
+        if !status.is_success() {
+            let raw = response
+                .text()
+                .map_err(|error| provider_read_error(error, Some(status.as_u16())))?;
+            return Err(provider_http_error(status.as_u16(), &raw, &content_type));
+        }
+        let mut chunks = Vec::new();
+        read_sse_json_values_stream(response, |chunk| {
+            if should_cancel.is_some_and(|cancelled| cancelled()) {
+                return Err(TURN_INTERRUPTED_ERROR.to_string());
+            }
+            for event in normalize_gemini_events(std::slice::from_ref(&chunk)) {
+                if matches!(
+                    event,
+                    ProviderStreamEvent::TextDelta { .. }
+                        | ProviderStreamEvent::ReasoningDelta { .. }
+                ) && let Some(sink) = stream_sink.as_deref_mut()
+                {
+                    sink(&event);
+                }
+            }
+            chunks.push(chunk);
+            Ok(())
+        })
+        .map_err(provider_stream_error)?;
+        normalize_gemini_events(&chunks)
+    } else {
+        let raw = response
+            .text()
+            .map_err(|error| provider_read_error(error, Some(status.as_u16())))?;
+        if !status.is_success() {
+            return Err(provider_http_error(status.as_u16(), &raw, &content_type));
+        }
+        let value: Value = serde_json::from_str(&raw).map_err(|error| {
+            non_retryable_provider_error(format!("gemini response was not JSON: {error}"))
+        })?;
+        normalize_gemini_events(&[value])
+    };
+    let events = apply_tool_call_dialect(events, dialect);
+    Ok(runtime_result_with_payload_performance(
+        provider_events_to_runtime_result(
+            &events,
+            if stream {
+                "gemini:generate_content:stream".to_string()
+            } else {
+                "gemini:generate_content".to_string()
+            },
+            None,
+        )?,
+        payload_performance,
+    ))
+}
+
+fn provider_payload_performance(
+    started: Instant,
+    payload: &Value,
+) -> Result<RuntimeProviderPayloadPerformance, RuntimeProviderCallError> {
+    let build_us = elapsed_micros(started);
+    let serialize_started = Instant::now();
+    let bytes = serde_json::to_vec(payload)
+        .map_err(|error| {
+            non_retryable_provider_error(format!("provider payload serialization failed: {error}"))
+        })?
+        .len()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Ok(RuntimeProviderPayloadPerformance {
+        build_us,
+        serialize_us: elapsed_micros(serialize_started),
+        bytes,
+    })
+}
+
+fn response_content_type(response: &reqwest::blocking::Response) -> String {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn non_retryable_provider_error(message: impl Into<String>) -> RuntimeProviderCallError {
+    RuntimeProviderCallError {
+        message: message.into(),
+        retryable: false,
+    }
 }
 
 fn call_openai_compatible_provider_for_runtime(
@@ -6349,16 +6689,49 @@ fn call_openai_compatible_provider_model(
     config.provider_id = provider.to_string();
     config.base_url = base_url.to_string();
     config.wire_api = wire_api.to_string();
+    let dialect =
+        tool_call_dialect_from_options(provider, wire_api, model_options).map_err(|message| {
+            RuntimeProviderCallError {
+                message,
+                retryable: false,
+            }
+        })?;
+    let requested_tool_policy = tool_call_policy_from_options(model_options);
+    let tool_policy = negotiate_tool_call_policy(
+        requested_tool_policy,
+        provider_capabilities(provider, dialect),
+        tools,
+    )
+    .map_err(|message| RuntimeProviderCallError {
+        message,
+        retryable: false,
+    })?
+    .effective;
     let (endpoint, mut payload) = if wire_api == "chat" {
-        let mut payload =
-            build_openai_chat_payload(&config, system_prompt, messages, tools, None, None, None);
+        let mut payload = build_openai_chat_payload_with_policy(
+            &config,
+            system_prompt,
+            messages,
+            tools,
+            None,
+            None,
+            None,
+            &tool_policy,
+        );
         if let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(stream));
         }
         (join_url(base_url, "chat/completions"), payload)
     } else {
-        let mut payload =
-            build_openai_responses_payload(&config, system_prompt, messages, tools, None, None);
+        let mut payload = build_openai_responses_payload_with_policy(
+            &config,
+            system_prompt,
+            messages,
+            tools,
+            None,
+            None,
+            &tool_policy,
+        );
         if let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(stream));
         }
@@ -6423,12 +6796,13 @@ fn call_openai_compatible_provider_model(
         } else {
             normalize_openai_responses_stream_events(&chunks)
         };
+        let events = apply_tool_call_dialect(events, dialect);
         return Ok(runtime_result_with_payload_performance(
             provider_events_to_runtime_result(
                 &events,
                 format!("{provider}:{wire_api}:stream"),
                 None,
-            ),
+            )?,
             payload_performance,
         ));
     }
@@ -6443,18 +6817,19 @@ fn call_openai_compatible_provider_model(
         retryable: false,
     })?;
     if wire_api == "chat" {
+        let events = apply_tool_call_dialect(normalize_openai_chat_response(&value), dialect);
         Ok(runtime_result_with_payload_performance(
-            openai_chat_response_to_runtime_result(&value, format!("{provider}:chat")),
+            provider_events_to_runtime_result(&events, format!("{provider}:chat"), Some(&value))?,
             payload_performance,
         ))
     } else {
-        let events = normalize_openai_responses_response(&value);
+        let events = apply_tool_call_dialect(normalize_openai_responses_response(&value), dialect);
         Ok(runtime_result_with_payload_performance(
             provider_events_to_runtime_result(
                 &events,
                 format!("{provider}:responses"),
                 Some(&value),
-            ),
+            )?,
             payload_performance,
         ))
     }
@@ -6631,6 +7006,76 @@ fn runtime_provider_retry_delay(attempt: u64) -> Duration {
     Duration::from_millis(750 * (1_u64 << attempt.saturating_sub(1).min(3)))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn send_runtime_native_provider_request(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    api_key: &str,
+    payload: &Value,
+    stream: bool,
+    max_retries: u64,
+    model: &str,
+    auth: NativeProviderAuth,
+    stream_sink: &mut Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+) -> Result<reqwest::blocking::Response, RuntimeProviderCallError> {
+    let mut attempt = 0_u64;
+    loop {
+        let request = client
+            .post(endpoint)
+            .header("content-type", "application/json");
+        let mut request = match auth {
+            NativeProviderAuth::Anthropic => request
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01"),
+            NativeProviderAuth::Gemini => request.header("x-goog-api-key", api_key),
+        };
+        if stream {
+            request = request.header("accept", "text/event-stream");
+        }
+        match request.json(payload).send() {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if runtime_provider_status_retryable(status) && attempt < max_retries {
+                    attempt += 1;
+                    let delay = runtime_provider_retry_delay(attempt);
+                    if let Some(sink) = stream_sink.as_deref_mut() {
+                        sink(&ProviderStreamEvent::Retry {
+                            attempt: attempt + 1,
+                            max_attempts: max_retries + 1,
+                            delay_ms: delay.as_millis() as u64,
+                            model: model.to_string(),
+                            reason: format!("provider returned HTTP {status}"),
+                        });
+                    }
+                    thread::sleep(delay);
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(error) if attempt < max_retries => {
+                attempt += 1;
+                let delay = runtime_provider_retry_delay(attempt);
+                if let Some(sink) = stream_sink.as_deref_mut() {
+                    sink(&ProviderStreamEvent::Retry {
+                        attempt: attempt + 1,
+                        max_attempts: max_retries + 1,
+                        delay_ms: delay.as_millis() as u64,
+                        model: model.to_string(),
+                        reason: error.to_string(),
+                    });
+                }
+                thread::sleep(delay);
+            }
+            Err(error) => {
+                return Err(RuntimeProviderCallError {
+                    message: format!("provider request failed: {error}"),
+                    retryable: true,
+                });
+            }
+        }
+    }
+}
+
 fn runtime_provider_request_retries() -> u64 {
     std::env::var("OPENAGENT_PROVIDER_RETRIES")
         .ok()
@@ -6794,6 +7239,31 @@ fn openai_stream_text_delta(wire_api: &str, chunk: &Value) -> Option<ProviderStr
     })
 }
 
+fn anthropic_stream_text_delta(chunk: &Value) -> Option<ProviderStreamEvent> {
+    let text = match chunk
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "content_block_start" => chunk
+            .get("content_block")
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "content_block_delta" => chunk
+            .get("delta")
+            .filter(|delta| delta.get("type").and_then(Value::as_str) == Some("text_delta"))
+            .and_then(|delta| delta.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        _ => "",
+    };
+    (!text.is_empty()).then(|| ProviderStreamEvent::TextDelta {
+        text: text.to_string(),
+    })
+}
+
 fn provider_reasoning_heartbeat_event(
     session_id: &str,
     run_id: &str,
@@ -6818,74 +7288,11 @@ fn should_emit_reasoning_heartbeat(reasoning_chars: u64, last_emitted_chars: u64
     last_emitted_chars == 0 || reasoning_chars.saturating_sub(last_emitted_chars) >= 80
 }
 
-fn openai_chat_response_to_runtime_result(value: &Value, source: String) -> RuntimeProviderResult {
-    let choice = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
-    let answer = message
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            let function = item.get("function")?;
-            Some(ToolCall {
-                call_id: item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| format!("chat_tool_call_{index}"), str::to_string),
-                name: function
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                input: parse_tool_arguments(
-                    function
-                        .get("arguments")
-                        .unwrap_or(&Value::String(String::new())),
-                ),
-            })
-        })
-        .collect::<Vec<_>>();
-    let usage = usage_from_provider_json(value.get("usage"));
-    RuntimeProviderResult {
-        answer: if answer.is_empty() && tool_calls.is_empty() {
-            stable_json_dumps(value)
-        } else {
-            answer
-        },
-        finish_reason: choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .unwrap_or(if tool_calls.is_empty() {
-                "stop"
-            } else {
-                "tool_call"
-            })
-            .to_string(),
-        tool_calls,
-        usage,
-        source,
-        payload_performance: RuntimeProviderPayloadPerformance::default(),
-    }
-}
-
 fn provider_events_to_runtime_result(
     events: &[ProviderStreamEvent],
     source: String,
     fallback: Option<&Value>,
-) -> RuntimeProviderResult {
+) -> Result<RuntimeProviderResult, RuntimeProviderCallError> {
     let mut answer = String::new();
     let mut tool_calls = Vec::new();
     let mut usage = Usage::default();
@@ -6906,6 +7313,15 @@ fn provider_events_to_runtime_result(
                 name: name.clone(),
                 input: input.clone(),
             }),
+            ProviderStreamEvent::ToolCallError { error } => {
+                return Err(RuntimeProviderCallError {
+                    message: format!(
+                        "provider tool call assembly failed [{}]: {}",
+                        error.code, error.message
+                    ),
+                    retryable: false,
+                });
+            }
             ProviderStreamEvent::Finish {
                 usage: item,
                 finish_reason: reason,
@@ -6921,14 +7337,14 @@ fn provider_events_to_runtime_result(
     {
         answer = stable_json_dumps(value);
     }
-    RuntimeProviderResult {
+    Ok(RuntimeProviderResult {
         answer,
         tool_calls,
         usage,
         source,
         finish_reason,
         payload_performance: RuntimeProviderPayloadPerformance::default(),
-    }
+    })
 }
 
 fn provider_max_steps(payload: &Value) -> u64 {
@@ -8515,6 +8931,7 @@ fn safe_context_replay_model_options(
         "service_tier",
         "stop",
         "temperature",
+        "tool_call_dialect",
         "tool_choice",
         "top_p",
         "verbosity",

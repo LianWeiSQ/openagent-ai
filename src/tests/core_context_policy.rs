@@ -42,6 +42,9 @@ fn context_pack_contract_is_deterministic_and_receipt_is_redacted() -> Result<()
         name: "read".to_string(),
         description: format!("private description {secret}"),
         schema: Some(json!({"type": "object", "secret": secret})),
+        strict: false,
+        output_schema: None,
+        parallel_safe: true,
         group: "workspace".to_string(),
         dangerous: false,
     }];
@@ -236,9 +239,10 @@ fn production_provider_boundaries_accept_only_verified_context_packs() {
     let provider_payload_files = rust_files_containing(
         repo,
         &[
-            "build_openai_chat_payload(",
-            "build_openai_responses_payload(",
-            "build_anthropic_payload(",
+            "build_openai_chat_payload_with_policy(",
+            "build_openai_responses_payload_with_policy(",
+            "build_anthropic_payload_with_policy(",
+            "build_gemini_payload(",
         ],
     );
     assert_eq!(
@@ -246,6 +250,7 @@ fn production_provider_boundaries_accept_only_verified_context_packs() {
         vec![
             "cli/src/prompt/provider.rs".to_string(),
             "runtime/http/src/http_runtime.rs".to_string(),
+            "src/provider/src/gemini.rs".to_string(),
             "src/provider/src/provider.rs".to_string(),
         ],
         "provider payload assembly escaped the approved wire adapters"
@@ -409,6 +414,9 @@ fn active_context_pack_normalizes_legacy_system_and_preserves_conversation_exact
         name: "read".to_string(),
         description: "Read a workspace file".to_string(),
         schema: Some(json!({"type": "object"})),
+        strict: false,
+        output_schema: None,
+        parallel_safe: true,
         group: "workspace".to_string(),
         dangerous: false,
     }];
@@ -589,6 +597,9 @@ fn stable_prefix_partitions_messages_and_semantically_dedupes_static_context() {
             name: "read".to_string(),
             description: "Read a file".to_string(),
             schema: Some(json!({"type": "object"})),
+            strict: false,
+            output_schema: None,
+            parallel_safe: true,
             group: "workspace".to_string(),
             dangerous: false,
         }],
@@ -679,6 +690,9 @@ fn typed_skill_and_mcp_manifest_items_do_not_duplicate_provider_messages()
         name: "mcp_tool_docs_search".to_string(),
         description: "Search remote docs".to_string(),
         schema: Some(json!({"type": "object", "properties": {"query": {"type": "string"}}})),
+        strict: false,
+        output_schema: None,
+        parallel_safe: false,
         group: "remote-mcp".to_string(),
         dangerous: true,
     };
@@ -889,6 +903,9 @@ fn model_aware_context_budget_drops_old_tool_output_and_is_deterministic()
             name: "read".to_string(),
             description: "Read a file".to_string(),
             schema: Some(json!({"type": "object"})),
+            strict: false,
+            output_schema: None,
+            parallel_safe: true,
             group: "workspace".to_string(),
             dangerous: false,
         }],
@@ -1290,6 +1307,9 @@ fn core_context_policy_fixture() -> Result<Value, Box<dyn Error>> {
             "type": "object",
             "properties": {"query": {"type": "string", "description": "B".repeat(80)}},
         })),
+        strict: false,
+        output_schema: None,
+        parallel_safe: true,
         group: "default".to_string(),
         dangerous: false,
     }];

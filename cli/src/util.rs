@@ -188,10 +188,10 @@ pub(super) fn resolve_provider_config(
         .get("wire_api")
         .cloned()
         .unwrap_or_else(|| "OPENAI_WIRE_API".to_string());
-    let default_wire_api = if provider == "anthropic" {
-        "messages".to_string()
-    } else {
-        DEFAULT_WIRE_API.to_string()
+    let default_wire_api = match provider.as_str() {
+        "anthropic" => "messages".to_string(),
+        "gemini" | "google" => "generate_content".to_string(),
+        _ => DEFAULT_WIRE_API.to_string(),
     };
     let wire_api = resolve_provider_field(
         "wire_api",
@@ -214,7 +214,7 @@ pub(super) fn resolve_provider_config(
         model_source: model.source,
         wire_api: wire_api.value,
         wire_api_source: wire_api.source,
-        native: provider == "anthropic",
+        native: matches!(provider.as_str(), "anthropic" | "gemini" | "google"),
         requires_api_key: provider_requires_api_key(&provider).unwrap_or(true),
         provider,
     })

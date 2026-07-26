@@ -75,6 +75,16 @@ pub(super) fn call_provider_for_run(
             model_options,
             stream_sink,
         )
+    } else if matches!(provider, "gemini" | "google") {
+        call_gemini_provider(
+            args,
+            &api_key,
+            model_id,
+            messages,
+            tools,
+            model_options,
+            stream_sink,
+        )
     } else {
         call_openai_compatible_provider(
             args,
@@ -119,6 +129,8 @@ fn provider_payload_option_allowed(key: &str) -> bool {
             | "input"
             | "tools"
             | "tool_choice"
+            | "parallel_tool_calls"
+            | "tool_call_dialect"
             | "stream"
             | "skill"
             | "skills"
@@ -199,9 +211,17 @@ fn call_openai_compatible_provider(
         .get("reasoning_effort")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let dialect = tool_call_dialect_from_options(provider, &wire_api, model_options)?;
+    let requested_tool_policy = tool_call_policy_from_options(model_options);
+    let tool_policy = negotiate_tool_call_policy(
+        requested_tool_policy,
+        provider_capabilities(provider, dialect),
+        tools,
+    )?
+    .effective;
     let stream = provider_streaming_enabled(args);
     let (endpoint, mut payload) = if wire_api == "chat" {
-        let mut payload = build_openai_chat_payload(
+        let mut payload = build_openai_chat_payload_with_policy(
             &config,
             system_prompt.as_deref(),
             messages,
@@ -209,19 +229,21 @@ fn call_openai_compatible_provider(
             None,
             None,
             None,
+            &tool_policy,
         );
         if let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(stream));
         }
         (join_url(&base_url, "chat/completions"), payload)
     } else {
-        let mut payload = build_openai_responses_payload(
+        let mut payload = build_openai_responses_payload_with_policy(
             &config,
             system_prompt.as_deref(),
             messages,
             tools,
             None,
             None,
+            &tool_policy,
         );
         if stream && let Some(object) = payload.as_object_mut() {
             object.insert("stream".to_string(), json!(true));
@@ -270,11 +292,12 @@ fn call_openai_compatible_provider(
         } else {
             normalize_openai_responses_stream_events(&chunks)
         };
-        return Ok(provider_events_to_run_result(
+        let events = apply_tool_call_dialect(events, dialect);
+        return provider_events_to_run_result(
             &events,
             format!("{provider}:{wire_api}:stream"),
             None,
-        ));
+        );
     }
     let raw = response
         .text()
@@ -289,34 +312,11 @@ fn call_openai_compatible_provider(
     let value: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("provider response was not JSON: {error}"))?;
     if wire_api == "chat" {
-        let answer = extract_chat_answer(&value);
-        let tool_calls = extract_chat_tool_calls(&value);
-        let finish_reason = extract_chat_finish_reason(&value).unwrap_or_else(|| {
-            if tool_calls.is_empty() {
-                "stop"
-            } else {
-                "tool_call"
-            }
-            .to_string()
-        });
-        Ok(ProviderRunResult {
-            answer: if answer.is_empty() && tool_calls.is_empty() {
-                stable_json_dumps(&value)
-            } else {
-                answer
-            },
-            tool_calls,
-            usage: usage_from_json(value.get("usage")),
-            source: format!("{provider}:{wire_api}"),
-            finish_reason,
-        })
+        let events = apply_tool_call_dialect(normalize_openai_chat_response(&value), dialect);
+        provider_events_to_run_result(&events, format!("{provider}:{wire_api}"), Some(&value))
     } else {
-        let events = normalize_openai_responses_response(&value);
-        Ok(provider_events_to_run_result(
-            &events,
-            format!("{provider}:{wire_api}"),
-            Some(&value),
-        ))
+        let events = apply_tool_call_dialect(normalize_openai_responses_response(&value), dialect);
+        provider_events_to_run_result(&events, format!("{provider}:{wire_api}"), Some(&value))
     }
 }
 
@@ -392,7 +392,15 @@ fn call_anthropic_provider(
     config.base_url = Some(provider_base_url("anthropic", args));
     let stream = provider_streaming_enabled(args);
     let system_prompt = system_prompt_from_messages(messages);
-    let mut payload = build_anthropic_payload(
+    let dialect = tool_call_dialect_from_options("anthropic", "messages", model_options)?;
+    let requested_tool_policy = tool_call_policy_from_options(model_options);
+    let tool_policy = negotiate_tool_call_policy(
+        requested_tool_policy,
+        provider_capabilities("anthropic", dialect),
+        tools,
+    )?
+    .effective;
+    let mut payload = build_anthropic_payload_with_policy(
         &config,
         system_prompt.as_deref(),
         messages,
@@ -400,6 +408,7 @@ fn call_anthropic_provider(
         None,
         None,
         None,
+        &tool_policy,
     );
     if let Some(object) = payload.as_object_mut() {
         object.insert("stream".to_string(), json!(stream));
@@ -459,12 +468,12 @@ fn call_anthropic_provider(
             chunks.push(chunk);
             Ok(())
         })?;
-        let events = normalize_anthropic_events(&chunks);
-        return Ok(provider_events_to_run_result(
+        let events = apply_tool_call_dialect(normalize_anthropic_events(&chunks), dialect);
+        return provider_events_to_run_result(
             &events,
             "anthropic:messages:stream".to_string(),
             None,
-        ));
+        );
     }
     let raw = response
         .text()
@@ -478,33 +487,117 @@ fn call_anthropic_provider(
     }
     let value: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("anthropic response was not JSON: {error}"))?;
-    let answer = value
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("");
-    let tool_calls = extract_anthropic_tool_calls(&value);
-    Ok(ProviderRunResult {
-        answer,
-        tool_calls,
-        usage: usage_from_json(value.get("usage")),
-        source: "anthropic:messages".to_string(),
-        finish_reason: value
-            .get("stop_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("stop")
-            .to_string(),
-    })
+    let events = apply_tool_call_dialect(normalize_anthropic_response(&value), dialect);
+    provider_events_to_run_result(&events, "anthropic:messages".to_string(), Some(&value))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_gemini_provider(
+    args: &[String],
+    api_key: &str,
+    model_id: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSchema],
+    model_options: &BTreeMap<String, Value>,
+    mut stream_sink: Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+) -> Result<ProviderRunResult, String> {
+    let timeout = Duration::from_secs(
+        value_for(args, &["--timeout-s"])
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60),
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut config = GeminiLanguageModelConfig::new(api_key, model_id);
+    config.base_url = provider_base_url("gemini", args);
+    let dialect = tool_call_dialect_from_options("gemini", "generate_content", model_options)?;
+    let requested_tool_policy = tool_call_policy_from_options(model_options);
+    let tool_policy = negotiate_tool_call_policy(
+        requested_tool_policy,
+        provider_capabilities("gemini", dialect),
+        tools,
+    )?
+    .effective;
+    let payload = build_gemini_payload(
+        system_prompt_from_messages(messages).as_deref(),
+        messages,
+        tools,
+        Some(model_options),
+        &tool_policy,
+    );
+    let stream = provider_streaming_enabled(args);
+    let mut request = client
+        .post(config.endpoint(stream))
+        .header("x-goog-api-key", api_key)
+        .header("content-type", "application/json");
+    if stream {
+        request = request.header("accept", "text/event-stream");
+    }
+    let response = request
+        .json(&payload)
+        .send()
+        .map_err(|error| format!("gemini request failed: {error}"))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !status.is_success() {
+        let raw = response
+            .text()
+            .map_err(|error| format!("gemini response read failed: {error}"))?;
+        return Err(format!(
+            "gemini returned HTTP {}: {}",
+            status.as_u16(),
+            summarize_http_error_body(&raw, &content_type)
+        ));
+    }
+    let events = if stream {
+        let mut chunks = Vec::new();
+        read_sse_json_values_stream(response, |chunk| {
+            for event in normalize_gemini_events(std::slice::from_ref(&chunk)) {
+                if matches!(
+                    event,
+                    ProviderStreamEvent::TextDelta { .. }
+                        | ProviderStreamEvent::ReasoningDelta { .. }
+                ) && let Some(sink) = stream_sink.as_deref_mut()
+                {
+                    sink(&event);
+                }
+            }
+            chunks.push(chunk);
+            Ok(())
+        })?;
+        normalize_gemini_events(&chunks)
+    } else {
+        let raw = response
+            .text()
+            .map_err(|error| format!("gemini response read failed: {error}"))?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("gemini response was not JSON: {error}"))?;
+        normalize_gemini_events(&[value])
+    };
+    let events = apply_tool_call_dialect(events, dialect);
+    provider_events_to_run_result(
+        &events,
+        if stream {
+            "gemini:generate_content:stream".to_string()
+        } else {
+            "gemini:generate_content".to_string()
+        },
+        None,
+    )
 }
 
 fn provider_events_to_run_result(
     events: &[ProviderStreamEvent],
     source: String,
     fallback_json: Option<&Value>,
-) -> ProviderRunResult {
+) -> Result<ProviderRunResult, String> {
     let mut answer = String::new();
     let mut usage = Usage::default();
     let mut tool_calls = Vec::new();
@@ -531,6 +624,12 @@ fn provider_events_to_run_result(
                     call_id: call_id.clone(),
                 });
             }
+            ProviderStreamEvent::ToolCallError { error } => {
+                return Err(format!(
+                    "provider tool call assembly failed [{}]: {}",
+                    error.code, error.message
+                ));
+            }
             ProviderStreamEvent::Reset { .. } => {
                 answer.clear();
                 tool_calls.clear();
@@ -546,13 +645,13 @@ fn provider_events_to_run_result(
     {
         answer = stable_json_dumps(value);
     }
-    ProviderRunResult {
+    Ok(ProviderRunResult {
         answer,
         tool_calls,
         usage,
         source,
         finish_reason,
-    }
+    })
 }
 
 fn provider_streaming_enabled(args: &[String]) -> bool {
@@ -719,198 +818,6 @@ fn anthropic_stream_text_delta(chunk: &Value) -> Option<ProviderStreamEvent> {
     })
 }
 
-fn normalize_openai_responses_stream_events(chunks: &[Value]) -> Vec<ProviderStreamEvent> {
-    let mut events = Vec::new();
-    let mut finish_reason = "stop".to_string();
-    let mut usage = Usage::default();
-    for chunk in chunks {
-        let event_type = chunk
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        match event_type {
-            "response.output_text.delta" | "response.refusal.delta" => {
-                let text = chunk
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !text.is_empty() {
-                    events.push(ProviderStreamEvent::TextDelta {
-                        text: text.to_string(),
-                    });
-                }
-            }
-            "response.output_item.done" => {
-                if let Some(tool_call) =
-                    response_stream_tool_call(chunk.get("item").unwrap_or(&Value::Null))
-                {
-                    finish_reason = "tool_call".to_string();
-                    events.push(tool_call);
-                }
-            }
-            "response.completed" => {
-                if let Some(response) = chunk.get("response") {
-                    let nested = normalize_openai_responses_response(response);
-                    if !nested.is_empty() {
-                        usage = nested
-                            .iter()
-                            .find_map(|event| match event {
-                                ProviderStreamEvent::Finish { usage, .. } => Some(usage.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or(usage);
-                    }
-                }
-            }
-            "response.failed" | "response.incomplete" => {
-                finish_reason = "error".to_string();
-            }
-            _ => {}
-        }
-    }
-    events.push(ProviderStreamEvent::Finish {
-        finish_reason,
-        usage,
-    });
-    events
-}
-
-fn response_stream_tool_call(item: &Value) -> Option<ProviderStreamEvent> {
-    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-    if !matches!(item_type, "function_call" | "custom_tool_call") {
-        return None;
-    }
-    let call_id = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("responses_tool_call")
-        .to_string();
-    let name = item
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let input = item
-        .get("arguments")
-        .or_else(|| item.get("input"))
-        .map(parse_tool_arguments)
-        .unwrap_or_else(|| json!({}));
-    Some(ProviderStreamEvent::ToolCall {
-        call_id,
-        name,
-        input,
-    })
-}
-
-fn extract_chat_answer(value: &Value) -> String {
-    value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn extract_chat_tool_calls(value: &Value) -> Vec<ToolCall> {
-    value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("message"))
-        .and_then(|message| message.get("tool_calls"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-        .filter_map(|(index, call)| {
-            let function = call.get("function");
-            let name = function
-                .and_then(|item| item.get("name"))
-                .or_else(|| call.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if name.is_empty() {
-                return None;
-            }
-            let call_id = call
-                .get("id")
-                .or_else(|| call.get("call_id"))
-                .and_then(Value::as_str)
-                .map_or_else(|| format!("chat_call_{index}"), str::to_string);
-            let arguments = function
-                .and_then(|item| item.get("arguments"))
-                .or_else(|| call.get("arguments"))
-                .or_else(|| call.get("input"))
-                .unwrap_or(&Value::Null);
-            Some(ToolCall {
-                name: name.to_string(),
-                input: parse_tool_arguments(arguments),
-                call_id,
-            })
-        })
-        .collect()
-}
-
-fn extract_chat_finish_reason(value: &Value) -> Option<String> {
-    value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("finish_reason"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn extract_anthropic_tool_calls(value: &Value) -> Vec<ToolCall> {
-    value
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            if item.get("type").and_then(Value::as_str) != Some("tool_use") {
-                return None;
-            }
-            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-            if name.is_empty() {
-                return None;
-            }
-            Some(ToolCall {
-                name: name.to_string(),
-                input: item.get("input").cloned().unwrap_or_else(|| json!({})),
-                call_id: item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| format!("toolu_{index}"), str::to_string),
-            })
-        })
-        .collect()
-}
-
-fn usage_from_json(value: Option<&Value>) -> Usage {
-    let Some(value) = value else {
-        return Usage::default();
-    };
-    Usage {
-        input_tokens: value
-            .get("input_tokens")
-            .or_else(|| value.get("prompt_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        output_tokens: value
-            .get("output_tokens")
-            .or_else(|| value.get("completion_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cost: 0.0,
-    }
-}
-
 pub(super) fn add_usage(total: &mut Usage, item: &Usage) {
     total.input_tokens += item.input_tokens;
     total.output_tokens += item.output_tokens;
@@ -1015,7 +922,8 @@ mod tests {
             ],
             "test".to_string(),
             None,
-        );
+        )
+        .expect("provider events");
 
         assert_eq!(result.answer, "clean fallback");
         assert!(result.tool_calls.is_empty());

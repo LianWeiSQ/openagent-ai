@@ -246,6 +246,9 @@ impl ToolDefinition {
             name: self.id.clone(),
             description: self.description.clone(),
             schema: Some(self.parameter_schema.clone()),
+            strict: false,
+            output_schema: None,
+            parallel_safe: matches!(self.execution_schema.concurrency, ToolConcurrency::Safe),
             group: self.group.clone(),
             dangerous: self.dangerous,
         }

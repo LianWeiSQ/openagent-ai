@@ -321,6 +321,176 @@ fn binary_run_uses_auth_file_provider_config_without_skip_doctor() -> Result<(),
 }
 
 #[test]
+fn binary_run_uses_native_gemini_payload_and_keeps_tool_controls_internal()
+-> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-native-gemini")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    let agent_dir = workspace.join(".openagent/agents");
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("gemini-native.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "gemini-native",
+            "name": "Gemini Native",
+            "mode": "primary",
+            "provider": "gemini",
+            "model": "gemini-fixture",
+            "tools": ["read"],
+            "model_options": {
+                "max_output_tokens": 32,
+                "parallel_tool_calls": false,
+                "tool_call_dialect": "native",
+                "tool_choice": "required"
+            }
+        }))?,
+    )?;
+    let (provider_port, provider_server, provider_requests) = serve_http_capture_once_on_free_port(
+        "application/json",
+        json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "native gemini answer"}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 3,
+                "candidatesTokenCount": 2
+            }
+        })
+        .to_string(),
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&workspace),
+            "--session-root",
+            path_str(&session_root),
+            "--agent",
+            "gemini-native",
+            "--format",
+            "json",
+            "Use",
+            "Gemini",
+        ])
+        .env_clear()
+        .env("GOOGLE_API_KEY", "gemini-secret")
+        .env(
+            "GOOGLE_BASE_URL",
+            format!("http://127.0.0.1:{provider_port}"),
+        )
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    provider_server
+        .join()
+        .expect("native Gemini server")
+        .expect("native Gemini response");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("gemini-secret"));
+    let events = stdout
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(events.iter().any(|event| {
+        event["method"] == "turn/completed"
+            && event["params"]["final_answer"] == "native gemini answer"
+            && event["params"]["source"] == "gemini:generate_content"
+    }));
+
+    let requests = provider_requests.lock().expect("Gemini request capture");
+    assert_eq!(requests.len(), 1);
+    let payload: Value = serde_json::from_str(&requests[0])?;
+    assert_eq!(payload["contents"][0]["parts"][0]["text"], "Use Gemini");
+    assert_eq!(
+        payload["toolConfig"]["functionCallingConfig"]["mode"],
+        "ANY"
+    );
+    assert_eq!(payload["generationConfig"]["maxOutputTokens"], 32);
+    assert!(
+        payload["tools"][0]["functionDeclarations"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "read"))
+    );
+    for internal_key in ["parallel_tool_calls", "tool_call_dialect", "tool_choice"] {
+        assert!(payload.get(internal_key).is_none(), "{internal_key} leaked");
+    }
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_native_tool_dialect_does_not_parse_xml_like_text() -> Result<(), Box<dyn Error>> {
+    let xml_like_answer =
+        r#"<tool_call>{"name":"read","arguments":{"file_path":"notes.txt"}}</tool_call>"#;
+    let (provider_port, provider_server, provider_requests) = serve_http_capture_once_on_free_port(
+        "application/json",
+        json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": xml_like_answer},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+        })
+        .to_string(),
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--wire-api",
+            "chat",
+            "--format",
+            "json",
+            "Explain",
+            "this",
+            "text",
+        ])
+        .env_clear()
+        .env("OPENAI_API_KEY", "test-key")
+        .env(
+            "OPENAI_BASE_URL",
+            format!("http://127.0.0.1:{provider_port}"),
+        )
+        .env("OPENAI_MODEL", "chat-fixture")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    provider_server
+        .join()
+        .expect("native dialect server")
+        .expect("native dialect response");
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(events.iter().any(|event| {
+        event["method"] == "turn/completed"
+            && event["params"]["final_answer"] == xml_like_answer
+            && event["params"]["tool_calls"] == 0
+    }));
+    assert_eq!(
+        provider_requests
+            .lock()
+            .expect("native dialect request capture")
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn binary_help_smoke_covers_legacy_command_surface() -> Result<(), Box<dyn Error>> {
     let root = run_openagent(["--help"], None)?;
     assert!(root.status.success());

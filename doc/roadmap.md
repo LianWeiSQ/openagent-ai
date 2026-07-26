@@ -30,23 +30,35 @@ runtime contracts that improve Desktop, CLI, and TUI together.
   storage migration, and source-only performance probes;
 - bounded HTTP service modules behind a single composition boundary.
 
+## Completed Provider And Tool-Calling Plane
+
+- first-class tool-call frames, strict fragmented-call assembly, and
+  interleaved parallel-call isolation;
+- native structured OpenAI Chat, OpenAI Responses, Anthropic, and Gemini
+  adapters;
+- explicit Hermes, Qwen XML, DeepSeek, and Pythonic compatibility dialects;
+- negotiated tool choice, strict schema, output schema, and parallel-call
+  capabilities;
+- native Gemini request, response, streaming, authentication, and tool-result
+  mapping;
+- fail-closed malformed/truncated call handling and cross-surface fake-provider
+  tests.
+
 ## Enhancement Sequence
 
-1. Provider and tool-calling plane: normalized tool-call frames, dialect
-   adapters, richer schemas, and negotiated provider capabilities.
-2. Durable session/turn engine: one persisted state machine, recovery policy,
+1. Durable session/turn engine: one persisted state machine, recovery policy,
    idempotency, and a rebuildable query catalog.
-3. Context operating system: deterministic assembly, typed assets, semantic
+2. Context operating system: deterministic assembly, typed assets, semantic
    compaction, and cross-client prompt parity.
-4. Concurrent tool scheduler: dependency-aware read parallelism, write
+3. Concurrent tool scheduler: dependency-aware read parallelism, write
    serialization, cancellation, and resource limits.
-5. Subagent control plane: durable background lifecycle, nested routing,
+4. Subagent control plane: durable background lifecycle, nested routing,
    worktree isolation, resume, promotion, and task-tree UX.
-6. MCP service plane: dynamic client registration, hardened remote OAuth,
+5. MCP service plane: dynamic client registration, hardened remote OAuth,
    reconnect policy, server logs, and capability negotiation.
-7. LSP service plane: managed clients, diagnostics, lifecycle control, logs,
+6. LSP service plane: managed clients, diagnostics, lifecycle control, logs,
    and server capability discovery.
-8. Product hardening: packaged-platform gates, accessibility, observability,
+7. Product hardening: packaged-platform gates, accessibility, observability,
    migration compatibility, and release automation.
 
 ## Documentation Rule

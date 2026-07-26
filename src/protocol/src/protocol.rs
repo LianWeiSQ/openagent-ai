@@ -188,8 +188,34 @@ pub struct ToolSchema {
     pub name: String,
     pub description: String,
     pub schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_safe: bool,
     pub group: String,
     pub dangerous: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    None,
+    Required,
+    Tool {
+        name: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolCallPolicy {
+    #[serde(default)]
+    pub choice: ToolChoice,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -340,6 +366,8 @@ pub struct OpenAiFunction {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -750,9 +778,14 @@ pub fn materialize_openai_compatible_tools(tools: &[ToolSchema]) -> Vec<OpenAiTo
                 parameters: tool.schema.clone().unwrap_or_else(|| {
                     json_object([("type", Value::String("object".to_string()))])
                 }),
+                strict: tool.strict,
             },
         })
         .collect()
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

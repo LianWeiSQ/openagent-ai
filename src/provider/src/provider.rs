@@ -4,10 +4,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use openagent_protocol::{
     ChatMessage, MaterializedPayload, Model, ModelCapabilities, ModelPricing, RUNTIME_OPTION_KEYS,
-    Role, ToolSchema, Usage, materialize_openai_compatible_payload,
+    Role, ToolCallPolicy, ToolChoice, ToolSchema, Usage, materialize_openai_compatible_payload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+mod gemini;
+mod tool_calling;
+
+pub use gemini::{
+    DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL, GeminiLanguageModelConfig, build_gemini_payload,
+    normalize_gemini_events,
+};
+pub use tool_calling::{
+    NegotiatedToolCallPolicy, ParsedTextToolCalls, ProviderCapability, ProviderCapabilitySet,
+    TOOL_CALL_DIALECT_OPTION, ToolCallArgumentsFrame, ToolCallAssembler, ToolCallAssemblyError,
+    ToolCallDialect, ToolCallFrame, apply_tool_call_dialect, negotiate_tool_call_policy,
+    parse_text_tool_calls, provider_capabilities, tool_call_dialect_from_options,
+    tool_call_policy_from_options,
+};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const DEFAULT_PROVIDER: &str = "openai";
@@ -57,6 +72,9 @@ pub enum ProviderStreamEvent {
         call_id: String,
         name: String,
         input: Value,
+    },
+    ToolCallError {
+        error: ToolCallAssemblyError,
     },
     Finish {
         finish_reason: String,
@@ -431,15 +449,45 @@ pub fn build_openai_chat_payload(
     max_output_tokens: Option<u64>,
     options: Option<&BTreeMap<String, Value>>,
 ) -> Value {
+    build_openai_chat_payload_with_policy(
+        config,
+        system,
+        messages,
+        tools,
+        temperature,
+        max_output_tokens,
+        options,
+        &ToolCallPolicy::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn build_openai_chat_payload_with_policy(
+    config: &OpenAiLanguageModelConfig,
+    system: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[ToolSchema],
+    temperature: Option<f64>,
+    max_output_tokens: Option<u64>,
+    options: Option<&BTreeMap<String, Value>>,
+    tool_policy: &ToolCallPolicy,
+) -> Value {
     let model = openai_compatible_model("openai", &config.model_id);
     let payload =
         materialize_openai_compatible_payload(system, messages, tools, Some(&model), options);
     let MaterializedPayload {
         messages,
-        tools,
+        mut tools,
         model,
         provider_options,
     } = payload;
+    let capabilities = provider_capabilities(&config.provider_id, ToolCallDialect::OpenAiChat);
+    if !capabilities.supports(ProviderCapability::StrictToolSchemas) {
+        for tool in &mut tools {
+            tool.function.strict = false;
+        }
+    }
     let mut item = Map::from_iter([
         ("messages".to_string(), json!(messages)),
         ("tools".to_string(), json!(tools)),
@@ -455,7 +503,13 @@ pub fn build_openai_chat_payload(
         item.insert("max_tokens".to_string(), json!(max_output_tokens));
     }
     if !tools.is_empty() {
-        item.insert("tool_choice".to_string(), json!("auto"));
+        item.insert(
+            "tool_choice".to_string(),
+            openai_chat_tool_choice(&tool_policy.choice),
+        );
+        if let Some(parallel) = tool_policy.parallel {
+            item.insert("parallel_tool_calls".to_string(), json!(parallel));
+        }
     }
     for (key, value) in provider_options {
         item.insert(key, value);
@@ -466,7 +520,8 @@ pub fn build_openai_chat_payload(
 #[must_use]
 pub fn normalize_openai_chat_sse_chunks(chunks: &[Value]) -> Vec<ProviderStreamEvent> {
     let mut events = Vec::new();
-    let mut tool_calls_by_index: BTreeMap<u64, OpenAiToolCallState> = BTreeMap::new();
+    let mut assembler = ToolCallAssembler::new(ToolCallDialect::OpenAiChat);
+    let mut argument_snapshots = BTreeMap::<String, String>::new();
     let mut finish_reason_raw = Value::Null;
     let mut usage_raw = Value::Null;
     let mut emitted_text = String::new();
@@ -499,21 +554,36 @@ pub fn normalize_openai_chat_sse_chunks(chunks: &[Value]) -> Vec<ProviderStreamE
                     continue;
                 };
                 let idx = value_as_u64(tool_call_obj.get("index")).unwrap_or(0);
-                let record = tool_calls_by_index.entry(idx).or_default();
-                if let Some(id) = tool_call_obj.get("id").and_then(Value::as_str) {
-                    record.id = Some(id.to_string());
+                let stream_id = idx.to_string();
+                let function = tool_call_obj.get("function").and_then(Value::as_object);
+                if let Err(error) = assembler.push(ToolCallFrame::Start {
+                    stream_id: stream_id.clone(),
+                    call_id: tool_call_obj
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    name: function
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }) {
+                    events.push(ProviderStreamEvent::ToolCallError { error });
+                    continue;
                 }
-                if let Some(function) = tool_call_obj.get("function").and_then(Value::as_object) {
-                    if let Some(name) = function.get("name").and_then(Value::as_str) {
-                        record.name = Some(name.to_string());
-                    }
-                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                        let (arguments_delta, arguments_emitted) =
-                            next_text_delta(arguments, &record.arguments_emitted);
-                        if !arguments_delta.is_empty() {
-                            record.arguments.push_str(&arguments_delta);
-                        }
-                        record.arguments_emitted = arguments_emitted;
+                if let Some(arguments) = function
+                    .and_then(|function| function.get("arguments"))
+                    .and_then(Value::as_str)
+                {
+                    let emitted = argument_snapshots.entry(stream_id.clone()).or_default();
+                    let (delta, next_emitted) = next_text_delta(arguments, emitted);
+                    *emitted = next_emitted;
+                    if !delta.is_empty()
+                        && let Err(error) = assembler.push(ToolCallFrame::Arguments {
+                            stream_id,
+                            arguments: ToolCallArgumentsFrame::Delta { text: delta },
+                        })
+                    {
+                        events.push(ProviderStreamEvent::ToolCallError { error });
                     }
                 }
             }
@@ -529,20 +599,111 @@ pub fn normalize_openai_chat_sse_chunks(chunks: &[Value]) -> Vec<ProviderStreamE
         }
     }
 
-    let has_tool_calls = !tool_calls_by_index.is_empty();
-    for (idx, record) in tool_calls_by_index {
-        let call_id = record.id.unwrap_or_else(|| format!("openai_call_{idx}"));
-        let name = record.name.unwrap_or_default();
-        let input = parse_tool_arguments(&Value::String(record.arguments));
-        events.push(ProviderStreamEvent::ToolCall {
-            call_id,
-            name,
-            input,
-        });
+    let completed = if finish_reason_raw.is_null() {
+        assembler
+            .abort_incomplete()
+            .into_iter()
+            .map(Err)
+            .collect::<Vec<_>>()
+    } else {
+        assembler.finish_all()
+    };
+    let mut has_tool_calls = false;
+    for result in completed {
+        match result {
+            Ok(call) => {
+                has_tool_calls = true;
+                events.push(ProviderStreamEvent::ToolCall {
+                    call_id: call.call_id,
+                    name: call.name,
+                    input: call.input,
+                });
+            }
+            Err(error) => events.push(ProviderStreamEvent::ToolCallError { error }),
+        }
     }
     events.push(ProviderStreamEvent::Finish {
         finish_reason: map_openai_finish_reason(&finish_reason_raw, has_tool_calls).to_string(),
         usage: usage_from_openai(usage_raw.as_object()),
+    });
+    events
+}
+
+#[must_use]
+pub fn normalize_openai_chat_response(value: &Value) -> Vec<ProviderStreamEvent> {
+    let mut events = Vec::new();
+    let choice = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .unwrap_or(&Value::Null);
+    let message = choice.get("message").unwrap_or(choice);
+    let text = extract_text_content(message);
+    if !text.is_empty() {
+        events.push(ProviderStreamEvent::TextDelta { text });
+    }
+    let mut has_tool_calls = false;
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for (index, tool_call) in tool_calls.iter().enumerate() {
+            let function = tool_call.get("function").and_then(Value::as_object);
+            let stream_id = index.to_string();
+            let mut assembler = ToolCallAssembler::new(ToolCallDialect::OpenAiChat);
+            let result = assembler
+                .push(ToolCallFrame::Start {
+                    stream_id: stream_id.clone(),
+                    call_id: tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    name: function
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+                .and_then(|_| {
+                    let arguments = function
+                        .and_then(|function| function.get("arguments"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    assembler.push(ToolCallFrame::Arguments {
+                        stream_id: stream_id.clone(),
+                        arguments: match arguments {
+                            Value::String(text) => ToolCallArgumentsFrame::Snapshot { text },
+                            value => ToolCallArgumentsFrame::Structured { value },
+                        },
+                    })
+                })
+                .and_then(|_| assembler.push(ToolCallFrame::End { stream_id }));
+            match result {
+                Ok(Some(call)) => {
+                    has_tool_calls = true;
+                    events.push(ProviderStreamEvent::ToolCall {
+                        call_id: call.call_id,
+                        name: call.name,
+                        input: call.input,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => events.push(ProviderStreamEvent::ToolCallError { error }),
+            }
+        }
+    }
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || {
+                if has_tool_calls {
+                    "tool_call".to_string()
+                } else {
+                    "stop".to_string()
+                }
+            },
+            |reason| map_openai_finish_reason(&json!(reason), has_tool_calls).to_string(),
+        );
+    events.push(ProviderStreamEvent::Finish {
+        finish_reason,
+        usage: usage_from_openai(value.get("usage").and_then(Value::as_object)),
     });
     events
 }
@@ -605,6 +766,27 @@ pub fn build_openai_responses_payload(
     max_output_tokens: Option<u64>,
     options: Option<&BTreeMap<String, Value>>,
 ) -> Value {
+    build_openai_responses_payload_with_policy(
+        config,
+        system,
+        messages,
+        tools,
+        max_output_tokens,
+        options,
+        &ToolCallPolicy::default(),
+    )
+}
+
+#[must_use]
+pub fn build_openai_responses_payload_with_policy(
+    config: &OpenAiLanguageModelConfig,
+    system: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[ToolSchema],
+    max_output_tokens: Option<u64>,
+    options: Option<&BTreeMap<String, Value>>,
+    tool_policy: &ToolCallPolicy,
+) -> Value {
     let mut payload = Map::from_iter([
         ("model".to_string(), json!(config.model_id)),
         (
@@ -617,8 +799,21 @@ pub fn build_openai_responses_payload(
         payload.insert("instructions".to_string(), json!(system));
     }
     if !tools.is_empty() {
-        payload.insert("tools".to_string(), materialize_responses_tools(tools));
-        payload.insert("tool_choice".to_string(), json!("auto"));
+        payload.insert(
+            "tools".to_string(),
+            materialize_responses_tools(
+                tools,
+                provider_capabilities(&config.provider_id, ToolCallDialect::OpenAiResponses)
+                    .supports(ProviderCapability::StrictToolSchemas),
+            ),
+        );
+        payload.insert(
+            "tool_choice".to_string(),
+            openai_responses_tool_choice(&tool_policy.choice),
+        );
+        if let Some(parallel) = tool_policy.parallel {
+            payload.insert("parallel_tool_calls".to_string(), json!(parallel));
+        }
     }
     if config.disable_response_storage {
         payload.insert("store".to_string(), json!(false));
@@ -648,19 +843,50 @@ pub fn build_openai_responses_payload(
 pub fn normalize_openai_responses_response(value: &Value) -> Vec<ProviderStreamEvent> {
     let mut events = Vec::new();
     let content = extract_responses_text(value);
-    let tool_calls = extract_responses_tool_calls(value);
     if !content.is_empty() {
         events.push(ProviderStreamEvent::TextDelta { text: content });
     }
-    for tool_call in &tool_calls {
-        events.push(ProviderStreamEvent::ToolCall {
-            call_id: tool_call.call_id.clone(),
-            name: tool_call.name.clone(),
-            input: tool_call.input.clone(),
-        });
+    let mut tool_call_count = 0;
+    if let Some(output) = value.get("output").and_then(Value::as_array) {
+        for (index, item) in output.iter().enumerate() {
+            if !response_item_is_tool_call(item) {
+                continue;
+            }
+            let stream_id = responses_stream_id(item, &json!({"output_index": index}));
+            let mut assembler = ToolCallAssembler::new(ToolCallDialect::OpenAiResponses);
+            let result = assembler
+                .push(responses_start_frame(item, &json!({"output_index": index})))
+                .and_then(|_| {
+                    let arguments = item
+                        .get("arguments")
+                        .or_else(|| item.get("input"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    assembler.push(ToolCallFrame::Arguments {
+                        stream_id: stream_id.clone(),
+                        arguments: match arguments {
+                            Value::String(text) => ToolCallArgumentsFrame::Snapshot { text },
+                            value => ToolCallArgumentsFrame::Structured { value },
+                        },
+                    })
+                })
+                .and_then(|_| assembler.push(ToolCallFrame::End { stream_id }));
+            match result {
+                Ok(Some(tool_call)) => {
+                    tool_call_count += 1;
+                    events.push(ProviderStreamEvent::ToolCall {
+                        call_id: tool_call.call_id,
+                        name: tool_call.name,
+                        input: tool_call.input,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => events.push(ProviderStreamEvent::ToolCallError { error }),
+            }
+        }
     }
     events.push(ProviderStreamEvent::Finish {
-        finish_reason: if tool_calls.is_empty() {
+        finish_reason: if tool_call_count == 0 {
             "stop".to_string()
         } else {
             "tool_call".to_string()
@@ -673,8 +899,11 @@ pub fn normalize_openai_responses_response(value: &Value) -> Vec<ProviderStreamE
 #[must_use]
 pub fn normalize_openai_responses_stream_events(chunks: &[Value]) -> Vec<ProviderStreamEvent> {
     let mut events = Vec::new();
+    let mut assembler = ToolCallAssembler::new(ToolCallDialect::OpenAiResponses);
     let mut finish_reason = "stop".to_string();
     let mut usage = Usage::default();
+    let mut stream_completed = false;
+    let mut has_tool_calls = false;
     for chunk in chunks {
         let event_type = chunk
             .get("type")
@@ -692,15 +921,85 @@ pub fn normalize_openai_responses_stream_events(chunks: &[Value]) -> Vec<Provide
                     });
                 }
             }
-            "response.output_item.done" => {
-                if let Some(tool_call) =
-                    response_stream_tool_call(chunk.get("item").unwrap_or(&Value::Null))
+            "response.output_item.added" => {
+                let item = chunk.get("item").unwrap_or(&Value::Null);
+                if response_item_is_tool_call(item)
+                    && let Err(error) = assembler.push(responses_start_frame(item, chunk))
                 {
-                    finish_reason = "tool_call".to_string();
-                    events.push(tool_call);
+                    events.push(ProviderStreamEvent::ToolCallError { error });
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let stream_id = responses_stream_id(chunk, chunk);
+                let delta = chunk
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !delta.is_empty()
+                    && let Err(error) = assembler.push(ToolCallFrame::Arguments {
+                        stream_id,
+                        arguments: ToolCallArgumentsFrame::Delta { text: delta },
+                    })
+                {
+                    events.push(ProviderStreamEvent::ToolCallError { error });
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let stream_id = responses_stream_id(chunk, chunk);
+                let arguments = chunk
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Err(error) = assembler.push(ToolCallFrame::Arguments {
+                    stream_id,
+                    arguments: ToolCallArgumentsFrame::Snapshot { text: arguments },
+                }) {
+                    events.push(ProviderStreamEvent::ToolCallError { error });
+                }
+            }
+            "response.output_item.done" => {
+                let item = chunk.get("item").unwrap_or(&Value::Null);
+                if response_item_is_tool_call(item) {
+                    let stream_id = responses_stream_id(item, chunk);
+                    if let Err(error) = assembler.push(responses_start_frame(item, chunk)) {
+                        events.push(ProviderStreamEvent::ToolCallError { error });
+                        continue;
+                    }
+                    if let Some(arguments) = item
+                        .get("arguments")
+                        .or_else(|| item.get("input"))
+                        .and_then(Value::as_str)
+                        && let Err(error) = assembler.push(ToolCallFrame::Arguments {
+                            stream_id: stream_id.clone(),
+                            arguments: ToolCallArgumentsFrame::Snapshot {
+                                text: arguments.to_string(),
+                            },
+                        })
+                    {
+                        events.push(ProviderStreamEvent::ToolCallError { error });
+                        continue;
+                    }
+                    match assembler.push(ToolCallFrame::End { stream_id }) {
+                        Ok(Some(call)) => {
+                            has_tool_calls = true;
+                            finish_reason = "tool_call".to_string();
+                            events.push(ProviderStreamEvent::ToolCall {
+                                call_id: call.call_id,
+                                name: call.name,
+                                input: call.input,
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            events.push(ProviderStreamEvent::ToolCallError { error });
+                        }
+                    }
                 }
             }
             "response.completed" => {
+                stream_completed = true;
                 if let Some(response) = chunk.get("response") {
                     let nested = normalize_openai_responses_response(response);
                     if !nested.is_empty() {
@@ -715,10 +1014,32 @@ pub fn normalize_openai_responses_stream_events(chunks: &[Value]) -> Vec<Provide
                 }
             }
             "response.failed" | "response.incomplete" => {
+                stream_completed = true;
                 finish_reason = "error".to_string();
             }
             _ => {}
         }
+    }
+    let pending = if stream_completed {
+        assembler.finish_all()
+    } else {
+        assembler.abort_incomplete().into_iter().map(Err).collect()
+    };
+    for result in pending {
+        match result {
+            Ok(call) => {
+                has_tool_calls = true;
+                events.push(ProviderStreamEvent::ToolCall {
+                    call_id: call.call_id,
+                    name: call.name,
+                    input: call.input,
+                });
+            }
+            Err(error) => events.push(ProviderStreamEvent::ToolCallError { error }),
+        }
+    }
+    if has_tool_calls && finish_reason == "stop" {
+        finish_reason = "tool_call".to_string();
     }
     events.push(ProviderStreamEvent::Finish {
         finish_reason,
@@ -727,32 +1048,38 @@ pub fn normalize_openai_responses_stream_events(chunks: &[Value]) -> Vec<Provide
     events
 }
 
-fn response_stream_tool_call(item: &Value) -> Option<ProviderStreamEvent> {
+fn response_item_is_tool_call(item: &Value) -> bool {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-    if !matches!(item_type, "function_call" | "custom_tool_call") {
-        return None;
-    }
+    matches!(item_type, "function_call" | "custom_tool_call")
+}
+
+fn responses_stream_id(item: &Value, envelope: &Value) -> String {
+    item.get("id")
+        .or_else(|| item.get("item_id"))
+        .or_else(|| envelope.get("item_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            item.get("output_index")
+                .or_else(|| envelope.get("output_index"))
+                .and_then(value_to_u64)
+                .map(|index| format!("output_{index}"))
+        })
+        .unwrap_or_else(|| "responses_tool_call".to_string())
+}
+
+fn responses_start_frame(item: &Value, envelope: &Value) -> ToolCallFrame {
     let call_id = item
         .get("call_id")
         .or_else(|| item.get("id"))
         .and_then(Value::as_str)
-        .unwrap_or("responses_tool_call")
-        .to_string();
-    let name = item
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let input = item
-        .get("arguments")
-        .or_else(|| item.get("input"))
-        .map(parse_tool_arguments)
-        .unwrap_or_else(|| json!({}));
-    Some(ProviderStreamEvent::ToolCall {
+        .map(str::to_string);
+    let name = item.get("name").and_then(Value::as_str).map(str::to_string);
+    ToolCallFrame::Start {
+        stream_id: responses_stream_id(item, envelope),
         call_id,
         name,
-        input,
-    })
+    }
 }
 
 #[must_use]
@@ -764,6 +1091,30 @@ pub fn build_anthropic_payload(
     temperature: Option<f64>,
     max_output_tokens: Option<u64>,
     options: Option<&BTreeMap<String, Value>>,
+) -> Value {
+    build_anthropic_payload_with_policy(
+        config,
+        system,
+        messages,
+        tools,
+        temperature,
+        max_output_tokens,
+        options,
+        &ToolCallPolicy::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn build_anthropic_payload_with_policy(
+    config: &AnthropicLanguageModelConfig,
+    system: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[ToolSchema],
+    temperature: Option<f64>,
+    max_output_tokens: Option<u64>,
+    options: Option<&BTreeMap<String, Value>>,
+    tool_policy: &ToolCallPolicy,
 ) -> Value {
     let mut payload = Map::from_iter([
         ("model".to_string(), json!(config.model_id)),
@@ -780,9 +1131,12 @@ pub fn build_anthropic_payload(
     if let Some(system) = system.filter(|value| !value.is_empty()) {
         payload.insert("system".to_string(), json!(system));
     }
-    if !tools.is_empty() {
+    if !tools.is_empty() && !matches!(tool_policy.choice, ToolChoice::None) {
         payload.insert("tools".to_string(), materialize_anthropic_tools(tools));
-        payload.insert("tool_choice".to_string(), json!({"type": "auto"}));
+        payload.insert(
+            "tool_choice".to_string(),
+            anthropic_tool_choice(tool_policy),
+        );
     }
     if let Some(temperature) = temperature {
         payload.insert("temperature".to_string(), json!(temperature));
@@ -796,10 +1150,12 @@ pub fn build_anthropic_payload(
 #[must_use]
 pub fn normalize_anthropic_events(source_events: &[Value]) -> Vec<ProviderStreamEvent> {
     let mut events = Vec::new();
-    let mut tool_uses: BTreeMap<u64, ToolUseState> = BTreeMap::new();
+    let mut assembler = ToolCallAssembler::new(ToolCallDialect::Anthropic);
     let mut finish_reason_raw = Value::Null;
     let mut input_tokens = 0;
     let mut output_tokens = 0;
+    let mut has_tool_calls = false;
+    let mut message_stopped = false;
 
     for event in source_events {
         let event_type = event
@@ -836,23 +1192,28 @@ pub fn normalize_anthropic_events(source_events: &[Value]) -> Vec<ProviderStream
                         }
                     }
                     "tool_use" => {
-                        tool_uses.insert(
-                            index,
-                            ToolUseState {
-                                call_id: block
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .map_or_else(|| format!("toolu_{index}"), str::to_string),
-                                name: block
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                input_value: block.get("input").cloned().unwrap_or(Value::Null),
-                                partial_json: String::new(),
-                                emitted: false,
+                        let stream_id = index.to_string();
+                        if let Err(error) = assembler.push(ToolCallFrame::Start {
+                            stream_id: stream_id.clone(),
+                            call_id: block.get("id").and_then(Value::as_str).map(str::to_string),
+                            name: block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        }) {
+                            events.push(ProviderStreamEvent::ToolCallError { error });
+                            continue;
+                        }
+                        if let Some(input) = block.get("input").filter(|input| {
+                            input.as_object().is_some_and(|value| !value.is_empty())
+                        }) && let Err(error) = assembler.push(ToolCallFrame::Arguments {
+                            stream_id,
+                            arguments: ToolCallArgumentsFrame::Structured {
+                                value: input.clone(),
                             },
-                        );
+                        }) {
+                            events.push(ProviderStreamEvent::ToolCallError { error });
+                        }
                     }
                     _ => {}
                 }
@@ -876,26 +1237,40 @@ pub fn normalize_anthropic_events(source_events: &[Value]) -> Vec<ProviderStream
                         }
                     }
                     "input_json_delta" => {
-                        let state = tool_uses.entry(index).or_insert_with(|| ToolUseState {
-                            call_id: format!("toolu_{index}"),
-                            name: String::new(),
-                            input_value: Value::Null,
-                            partial_json: String::new(),
-                            emitted: false,
-                        });
-                        state.partial_json.push_str(
-                            delta
-                                .get("partial_json")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        );
+                        let partial_json = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if !partial_json.is_empty()
+                            && let Err(error) = assembler.push(ToolCallFrame::Arguments {
+                                stream_id: index.to_string(),
+                                arguments: ToolCallArgumentsFrame::Delta { text: partial_json },
+                            })
+                        {
+                            events.push(ProviderStreamEvent::ToolCallError { error });
+                        }
                     }
                     _ => {}
                 }
             }
             "content_block_stop" => {
                 let index = event.get("index").and_then(value_to_u64).unwrap_or(0);
-                emit_anthropic_tool(&mut events, &mut tool_uses, index);
+                match assembler.push(ToolCallFrame::End {
+                    stream_id: index.to_string(),
+                }) {
+                    Ok(Some(call)) => {
+                        has_tool_calls = true;
+                        events.push(ProviderStreamEvent::ToolCall {
+                            call_id: call.call_id,
+                            name: call.name,
+                            input: call.input,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) if error.code.as_ref() == "tool_call_missing_start" => {}
+                    Err(error) => events.push(ProviderStreamEvent::ToolCallError { error }),
+                }
             }
             "message_delta" => {
                 if let Some(reason) = event
@@ -912,17 +1287,33 @@ pub fn normalize_anthropic_events(source_events: &[Value]) -> Vec<ProviderStream
                     output_tokens = value;
                 }
             }
-            "message_stop" => break,
+            "message_stop" => {
+                message_stopped = true;
+                break;
+            }
             _ => {}
         }
     }
-    let indexes = tool_uses.keys().copied().collect::<Vec<_>>();
-    for index in indexes {
-        emit_anthropic_tool(&mut events, &mut tool_uses, index);
+    let pending = if message_stopped {
+        assembler.finish_all()
+    } else {
+        assembler.abort_incomplete().into_iter().map(Err).collect()
+    };
+    for result in pending {
+        match result {
+            Ok(call) => {
+                has_tool_calls = true;
+                events.push(ProviderStreamEvent::ToolCall {
+                    call_id: call.call_id,
+                    name: call.name,
+                    input: call.input,
+                });
+            }
+            Err(error) => events.push(ProviderStreamEvent::ToolCallError { error }),
+        }
     }
     events.push(ProviderStreamEvent::Finish {
-        finish_reason: map_anthropic_finish_reason(&finish_reason_raw, !tool_uses.is_empty())
-            .to_string(),
+        finish_reason: map_anthropic_finish_reason(&finish_reason_raw, has_tool_calls).to_string(),
         usage: Usage {
             input_tokens,
             output_tokens,
@@ -932,28 +1323,99 @@ pub fn normalize_anthropic_events(source_events: &[Value]) -> Vec<ProviderStream
     events
 }
 
-#[derive(Clone, Debug, Default)]
-struct OpenAiToolCallState {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-    arguments_emitted: String,
-}
-
-#[derive(Clone, Debug)]
-struct ParsedToolCall {
-    call_id: String,
-    name: String,
-    input: Value,
-}
-
-#[derive(Clone, Debug)]
-struct ToolUseState {
-    call_id: String,
-    name: String,
-    input_value: Value,
-    partial_json: String,
-    emitted: bool,
+#[must_use]
+pub fn normalize_anthropic_response(value: &Value) -> Vec<ProviderStreamEvent> {
+    let mut events = Vec::new();
+    let mut has_tool_calls = false;
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        for (index, block) in content.iter().enumerate() {
+            match block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        events.push(ProviderStreamEvent::TextDelta {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+                "thinking" => {
+                    if let Some(text) = block
+                        .get("thinking")
+                        .or_else(|| block.get("text"))
+                        .and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        events.push(ProviderStreamEvent::ReasoningDelta {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+                "tool_use" => {
+                    let stream_id = index.to_string();
+                    let mut assembler = ToolCallAssembler::new(ToolCallDialect::Anthropic);
+                    let result = assembler
+                        .push(ToolCallFrame::Start {
+                            stream_id: stream_id.clone(),
+                            call_id: block.get("id").and_then(Value::as_str).map(str::to_string),
+                            name: block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                        .and_then(|_| {
+                            assembler.push(ToolCallFrame::Arguments {
+                                stream_id: stream_id.clone(),
+                                arguments: ToolCallArgumentsFrame::Structured {
+                                    value: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                                },
+                            })
+                        })
+                        .and_then(|_| assembler.push(ToolCallFrame::End { stream_id }));
+                    match result {
+                        Ok(Some(call)) => {
+                            has_tool_calls = true;
+                            events.push(ProviderStreamEvent::ToolCall {
+                                call_id: call.call_id,
+                                name: call.name,
+                                input: call.input,
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            events.push(ProviderStreamEvent::ToolCallError { error });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    events.push(ProviderStreamEvent::Finish {
+        finish_reason: map_anthropic_finish_reason(
+            value.get("stop_reason").unwrap_or(&Value::Null),
+            has_tool_calls,
+        )
+        .to_string(),
+        usage: Usage {
+            input_tokens: value
+                .get("usage")
+                .and_then(|usage| usage.get("input_tokens"))
+                .and_then(value_to_u64)
+                .unwrap_or_default(),
+            output_tokens: value
+                .get("usage")
+                .and_then(|usage| usage.get("output_tokens"))
+                .and_then(value_to_u64)
+                .unwrap_or_default(),
+            cost: 0.0,
+        },
+    });
+    events
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1010,7 +1472,7 @@ fn provider_metadata(provider: &str) -> Option<ProviderMetadata> {
     let metadata = match provider {
         "anthropic" => ProviderMetadata {
             label: Some("Anthropic"),
-            default_base_url: None,
+            default_base_url: Some("https://api.anthropic.com/v1"),
             default_model: Some(DEFAULT_ANTHROPIC_MODEL),
             requires_api_key: true,
             auth_notes: Some(
@@ -1044,11 +1506,11 @@ fn provider_metadata(provider: &str) -> Option<ProviderMetadata> {
         },
         "gemini" => ProviderMetadata {
             label: Some("Google Gemini"),
-            default_base_url: None,
-            default_model: Some("gemini-2.5-pro"),
+            default_base_url: Some(DEFAULT_GEMINI_BASE_URL),
+            default_model: Some(DEFAULT_GEMINI_MODEL),
             requires_api_key: true,
             auth_notes: Some(
-                "Native Gemini SDK routing is not implemented; use an OpenAI-compatible gateway/base URL for runtime calls.",
+                "Native Gemini generateContent routing is supported with GOOGLE_API_KEY.",
             ),
         },
         "groq" => ProviderMetadata {
@@ -1103,9 +1565,55 @@ fn provider_options(options: Option<&BTreeMap<String, Value>>) -> BTreeMap<Strin
     options
         .into_iter()
         .flat_map(BTreeMap::iter)
-        .filter(|(key, _value)| !runtime_keys.contains(key.as_str()))
+        .filter(|(key, _value)| {
+            !runtime_keys.contains(key.as_str())
+                && !matches!(
+                    key.as_str(),
+                    "tool_choice" | "parallel_tool_calls" | TOOL_CALL_DIALECT_OPTION
+                )
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn openai_chat_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::None => json!("none"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Tool { name } => json!({
+            "type": "function",
+            "function": {"name": name},
+        }),
+    }
+}
+
+fn openai_responses_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::None => json!("none"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Tool { name } => json!({
+            "type": "function",
+            "name": name,
+        }),
+    }
+}
+
+fn anthropic_tool_choice(policy: &ToolCallPolicy) -> Value {
+    let mut choice = match &policy.choice {
+        ToolChoice::Auto => Map::from_iter([("type".to_string(), json!("auto"))]),
+        ToolChoice::None => Map::from_iter([("type".to_string(), json!("none"))]),
+        ToolChoice::Required => Map::from_iter([("type".to_string(), json!("any"))]),
+        ToolChoice::Tool { name } => Map::from_iter([
+            ("type".to_string(), json!("tool")),
+            ("name".to_string(), json!(name)),
+        ]),
+    };
+    if policy.parallel == Some(false) {
+        choice.insert("disable_parallel_tool_use".to_string(), json!(true));
+    }
+    Value::Object(choice)
 }
 
 fn value_as_u64(value: Option<&Value>) -> Option<u64> {
@@ -1424,17 +1932,26 @@ fn responses_function_call_item(call: &Value) -> Option<Value> {
     }))
 }
 
-fn materialize_responses_tools(tools: &[ToolSchema]) -> Value {
+fn materialize_responses_tools(tools: &[ToolSchema], supports_strict: bool) -> Value {
     Value::Array(
         tools
             .iter()
             .map(|tool| {
-                json!({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.schema.clone().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-                })
+                let mut definition = Map::from_iter([
+                    ("type".to_string(), json!("function")),
+                    ("name".to_string(), json!(tool.name)),
+                    ("description".to_string(), json!(tool.description)),
+                    (
+                        "parameters".to_string(),
+                        tool.schema
+                            .clone()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                    ),
+                ]);
+                if supports_strict && tool.strict {
+                    definition.insert("strict".to_string(), json!(true));
+                }
+                Value::Object(definition)
             })
             .collect(),
     )
@@ -1484,40 +2001,6 @@ fn extract_responses_text(value: &Value) -> String {
         return extract_choice_text(first);
     }
     String::new()
-}
-
-fn extract_responses_tool_calls(value: &Value) -> Vec<ParsedToolCall> {
-    let Some(output) = value.get("output").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut parsed = Vec::new();
-    for item in output {
-        if item.get("type").and_then(Value::as_str) != Some("function_call") {
-            continue;
-        }
-        let name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let call_id = item
-            .get("call_id")
-            .or_else(|| item.get("id"))
-            .and_then(Value::as_str)
-            .map_or_else(
-                || format!("responses_call_{}", parsed.len()),
-                str::to_string,
-            );
-        parsed.push(ParsedToolCall {
-            call_id,
-            name,
-            input: parse_tool_arguments(item.get("arguments").unwrap_or(&Value::Null)),
-        });
-    }
-    parsed
 }
 
 fn parse_json_object(value: &Value) -> Value {
@@ -1634,30 +2117,6 @@ fn materialize_anthropic_tools(tools: &[ToolSchema]) -> Value {
             })
             .collect(),
     )
-}
-
-fn emit_anthropic_tool(
-    events: &mut Vec<ProviderStreamEvent>,
-    tool_uses: &mut BTreeMap<u64, ToolUseState>,
-    index: u64,
-) {
-    let Some(state) = tool_uses.get_mut(&index) else {
-        return;
-    };
-    if state.emitted {
-        return;
-    }
-    state.emitted = true;
-    let input = if state.partial_json.is_empty() {
-        parse_json_object(&state.input_value)
-    } else {
-        parse_json_object(&Value::String(state.partial_json.clone()))
-    };
-    events.push(ProviderStreamEvent::ToolCall {
-        call_id: state.call_id.clone(),
-        name: state.name.clone(),
-        input,
-    });
 }
 
 #[cfg(test)]

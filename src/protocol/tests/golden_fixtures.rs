@@ -288,6 +288,9 @@ fn fixture_tool_schema() -> ToolSchema {
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
         })),
+        strict: false,
+        output_schema: None,
+        parallel_safe: false,
         group: "workspace".to_string(),
         dangerous: false,
     }

@@ -33,6 +33,26 @@ OPENAGENT_PROVIDER_FALLBACK_MODELS=<comma-separated-models>
 Equivalent `OPENAI_*` variables are supported. Keep them in ignored local env
 files or the process environment; do not put real values in docs or fixtures.
 
+Native Anthropic routing uses `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, and
+`ANTHROPIC_MODEL`. Native Gemini routing uses `GOOGLE_API_KEY`,
+`GOOGLE_BASE_URL`, and `GOOGLE_MODEL`. Gemini credentials are sent in the
+`x-goog-api-key` header rather than a URL query parameter.
+
+Agent profile `model_options` may include runtime provider controls:
+
+```json
+{
+  "tool_call_dialect": "native",
+  "tool_choice": "auto",
+  "parallel_tool_calls": true
+}
+```
+
+`native` resolves to the provider's structured tool-call protocol. Text
+dialects such as `hermes`, `qwen_xml`, `deepseek`, and `pythonic` are opt-in
+compatibility modes. These control keys are consumed by the provider plane and
+are not copied into the provider payload as arbitrary model parameters.
+
 ## Authentication And Origins
 
 Prefer `--auth-token-file <path>` or

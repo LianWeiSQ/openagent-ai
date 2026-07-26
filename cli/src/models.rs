@@ -654,10 +654,20 @@ fn strip_provider_prefix(provider: &str, model_id: &str) -> String {
 }
 
 fn provider_native_streaming(provider: &str) -> Value {
+    let dialect = match provider {
+        "anthropic" => ToolCallDialect::Anthropic,
+        "gemini" | "google" => ToolCallDialect::Gemini,
+        _ => ToolCallDialect::OpenAiChat,
+    };
+    let tool_calling = provider_capabilities(provider, dialect);
     json!({
-        "chat_completions_sse": provider != "anthropic",
-        "responses_sse": provider != "anthropic",
+        "chat_completions_sse": !matches!(provider, "anthropic" | "gemini" | "google"),
+        "responses_sse": !matches!(provider, "anthropic" | "gemini" | "google"),
         "anthropic_messages_sse": provider == "anthropic",
+        "gemini_generate_content_sse": matches!(provider, "gemini" | "google"),
+        "tool_calling": tool_calling,
+        "parallel_tool_calls": tool_calling.supports(ProviderCapability::ParallelToolCalls),
+        "strict_tool_schemas": tool_calling.supports(ProviderCapability::StrictToolSchemas),
         "implemented": matches!(provider, "anthropic" | "openai" | "openrouter" | "groq" | "mistral" | "deepseek" | "xai" | "ollama" | "gemini" | "azure-openai"),
     })
 }

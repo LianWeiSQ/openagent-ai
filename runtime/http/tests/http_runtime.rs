@@ -2007,6 +2007,93 @@ fn remote_runtime_client_retries_retryable_provider_503_same_model() -> Result<(
 }
 
 #[test]
+fn remote_runtime_uses_native_gemini_payload_and_internal_tool_controls()
+-> Result<(), Box<dyn Error>> {
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence(vec![serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "native Gemini runtime answer"}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 4,
+                "candidatesTokenCount": 3
+            }
+        })])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-native-gemini")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1beta");
+    let mut server = spawn_runtime_with_env(
+        port,
+        &workspace,
+        &session_root,
+        &[
+            ("OPENAGENT_PROVIDER", "gemini"),
+            ("GOOGLE_API_KEY", "gemini-runtime-secret"),
+            ("GOOGLE_BASE_URL", provider_base_url.as_str()),
+            ("GOOGLE_MODEL", "gemini-runtime-fixture"),
+        ],
+    )?;
+    wait_for_server(port)?;
+
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let started = client.start_turn(
+        &session_id,
+        "ask native Gemini",
+        serde_json::json!({
+            "model_options": {
+                "max_output_tokens": 64,
+                "parallel_tool_calls": false,
+                "tool_call_dialect": "native",
+                "tool_choice": "required"
+            }
+        }),
+    )?;
+    assert_eq!(started["status"], "completed");
+    assert_eq!(
+        started["turn"]["final_answer"],
+        "native Gemini runtime answer"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = provider_thread.join();
+    let requests = provider_requests.lock().expect("Gemini requests");
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].contains("gemini-runtime-secret"));
+    let payload: Value = serde_json::from_str(&requests[0])?;
+    assert_eq!(
+        payload["contents"][0]["parts"][0]["text"],
+        "ask native Gemini"
+    );
+    assert_eq!(
+        payload["toolConfig"]["functionCallingConfig"]["mode"],
+        "ANY"
+    );
+    assert_eq!(payload["generationConfig"]["maxOutputTokens"], 64);
+    assert!(
+        payload["tools"][0]["functionDeclarations"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    for internal_key in ["parallel_tool_calls", "tool_call_dialect", "tool_choice"] {
+        assert!(payload.get(internal_key).is_none(), "{internal_key} leaked");
+    }
+    drop(requests);
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn remote_runtime_client_falls_back_from_retryable_provider_502() -> Result<(), Box<dyn Error>> {
     let (provider_port, provider_thread, provider_requests) =
         spawn_fake_openai_responses_provider_http_sequence(vec![
@@ -7670,6 +7757,14 @@ fn spawn_runtime_with_env(
         "OPENAGENT_TURN_QUEUE_TIMEOUT_MS",
         "OPENAGENT_PROVIDER_RETRIES",
         "OPENAGENT_PROVIDER_FALLBACK_MODELS",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_WIRE_API",
+        "GOOGLE_API_KEY",
+        "GOOGLE_BASE_URL",
+        "GOOGLE_MODEL",
+        "GOOGLE_WIRE_API",
     ] {
         command.env_remove(key);
     }

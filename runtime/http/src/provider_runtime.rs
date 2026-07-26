@@ -225,6 +225,17 @@ fn provider_model_capabilities(model: &str, profile: &str) -> Value {
     } else {
         json!(32_768)
     };
+    let dialect = if profile == "gpt" {
+        ToolCallDialect::OpenAiResponses
+    } else {
+        ToolCallDialect::OpenAiChat
+    };
+    let provider = if profile == "gpt" {
+        "openai"
+    } else {
+        "openai_compatible"
+    };
+    let tool_calling = provider_capabilities(provider, dialect);
     json!({
         "input_modalities": if image_output { json!(["text", "image"]) } else { json!(["text"]) },
         "output_modalities": if image_output { json!(["image"]) } else { json!(["text"]) },
@@ -234,6 +245,10 @@ fn provider_model_capabilities(model: &str, profile: &str) -> Value {
         "reasoning": reasoning && !image_output,
         "context_window": context_window,
         "tools": !image_output,
+        "tool_calling": tool_calling,
+        "parallel_tool_calls": !image_output && tool_calling.supports(ProviderCapability::ParallelToolCalls),
+        "strict_tool_schemas": !image_output && tool_calling.supports(ProviderCapability::StrictToolSchemas),
+        "tool_choice": ["auto", "none", "required", "named"],
         "selectable": !image_output,
     })
 }

@@ -25,13 +25,17 @@ use openagent_mcp::{
 use openagent_protocol::ToolResult;
 use openagent_protocol::{ChatMessage, PermissionRuleset, Role, ToolCall, ToolSchema, Usage};
 use openagent_provider::{
-    AnthropicLanguageModelConfig, OpenAiLanguageModelConfig, ProviderStreamEvent, anthropic_model,
-    build_anthropic_payload, build_openai_chat_payload, build_openai_responses_payload,
-    default_env_mapping, normalize_anthropic_events, normalize_openai_chat_sse_chunks,
-    normalize_openai_responses_response, normalize_provider, openagent_context_model,
-    openai_compatible_model, parse_tool_arguments, provider_auth_methods,
+    AnthropicLanguageModelConfig, GeminiLanguageModelConfig, OpenAiLanguageModelConfig,
+    ProviderCapability, ProviderStreamEvent, ToolCallDialect, anthropic_model,
+    apply_tool_call_dialect, build_anthropic_payload_with_policy, build_gemini_payload,
+    build_openai_chat_payload_with_policy, build_openai_responses_payload_with_policy,
+    default_env_mapping, negotiate_tool_call_policy, normalize_anthropic_events,
+    normalize_anthropic_response, normalize_gemini_events, normalize_openai_chat_response,
+    normalize_openai_chat_sse_chunks, normalize_openai_responses_response,
+    normalize_openai_responses_stream_events, normalize_provider, openagent_context_model,
+    openai_compatible_model, parse_tool_arguments, provider_auth_methods, provider_capabilities,
     provider_default_base_url, provider_default_model, provider_label, provider_requires_api_key,
-    summarize_http_error_body,
+    summarize_http_error_body, tool_call_dialect_from_options, tool_call_policy_from_options,
 };
 use openagent_session::{
     FileSessionStore, Session, SessionEventOptions, SessionForkBoundary, SessionPartOptions,

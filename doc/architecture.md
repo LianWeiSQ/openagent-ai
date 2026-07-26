@@ -25,7 +25,7 @@ User task
 | `src` | Core agent loop, context, permission, policy, and skills |
 | `src/protocol` | Shared serde protocol types and runtime contracts |
 | `src/tools` | Tool registry, built-in tools, and workspace runtime |
-| `src/provider` | Provider metadata and stream normalization |
+| `src/provider` | Provider adapters, tool-call assembly, capability negotiation, and stream normalization |
 | `src/session` | Session store, trace, observability, and replay evidence |
 | `src/mcp` | MCP config, discovery, auth, and tool bridge contracts |
 | `swarm` | Agent-agnostic swarm runner orchestration |
@@ -105,6 +105,16 @@ Provider-specific SDKs and wire formats should stay outside the agent loop.
 The loop consumes normalized model text, tool calls, usage, and stream events.
 This keeps provider changes from leaking into tool execution, context
 assembly, permission policy, and session persistence.
+
+The provider plane uses `ToolCallFrame` as its transport-neutral assembly
+input, `ToolCallAssembler` to validate fragmented and parallel calls, and
+`ToolCallDialect` to make text-based compatibility parsing explicit. Native
+OpenAI, Anthropic, and Gemini adapters read structured response fields; native
+mode never scans ordinary assistant text for tool syntax. Tool choice, strict
+schemas, output schemas, and parallel-call behavior are negotiated against a
+provider capability set before request serialization.
+
+See [`provider.md`](provider.md) for the contracts and extension rules.
 
 ## Repository Boundary
 
