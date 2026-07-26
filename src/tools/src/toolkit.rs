@@ -3169,7 +3169,9 @@ fn skill_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput
         SkillRegistryOptions {
             include_builtin_skills: builtin_skills_enabled(ctx),
         },
-    );
+    )
+    .with_extra_roots(extra_skill_roots(ctx))
+    .with_disabled_names(disabled_skill_names(ctx));
 
     if requested_name.is_empty() {
         let mut report = registry.report(
@@ -3500,7 +3502,9 @@ pub fn fork_skill_task_from_input(
         SkillRegistryOptions {
             include_builtin_skills: builtin_skills_enabled(ctx),
         },
-    );
+    )
+    .with_extra_roots(extra_skill_roots(ctx))
+    .with_disabled_names(disabled_skill_names(ctx));
     let Some(document) = registry.get(requested_name) else {
         return Ok(None);
     };
@@ -4767,6 +4771,27 @@ fn skill_roots(ctx: &ToolContext) -> Option<Vec<String>> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     (!roots.is_empty()).then_some(roots)
+}
+
+fn agent_option_string_list(ctx: &ToolContext, key: &str) -> Vec<String> {
+    ctx.agent_options
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn extra_skill_roots(ctx: &ToolContext) -> Vec<String> {
+    agent_option_string_list(ctx, "extra_skill_roots")
+}
+
+fn disabled_skill_names(ctx: &ToolContext) -> Vec<String> {
+    agent_option_string_list(ctx, "disabled_skills")
 }
 
 fn builtin_skills_enabled(ctx: &ToolContext) -> bool {

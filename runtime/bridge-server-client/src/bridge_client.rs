@@ -1,6 +1,11 @@
 //! Bridge API client-side state for the Rust rewrite.
 
-use std::{collections::BTreeSet, io::Read, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    path::Path,
+    time::Duration,
+};
 
 use openagent_bridge_server::BridgeEvent;
 use serde::{Deserialize, Serialize};
@@ -204,6 +209,24 @@ pub struct RemoteTurnAttachment {
     pub size_bytes: u64,
     pub content_type: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub media_metadata: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_content_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub included_content_bytes: Option<u64>,
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl RemoteTurnAttachment {
@@ -223,6 +246,13 @@ impl RemoteTurnAttachment {
             size_bytes,
             content_type: content_type.into(),
             content: content.into(),
+            source: None,
+            page_count: None,
+            media_metadata: BTreeMap::new(),
+            truncated: false,
+            truncation_reason: None,
+            original_content_bytes: None,
+            included_content_bytes: None,
         }
     }
 
@@ -551,10 +581,47 @@ impl RemoteRuntimeClient {
         )
     }
 
+    pub fn start_task(&self, session_id: &str, task_id: &str) -> Result<Value, String> {
+        self.json(
+            "POST",
+            &format!("/api/sessions/{session_id}/tasks/{task_id}/start"),
+            None,
+        )
+    }
+
+    pub fn wait_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        timeout_ms: u64,
+    ) -> Result<Value, String> {
+        self.json(
+            "POST",
+            &format!("/api/sessions/{session_id}/tasks/{task_id}/wait"),
+            Some(json!({"timeout_ms": timeout_ms})),
+        )
+    }
+
+    pub fn promote_task(&self, session_id: &str, task_id: &str) -> Result<Value, String> {
+        self.json(
+            "POST",
+            &format!("/api/sessions/{session_id}/tasks/{task_id}/promote"),
+            None,
+        )
+    }
+
     pub fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<Value, String> {
         self.json(
             "POST",
             &format!("/api/sessions/{session_id}/tasks/{task_id}/cancel"),
+            None,
+        )
+    }
+
+    pub fn resume_task(&self, session_id: &str, task_id: &str) -> Result<Value, String> {
+        self.json(
+            "POST",
+            &format!("/api/sessions/{session_id}/tasks/{task_id}/resume"),
             None,
         )
     }
@@ -573,6 +640,35 @@ impl RemoteRuntimeClient {
 
     pub fn session_diff(&self, session_id: &str) -> Result<Value, String> {
         self.json("GET", &format!("/api/sessions/{session_id}/diff"), None)
+    }
+
+    pub fn git_status(&self, path: Option<&str>) -> Result<Value, String> {
+        let path = path
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("?path={}", quote_path(value)))
+            .unwrap_or_default();
+        self.json("GET", &format!("/api/git{path}"), None)
+    }
+
+    pub fn undo_session_file(&self, session_id: &str, path: &str) -> Result<Value, String> {
+        self.undo_session_file_for_run(session_id, path, None)
+    }
+
+    pub fn undo_session_file_for_run(
+        &self,
+        session_id: &str,
+        path: &str,
+        run_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut body = json!({"path": path});
+        if let Some(run_id) = run_id.filter(|value| !value.trim().is_empty()) {
+            body["run_id"] = json!(run_id);
+        }
+        self.json(
+            "POST",
+            &format!("/api/sessions/{session_id}/files/undo"),
+            Some(body),
+        )
     }
 
     pub fn undo_session(&self, session_id: &str) -> Result<Value, String> {

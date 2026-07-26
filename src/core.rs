@@ -47,6 +47,8 @@ pub const CONTEXT_PROVIDER_PAYLOAD_SERIALIZE_WARN_US: u64 = 100_000;
 pub const CONTEXT_PROVIDER_PAYLOAD_WARN_BYTES: u64 = 16 * 1024 * 1024;
 pub const CONTEXT_PRIORITY_INSTRUCTION: i64 = 100;
 pub const CONTEXT_PRIORITY_SKILL_PRELOADED: i64 = 98;
+pub const CONTEXT_PRIORITY_GOAL: i64 = 97;
+pub const CONTEXT_PRIORITY_PLAN: i64 = 96;
 pub const CONTEXT_PRIORITY_WORK_STATE: i64 = 95;
 pub const CONTEXT_PRIORITY_RUNTIME: i64 = 90;
 pub const CONTEXT_PRIORITY_SANDBOX: i64 = 85;
@@ -681,6 +683,8 @@ pub enum ContextAttachmentKind {
     #[default]
     File,
     Image,
+    Pdf,
+    Document,
     Folder,
 }
 
@@ -691,6 +695,8 @@ impl ContextAttachmentKind {
             Self::Text => "text",
             Self::File => "file",
             Self::Image => "image",
+            Self::Pdf => "pdf",
+            Self::Document => "document",
             Self::Folder => "folder",
         }
     }
@@ -701,6 +707,8 @@ impl ContextAttachmentKind {
             "text" => Some(Self::Text),
             "file" => Some(Self::File),
             "image" => Some(Self::Image),
+            "pdf" => Some(Self::Pdf),
+            "document" | "doc" => Some(Self::Document),
             "folder" | "directory" => Some(Self::Folder),
             _ => None,
         }
@@ -718,6 +726,20 @@ pub struct ContextAttachment {
     pub content_type: String,
     pub size_bytes: u64,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub media_metadata: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_content_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub included_content_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_message_index: Option<usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -742,6 +764,13 @@ impl ContextAttachment {
             content_type: content_type.into(),
             size_bytes,
             content: content.into(),
+            source: None,
+            page_count: None,
+            media_metadata: BTreeMap::new(),
+            truncated: false,
+            truncation_reason: None,
+            original_content_bytes: None,
+            included_content_bytes: None,
             source_message_index: None,
             metadata: BTreeMap::new(),
         };
@@ -796,6 +825,131 @@ impl ContextTodo {
             status,
             priority,
             metadata: BTreeMap::new(),
+        }
+    }
+}
+
+pub const DURABLE_GOAL_SCHEMA_VERSION: &str = "openagent.durable_goal.v1";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableGoalStatus {
+    Active,
+    Paused,
+    Completed,
+}
+
+impl DurableGoalStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DurableGoal {
+    pub schema_version: String,
+    pub id: String,
+    pub title: String,
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
+    pub status: DurableGoalStatus,
+    pub revision: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
+impl DurableGoal {
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        objective: impl Into<String>,
+        acceptance_criteria: Vec<String>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            schema_version: DURABLE_GOAL_SCHEMA_VERSION.to_string(),
+            id: id.into(),
+            title: title.into(),
+            objective: objective.into(),
+            acceptance_criteria,
+            status: DurableGoalStatus::Active,
+            revision: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            completed_at_ms: None,
+        }
+    }
+}
+
+pub const DURABLE_PLAN_SCHEMA_VERSION: &str = "openagent.durable_plan.v1";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurablePlanStatus {
+    Planning,
+    Executing,
+    Completed,
+}
+
+impl DurablePlanStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Executing => "executing",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DurablePlan {
+    pub schema_version: String,
+    pub id: String,
+    pub title: String,
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<String>,
+    pub status: DurablePlanStatus,
+    pub revision: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
+impl DurablePlan {
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        objective: impl Into<String>,
+        steps: Vec<String>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            schema_version: DURABLE_PLAN_SCHEMA_VERSION.to_string(),
+            id: id.into(),
+            title: title.into(),
+            objective: objective.into(),
+            steps,
+            status: DurablePlanStatus::Planning,
+            revision: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            execution_started_at_ms: None,
+            completed_at_ms: None,
         }
     }
 }
@@ -892,6 +1046,32 @@ pub struct ContextPackTraceEntry {
     pub truncation_strategy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_duplicate_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<ContextAttachmentTrace>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextAttachmentTrace {
+    pub id: String,
+    pub kind: ContextAttachmentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub content_type: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub media_metadata: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub source_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_truncation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_content_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub included_content_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -1200,6 +1380,8 @@ impl ContextPackBuilder {
             items.push(sandbox);
         }
         let todos = todo_items(&input.todos);
+        let goal = durable_goal_item(input.metadata.get("durable_goal"));
+        let plan = durable_plan_item(input.metadata.get("durable_plan"));
         let checkpoints = checkpoint_items(&input.checkpoints);
         let work_state = work_state_item(
             input.work_state.as_ref(),
@@ -1210,6 +1392,8 @@ impl ContextPackBuilder {
             &input.messages,
             &input.attachments,
             work_state,
+            goal,
+            plan,
             todos,
             checkpoints,
         ));
@@ -1337,6 +1521,7 @@ impl ContextPackBuilder {
                         .get("context_semantic_duplicate_of")
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
+                    attachment: context_attachment_trace(item),
                 }
             })
             .collect()
@@ -1658,6 +1843,10 @@ fn required_context_truncation_order(item: &ContextItem) -> u8 {
         10
     } else if item.kind == "todo" {
         20
+    } else if item.kind == "goal" {
+        25
+    } else if item.kind == "plan" {
+        27
     } else if matches!(item.kind.as_str(), "runtime" | "sandbox") {
         30
     } else if item.kind == "work_state" {
@@ -1676,7 +1865,10 @@ fn required_context_minimum_bytes(item: &ContextItem) -> usize {
         128
     } else if item.kind.starts_with("attachment_") {
         320
-    } else if matches!(item.kind.as_str(), "todo" | "runtime" | "sandbox") {
+    } else if matches!(
+        item.kind.as_str(),
+        "goal" | "plan" | "todo" | "runtime" | "sandbox"
+    ) {
         256
     } else if item.kind == "work_state" {
         512
@@ -1775,7 +1967,7 @@ fn truncate_required_context_item(
 fn required_context_truncation_strategy(item: &ContextItem) -> (&'static str, bool) {
     if item.kind.starts_with("attachment_") {
         ("attachment_header_head_tail", true)
-    } else if item.kind == "todo" {
+    } else if matches!(item.kind.as_str(), "goal" | "plan" | "todo") {
         ("todo_header_head_tail", true)
     } else if item.kind == "work_state" {
         ("work_state_sections_head_tail", true)
@@ -2773,6 +2965,8 @@ pub struct SkillDiscoveryReport {
 pub struct SkillRegistry {
     session_root: PathBuf,
     roots: Vec<String>,
+    extra_roots: Vec<String>,
+    disabled_names: BTreeSet<String>,
     home_dir: PathBuf,
     include_builtin_skills: bool,
 }
@@ -2819,11 +3013,33 @@ impl SkillRegistry {
                 }),
             ),
             roots: roots.unwrap_or_default(),
+            extra_roots: Vec::new(),
+            disabled_names: BTreeSet::new(),
             home_dir: canonicalize_existing(
                 &home_dir.map(Into::into).unwrap_or_else(default_home_dir),
             ),
             include_builtin_skills: options.include_builtin_skills,
         }
+    }
+
+    #[must_use]
+    pub fn with_extra_roots(mut self, roots: impl IntoIterator<Item = String>) -> Self {
+        self.extra_roots = roots
+            .into_iter()
+            .map(|root| root.trim().to_string())
+            .filter(|root| !root.is_empty())
+            .collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_disabled_names(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.disabled_names = names
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+        self
     }
 
     #[must_use]
@@ -2938,6 +3154,9 @@ impl SkillRegistry {
                     continue;
                 }
             };
+            if self.disabled_names.contains(&document.name) {
+                continue;
+            }
             if let Some(existing) = documents.get(&document.name) {
                 issues.push(SkillIssue {
                     kind: "duplicate".to_string(),
@@ -2958,7 +3177,9 @@ impl SkillRegistry {
 
     fn iter_skill_files(&self) -> Vec<PathBuf> {
         if !self.roots.is_empty() {
-            return self.iter_explicit_skill_files();
+            let mut result = self.iter_explicit_skill_files();
+            append_skill_roots(&self.session_root, &self.extra_roots, &mut result);
+            return result;
         }
         let mut seen = BTreeSet::new();
         let mut result = Vec::new();
@@ -2977,6 +3198,7 @@ impl SkillRegistry {
                 }
             }
         }
+        append_skill_roots(&self.session_root, &self.extra_roots, &mut result);
         result
     }
 
@@ -4097,6 +4319,106 @@ fn sandbox_item(execution: &Value) -> Option<ContextItem> {
     Some(item)
 }
 
+fn durable_goal_item(value: Option<&Value>) -> Option<ContextItem> {
+    let goal = serde_json::from_value::<DurableGoal>(value?.clone()).ok()?;
+    if goal.schema_version != DURABLE_GOAL_SCHEMA_VERSION
+        || goal.objective.trim().is_empty()
+        || goal.status == DurableGoalStatus::Completed
+    {
+        return None;
+    }
+    let criteria = goal
+        .acceptance_criteria
+        .iter()
+        .filter(|criterion| !criterion.trim().is_empty())
+        .map(|criterion| format!("- {}", criterion.trim()))
+        .collect::<Vec<_>>();
+    let mut content = format!(
+        "[Durable goal]\nTitle: {}\nStatus: {}\nObjective: {}",
+        goal.title.trim(),
+        goal.status.as_str(),
+        goal.objective.trim(),
+    );
+    if !criteria.is_empty() {
+        content.push_str("\nAcceptance criteria:\n");
+        content.push_str(&criteria.join("\n"));
+    }
+    let mut item = ContextItem::new(
+        format!("goal:{}", goal.id),
+        "goal",
+        "session.metadata.durable_goal",
+        content,
+        CONTEXT_PRIORITY_GOAL,
+    );
+    item.pinned = true;
+    item.metadata = BTreeMap::from([
+        ("goal_id".to_string(), json!(goal.id)),
+        ("status".to_string(), json!(goal.status.as_str())),
+        ("revision".to_string(), json!(goal.revision)),
+        ("updated_at_ms".to_string(), json!(goal.updated_at_ms)),
+        (
+            "acceptance_criteria_count".to_string(),
+            json!(goal.acceptance_criteria.len()),
+        ),
+    ]);
+    Some(item)
+}
+
+fn durable_plan_item(value: Option<&Value>) -> Option<ContextItem> {
+    let plan = serde_json::from_value::<DurablePlan>(value?.clone()).ok()?;
+    if plan.schema_version != DURABLE_PLAN_SCHEMA_VERSION
+        || plan.objective.trim().is_empty()
+        || plan.status == DurablePlanStatus::Completed
+    {
+        return None;
+    }
+    let steps = plan
+        .steps
+        .iter()
+        .filter(|step| !step.trim().is_empty())
+        .enumerate()
+        .map(|(index, step)| format!("{}. {}", index + 1, step.trim()))
+        .collect::<Vec<_>>();
+    let mut content = format!(
+        "[Durable plan]\nTitle: {}\nMode: {}\nObjective: {}",
+        plan.title.trim(),
+        plan.status.as_str(),
+        plan.objective.trim(),
+    );
+    if plan.status == DurablePlanStatus::Planning {
+        content.push_str(
+            "\nConstraint: inspect and plan only; do not modify files or execute mutating tools.",
+        );
+    } else {
+        content
+            .push_str("\nInstruction: execute this plan and keep progress aligned with its steps.");
+    }
+    if !steps.is_empty() {
+        content.push_str("\nSteps:\n");
+        content.push_str(&steps.join("\n"));
+    }
+    let mut item = ContextItem::new(
+        format!("plan:{}", plan.id),
+        "plan",
+        "session.metadata.durable_plan",
+        content,
+        CONTEXT_PRIORITY_PLAN,
+    );
+    item.pinned = true;
+    item.metadata = BTreeMap::from([
+        ("plan_id".to_string(), json!(plan.id)),
+        ("status".to_string(), json!(plan.status.as_str())),
+        ("revision".to_string(), json!(plan.revision)),
+        ("updated_at_ms".to_string(), json!(plan.updated_at_ms)),
+        ("step_count".to_string(), json!(plan.steps.len())),
+        (
+            "runtime_read_only".to_string(),
+            json!(plan.status == DurablePlanStatus::Planning),
+        ),
+    ]);
+    Some(item)
+}
+
 fn todo_items(todos: &[ContextTodo]) -> Vec<ContextItem> {
     todos
         .iter()
@@ -4187,6 +4509,8 @@ fn message_and_session_context_items(
     messages: &[ChatMessage],
     attachments: &[ContextAttachment],
     work_state: Option<ContextItem>,
+    goal: Option<ContextItem>,
+    plan: Option<ContextItem>,
     todos: Vec<ContextItem>,
     checkpoints: Vec<ContextItem>,
 ) -> Vec<ContextItem> {
@@ -4205,7 +4529,13 @@ fn message_and_session_context_items(
         .rposition(|message| message.role == Role::User)
         .unwrap_or(messages.len());
     let mut work_state = work_state;
-    let mut session_items = Some(todos.into_iter().chain(checkpoints).collect::<Vec<_>>());
+    let mut session_items = Some(
+        goal.into_iter()
+            .chain(plan)
+            .chain(todos)
+            .chain(checkpoints)
+            .collect::<Vec<_>>(),
+    );
     for position in 0..=messages.len() {
         if work_state_position == Some(position)
             && let Some(item) = work_state.take()
@@ -4339,7 +4669,50 @@ fn attachment_context_item(
             json!(source_message_index),
         ),
     ]);
+    if attachment.truncated {
+        item.metadata
+            .insert("context_truncated".to_string(), Value::Bool(true));
+        item.metadata.insert(
+            "context_truncation_reason".to_string(),
+            json!(
+                attachment
+                    .truncation_reason
+                    .as_deref()
+                    .unwrap_or("attachment_source_truncated")
+            ),
+        );
+        item.metadata.insert(
+            "context_truncation_strategy".to_string(),
+            json!(if attachment.content.is_empty() {
+                "attachment_metadata_only"
+            } else {
+                "attachment_source_head_tail"
+            }),
+        );
+    }
     item
+}
+
+fn context_attachment_trace(item: &ContextItem) -> Option<ContextAttachmentTrace> {
+    let attachment = item
+        .metadata
+        .get("context_attachment")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ContextAttachment>(value).ok())?;
+    Some(ContextAttachmentTrace {
+        id: attachment.id,
+        kind: attachment.kind,
+        name: attachment.name,
+        content_type: attachment.content_type,
+        size_bytes: attachment.size_bytes,
+        source: attachment.source,
+        page_count: attachment.page_count,
+        media_metadata: attachment.media_metadata,
+        source_truncated: attachment.truncated,
+        source_truncation_reason: attachment.truncation_reason,
+        original_content_bytes: attachment.original_content_bytes,
+        included_content_bytes: attachment.included_content_bytes,
+    })
 }
 
 fn render_context_attachment(attachment: &ContextAttachment) -> String {
@@ -4492,6 +4865,23 @@ fn builtin_skill_roots() -> Vec<PathBuf> {
     vec![canonicalize_existing(
         &manifest_dir.join("../skill/openagent"),
     )]
+}
+
+fn append_skill_roots(session_root: &Path, roots: &[String], result: &mut Vec<PathBuf>) {
+    let mut seen = result.iter().cloned().collect::<BTreeSet<_>>();
+    for raw_root in roots {
+        let raw = PathBuf::from(raw_root);
+        let root = if raw.is_absolute() {
+            canonicalize_existing(&raw)
+        } else {
+            canonicalize_existing(&session_root.join(raw))
+        };
+        for path in recursive_skill_files(&root) {
+            if seen.insert(path.clone()) {
+                result.push(path);
+            }
+        }
+    }
 }
 
 fn recursive_skill_files(root: &Path) -> Vec<PathBuf> {

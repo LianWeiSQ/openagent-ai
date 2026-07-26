@@ -974,6 +974,34 @@ impl FileSessionStore {
     }
 
     pub fn save_state(&self, session: &Session, run_id: Option<&str>) -> SessionResult<()> {
+        let updated_at_ms = now_ms();
+        let session_path = self.session_json_path(&session.id);
+        let mut session_record = read_json_object(&session_path)?.unwrap_or_default();
+        let created_at_ms = session_record
+            .get("created_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(updated_at_ms);
+        session_record.insert("schema_version".to_string(), json!("openagent.session.v1"));
+        session_record.insert("session_id".to_string(), json!(session.id));
+        session_record.insert(
+            "workspace".to_string(),
+            json!(session.directory.to_string_lossy().to_string()),
+        );
+        session_record.insert(
+            "status".to_string(),
+            json!(session_status_str(&session.status)),
+        );
+        session_record.insert("created_at_ms".to_string(), json!(created_at_ms));
+        session_record.insert("updated_at_ms".to_string(), json!(updated_at_ms));
+        if let Some(run_id) = run_id {
+            session_record.insert("active_run_id".to_string(), json!(run_id));
+        } else {
+            session_record
+                .entry("active_run_id".to_string())
+                .or_insert(Value::Null);
+        }
+        write_json(&session_path, &Value::Object(session_record))?;
+
         let messages_v2 = self
             .list_messages_with_parts(&session.id, None, None)
             .unwrap_or_default();
@@ -983,7 +1011,7 @@ impl FileSessionStore {
             run_id: run_id.map(ToString::to_string),
             workspace: session.directory.to_string_lossy().to_string(),
             status: session.status.clone(),
-            updated_at_ms: now_ms(),
+            updated_at_ms,
             messages: session
                 .messages
                 .iter()
@@ -3817,8 +3845,36 @@ fn write_json(path: &Path, payload: &impl Serialize) -> SessionResult<()> {
             .unwrap_or("json")
     ));
     fs::write(&tmp, serde_json::to_string_pretty(payload)? + "\n")?;
-    fs::rename(tmp, path)?;
+    replace_json_file(&tmp, path)?;
     Ok(())
+}
+
+fn replace_json_file(temporary: &Path, target: &Path) -> SessionResult<()> {
+    if !target.exists() {
+        fs::rename(temporary, target)?;
+        return Ok(());
+    }
+    let swap = target.with_extension(format!(
+        "{}.swap-{}-{}",
+        target
+            .extension()
+            .and_then(|item| item.to_str())
+            .unwrap_or("json"),
+        std::process::id(),
+        now_ms(),
+    ));
+    fs::rename(target, &swap)?;
+    match fs::rename(temporary, target) {
+        Ok(()) => {
+            fs::remove_file(swap)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&swap, target);
+            let _ = fs::remove_file(temporary);
+            Err(error.into())
+        }
+    }
 }
 
 fn append_jsonl(path: &Path, payload: &impl Serialize) -> SessionResult<()> {
@@ -4107,5 +4163,54 @@ mod tests {
     fn links_to_protocol_crate() {
         assert_eq!(crate_name(), "openagent-session");
         assert_eq!(protocol_crate_name(), "openagent-protocol");
+    }
+
+    #[test]
+    fn save_state_keeps_session_descriptor_current() {
+        let root = std::env::temp_dir().join(format!(
+            "openagent-session-descriptor-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let store = FileSessionStore::new(root.join("sessions"));
+        let mut session = Session::new("session_descriptor_fixture", &workspace);
+
+        store.save_state(&session, None).expect("initial state");
+        let initial = read_json_object(&store.session_json_path(&session.id))
+            .expect("read descriptor")
+            .expect("descriptor exists");
+        let created_at_ms = initial
+            .get("created_at_ms")
+            .and_then(Value::as_u64)
+            .expect("created timestamp");
+        assert_eq!(
+            initial.get("schema_version"),
+            Some(&json!("openagent.session.v1"))
+        );
+        assert_eq!(initial.get("active_run_id"), Some(&Value::Null));
+
+        session.status = SessionStatus::Running;
+        store
+            .save_state(&session, Some("run_descriptor_fixture"))
+            .expect("updated state");
+        let updated = read_json_object(&store.session_json_path(&session.id))
+            .expect("read updated descriptor")
+            .expect("updated descriptor exists");
+        assert_eq!(updated.get("created_at_ms"), Some(&json!(created_at_ms)));
+        assert_eq!(updated.get("status"), Some(&json!("running")));
+        assert_eq!(
+            updated.get("active_run_id"),
+            Some(&json!("run_descriptor_fixture"))
+        );
+        assert_eq!(
+            read_json_object(&store.state_path(&session.id))
+                .expect("read state")
+                .expect("state exists")
+                .get("schema_version"),
+            Some(&json!("openagent.session_state.v1"))
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
