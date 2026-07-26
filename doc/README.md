@@ -9,6 +9,7 @@ comparison reports do not live here.
 | [Architecture](architecture.md) | Runtime boundaries and data flow |
 | [Bridge API](bridge-api.md) | HTTP/SSE contract consumed by Desktop, CLI, and TUI |
 | [Context](context.md) | Context assembly, compaction, and persistence |
+| [Session Engine](session-engine.md) | Durable execution states, recovery, idempotency, effects, and catalog |
 | [Operations](operations.md) | Startup, local state, security, diagnostics, and verification |
 | [TUI](tui.md) | Terminal UI usage and responsibility boundary |
 | [Swarm](swarm.md) | Rust swarm runner contract and CLI |

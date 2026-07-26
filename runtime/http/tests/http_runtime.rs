@@ -6736,13 +6736,15 @@ fn async_turn_expires_queued_turn_after_timeout() -> Result<(), Box<dyn Error>> 
         .iter()
         .find(|turn| turn["turn_id"] == second_turn_id)
         .expect("expired queued turn");
-    assert_eq!(expired_turn["status"], "expired");
+    assert_eq!(expired_turn["status"], "cancelled");
+    assert_eq!(expired_turn["terminal_reason"], "queue_timeout");
     assert!(
         !queued_payload_path.exists(),
         "expired queued turn payload should be removed"
     );
     let second_status = client.turn_status(second_turn_id)?;
-    assert_eq!(second_status["status"], "expired");
+    assert_eq!(second_status["status"], "cancelled");
+    assert_eq!(second_status["job"]["terminal_reason"], "queue_timeout");
 
     let first_events = client.turn_events_live(first_turn_id, 0, Duration::from_secs(4))?;
     assert!(
@@ -7474,6 +7476,289 @@ fn global_sse_live_tails_events_after_connection() -> Result<(), Box<dyn Error>>
     assert!(live_response.contains("event: turn/completed"));
 
     let _ = server.kill();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn durable_catalog_and_turn_idempotency_survive_runtime_restart() -> Result<(), Box<dyn Error>> {
+    let response = serde_json::json!({
+        "id": "resp_durable_idempotency",
+        "output_text": "durable idempotency answer",
+        "usage": {"input_tokens": 8, "output_tokens": 3}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence_with_delays(vec![(response, 250)])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-durable-catalog")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let env = [
+        ("OPENAI_API_KEY", "test-key"),
+        ("OPENAI_BASE_URL", provider_base_url.as_str()),
+        ("OPENAI_WIRE_API", "responses"),
+        ("OPENAI_MODEL", "fake-model"),
+    ];
+    let mut server = spawn_runtime_with_env(port, &workspace, &session_root, &env)?;
+    wait_for_server(port)?;
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let body = serde_json::json!({
+        "input": "durable catalog searchable request",
+        "async": true,
+        "idempotency_key": "request-durable-001",
+    })
+    .to_string();
+    let first = json_body(&authorized_request(
+        port,
+        "POST",
+        &format!("/api/sessions/{session_id}/turns"),
+        &body,
+        false,
+    )?)?;
+    let duplicate = json_body(&authorized_request(
+        port,
+        "POST",
+        &format!("/api/sessions/{session_id}/turns"),
+        &body,
+        false,
+    )?)?;
+    assert_eq!(first["turn_id"], duplicate["turn_id"]);
+    assert_eq!(first["deduplicated"], false);
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(duplicate["idempotency_key"], "request-durable-001");
+    assert_eq!(duplicate["attempt"], 1);
+    let turn_id = first["turn_id"].as_str().expect("turn id").to_string();
+    for _ in 0..100 {
+        if client.turn_status(&turn_id)?["status"] == "completed" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(client.turn_status(&turn_id)?["status"], "completed");
+
+    let rebuilt = json_body(&authorized_request(
+        port,
+        "POST",
+        "/api/session-catalog/rebuild",
+        "",
+        false,
+    )?)?;
+    assert!(rebuilt["catalog"]["sessions"].as_u64().unwrap_or_default() >= 1);
+    assert!(
+        rebuilt["catalog"]["executions"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 2
+    );
+    let catalog = json_body(&authorized_request(
+        port,
+        "GET",
+        "/api/session-catalog?query=searchable%20request",
+        "",
+        false,
+    )?)?;
+    assert!(
+        catalog["message_hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty())
+    );
+    let executions = json_body(&authorized_request(
+        port,
+        "GET",
+        &format!("/api/sessions/{session_id}/executions"),
+        "",
+        false,
+    )?)?;
+    assert!(
+        executions["executions"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["execution_id"] == turn_id
+                    && item["idempotency_key"] == "request-durable-001"
+                    && item["status"] == "completed"
+            }))
+    );
+    assert_eq!(executions["source_of_truth"], "append_only_ledgers");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let restart_port = free_port()?;
+    let mut restarted = spawn_runtime_with_env(restart_port, &workspace, &session_root, &env)?;
+    wait_for_server(restart_port)?;
+    let restarted_catalog = json_body(&authorized_request(
+        restart_port,
+        "GET",
+        "/api/session-catalog?query=durable%20catalog",
+        "",
+        false,
+    )?)?;
+    assert!(
+        restarted_catalog["message_hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "startup must rebuild the disposable catalog from ledgers"
+    );
+    let lifecycle = fs::read_to_string(session_root.join(&session_id).join("lifecycle.jsonl"))?;
+    assert!(lifecycle.contains("\"event_type\":\"execution.created\""));
+    assert!(lifecycle.contains("\"idempotency_key\":\"request-durable-001\""));
+
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    let _ = provider_thread.join();
+    assert_eq!(
+        provider_requests.lock().expect("provider requests").len(),
+        1
+    );
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn approval_wait_remains_resumable_across_runtime_restart() -> Result<(), Box<dyn Error>> {
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-durable-approval-restart")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let mut server = spawn_runtime(port, &workspace, &session_root)?;
+    wait_for_server(port)?;
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let started = client.start_turn(
+        &session_id,
+        "write after restart approval",
+        serde_json::json!({
+            "permission": "PLAN_ONLY",
+            "tool_call": {
+                "call_id": "call_durable_approval",
+                "name": "write",
+                "input": {
+                    "file_path": "approved-after-restart.txt",
+                    "content": "approved once\n"
+                }
+            }
+        }),
+    )?;
+    assert_eq!(started["status"], "waiting_approval");
+    let turn_id = started["turn_id"].as_str().expect("turn id").to_string();
+    let mut approval = started["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["method"] == "turn/approval_requested")
+        .map(|event| event["params"]["approval"].clone())
+        .expect("approval payload");
+    approval["action"] = Value::String("allow".to_string());
+    approval["scope"] = Value::String("once".to_string());
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let restart_port = free_port()?;
+    let mut restarted = spawn_runtime(restart_port, &workspace, &session_root)?;
+    wait_for_server(restart_port)?;
+    let restarted_client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{restart_port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let status = restarted_client.turn_status(&turn_id)?;
+    assert_eq!(status["status"], "waiting");
+    assert_eq!(status["job"]["phase"], "approval");
+    assert_eq!(status["job"]["recovery"], "resume");
+
+    let resolved = restarted_client.respond_approval(&approval)?;
+    assert_eq!(resolved["status"], "completed");
+    assert_eq!(
+        fs::read_to_string(workspace.join("approved-after-restart.txt"))?,
+        "approved once\n"
+    );
+    let executions = json_body(&authorized_request(
+        restart_port,
+        "GET",
+        &format!("/api/sessions/{session_id}/executions"),
+        "",
+        false,
+    )?)?;
+    assert!(executions["executions"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["kind"] == "approval" && item["status"] == "completed")
+    }));
+
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn provider_crash_is_classified_retryable_without_replaying_request() -> Result<(), Box<dyn Error>>
+{
+    let response = serde_json::json!({
+        "id": "resp_provider_crash",
+        "output_text": "must not be replayed automatically",
+        "usage": {"input_tokens": 5, "output_tokens": 2}
+    });
+    let (provider_port, provider_thread, provider_requests) =
+        spawn_fake_openai_responses_provider_sequence_with_delays(vec![(response, 1_500)])?;
+    let port = free_port()?;
+    let temp = temp_dir("openagent-http-runtime-provider-crash")?;
+    let workspace = temp.join("workspace");
+    let session_root = temp.join("sessions");
+    fs::create_dir_all(&workspace)?;
+    let provider_base_url = format!("http://127.0.0.1:{provider_port}/v1");
+    let env = [
+        ("OPENAI_API_KEY", "test-key"),
+        ("OPENAI_BASE_URL", provider_base_url.as_str()),
+        ("OPENAI_WIRE_API", "responses"),
+        ("OPENAI_MODEL", "fake-model"),
+        ("OPENAGENT_TURN_QUEUE_LEASE_STALE_MS", "100"),
+    ];
+    let mut server = spawn_runtime_with_env(port, &workspace, &session_root, &env)?;
+    wait_for_server(port)?;
+    let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let session_id = client.create_session(&workspace, None)?;
+    let accepted = json_body(&authorized_request(
+        port,
+        "POST",
+        &format!("/api/sessions/{session_id}/turns"),
+        &serde_json::json!({
+            "input": "crash during provider request",
+            "async": true,
+        })
+        .to_string(),
+        false,
+    )?)?;
+    let turn_id = accepted["turn_id"].as_str().expect("turn id").to_string();
+    assert_eq!(accepted["status"], "running");
+    thread::sleep(Duration::from_millis(100));
+    let _ = server.kill();
+    let _ = server.wait();
+
+    let restart_port = free_port()?;
+    let mut restarted = spawn_runtime_with_env(restart_port, &workspace, &session_root, &env)?;
+    wait_for_server(restart_port)?;
+    thread::sleep(Duration::from_millis(150));
+    let restarted_client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{restart_port}"))
+        .with_auth(RemoteAuth::bearer("secret"));
+    let status = restarted_client.turn_status(&turn_id)?;
+    assert_eq!(status["status"], "interrupted");
+    assert_eq!(status["job"]["phase"], "provider");
+    assert_eq!(status["job"]["recovery"], "retry");
+    assert_eq!(status["job"]["terminal_reason"], "runtime_restart");
+    assert_eq!(status["job"]["attempt"], 1);
+
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    let _ = provider_thread.join();
+    assert_eq!(
+        provider_requests.lock().expect("provider requests").len(),
+        1,
+        "restart classification must not replay a provider request automatically"
+    );
     let _ = fs::remove_dir_all(temp);
     Ok(())
 }

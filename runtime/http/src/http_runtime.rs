@@ -6,7 +6,10 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -55,8 +58,10 @@ use openagent_provider::{
     tool_call_dialect_from_options, tool_call_policy_from_options,
 };
 use openagent_session::{
-    FileSessionStore, Session, SessionCheckpointRecord, SessionEventOptions, SessionPartOptions,
-    SessionStatus, StartRunOptions, TodoItem as SessionTodoItem,
+    DurableExecutionRecord, DurableExecutionStore, DurableSessionCatalog, EffectClaim,
+    ExecutionKind, ExecutionLease, ExecutionPhase, ExecutionStatus, FileSessionStore, NewExecution,
+    RecoveryDisposition, RecoveryPolicy, Session, SessionCheckpointRecord, SessionEventOptions,
+    SessionPartOptions, SessionStatus, StartRunOptions, TodoItem as SessionTodoItem,
 };
 use openagent_tools::{
     DEFAULT_BUILD_AGENT_PROMPT, SessionRunnerFacade, SkillPermissionRule, TASK_TOOL_ID,
@@ -260,6 +265,111 @@ fn list_sessions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Valu
             .cmp(&left["updated_at_ms"].as_u64())
     });
     json!({"session_root": root.to_string_lossy(), "query": query, "sessions": sessions})
+}
+
+fn initialize_durable_catalog(config: &HttpRuntimeConfig) -> Result<Value, String> {
+    let root = session_root(config);
+    let catalog = DurableSessionCatalog::open(&root).map_err(|error| error.to_string())?;
+    let report = catalog.rebuild(&root).map_err(|error| error.to_string())?;
+    Ok(json!({
+        "catalog": catalog.counts().map_err(|error| error.to_string())?,
+        "rebuild": report,
+    }))
+}
+
+fn durable_catalog_payload(
+    config: &HttpRuntimeConfig,
+    request_path: &str,
+) -> Result<Value, String> {
+    let root = session_root(config);
+    let catalog = DurableSessionCatalog::open(&root).map_err(|error| error.to_string())?;
+    let query = query_param(request_path, "query").unwrap_or_default();
+    let limit = query_param(request_path, "limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let sessions = catalog
+        .list_sessions((!query.is_empty()).then_some(query.as_str()), limit)
+        .map_err(|error| error.to_string())?;
+    let message_hits = if query.is_empty() {
+        Vec::new()
+    } else {
+        catalog
+            .search_messages(&query, limit)
+            .map_err(|error| error.to_string())?
+    };
+    Ok(json!({
+        "catalog": catalog.counts().map_err(|error| error.to_string())?,
+        "query": query,
+        "sessions": sessions,
+        "message_hits": message_hits,
+    }))
+}
+
+fn session_executions_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+) -> Result<Value, String> {
+    let root = session_root(config);
+    let catalog = DurableSessionCatalog::open(&root).map_err(|error| error.to_string())?;
+    let executions = catalog
+        .list_executions(session_id)
+        .map_err(|error| error.to_string())?;
+    let status_counts =
+        executions
+            .iter()
+            .fold(BTreeMap::<String, u64>::new(), |mut counts, execution| {
+                *counts
+                    .entry(execution.status.as_str().to_string())
+                    .or_default() += 1;
+                counts
+            });
+    Ok(json!({
+        "session_id": session_id,
+        "executions": executions,
+        "count": executions.len(),
+        "status_counts": status_counts,
+        "source": "sqlite_projection",
+        "source_of_truth": "append_only_ledgers",
+    }))
+}
+
+fn persist_session_execution(
+    root: &Path,
+    session_id: &str,
+    status: ExecutionStatus,
+    phase: ExecutionPhase,
+    reason: Option<&str>,
+) -> Result<DurableExecutionRecord, String> {
+    let store = DurableExecutionStore::new(root);
+    if let Some(mut record) = store
+        .get(session_id, session_id)
+        .map_err(|error| error.to_string())?
+    {
+        if record.status.can_transition_to(status) {
+            record.status = status;
+        }
+        record.phase = phase;
+        record.reason = reason.map(ToString::to_string);
+        return store
+            .upsert_snapshot(record, "session.state_changed")
+            .map_err(|error| error.to_string());
+    }
+    store
+        .create(NewExecution {
+            execution_id: session_id.to_string(),
+            session_id: session_id.to_string(),
+            kind: ExecutionKind::Session,
+            parent_execution_id: None,
+            status,
+            phase,
+            attempt: 1,
+            idempotency_key: session_id.to_string(),
+            lease: None,
+            metadata: BTreeMap::new(),
+        })
+        .map(|created| created.record)
+        .map_err(|error| error.to_string())
 }
 
 // mcp_runtime implementation lives in `mcp_runtime.rs`.
@@ -1466,6 +1576,30 @@ fn create_session_payload(config: &HttpRuntimeConfig, body: &str) -> Result<Valu
     store
         .save_state(&session, None)
         .map_err(|error| format!("Failed to persist session {session_id}: {error}"))?;
+    let mut execution = NewExecution {
+        execution_id: session_id.clone(),
+        session_id: session_id.clone(),
+        kind: ExecutionKind::Session,
+        parent_execution_id: payload
+            .get("fork_from")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        status: ExecutionStatus::Waiting,
+        phase: ExecutionPhase::Scheduling,
+        attempt: 1,
+        idempotency_key: session_id.clone(),
+        lease: None,
+        metadata: BTreeMap::new(),
+    };
+    if let Some(title) = session.metadata.get("title") {
+        execution
+            .metadata
+            .insert("title".to_string(), title.clone());
+    }
+    DurableExecutionStore::new(&store.root)
+        .create(execution)
+        .map_err(|error| format!("Failed to persist session lifecycle {session_id}: {error}"))?;
+    let _ = initialize_durable_catalog(config);
     let persisted = store
         .load_session(&session_id)
         .map_err(|error| format!("Failed to verify session {session_id}: {error}"))?;
@@ -2164,6 +2298,206 @@ fn task_status_value(session: &Session) -> &str {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Copy)]
+struct ExecutionStateUpdate<'a> {
+    status: ExecutionStatus,
+    phase: ExecutionPhase,
+    reason: Option<&'a str>,
+}
+
+fn persist_task_execution(
+    root: &Path,
+    parent_session_id: &str,
+    task_id: &str,
+    parent_execution_id: Option<&str>,
+    attempt: u32,
+    update: ExecutionStateUpdate<'_>,
+) -> Result<DurableExecutionRecord, String> {
+    let store = DurableExecutionStore::new(root);
+    if let Some(mut record) = store
+        .get(parent_session_id, task_id)
+        .map_err(|error| error.to_string())?
+    {
+        if record.status.can_transition_to(update.status) {
+            record.status = update.status;
+        }
+        record.phase = update.phase;
+        record.attempt = attempt.max(record.attempt).max(1);
+        record.reason = update.reason.map(ToString::to_string);
+        record.parent_execution_id = parent_execution_id
+            .map(ToString::to_string)
+            .or(record.parent_execution_id);
+        if update.status.is_terminal() {
+            record.lease = None;
+        }
+        return store
+            .upsert_snapshot(record, "task.state_changed")
+            .map_err(|error| error.to_string());
+    }
+    let execution = NewExecution {
+        execution_id: task_id.to_string(),
+        session_id: parent_session_id.to_string(),
+        kind: ExecutionKind::Task,
+        parent_execution_id: parent_execution_id.map(ToString::to_string),
+        status: update.status,
+        phase: update.phase,
+        attempt: attempt.max(1),
+        idempotency_key: format!("task:{task_id}"),
+        lease: None,
+        metadata: BTreeMap::new(),
+    };
+    store
+        .create(execution)
+        .map(|created| created.record)
+        .map_err(|error| error.to_string())
+}
+
+fn persist_interaction_execution(
+    root: &Path,
+    session_id: &str,
+    request_id: &str,
+    turn_id: &str,
+    kind: ExecutionKind,
+    update: ExecutionStateUpdate<'_>,
+) -> Result<DurableExecutionRecord, String> {
+    let store = DurableExecutionStore::new(root);
+    if let Some(mut record) = store
+        .get(session_id, request_id)
+        .map_err(|error| error.to_string())?
+    {
+        if record.status.can_transition_to(update.status) {
+            record.status = update.status;
+        }
+        record.phase = update.phase;
+        record.reason = update.reason.map(ToString::to_string);
+        if update.status.is_terminal() {
+            record.lease = None;
+        }
+        return store
+            .upsert_snapshot(record, "interaction.state_changed")
+            .map_err(|error| error.to_string());
+    }
+    store
+        .create(NewExecution {
+            execution_id: request_id.to_string(),
+            session_id: session_id.to_string(),
+            kind,
+            parent_execution_id: Some(turn_id.to_string()),
+            status: update.status,
+            phase: update.phase,
+            attempt: 1,
+            idempotency_key: format!("{}:{request_id}", kind.as_str()),
+            lease: None,
+            metadata: BTreeMap::new(),
+        })
+        .map(|created| created.record)
+        .map_err(|error| error.to_string())
+}
+
+fn execute_tool_with_receipt(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    tool_call: &ToolCall,
+    effect_scope: &str,
+    execute: impl FnOnce() -> ToolResult,
+) -> ToolResult {
+    let executions = DurableExecutionStore::new(&store.root);
+    let execution = match executions.get(session_id, run_id) {
+        Ok(Some(mut record)) => {
+            if record.status.can_transition_to(ExecutionStatus::Running) {
+                record.status = ExecutionStatus::Running;
+            }
+            record.phase = ExecutionPhase::Tool;
+            executions.upsert_snapshot(record, "turn.tool_started")
+        }
+        Ok(None) => {
+            let mut spec = NewExecution::turn(session_id, run_id, run_id);
+            spec.status = ExecutionStatus::Running;
+            spec.phase = ExecutionPhase::Tool;
+            executions.create(spec).map(|created| created.record)
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = execution {
+        return ToolResult {
+            call_id: tool_call.call_id.clone(),
+            output: String::new(),
+            error: Some(format!("failed to persist tool execution: {error}")),
+            metadata: BTreeMap::from([
+                ("effect_committed".to_string(), json!(false)),
+                ("effect_error".to_string(), json!(error.to_string())),
+            ]),
+        };
+    }
+    let effect_key = format!(
+        "tool:{session_id}:{run_id}:{}:{effect_scope}",
+        tool_call.call_id
+    );
+    match executions.claim_effect(session_id, run_id, &effect_key, ExecutionPhase::Tool) {
+        Ok(EffectClaim::Acquired(_)) => {
+            let mut result = execute();
+            let serialized = serde_json::to_value(&result).ok();
+            match executions.commit_effect(session_id, run_id, &effect_key, serialized) {
+                Ok(receipt) => {
+                    result
+                        .metadata
+                        .insert("effect_committed".to_string(), json!(true));
+                    result.metadata.insert(
+                        "effect_idempotency_key".to_string(),
+                        json!(receipt.idempotency_key),
+                    );
+                }
+                Err(error) => {
+                    result
+                        .metadata
+                        .insert("effect_committed".to_string(), json!(false));
+                    result
+                        .metadata
+                        .insert("effect_receipt_error".to_string(), json!(error.to_string()));
+                }
+            }
+            result
+        }
+        Ok(EffectClaim::AlreadyCommitted(receipt)) => receipt
+            .result
+            .and_then(|value| serde_json::from_value::<ToolResult>(value).ok())
+            .map(|mut result| {
+                result
+                    .metadata
+                    .insert("effect_replayed".to_string(), json!(true));
+                result
+            })
+            .unwrap_or_else(|| ToolResult {
+                call_id: tool_call.call_id.clone(),
+                output: String::new(),
+                error: Some("committed tool effect is missing its result receipt".to_string()),
+                metadata: BTreeMap::from([("effect_replayed".to_string(), json!(true))]),
+            }),
+        Ok(EffectClaim::Uncertain(receipt)) => ToolResult {
+            call_id: tool_call.call_id.clone(),
+            output: String::new(),
+            error: Some(
+                "tool effect outcome is uncertain after restart; duplicate execution refused"
+                    .to_string(),
+            ),
+            metadata: BTreeMap::from([
+                ("effect_uncertain".to_string(), json!(true)),
+                (
+                    "effect_idempotency_key".to_string(),
+                    json!(receipt.idempotency_key),
+                ),
+            ]),
+        },
+        Err(error) => ToolResult {
+            call_id: tool_call.call_id.clone(),
+            output: String::new(),
+            error: Some(format!("failed to claim tool effect: {error}")),
+            metadata: BTreeMap::from([("effect_committed".to_string(), json!(false))]),
+        },
+    }
+}
+
 fn session_task_cancel_marker_path(root: &Path, task_id: &str) -> PathBuf {
     root.join(task_id).join("task.cancel.json")
 }
@@ -2320,6 +2654,30 @@ fn run_session_task_payload(
             },
         )
         .map_err(|error| format!("failed to start task run: {error}"))?;
+    let parent_execution_id = child_session
+        .metadata
+        .get("parent_run_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let attempt = child_session
+        .metadata
+        .get("resume_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(1)
+        .min(u64::from(u32::MAX)) as u32;
+    persist_task_execution(
+        &store.root,
+        parent_session_id,
+        task_id,
+        parent_execution_id.as_deref(),
+        attempt,
+        ExecutionStateUpdate {
+            status: ExecutionStatus::Running,
+            phase: ExecutionPhase::Subagent,
+            reason: None,
+        },
+    )?;
 
     for (index, message) in child_session.messages.iter().enumerate() {
         store
@@ -2423,6 +2781,23 @@ fn run_session_task_payload(
             )
         }
     };
+    let durable_status = ExecutionStatus::from_runtime(&status);
+    let _ = persist_task_execution(
+        &store.root,
+        parent_session_id,
+        task_id,
+        parent_execution_id.as_deref(),
+        attempt,
+        ExecutionStateUpdate {
+            status: durable_status,
+            phase: if durable_status.is_terminal() {
+                ExecutionPhase::Finalize
+            } else {
+                ExecutionPhase::Subagent
+            },
+            reason: output.get("error").and_then(Value::as_str),
+        },
+    );
     clear_session_task_cancel_marker(&store.root, task_id);
     let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
     let task = session_task_summary_from_state(&session_root(config), &state, task_id);
@@ -2531,14 +2906,15 @@ fn wait_session_task_payload(
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let terminal = matches!(status, "completed" | "failed" | "cancelled");
+        let run_lock_released = !task_run_lock_path(config, task_id).exists();
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        if terminal || elapsed_ms >= timeout_ms {
+        if (terminal && run_lock_released) || elapsed_ms >= timeout_ms {
             return Ok(json!({
                 "session_id": parent_session_id,
                 "task_id": task_id,
                 "status": status,
-                "completed": terminal,
-                "timed_out": !terminal,
+                "completed": terminal && run_lock_released,
+                "timed_out": !terminal || !run_lock_released,
                 "elapsed_ms": elapsed_ms,
                 "task": task,
             }));
@@ -2606,6 +2982,22 @@ fn resume_session_task_payload(
     store
         .save_state(&child_session, None)
         .map_err(|error| format!("failed to resume task: {error}"))?;
+    let parent_execution_id = child_session
+        .metadata
+        .get("parent_run_id")
+        .and_then(Value::as_str);
+    persist_task_execution(
+        &store.root,
+        parent_session_id,
+        task_id,
+        parent_execution_id,
+        resume_count.saturating_add(1).min(u64::from(u32::MAX)) as u32,
+        ExecutionStateUpdate {
+            status: ExecutionStatus::Queued,
+            phase: ExecutionPhase::Scheduling,
+            reason: Some("manual_resume"),
+        },
+    )?;
     let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
     let task = session_task_summary_from_state(&session_root(config), &state, task_id);
     Ok(json!({
@@ -2728,6 +3120,29 @@ fn cancel_session_task_payload(
             .metadata
             .insert("cancel_requested_at_ms".to_string(), json!(now_ms()));
         let _ = store.save_state(&child_session, Some(&run_id));
+        let parent_execution_id = child_session
+            .metadata
+            .get("parent_run_id")
+            .and_then(Value::as_str);
+        let attempt = child_session
+            .metadata
+            .get("resume_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .saturating_add(1)
+            .min(u64::from(u32::MAX)) as u32;
+        let _ = persist_task_execution(
+            &store.root,
+            parent_session_id,
+            task_id,
+            parent_execution_id,
+            attempt,
+            ExecutionStateUpdate {
+                status: ExecutionStatus::Waiting,
+                phase: ExecutionPhase::Subagent,
+                reason: Some("cancel_requested"),
+            },
+        );
         let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
         let task = session_task_summary_from_state(&session_root(config), &state, task_id);
         return Ok(json!({
@@ -2748,6 +3163,29 @@ fn cancel_session_task_payload(
     store
         .save_state(&child_session, Some(&run_id))
         .map_err(|error| format!("failed to cancel task: {error}"))?;
+    let parent_execution_id = child_session
+        .metadata
+        .get("parent_run_id")
+        .and_then(Value::as_str);
+    let attempt = child_session
+        .metadata
+        .get("resume_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(1)
+        .min(u64::from(u32::MAX)) as u32;
+    persist_task_execution(
+        &store.root,
+        parent_session_id,
+        task_id,
+        parent_execution_id,
+        attempt,
+        ExecutionStateUpdate {
+            status: ExecutionStatus::Cancelled,
+            phase: ExecutionPhase::Finalize,
+            reason: Some("cancel_requested"),
+        },
+    )?;
     let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
     let task = session_task_summary_from_state(&session_root(config), &state, task_id);
     Ok(json!({
@@ -2816,6 +3254,13 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
     ) {
         return Err("session must be idle before compacting".to_string());
     }
+    persist_session_execution(
+        &store.root,
+        session_id,
+        ExecutionStatus::Running,
+        ExecutionPhase::Compaction,
+        Some("compaction_started"),
+    )?;
     session.status = SessionStatus::Compacting;
     store
         .save_state(&session, None)
@@ -2854,6 +3299,13 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
     store
         .save_state(&session, Some(&run_id))
         .map_err(|error| error.to_string())?;
+    persist_session_execution(
+        &store.root,
+        session_id,
+        ExecutionStatus::Waiting,
+        ExecutionPhase::Scheduling,
+        Some("compaction_completed"),
+    )?;
     Ok(json!({
         "session_id": session.id,
         "status": "compacted",
@@ -8478,6 +8930,39 @@ fn execute_runtime_task_tool_call(
     let user = runtime_chat_message(Role::User, prompt.clone());
     let user_index = child_session.messages.len() as u64;
     child_session.add(user.clone());
+    let task_attempt = child_session
+        .metadata
+        .get("task_resume_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(1)
+        .min(u64::from(u32::MAX)) as u32;
+    if let Err(error) = persist_task_execution(
+        &task_context.store.root,
+        &task_context.parent_session.id,
+        &child_session.id,
+        Some(task_context.parent_run_id),
+        task_attempt,
+        ExecutionStateUpdate {
+            status: if background {
+                ExecutionStatus::Queued
+            } else {
+                ExecutionStatus::Running
+            },
+            phase: if background {
+                ExecutionPhase::Scheduling
+            } else {
+                ExecutionPhase::Subagent
+            },
+            reason: None,
+        },
+    ) {
+        return runtime_task_tool_error(
+            tool_call,
+            &format!("failed to persist subagent lifecycle: {error}"),
+            BTreeMap::from([("subagent_type".to_string(), json!(profile.id.clone()))]),
+        );
+    }
 
     if background {
         child_session.status = SessionStatus::Idle;
@@ -8588,6 +9073,23 @@ fn execute_runtime_task_tool_call(
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("completed");
+            let durable_status = ExecutionStatus::from_runtime(status);
+            let _ = persist_task_execution(
+                &task_context.store.root,
+                &task_context.parent_session.id,
+                &child_session.id,
+                Some(task_context.parent_run_id),
+                task_attempt,
+                ExecutionStateUpdate {
+                    status: durable_status,
+                    phase: if durable_status.is_terminal() {
+                        ExecutionPhase::Finalize
+                    } else {
+                        ExecutionPhase::Subagent
+                    },
+                    reason: None,
+                },
+            );
             let final_answer = value
                 .get("turn")
                 .and_then(|turn| turn.get("final_answer"))
@@ -8676,36 +9178,50 @@ fn execute_runtime_task_tool_call(
                 metadata,
             }
         }
-        Err(error) => runtime_task_tool_error(
-            tool_call,
-            &format!("subagent {} failed: {error}", profile.id),
-            BTreeMap::from([
-                ("tool".to_string(), json!(TASK_TOOL_ID)),
-                ("title".to_string(), json!(description)),
-                ("subagent_type".to_string(), json!(profile.id.clone())),
-                ("task_id".to_string(), json!(child_session.id.clone())),
-                ("session_id".to_string(), json!(child_session.id.clone())),
-                ("run_id".to_string(), json!(child_run_id)),
-                ("status".to_string(), json!("failed")),
-                (
-                    "model_options".to_string(),
-                    json!(profile.model_options.clone()),
-                ),
-                ("task_depth".to_string(), json!(child_task_depth)),
-                (
-                    "task_root_session_id".to_string(),
-                    json!(task_root_session_id),
-                ),
-                (
-                    "task_parent_session_id".to_string(),
-                    json!(task_context.parent_session.id.clone()),
-                ),
-                (
-                    "task_lineage_subagents".to_string(),
-                    json!(task_lineage_subagents),
-                ),
-            ]),
-        ),
+        Err(error) => {
+            let _ = persist_task_execution(
+                &task_context.store.root,
+                &task_context.parent_session.id,
+                &child_session.id,
+                Some(task_context.parent_run_id),
+                task_attempt,
+                ExecutionStateUpdate {
+                    status: ExecutionStatus::Failed,
+                    phase: ExecutionPhase::Finalize,
+                    reason: Some(&error),
+                },
+            );
+            runtime_task_tool_error(
+                tool_call,
+                &format!("subagent {} failed: {error}", profile.id),
+                BTreeMap::from([
+                    ("tool".to_string(), json!(TASK_TOOL_ID)),
+                    ("title".to_string(), json!(description)),
+                    ("subagent_type".to_string(), json!(profile.id.clone())),
+                    ("task_id".to_string(), json!(child_session.id.clone())),
+                    ("session_id".to_string(), json!(child_session.id.clone())),
+                    ("run_id".to_string(), json!(child_run_id)),
+                    ("status".to_string(), json!("failed")),
+                    (
+                        "model_options".to_string(),
+                        json!(profile.model_options.clone()),
+                    ),
+                    ("task_depth".to_string(), json!(child_task_depth)),
+                    (
+                        "task_root_session_id".to_string(),
+                        json!(task_root_session_id),
+                    ),
+                    (
+                        "task_parent_session_id".to_string(),
+                        json!(task_context.parent_session.id.clone()),
+                    ),
+                    (
+                        "task_lineage_subagents".to_string(),
+                        json!(task_lineage_subagents),
+                    ),
+                ]),
+            )
+        }
     }
 }
 
@@ -9937,6 +10453,29 @@ fn execute_provider_tool_call(
         let assistant_message_id = latest_assistant_message_id_for_tool(session, tool_call);
         let mut question = question_payload_for_tool_call(session, run_id, step, tool_call);
         attach_runtime_step_to_question(&mut question, assistant_message_id.as_deref());
+        let request_id = question
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "question missing request_id".to_string())?;
+        persist_interaction_execution(
+            &store.root,
+            &session.id,
+            request_id,
+            run_id,
+            ExecutionKind::Question,
+            ExecutionStateUpdate {
+                status: ExecutionStatus::Waiting,
+                phase: ExecutionPhase::Question,
+                reason: Some("awaiting_user_response"),
+            },
+        )?;
+        mark_turn_job_state(
+            config,
+            run_id,
+            ExecutionStatus::Waiting,
+            ExecutionPhase::Question,
+            Some("awaiting_question"),
+        );
         session.status = SessionStatus::Paused;
         session
             .metadata
@@ -10018,18 +10557,28 @@ fn execute_provider_tool_call(
     }
 
     let change_before = capture_file_change_before(session, tool_call);
-    let mut tool_result = execute_runtime_tool_call(
-        toolkit,
-        mcp_runtime,
+    let execution_session_id = session.id.clone();
+    let mut tool_result = execute_tool_with_receipt(
+        store,
+        &execution_session_id,
+        run_id,
         tool_call,
-        ctx,
-        RuntimeTaskExecutionContext {
-            config,
-            store,
-            parent_session: session,
-            parent_run_id: run_id,
-            payload,
-            skip_permissions,
+        "initial",
+        || {
+            execute_runtime_tool_call(
+                toolkit,
+                mcp_runtime,
+                tool_call,
+                ctx,
+                RuntimeTaskExecutionContext {
+                    config,
+                    store,
+                    parent_session: session,
+                    parent_run_id: run_id,
+                    payload,
+                    skip_permissions,
+                },
+            )
         },
     );
     if tool_result
@@ -10053,6 +10602,29 @@ fn execute_provider_tool_call(
         {
             object.insert("preview".to_string(), preview);
         }
+        let request_id = approval
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "approval missing request_id".to_string())?;
+        persist_interaction_execution(
+            &store.root,
+            &session.id,
+            request_id,
+            run_id,
+            ExecutionKind::Approval,
+            ExecutionStateUpdate {
+                status: ExecutionStatus::Waiting,
+                phase: ExecutionPhase::Approval,
+                reason: Some("awaiting_approval"),
+            },
+        )?;
+        mark_turn_job_state(
+            config,
+            run_id,
+            ExecutionStatus::Waiting,
+            ExecutionPhase::Approval,
+            Some("awaiting_approval"),
+        );
         session.status = SessionStatus::Paused;
         session
             .metadata
@@ -10848,7 +11420,7 @@ fn start_turn_payload(
     body: &str,
 ) -> Result<Value, String> {
     let payload: Value = serde_json::from_str(body).map_err(|error| error.to_string())?;
-    start_turn_payload_inner(config, session_id, payload, None)
+    start_turn_sync_payload(config, session_id, payload)
 }
 
 fn start_turn_response(
@@ -10870,9 +11442,106 @@ fn start_turn_response(
             Err(error) => session_error_response(error),
         }
     } else {
-        match start_turn_payload_inner(config, session_id, payload, None) {
+        match start_turn_sync_payload(config, session_id, payload) {
             Ok(payload) => json_response(200, payload),
             Err(error) => session_error_response(error),
+        }
+    }
+}
+
+fn start_turn_sync_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    payload: Value,
+) -> Result<Value, String> {
+    validate_start_turn_payload(&payload)?;
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let run_id = new_id("turn");
+    let root = session_root(config);
+    persist_turn_retry_payload(&root, session_id, &run_id, &payload)?;
+    let registration = register_turn_job(config, session_id, &run_id, payload.clone()).map_err(
+        |error| match error {
+            TurnJobRegisterError::Unavailable => "turn job registry unavailable".to_string(),
+            TurnJobRegisterError::QueuePersistFailed(error) => error,
+            TurnJobRegisterError::QueueFull {
+                queued_count,
+                max_queued_turns_per_session,
+            } => format!("turn queue is full: {queued_count}/{max_queued_turns_per_session}"),
+        },
+    )?;
+    match registration {
+        TurnJobRegistration::Existing { job } => {
+            remove_turn_retry_payload(&root, &run_id);
+            Ok(json!({
+                "session_id": session_id,
+                "turn_id": job.get("turn_id").cloned().unwrap_or(Value::Null),
+                "status": job.get("status").cloned().unwrap_or_else(|| json!("interrupted")),
+                "accepted": true,
+                "deduplicated": true,
+                "turn": job,
+                "events": [],
+            }))
+        }
+        TurnJobRegistration::Queued {
+            job,
+            queue_position,
+            queue_reason,
+        } => {
+            persist_session_execution(
+                &root,
+                session_id,
+                ExecutionStatus::Waiting,
+                ExecutionPhase::Scheduling,
+                Some("turn_queued"),
+            )?;
+            Ok(json!({
+                "session_id": session_id,
+                "turn_id": job.turn_id,
+                "status": "queued",
+                "accepted": true,
+                "async": true,
+                "queued": true,
+                "queue_position": queue_position,
+                "queue_reason": queue_reason,
+                "deduplicated": false,
+                "turn": job.to_value(),
+                "events": [],
+            }))
+        }
+        TurnJobRegistration::Running(_cancel) => {
+            persist_session_execution(
+                &root,
+                session_id,
+                ExecutionStatus::Running,
+                ExecutionPhase::Provider,
+                Some("turn_started"),
+            )?;
+            let heartbeat_stop = Arc::new(AtomicBool::new(false));
+            let heartbeat = spawn_turn_heartbeat(
+                config.clone(),
+                session_id.to_string(),
+                run_id.clone(),
+                Arc::clone(&heartbeat_stop),
+            );
+            let result =
+                start_turn_payload_inner(config, session_id, payload, Some(run_id.clone()));
+            mark_turn_job_status_from_result(config, &run_id, &result);
+            let _ = persist_session_execution(
+                &root,
+                session_id,
+                ExecutionStatus::Waiting,
+                ExecutionPhase::Scheduling,
+                Some("turn_stopped"),
+            );
+            heartbeat_stop.store(true, Ordering::SeqCst);
+            if let Some(heartbeat) = heartbeat {
+                heartbeat.thread().unpark();
+                let _ = heartbeat.join();
+            }
+            start_next_queued_turns(config);
+            result
         }
     }
 }
@@ -10898,6 +11567,8 @@ fn start_turn_async_payload_trusted(
         return Err("session_not_found".to_string());
     }
     let run_id = new_id("turn");
+    let idempotency_key = turn_idempotency_key(&payload, &run_id);
+    let attempt = turn_attempt(&payload);
     let root = session_root(config);
     persist_turn_retry_payload(&root, session_id, &run_id, &payload)?;
     let registration = match register_turn_job(config, session_id, &run_id, payload.clone()) {
@@ -10950,14 +11621,62 @@ fn start_turn_async_payload_trusted(
     };
     let (status, queue_position, queue_reason) = match registration {
         TurnJobRegistration::Running(_cancel) => {
+            persist_session_execution(
+                &root,
+                session_id,
+                ExecutionStatus::Running,
+                ExecutionPhase::Provider,
+                Some("turn_started"),
+            )?;
             spawn_async_turn_worker(config, session_id.to_string(), run_id.clone(), payload)?;
             ("running", None, None)
+        }
+        TurnJobRegistration::Existing { job } => {
+            remove_turn_retry_payload(&root, &run_id);
+            let existing_turn_id = job
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&run_id);
+            let existing_status = job
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("interrupted");
+            let response_status = if turn_job_status_terminal(existing_status) {
+                200
+            } else {
+                202
+            };
+            return Ok((
+                response_status,
+                json!({
+                    "session_id": session_id,
+                    "turn_id": existing_turn_id,
+                    "status": existing_status,
+                    "accepted": true,
+                    "async": true,
+                    "queued": existing_status == "queued",
+                    "deduplicated": true,
+                    "idempotency_key": job.get("idempotency_key").cloned().unwrap_or(Value::Null),
+                    "attempt": job.get("attempt").cloned().unwrap_or_else(|| json!(1)),
+                    "turn": job,
+                    "events": [],
+                }),
+            ));
         }
         TurnJobRegistration::Queued {
             job: _job,
             queue_position,
             queue_reason,
-        } => ("queued", Some(queue_position), Some(queue_reason)),
+        } => {
+            persist_session_execution(
+                &root,
+                session_id,
+                ExecutionStatus::Waiting,
+                ExecutionPhase::Scheduling,
+                Some("turn_queued"),
+            )?;
+            ("queued", Some(queue_position), Some(queue_reason))
+        }
     };
     Ok((
         202,
@@ -10968,6 +11687,9 @@ fn start_turn_async_payload_trusted(
             "accepted": true,
             "async": true,
             "queued": status == "queued",
+            "deduplicated": false,
+            "idempotency_key": idempotency_key,
+            "attempt": attempt,
             "queue_position": queue_position,
             "queue_reason": queue_reason,
             "scheduler": {
@@ -11000,6 +11722,20 @@ fn spawn_async_turn_worker(
     thread::Builder::new()
         .name(format!("openagent-turn-{thread_run_id}"))
         .spawn(move || {
+            let _ = persist_session_execution(
+                &session_root(&thread_config),
+                &thread_session_id,
+                ExecutionStatus::Running,
+                ExecutionPhase::Provider,
+                Some("turn_worker_started"),
+            );
+            let heartbeat_stop = Arc::new(AtomicBool::new(false));
+            let heartbeat = spawn_turn_heartbeat(
+                thread_config.clone(),
+                thread_session_id.clone(),
+                thread_run_id.clone(),
+                Arc::clone(&heartbeat_stop),
+            );
             match start_turn_payload_inner(
                 &thread_config,
                 &thread_session_id,
@@ -11036,6 +11772,18 @@ fn spawn_async_turn_worker(
                     );
                     mark_turn_job_status(&thread_config, &thread_run_id, "failed");
                 }
+            }
+            let _ = persist_session_execution(
+                &session_root(&thread_config),
+                &thread_session_id,
+                ExecutionStatus::Waiting,
+                ExecutionPhase::Scheduling,
+                Some("turn_worker_stopped"),
+            );
+            heartbeat_stop.store(true, Ordering::SeqCst);
+            if let Some(heartbeat) = heartbeat {
+                heartbeat.thread().unpark();
+                let _ = heartbeat.join();
             }
             start_next_queued_turns(&thread_config);
         })
@@ -11770,18 +12518,28 @@ fn run_http_tool_turn(
                 .tool_call_started_event(run_id, step, &tool_call, Some(run_id), BTreeMap::new()),
         );
         let change_before = capture_file_change_before(session, &tool_call);
-        let mut tool_result = execute_runtime_tool_call(
-            &toolkit,
-            mcp_runtime.as_ref(),
+        let execution_session_id = session.id.clone();
+        let mut tool_result = execute_tool_with_receipt(
+            store,
+            &execution_session_id,
+            run_id,
             &tool_call,
-            &mut ctx,
-            RuntimeTaskExecutionContext {
-                config,
-                store,
-                parent_session: session,
-                parent_run_id: run_id,
-                payload: &empty_payload,
-                skip_permissions,
+            "initial",
+            || {
+                execute_runtime_tool_call(
+                    &toolkit,
+                    mcp_runtime.as_ref(),
+                    &tool_call,
+                    &mut ctx,
+                    RuntimeTaskExecutionContext {
+                        config,
+                        store,
+                        parent_session: session,
+                        parent_run_id: run_id,
+                        payload: &empty_payload,
+                        skip_permissions,
+                    },
+                )
             },
         );
         if tool_result
@@ -11809,6 +12567,29 @@ fn run_http_tool_turn(
             {
                 object.insert("preview".to_string(), preview);
             }
+            let request_id = approval
+                .get("request_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "approval missing request_id".to_string())?;
+            persist_interaction_execution(
+                &store.root,
+                &session.id,
+                request_id,
+                run_id,
+                ExecutionKind::Approval,
+                ExecutionStateUpdate {
+                    status: ExecutionStatus::Waiting,
+                    phase: ExecutionPhase::Approval,
+                    reason: Some("awaiting_approval"),
+                },
+            )?;
+            mark_turn_job_state(
+                config,
+                run_id,
+                ExecutionStatus::Waiting,
+                ExecutionPhase::Approval,
+                Some("awaiting_approval"),
+            );
             session.status = SessionStatus::Paused;
             session
                 .metadata
@@ -11971,6 +12752,27 @@ fn respond_approval_payload(
             ..SessionEventOptions::default()
         },
     );
+    persist_interaction_execution(
+        &store.root,
+        &session.id,
+        &request_id,
+        &run_id,
+        ExecutionKind::Approval,
+        ExecutionStateUpdate {
+            status: ExecutionStatus::Completed,
+            phase: ExecutionPhase::Finalize,
+            reason: Some(action),
+        },
+    )?;
+    if action == "allow" {
+        mark_turn_job_state(
+            config,
+            &run_id,
+            ExecutionStatus::Running,
+            ExecutionPhase::Tool,
+            Some("approval_resolved"),
+        );
+    }
 
     let response_status: &str;
     if action == "allow" {
@@ -12005,18 +12807,28 @@ fn respond_approval_payload(
         )
         .tool_context();
         let change_before = capture_file_change_before(&session, &tool_call);
-        let mut tool_result = execute_runtime_tool_call(
-            &toolkit,
-            mcp_runtime.as_ref(),
+        let execution_session_id = session.id.clone();
+        let mut tool_result = execute_tool_with_receipt(
+            &store,
+            &execution_session_id,
+            &run_id,
             &tool_call,
-            &mut ctx,
-            RuntimeTaskExecutionContext {
-                config,
-                store: &store,
-                parent_session: &session,
-                parent_run_id: &run_id,
-                payload: &pending_payload,
-                skip_permissions: pending_skip_permissions,
+            "approved",
+            || {
+                execute_runtime_tool_call(
+                    &toolkit,
+                    mcp_runtime.as_ref(),
+                    &tool_call,
+                    &mut ctx,
+                    RuntimeTaskExecutionContext {
+                        config,
+                        store: &store,
+                        parent_session: &session,
+                        parent_run_id: &run_id,
+                        payload: &pending_payload,
+                        skip_permissions: pending_skip_permissions,
+                    },
+                )
             },
         );
         let approval_step = approval.get("step").and_then(Value::as_u64).unwrap_or(1);
@@ -12204,12 +13016,28 @@ fn respond_question_payload(
             "question": response.clone(),
         }
     })];
-
-    if response
+    let dismissed = response
         .get("dismissed")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    persist_interaction_execution(
+        &store.root,
+        &session.id,
+        &request_id,
+        &run_id,
+        ExecutionKind::Question,
+        ExecutionStateUpdate {
+            status: if dismissed {
+                ExecutionStatus::Cancelled
+            } else {
+                ExecutionStatus::Completed
+            },
+            phase: ExecutionPhase::Finalize,
+            reason: Some(if dismissed { "dismissed" } else { "answered" }),
+        },
+    )?;
+
+    if dismissed {
         session.metadata.remove("pending_provider_turn");
         session.status = SessionStatus::Idle;
         append_interaction_resolution_part(
@@ -12262,6 +13090,13 @@ fn respond_question_payload(
         }));
     }
 
+    mark_turn_job_state(
+        config,
+        &run_id,
+        ExecutionStatus::Running,
+        ExecutionPhase::Tool,
+        Some("question_answered"),
+    );
     let tool_call = pending_question_tool_call(&question)?;
     let agent_profile = runtime_agent_profile_for_session(&session);
     sync_plugin_runtime_metadata(config, &mut session);
@@ -12272,11 +13107,21 @@ fn respond_question_payload(
     }
     let mut ctx = runner_facade.tool_context();
     let toolkit = toolkit_with_runtime_task_tool(&session, agent_profile.as_ref());
-    let mut tool_result = toolkit.execute(
+    let execution_session_id = session.id.clone();
+    let mut tool_result = execute_tool_with_receipt(
+        &store,
+        &execution_session_id,
+        &run_id,
+        &tool_call,
         "question",
-        tool_call.input.clone(),
-        &tool_call.call_id,
-        &mut ctx,
+        || {
+            toolkit.execute(
+                "question",
+                tool_call.input.clone(),
+                &tool_call.call_id,
+                &mut ctx,
+            )
+        },
     );
     append_completed_tool_result(
         &store,

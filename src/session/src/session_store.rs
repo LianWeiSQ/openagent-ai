@@ -17,6 +17,9 @@ use openagent_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+mod durable_engine;
+pub use durable_engine::*;
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const SESSION_STORE_METADATA_KEY: &str = "session_store";
 pub const TRACE_METADATA_KEY: &str = "agent_trace";

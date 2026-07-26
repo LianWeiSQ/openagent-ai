@@ -44,21 +44,32 @@ runtime contracts that improve Desktop, CLI, and TUI together.
 - fail-closed malformed/truncated call handling and cross-surface fake-provider
   tests.
 
+## Completed Durable Session And Turn Engine
+
+- one canonical seven-state model for session, turn, task, approval, and
+  question execution;
+- phase-aware recovery decisions for provider, tool, approval, question,
+  compaction, and subagent crashes;
+- owner leases, heartbeats, attempts, turn idempotency keys, and at-most-once
+  tool effect receipts;
+- append-only lifecycle ledgers with cross-process append/read locking;
+- rebuildable SQLite session history, execution tree, lease, and FTS catalog;
+- sync/async turn parity, runtime-root queue isolation, restart reconciliation,
+  and catalog service APIs.
+
 ## Enhancement Sequence
 
-1. Durable session/turn engine: one persisted state machine, recovery policy,
-   idempotency, and a rebuildable query catalog.
-2. Context operating system: deterministic assembly, typed assets, semantic
+1. Context operating system: deterministic assembly, typed assets, semantic
    compaction, and cross-client prompt parity.
-3. Concurrent tool scheduler: dependency-aware read parallelism, write
+2. Concurrent tool scheduler: dependency-aware read parallelism, write
    serialization, cancellation, and resource limits.
-4. Subagent control plane: durable background lifecycle, nested routing,
+3. Subagent control plane: durable background lifecycle, nested routing,
    worktree isolation, resume, promotion, and task-tree UX.
-5. MCP service plane: dynamic client registration, hardened remote OAuth,
+4. MCP service plane: dynamic client registration, hardened remote OAuth,
    reconnect policy, server logs, and capability negotiation.
-6. LSP service plane: managed clients, diagnostics, lifecycle control, logs,
+5. LSP service plane: managed clients, diagnostics, lifecycle control, logs,
    and server capability discovery.
-7. Product hardening: packaged-platform gates, accessibility, observability,
+6. Product hardening: packaged-platform gates, accessibility, observability,
    migration compatibility, and release automation.
 
 ## Documentation Rule

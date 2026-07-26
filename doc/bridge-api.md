@@ -39,6 +39,7 @@ discovery. The stable route groups are:
 | Discovery | `GET /api/health`, `GET /api/protocol` |
 | Providers | `GET /api/providers`, `PUT /api/providers/config`, `POST /api/providers/validate`, `GET /api/models` |
 | Sessions | `GET\|POST /api/sessions`, `GET\|PATCH\|DELETE /api/sessions/{session_id}` |
+| Durable catalog | `GET /api/session-catalog`, `POST /api/session-catalog/rebuild`, `GET /api/sessions/{session_id}/executions` |
 | Goal and plan | `GET\|PUT /api/sessions/{session_id}/goal`, `GET\|PUT /api/sessions/{session_id}/plan` |
 | Turns | `GET /api/turns`, `POST /api/sessions/{session_id}/turns`, `GET /api/turns/{turn_id}`, `POST /api/turns/{turn_id}/retry\|interrupt` |
 | Tasks | `GET /api/sessions/{session_id}/tasks`, task `start\|wait\|promote\|cancel\|resume` actions |
@@ -79,7 +80,16 @@ The event stream uses Codex-like method names:
 - `turn/approval_requested`
 - `turn/approval_resolved`
 
-Interrupt is cooperative: the running turn is marked as interrupting immediately, and the background OpenAgent loop stops at the next model/tool event boundary. A blocking provider request or tool process may still need to return control before the final `turn/interrupted` event is emitted.
+Interrupt is cooperative: a running turn remains in the canonical `waiting`
+state with `cancel_requested=true` while the background OpenAgent loop stops at
+the next model/tool event boundary. A blocking provider request or tool process
+may still need to return control before the final `turn/interrupted` event is
+emitted.
+
+Turn requests may include an `idempotency_key`. Repeating that key in the same
+session returns the original turn with `deduplicated=true`; it does not submit
+another provider request. See [`session-engine.md`](session-engine.md) for
+state, lease, effect receipt, recovery, and catalog semantics.
 
 Approvals are driven by the existing permission system. When `OPENAGENT_BRIDGE_PERMISSION=PLAN_ONLY` or a custom ask rule requires confirmation, the loop pauses and emits `turn/approval_requested` with:
 

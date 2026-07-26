@@ -7,9 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fs2.workspace = true
 openagent-protocol.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [lib]
 path = "src/session_store.rs"

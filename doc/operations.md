@@ -76,6 +76,13 @@ capability state, plugin metadata, OAuth records, performance samples, and
 storage migration receipts. Public API summaries are constructed from
 allowlisted fields and never expose stored credentials.
 
+The rebuildable session catalog is
+`<session-root>/.openagent-runtime/session_catalog.sqlite3`. The Bridge rebuilds
+it from session lifecycle and transcript ledgers at startup. Use
+`POST /api/session-catalog/rebuild` for an explicit repair and
+`GET /api/session-catalog` to inspect counts and search history. Deleting the
+catalog does not delete session data.
+
 Treat both areas as local application data:
 
 - do not commit it;
@@ -95,9 +102,12 @@ events. Exhausted failures become terminal failed turns with a user-facing
 error and resumability metadata. A retryable failed turn can be resubmitted
 with `POST /api/turns/{turn_id}/retry`.
 
-Interrupted, failed, expired, and completed are distinct terminal states.
-Clients should render those states directly instead of inferring completion
-from a closed connection.
+Completed, failed, cancelled, and interrupted are terminal states. Queue
+timeout is reported as `cancelled` with `terminal_reason=queue_timeout`.
+Clients should render canonical state and recovery fields directly instead of
+inferring completion from a closed connection. A claimed but uncommitted tool
+effect is intentionally reported as uncertain and is not retried
+automatically.
 
 ## Verification
 

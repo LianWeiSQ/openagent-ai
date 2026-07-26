@@ -150,6 +150,8 @@ pub fn bridge_protocol_payload() -> Value {
             "protocol": "GET /api/protocol",
             "sessions": "GET|POST /api/sessions",
             "session": "GET|PATCH|DELETE /api/sessions/{session_id}",
+            "session_catalog": "GET /api/session-catalog?query={query}; POST /api/session-catalog/rebuild",
+            "session_executions": "GET /api/sessions/{session_id}/executions",
             "goal": "GET|PUT /api/sessions/{session_id}/goal",
             "plan": "GET|PUT /api/sessions/{session_id}/plan",
             "tasks": "GET /api/sessions/{session_id}/tasks; POST /api/sessions/{session_id}/tasks/{task_id}/start|wait|promote|cancel|resume (run remains a synchronous compatibility route)",
@@ -533,6 +535,9 @@ pub(super) fn serve_blocking(config: HttpRuntimeConfig) -> CliRunResult {
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| format!("{}:{}", config.host, config.port));
     println!("openagent HTTP runtime listening on http://{local}");
+    if let Err(error) = initialize_durable_catalog(&config) {
+        eprintln!("openagent durable catalog rebuild failed: {error}");
+    }
     recover_and_start_persisted_queued_turns(&config);
     start_background_task_worker(config.clone());
     for stream in listener.incoming() {
@@ -898,6 +903,14 @@ pub(super) fn route_http_request(
         ("GET", "/api/sessions") => {
             json_response(200, list_sessions_payload(config, &request.path))
         }
+        ("GET", "/api/session-catalog") => match durable_catalog_payload(config, &request.path) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(500, json!({"error": error})),
+        },
+        ("POST", "/api/session-catalog/rebuild") => match initialize_durable_catalog(config) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(500, json!({"error": error})),
+        },
         ("POST", "/api/sessions") => match create_session_payload(config, &request.body) {
             Ok(payload) => json_response(201, payload),
             Err(error) => json_response(
@@ -1134,6 +1147,17 @@ pub(super) fn route_dynamic_request(
             }
             "DELETE" => mcp_config_response(mcp_delete_server_payload(config, parts[3])),
             _ => route_unknown(),
+        };
+    }
+    if parts.len() == 4
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "executions"
+        && request.method == "GET"
+    {
+        return match session_executions_payload(config, parts[2]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(500, json!({"error": error})),
         };
     }
     if parts.len() == 4

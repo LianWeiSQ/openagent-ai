@@ -93,11 +93,20 @@ queues and leases, task trees, approval/question waits, checkpoints, and
 context receipts. Product surfaces project that state; they do not recreate a
 parallel session state machine.
 
+Session, turn, task, approval, and question execution share one seven-state
+contract and one phase-aware recovery policy. Tool effects use durable
+idempotency receipts, so a committed result can be replayed and an ambiguous
+post-crash effect is never executed automatically. A rebuildable SQLite
+catalog projects session history, execution trees, leases, and message FTS
+from the ledgers; it is not a source of truth.
+
 This layer is the bridge between raw model messages and product/runtime
 observability: product surfaces can inspect the session, while eval tooling can
 replay or score the same run evidence.
 
-See [`operations.md`](operations.md) for runtime events and operational data.
+See [`session-engine.md`](session-engine.md) for state, recovery, idempotency,
+and catalog contracts, and [`operations.md`](operations.md) for runtime events
+and operational data.
 
 ## Provider Boundary
 
