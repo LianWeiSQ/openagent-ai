@@ -765,6 +765,10 @@ fn typed_attachment_is_stable_interleaved_and_redacted_from_receipt() -> Result<
     });
 
     assert_eq!(stable_id.len(), "att_".len() + 16);
+    assert_eq!(
+        pack.messages[2].metadata["context_attachment"]["included_content_bytes"],
+        json!(secret.len())
+    );
     assert_eq!(pack.messages.len(), 4);
     assert_eq!(pack.messages[1].content, "Review the attachment");
     assert_eq!(pack.messages[2].role, Role::User);

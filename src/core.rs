@@ -756,6 +756,8 @@ impl ContextAttachment {
         size_bytes: u64,
         content: impl Into<String>,
     ) -> Self {
+        let content = content.into();
+        let included_content_bytes = content.len() as u64;
         let mut attachment = Self {
             id: String::new(),
             kind,
@@ -763,14 +765,14 @@ impl ContextAttachment {
             name,
             content_type: content_type.into(),
             size_bytes,
-            content: content.into(),
+            content,
             source: None,
             page_count: None,
             media_metadata: BTreeMap::new(),
             truncated: false,
             truncation_reason: None,
             original_content_bytes: None,
-            included_content_bytes: None,
+            included_content_bytes: Some(included_content_bytes),
             source_message_index: None,
             metadata: BTreeMap::new(),
         };
