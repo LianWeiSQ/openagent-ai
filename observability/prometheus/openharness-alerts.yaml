@@ -1,0 +1,127 @@
+groups:
+  - name: openharness-slo-recording
+    interval: 30s
+    rules:
+      - record: openharness:sli_run_success_ratio:10m
+        expr: |
+          sum(rate(openharness_runs_total{outcome=~"success|degraded"}[10m]))
+          /
+          clamp_min(sum(rate(openharness_runs_total[10m])), 1e-9)
+      - record: openharness:sli_run_latency_p95_seconds:10m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(openharness_run_duration_seconds_bucket[10m]))
+          )
+      - record: openharness:sli_queue_wait_p95_seconds:10m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(openharness_queue_wait_seconds_bucket[10m]))
+          )
+      - record: openharness:sli_trace_completeness_ratio:15m
+        expr: |
+          sum(rate(openharness_trace_completeness_ratio_sum[15m]))
+          /
+          clamp_min(sum(rate(openharness_trace_completeness_ratio_count[15m])), 1e-9)
+
+  - name: openharness-slo-alerts
+    interval: 30s
+    rules:
+      - alert: OpenHarnessRunSLOBurnWarning
+        expr: |
+          openharness:sli_run_success_ratio:10m < 0.99
+          and sum(rate(openharness_runs_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: openharness
+          slo: run_success
+        annotations:
+          summary: OpenHarness successful-or-degraded run ratio is below 99%
+          description: Inspect outcomes, bounded reason codes, provider failures, and the version-mix panel before drilling into a correlated trace.
+          runbook: doc/operations.md#openharness-observability
+
+      - alert: OpenHarnessRunSLOBurnCritical
+        expr: |
+          openharness:sli_run_success_ratio:10m < 0.98
+          and sum(rate(openharness_runs_total[10m])) > 0
+        for: 20m
+        labels:
+          severity: critical
+          service: openharness
+          slo: run_success
+        annotations:
+          summary: OpenHarness successful-or-degraded run ratio is below 98%
+          description: Stop rollout if this coincides with a version change; use reason_code and provider/tool diagnostics to isolate the regression.
+          runbook: doc/operations.md#openharness-observability
+
+      - alert: OpenHarnessRunLatencyP95High
+        expr: |
+          openharness:sli_run_latency_p95_seconds:10m > 120
+          and sum(rate(openharness_run_duration_seconds_count[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: openharness
+          slo: run_latency
+        annotations:
+          summary: OpenHarness run latency p95 exceeds 120 seconds
+          description: Compare queue, provider, tool, approval/question, and step p95 to locate the dominant stage.
+          runbook: doc/operations.md#openharness-observability
+
+      - alert: OpenHarnessQueueWaitP95High
+        expr: |
+          openharness:sli_queue_wait_p95_seconds:10m > 5
+          and sum(rate(openharness_queue_wait_seconds_count[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: openharness
+          slo: queue_wait
+        annotations:
+          summary: OpenHarness queue wait p95 exceeds 5 seconds
+          description: Check queue depth, active workers, per-session serialization, global worker limits, and lease recovery.
+          runbook: doc/operations.md#openharness-observability
+
+      - alert: OpenHarnessTraceCompletenessLow
+        expr: |
+          openharness:sli_trace_completeness_ratio:15m < 0.95
+          and sum(rate(openharness_trace_completeness_ratio_count[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: openharness
+          slo: trace_completeness
+        annotations:
+          summary: Fewer than 95% of critical OpenHarness trace boundaries are present
+          description: Verify root, step, and provider-or-tool span events in the durable run ledger, then check exporter health.
+          runbook: doc/operations.md#openharness-observability
+
+      - alert: OpenHarnessTelemetryExportFailures
+        expr: sum(rate(openharness_telemetry_export_failures_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: openharness
+          slo: telemetry_export
+        annotations:
+          summary: OpenHarness telemetry export is failing
+          description: Agent execution remains fail-open. Check collector reachability and exporter queue pressure without restarting healthy runs.
+          runbook: doc/operations.md#openharness-observability
+
+      - alert: OpenHarnessDegradedRunRatioHigh
+        expr: |
+          sum(rate(openharness_runs_total{outcome="degraded"}[15m]))
+          /
+          clamp_min(sum(rate(openharness_runs_total[15m])), 1e-9) > 0.05
+          and sum(rate(openharness_runs_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: openharness
+          slo: degraded_runs
+        annotations:
+          summary: More than 5% of OpenHarness runs are degraded
+          description: Inspect fallback, partial tool failure, context truncation, and budget reason codes before treating terminal success as healthy.
+          runbook: doc/operations.md#openharness-observability

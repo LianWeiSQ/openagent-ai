@@ -1,0 +1,60 @@
+{
+  "schema_version": "openharness.regression_fixture.artifact.v1",
+  "content_fingerprint": "f715d3de2989527587f2b89463fae82ff8fb221b3f28be41c4204a2524de0921",
+  "fixture": {
+    "schema_version": "openharness.regression_fixture.v1",
+    "fixture_id": "runtime.deadline.bad-case-42",
+    "dataset_version": "release-suite-v4",
+    "promoted_at_ms": 105,
+    "source_bad_case_id": "bad-case-42",
+    "source_bad_case_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "source": {
+      "session_id": "source-session",
+      "run_id": "source-run",
+      "trace_id": "11111111111111111111111111111111",
+      "task_contract_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+      "versions": {
+        "harness_version": "0.1.0+42",
+        "agent_version": "agent-v7",
+        "prompt_version": "prompt-v11",
+        "skill_set_version": "skills-v4",
+        "tool_set_version": "tools-v9",
+        "config_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "outcome": "failed",
+      "reason_code": "deadline_exceeded"
+    },
+    "replay": {
+      "input": {
+        "input": "do not call provider"
+      },
+      "runtime_overrides": {
+        "deadline_at_ms": 1
+      },
+      "expected_assertions": [
+        {
+          "kind": "json_path",
+          "path": "$.reason_code",
+          "operator": "eq",
+          "expected": "deadline_exceeded"
+        },
+        {
+          "kind": "json_path",
+          "path": "$.events[0].status",
+          "operator": "contains",
+          "expected": "fail"
+        },
+        {
+          "kind": "json_path",
+          "path": "$.usage.total_tokens",
+          "operator": "lte",
+          "expected": 0
+        }
+      ],
+      "tags": [
+        "deadline",
+        "runtime"
+      ]
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "schema_version": "openharness.fault_injection.plan.v1",
+  "plan_id": "openharness-release-faults-v1",
+  "scenarios": [
+    {
+      "id": "runtime.cancel",
+      "layer": "runtime",
+      "injection": "Interrupt an asynchronous run while the provider stream is still open.",
+      "expected": "The provider stream is cancelled, the run becomes terminal, and no late completion is committed.",
+      "test_command": "cargo test -p openagent-http-runtime --test http_runtime async_turn_interrupt_cancels_provider_stream_before_completion -- --exact",
+      "critical": true
+    },
+    {
+      "id": "runtime.deadline",
+      "layer": "runtime",
+      "injection": "Start a run with an already-expired deadline and a tool call that would mutate a file.",
+      "expected": "The run fails with deadline_exceeded before any provider or tool side effect.",
+      "test_command": "cargo test -p openagent-http-runtime --lib tests::runtime_budgets_fail_terminally_before_provider_or_tool_side_effects -- --exact",
+      "critical": true
+    },
+    {
+      "id": "runtime.provider-retry",
+      "layer": "provider",
+      "injection": "Return retryable HTTP 503 from the provider before a successful response.",
+      "expected": "The same model is retried within bounds and the run completes once without duplicate effects.",
+      "test_command": "cargo test -p openagent-http-runtime --test http_runtime remote_runtime_client_retries_retryable_provider_503_same_model -- --exact",
+      "critical": true
+    },
+    {
+      "id": "runtime.tool-permission-deny",
+      "layer": "tool_governance",
+      "injection": "Deny a pending approval for a mutating tool.",
+      "expected": "The tool is not executed, the provider is not resumed, and the run records tool_denied evidence.",
+      "test_command": "cargo test -p openagent-http-runtime --test http_runtime remote_runtime_client_stops_provider_after_approval_deny -- --exact",
+      "critical": true
+    },
+    {
+      "id": "recovery.restart",
+      "layer": "durability",
+      "injection": "Restart the runtime after a committed tool effect and replay the idempotency key.",
+      "expected": "The effect receipt survives restart and the tool side effect is not duplicated.",
+      "test_command": "cargo test -p openagent-http-runtime --test http_runtime committed_tool_effect_and_turn_idempotency_survive_runtime_restart -- --exact",
+      "critical": true
+    },
+    {
+      "id": "telemetry.collector-outage",
+      "layer": "telemetry",
+      "injection": "Point the OTLP exporter at an unavailable collector.",
+      "expected": "Run execution stays available and exporter failure metrics are incremented.",
+      "test_command": "cargo test -p openagent-telemetry --lib runtime::tests::collector_outage_is_fail_open_and_counted -- --exact",
+      "critical": true
+    },
+    {
+      "id": "runtime.queue-timeout",
+      "layer": "scheduler",
+      "injection": "Hold a session worker and let a queued turn exceed its queue deadline.",
+      "expected": "The queued turn expires with queue_timeout and queue depth returns to zero.",
+      "test_command": "cargo test -p openagent-http-runtime --test http_runtime async_turn_expires_queued_turn_after_timeout -- --exact",
+      "critical": false
+    },
+    {
+      "id": "recovery.approval-restart",
+      "layer": "durability",
+      "injection": "Restart while a mutating tool is waiting for approval.",
+      "expected": "The approval remains resumable and the tool executes once after explicit allow.",
+      "test_command": "cargo test -p openagent-http-runtime --test http_runtime approval_wait_remains_resumable_across_runtime_restart -- --exact",
+      "critical": false
+    }
+  ]
+}

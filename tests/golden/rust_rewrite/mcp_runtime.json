@@ -9,7 +9,7 @@
       }
     ],
     "definition": {
-      "dangerous": true,
+    "dangerous": false,
       "description": "Remote MCP tool from server 'Demo Server'. Original MCP tool name: 'Weather.Search'.\n\nFind a forecast for a city.",
       "execution_schema": {
         "batch_group": "remote-mcp",
@@ -20,7 +20,7 @@
         "mutates_external": false,
         "mutates_session": false,
         "mutates_workspace": false,
-        "read_only": false,
+      "read_only": true,
         "requires_user_interaction": false
       },
       "execution_scope": "agnostic",

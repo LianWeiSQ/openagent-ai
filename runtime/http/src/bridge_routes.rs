@@ -44,6 +44,7 @@ pub fn health_payload(config: &HttpRuntimeConfig) -> Value {
         "service": command_name(),
         "bridge_server": bridge_server_crate_name(),
         "auth_required": config.auth_required(),
+        "telemetry": telemetry_health_payload(),
     })
 }
 
@@ -85,7 +86,9 @@ pub fn route_options() -> HttpResponseSpec {
     );
     headers.insert(
         "Access-Control-Allow-Headers".to_string(),
-        Value::String("Authorization, Content-Type, X-OpenAgent-Token".to_string()),
+        Value::String(
+            "Authorization, Content-Type, Traceparent, Tracestate, X-OpenAgent-Token".to_string(),
+        ),
     );
     headers.insert(
         "Access-Control-Max-Age".to_string(),
@@ -148,7 +151,7 @@ pub fn bridge_protocol_payload() -> Value {
         "endpoints": {
             "health": "GET /api/health",
             "protocol": "GET /api/protocol",
-            "sessions": "GET|POST /api/sessions",
+            "sessions": "GET|POST /api/sessions (GET hides internal task sessions; pass include_subagents=true for diagnostics)",
             "session": "GET|PATCH|DELETE /api/sessions/{session_id}",
             "session_catalog": "GET /api/session-catalog?query={query}; POST /api/session-catalog/rebuild",
             "session_executions": "GET /api/sessions/{session_id}/executions",
@@ -180,10 +183,13 @@ pub fn bridge_protocol_payload() -> Value {
             "performance": "GET /api/performance?session_id={session_id}; POST /api/performance/probe?session_id={session_id}",
             "storage": "GET /api/storage; POST /api/storage/audit|migrate|rollback",
             "agents": "GET /api/agents",
+            "tool_governance": "GET /api/tool-governance",
+            "bad_cases": "GET /api/bad-cases; GET /api/bad-cases/{bad_case_id}; POST /api/turns/{turn_id}/bad-cases; POST /api/bad-cases/{bad_case_id}/transition|promote",
             "tui_control": "GET /tui/control/next; POST /tui/control/response; POST /tui/*",
         },
         "event_methods": [
             "turn/started",
+            "turn/provider",
             "turn/retried",
             "turn/retrying",
             "turn/fallback",
@@ -520,6 +526,13 @@ fn auth_token_from_file(path: &Path) -> String {
 }
 
 pub(super) fn serve_blocking(config: HttpRuntimeConfig) -> CliRunResult {
+    if let Err(error) = recover_storage_before_start(&config) {
+        return CliRunResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!("failed to recover storage before startup: {error}\n"),
+        };
+    }
     let listener = match TcpListener::bind((config.host.as_str(), config.port)) {
         Ok(listener) => listener,
         Err(error) => {
@@ -791,6 +804,7 @@ pub(super) fn route_http_request(
     }
     match (request.method.as_str(), path) {
         ("GET", "/api/health") => json_response(200, health_payload(config)),
+        ("GET", "/metrics") => telemetry_metrics_response(),
         ("GET", "/api/protocol") => json_response(200, bridge_protocol_payload()),
         ("GET", "/api/models") | ("GET", "/api/providers") => {
             json_response(200, providers_payload(config, &request.path))
@@ -824,6 +838,8 @@ pub(super) fn route_http_request(
             Err(error) => json_response(400, json!({"error": error})),
         },
         ("GET", "/api/agents") => json_response(200, agents_payload(config)),
+        ("GET", "/api/tool-governance") => json_response(200, tool_governance_payload(config)),
+        ("GET", "/api/bad-cases") => json_response(200, list_bad_cases_payload(config)),
         ("GET", "/api/mdns") => json_response(200, mdns_payload(config)),
         ("GET", "/api/files") => match files_payload(config, &request.path) {
             Ok(payload) => json_response(200, payload),
@@ -1344,7 +1360,13 @@ pub(super) fn route_dynamic_request(
         && parts[3] == "turns"
         && request.method == "POST"
     {
-        return start_turn_response(config, parts[2], &request.path, &request.body);
+        return start_turn_response(
+            config,
+            parts[2],
+            &request.path,
+            &request.body,
+            &request.headers,
+        );
     }
     if parts.len() == 4
         && parts[0] == "api"
@@ -1378,6 +1400,37 @@ pub(super) fn route_dynamic_request(
         && request.method == "POST"
     {
         return retry_turn_response(config, parts[2]);
+    }
+    if parts.len() == 4
+        && parts[0] == "api"
+        && parts[1] == "turns"
+        && parts[3] == "bad-cases"
+        && request.method == "POST"
+    {
+        return match capture_turn_bad_case_payload(config, parts[2], &request.body) {
+            Ok(payload) => json_response(201, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
+    if parts.len() == 3 && parts[0] == "api" && parts[1] == "bad-cases" && request.method == "GET" {
+        return match get_bad_case_payload(config, parts[2]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(404, json!({"error": error})),
+        };
+    }
+    if parts.len() == 4 && parts[0] == "api" && parts[1] == "bad-cases" && request.method == "POST"
+    {
+        return match parts[3] {
+            "transition" => match transition_bad_case_payload(config, parts[2], &request.body) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            "promote" => match promote_bad_case_payload(config, parts[2], &request.body) {
+                Ok(payload) => json_response(201, payload),
+                Err(error) => json_response(400, json!({"error": error})),
+            },
+            _ => route_unknown(),
+        };
     }
     if path.starts_with("/api/turns/") && path.contains("/approvals/") && request.method == "POST" {
         return match respond_approval_payload(config, path, &request.body) {

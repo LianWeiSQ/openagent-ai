@@ -1,0 +1,19 @@
+{
+  "schema_version": "openharness.regression_observations.v1",
+  "observations": {
+    "runtime.deadline.bad-case-42": {
+      "session_id": "replay-session",
+      "turn_id": "replay-run",
+      "trace_id": "33333333333333333333333333333333",
+      "reason_code": "deadline_exceeded",
+      "events": [
+        {
+          "status": "failed"
+        }
+      ],
+      "usage": {
+        "total_tokens": 0
+      }
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "schema_version": "openharness.load_test.plan.v1",
+  "workload_id": "staging-bridge-turn-soak-v1",
+  "mode": "bridge_turn",
+  "base_url": "http://127.0.0.1:18787",
+  "workspace": ".",
+  "auth_token_env": "OPENHARNESS_LOAD_TOKEN",
+  "method": "POST",
+  "path": "/ignored-in-bridge-turn-mode",
+  "request_body": {
+    "input": "read the current todo state",
+    "permission": "READONLY",
+    "tool_call": {
+      "call_id": "soak_todoread",
+      "name": "todoread",
+      "input": {}
+    }
+  },
+  "concurrency": 4,
+  "requests_per_worker": 0,
+  "duration_seconds": 1800,
+  "think_time_ms": 1000,
+  "request_timeout_ms": 30000,
+  "max_response_bytes": 1048576,
+  "use_system_proxy": false,
+  "min_success_rate": 0.99,
+  "max_p95_duration_ms": 2000,
+  "max_p99_duration_ms": 5000,
+  "max_average_tokens_per_request": 20.0,
+  "max_average_cost_microunits_per_request": 0.0,
+  "max_p95_regression_ratio": 0.2,
+  "max_token_regression_ratio": 0.05,
+  "max_cost_regression_ratio": 0.0
+}

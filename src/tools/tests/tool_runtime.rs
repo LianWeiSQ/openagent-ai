@@ -13,12 +13,13 @@ use openagent_core::PermissionManager;
 use openagent_lsp::{command_available, lsp_status, shutdown_workspace_clients};
 use openagent_protocol::{PermissionAction, PermissionRuleset, ToolCall, ToolResult, Usage};
 use openagent_tools::{
-    LocalWorkspaceRuntime, SessionRunnerFacade, TaskSubagentDescriptor, TodoItem, ToolContext,
-    ToolRegistry, Toolkit, benchmark_mode_allows_shell_command,
-    benchmark_mode_value_allows_shell_command, blocked_command, ensure_within_root,
-    exclusive_schema, format_read_output_from_text, parse_agent_profile_schema,
-    prepare_isolated_workspace, qualify_tool_id, question_answers_from_json, readonly_schema,
-    register_builtin_tools, select_task_subagent_for_prompt, truncate_output,
+    LocalWorkspaceRuntime, SessionRunnerFacade, TOOL_GOVERNANCE_SCHEMA_VERSION,
+    TaskSubagentDescriptor, TodoItem, ToolContext, ToolRegistry, ToolRiskTier, Toolkit,
+    benchmark_mode_allows_shell_command, benchmark_mode_value_allows_shell_command,
+    blocked_command, ensure_within_root, exclusive_schema, format_read_output_from_text,
+    parse_agent_profile_schema, prepare_isolated_workspace, qualify_tool_id,
+    question_answers_from_json, readonly_schema, register_builtin_tools,
+    select_task_subagent_for_prompt, truncate_output,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -30,6 +31,74 @@ fn tool_runtime_fixture_matches_legacy_oracle() -> Result<(), Box<dyn Error>> {
     ))?;
     assert_eq!(fixture, tool_runtime_fixture()?);
     Ok(())
+}
+
+#[test]
+fn builtin_tool_governance_manifest_is_complete_and_fail_closed() {
+    let mut registry = ToolRegistry::new();
+    register_builtin_tools(&mut registry);
+    let manifest = registry.governance_manifest();
+    assert_eq!(manifest.schema_version, TOOL_GOVERNANCE_SCHEMA_VERSION);
+    assert!(manifest.passed, "{:?}", manifest.violations);
+    assert_eq!(manifest.tool_set_fingerprint.len(), 64);
+
+    let bash = manifest
+        .tools
+        .iter()
+        .find(|tool| tool.tool_id == "bash")
+        .expect("bash governance entry");
+    assert_eq!(bash.risk_tier, ToolRiskTier::Privileged);
+    assert_eq!(bash.default_actions["FULL"], "allow");
+    assert_eq!(bash.default_actions["READONLY"], "deny");
+    assert_eq!(bash.default_actions["PLAN_ONLY"], "ask");
+    assert_eq!(bash.default_actions["NONE"], "deny");
+
+    let mut unsafe_write = registry.get("write").expect("write tool").clone();
+    unsafe_write.id = "unsafe_write".to_string();
+    unsafe_write.dangerous = false;
+    registry.register(unsafe_write);
+    let invalid = registry.governance_manifest();
+    assert!(!invalid.passed);
+    assert!(
+        invalid
+            .violations
+            .iter()
+            .any(|violation| violation.contains("unsafe_write must be marked dangerous"))
+    );
+}
+
+#[test]
+fn dynamic_tool_registration_is_atomic_and_cannot_replace_or_hide_unsafe_tools() {
+    let mut registry = ToolRegistry::new();
+    register_builtin_tools(&mut registry);
+    let baseline = registry.governance_manifest().tool_set_fingerprint;
+
+    let mut invalid = registry.get("write").expect("write tool").clone();
+    invalid.id = "dynamic_unsafe_write".to_string();
+    invalid.dangerous = false;
+    let violations = registry
+        .register_governed(invalid)
+        .expect_err("unsafe dynamic tool must be rejected");
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("must be marked dangerous"))
+    );
+    assert!(registry.get("dynamic_unsafe_write").is_none());
+    assert_eq!(
+        registry.governance_manifest().tool_set_fingerprint,
+        baseline
+    );
+
+    let replacement = registry.get("read").expect("read tool").clone();
+    let violations = registry
+        .register_governed(replacement)
+        .expect_err("dynamic tools cannot replace built-ins");
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("conflicts with an existing tool identifier"))
+    );
 }
 
 #[test]
@@ -649,6 +718,9 @@ fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(),
     assert_eq!(read.metadata["preview"], json!("beta"));
     assert_eq!(read.metadata["tool"], json!("read"));
     assert_eq!(read.metadata["title"], json!("notes.txt"));
+    assert_eq!(read.metadata["file_path"], json!("notes.txt"));
+    assert_eq!(read.metadata["read_lines"], json!(1));
+    assert_eq!(read.metadata["read_start_line"], json!(2));
     assert_eq!(read.metadata["truncated"], json!(true));
 
     let edit = toolkit.execute(
@@ -991,6 +1063,13 @@ fn toolkit_enforces_permission_rules_before_execution() -> Result<(), Box<dyn Er
     );
     assert!(read.error.is_none());
     assert_eq!(read.metadata["tool"], json!("read"));
+    assert_eq!(
+        read.metadata["governance_schema_version"],
+        json!(TOOL_GOVERNANCE_SCHEMA_VERSION)
+    );
+    assert_eq!(read.metadata["governance_enforced"], json!(true));
+    assert_eq!(read.metadata["governance_effective_action"], json!("allow"));
+    assert_eq!(read.metadata["governance_risk_tier"], json!("read_only"));
 
     let denied_write = toolkit.execute(
         "write",
@@ -1006,6 +1085,10 @@ fn toolkit_enforces_permission_rules_before_execution() -> Result<(), Box<dyn Er
             .contains("Permission denied")
     );
     assert_eq!(denied_write.metadata["permission_action"], json!("deny"));
+    assert_eq!(
+        denied_write.metadata["governance_effective_action"],
+        json!("deny")
+    );
     assert_eq!(
         denied_write.metadata["error_kind"],
         json!("permission_denied")
@@ -1029,6 +1112,10 @@ fn toolkit_enforces_permission_rules_before_execution() -> Result<(), Box<dyn Er
             .contains("Permission requires user confirmation")
     );
     assert_eq!(needs_approval.metadata["permission_action"], json!("ask"));
+    assert_eq!(
+        needs_approval.metadata["governance_requested_action"],
+        json!("ask")
+    );
     assert_eq!(needs_approval.metadata["requires_approval"], json!(true));
     assert_eq!(
         needs_approval.metadata["input"]["command"],
@@ -1047,6 +1134,22 @@ fn toolkit_enforces_permission_rules_before_execution() -> Result<(), Box<dyn Er
     );
     assert!(allowed_by_skip.error.is_none());
     assert_eq!(allowed_by_skip.output, "allowed");
+    assert_eq!(
+        allowed_by_skip.metadata["governance_requested_action"],
+        json!("ask")
+    );
+    assert_eq!(
+        allowed_by_skip.metadata["governance_effective_action"],
+        json!("allow")
+    );
+    assert_eq!(
+        allowed_by_skip.metadata["governance_approval_bypassed"],
+        json!(true)
+    );
+    assert_eq!(
+        allowed_by_skip.metadata["governance_risk_tier"],
+        json!("privileged")
+    );
 
     let mut auto_deny = ToolContext::new(&root)
         .with_session_id("session/auto-deny")

@@ -1,0 +1,14 @@
+{
+  "schema_version": "openharness.release_evidence.request.v1",
+  "evidence_id": "ci-release-contract-evidence",
+  "candidate_id": "ci-candidate",
+  "generated_at_ms": 1786114000000,
+  "eval_dataset_version": "ci-contract-v1",
+  "baseline_id": "ci-baseline",
+  "eval_report_path": "report.json",
+  "baseline_report_path": "baseline.json",
+  "regression_report_path": "regression.json",
+  "privacy_report_path": "privacy.json",
+  "eval_dataset_manifest_path": "dataset.json",
+  "session_root": "sessions"
+}

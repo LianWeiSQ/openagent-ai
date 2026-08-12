@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "case_id": "runtime.deadline",
+      "status": "pass",
+      "score": 1.0,
+      "duration_ms": 100,
+      "input_tokens": 80,
+      "output_tokens": 20,
+      "cost": 0.0001
+    },
+    {
+      "case_id": "telemetry.collector-outage",
+      "status": "pass",
+      "score": 1.0,
+      "duration_ms": 120,
+      "input_tokens": 90,
+      "output_tokens": 20,
+      "cost": 0.0001
+    }
+  ]
+}

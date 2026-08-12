@@ -1,10 +1,12 @@
 use super::*;
+use fs2::FileExt;
 
 const STORAGE_STATUS_SCHEMA: &str = "openagent.storage_status.v1";
 const STORAGE_MIGRATION_SCHEMA: &str = "openagent.storage_migration.v1";
 const STORAGE_SCHEMA_SET: &str = "openagent.storage.2026-07";
 const MIGRATION_DIR: &str = ".openagent-runtime/migrations";
 const MIGRATION_BACKUP_DIR: &str = ".openagent-runtime/migration-backups";
+const MIGRATION_LOCK_FILE: &str = ".openagent-runtime/storage-migration.lock";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StorageMigrationAction {
@@ -48,11 +50,16 @@ struct StorageAuditPlan {
 }
 
 pub(super) fn storage_status_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
-    storage_status_for_root(&session_root(config))
+    let root = session_root(config);
+    let _lock = lock_storage_migrations(&root)?;
+    recover_incomplete_storage_migrations(&root)?;
+    storage_status_for_root(&root)
 }
 
 pub(super) fn storage_migrate_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
     let root = session_root(config);
+    let _lock = lock_storage_migrations(&root)?;
+    recover_incomplete_storage_migrations(&root)?;
     let plan = audit_storage(&root)?;
     if !plan.blocked_reasons.is_empty() {
         return Err("storage migration is blocked by incompatible or corrupt state".to_string());
@@ -83,6 +90,8 @@ pub(super) fn storage_rollback_payload(
 ) -> Result<Value, String> {
     let request = serde_json::from_str::<StorageRollbackRequest>(body).unwrap_or_default();
     let root = session_root(config);
+    let _lock = lock_storage_migrations(&root)?;
+    recover_incomplete_storage_migrations(&root)?;
     let migration_id = request
         .migration_id
         .filter(|value| valid_migration_id(value))
@@ -99,6 +108,15 @@ pub(super) fn storage_rollback_payload(
     let mut status = storage_status_for_root(&root)?;
     status["migration"] = public_migration_manifest(&manifest);
     Ok(status)
+}
+
+pub(super) fn recover_storage_before_start(config: &HttpRuntimeConfig) -> Result<(), String> {
+    let root = session_root(config);
+    if !migration_manifest_dir(&root).is_dir() {
+        return Ok(());
+    }
+    let _lock = lock_storage_migrations(&root)?;
+    recover_incomplete_storage_migrations(&root)
 }
 
 fn storage_status_for_root(root: &Path) -> Result<Value, String> {
@@ -371,13 +389,26 @@ fn audit_transcript(path: &Path, plan: &mut StorageAuditPlan) {
             }
         };
         plan.transcript_record_count = plan.transcript_record_count.saturating_add(1);
-        if value
-            .get("schema_version")
-            .and_then(Value::as_str)
-            .is_none_or(|schema| schema == "openagent.message.v1")
-        {
-            plan.compatible_legacy_record_count =
-                plan.compatible_legacy_record_count.saturating_add(1);
+        let schema = value.get("schema_version").and_then(Value::as_str);
+        match schema {
+            None | Some("openagent.message.v1") => {
+                plan.compatible_legacy_record_count =
+                    plan.compatible_legacy_record_count.saturating_add(1);
+            }
+            Some(
+                "openagent.message.v2"
+                | "openagent.message_part.v2"
+                | "openagent.message_tombstone.v2"
+                | "openagent.message_part_tombstone.v2",
+            ) => {}
+            Some(schema) if schema.ends_with(".v0") => {
+                plan.compatible_legacy_record_count =
+                    plan.compatible_legacy_record_count.saturating_add(1);
+            }
+            Some(_) => {
+                increment_reason(plan, "unsupported_transcript_schema");
+                return;
+            }
         }
     }
 }
@@ -404,9 +435,17 @@ fn execute_storage_migration(
     };
     backup_migration_files(root, &mut manifest)?;
     write_migration_manifest(root, &manifest)?;
+    manifest.status = "applying".to_string();
+    write_migration_manifest(root, &manifest)?;
     let result = apply_migration_actions(root, &manifest.actions, fail_after);
     if result.is_err() {
-        let _ = restore_migration_files(root, &manifest);
+        if let Err(rollback_error) = restore_migration_files(root, &manifest) {
+            manifest.error_code = Some("migration_rollback_failed".to_string());
+            let _ = write_migration_manifest(root, &manifest);
+            return Err(format!(
+                "storage migration failed and rollback is incomplete: {rollback_error}"
+            ));
+        }
         manifest.status = "failed_rolled_back".to_string();
         manifest.rolled_back_at_ms = Some(now_ms());
         manifest.error_code = Some("migration_apply_failed".to_string());
@@ -415,7 +454,13 @@ fn execute_storage_migration(
     }
     let post = audit_storage(root)?;
     if !post.blocked_reasons.is_empty() || !post.actions.is_empty() {
-        let _ = restore_migration_files(root, &manifest);
+        if let Err(rollback_error) = restore_migration_files(root, &manifest) {
+            manifest.error_code = Some("migration_rollback_failed".to_string());
+            let _ = write_migration_manifest(root, &manifest);
+            return Err(format!(
+                "storage migration validation failed and rollback is incomplete: {rollback_error}"
+            ));
+        }
         manifest.status = "failed_rolled_back".to_string();
         manifest.rolled_back_at_ms = Some(now_ms());
         manifest.error_code = Some("migration_validation_failed".to_string());
@@ -429,6 +474,22 @@ fn execute_storage_migration(
     manifest.changed_file_count = manifest.actions.len();
     write_migration_manifest(root, &manifest)?;
     Ok(manifest)
+}
+
+fn recover_incomplete_storage_migrations(root: &Path) -> Result<(), String> {
+    let mut manifests = migration_manifests(root)
+        .into_iter()
+        .filter(|manifest| matches!(manifest.status.as_str(), "prepared" | "applying"))
+        .collect::<Vec<_>>();
+    manifests.sort_by_key(|manifest| manifest.created_at_ms);
+    for mut manifest in manifests {
+        restore_migration_files(root, &manifest)?;
+        manifest.status = "failed_rolled_back".to_string();
+        manifest.rolled_back_at_ms = Some(now_ms());
+        manifest.error_code = Some("migration_interrupted".to_string());
+        write_migration_manifest(root, &manifest)?;
+    }
+    Ok(())
 }
 
 fn apply_migration_actions(
@@ -513,7 +574,7 @@ fn backup_migration_files(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        fs::copy(source, target).map_err(|error| error.to_string())?;
+        copy_file_durable(&source, &target)?;
         manifest.backup_file_count = manifest.backup_file_count.saturating_add(1);
     }
     Ok(())
@@ -532,9 +593,13 @@ fn restore_migration_files(root: &Path, manifest: &StorageMigrationManifest) -> 
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|error| error.to_string())?;
             }
-            fs::copy(backup, target).map_err(|error| error.to_string())?;
+            let temporary =
+                target.with_extension(format!("restore-{}-{}", std::process::id(), now_ms()));
+            copy_file_durable(&backup, &temporary)?;
+            replace_file(&temporary, &target)?;
         } else if target.exists() {
-            fs::remove_file(target).map_err(|error| error.to_string())?;
+            fs::remove_file(&target).map_err(|error| error.to_string())?;
+            sync_parent_directory(&target)?;
         }
     }
     Ok(())
@@ -576,27 +641,51 @@ fn read_migration_manifest(
 }
 
 fn latest_migration_manifest(root: &Path) -> Option<StorageMigrationManifest> {
-    let mut manifests = fs::read_dir(migration_manifest_dir(root))
-        .ok()?
-        .flatten()
-        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-        .filter_map(|raw| serde_json::from_str::<StorageMigrationManifest>(&raw).ok())
-        .collect::<Vec<_>>();
+    let mut manifests = migration_manifests(root);
     manifests.sort_by_key(|manifest| manifest.created_at_ms);
     manifests.pop()
 }
 
 fn latest_completed_manifest(root: &Path) -> Option<StorageMigrationManifest> {
-    let mut manifests = fs::read_dir(migration_manifest_dir(root))
-        .ok()?
-        .flatten()
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-        .filter_map(|raw| serde_json::from_str::<StorageMigrationManifest>(&raw).ok())
+    let mut manifests = migration_manifests(root)
+        .into_iter()
         .filter(|manifest| manifest.status == "completed")
         .collect::<Vec<_>>();
     manifests.sort_by_key(|manifest| manifest.created_at_ms);
     manifests.pop()
+}
+
+fn migration_manifests(root: &Path) -> Vec<StorageMigrationManifest> {
+    fs::read_dir(migration_manifest_dir(root))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|raw| serde_json::from_str::<StorageMigrationManifest>(&raw).ok())
+        .collect()
+}
+
+fn lock_storage_migrations(root: &Path) -> Result<StorageMigrationLock, String> {
+    let path = root.join(MIGRATION_LOCK_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.try_lock_exclusive()
+        .map_err(|error| format!("failed to lock storage migration: {error}"))?;
+    Ok(StorageMigrationLock { _file: file })
+}
+
+struct StorageMigrationLock {
+    _file: fs::File,
 }
 
 fn public_migration_manifest(manifest: &StorageMigrationManifest) -> Value {
@@ -633,6 +722,13 @@ fn atomic_write_private_json(path: &Path, value: &Value) -> Result<(), String> {
     replace_file(&temporary, path)
 }
 
+#[cfg(unix)]
+fn replace_file(temporary: &Path, target: &Path) -> Result<(), String> {
+    fs::rename(temporary, target).map_err(|error| error.to_string())?;
+    sync_parent_directory(target)
+}
+
+#[cfg(not(unix))]
 fn replace_file(temporary: &Path, target: &Path) -> Result<(), String> {
     if !target.exists() {
         return fs::rename(temporary, target).map_err(|error| error.to_string());
@@ -650,6 +746,26 @@ fn replace_file(temporary: &Path, target: &Path) -> Result<(), String> {
             Err(error.to_string())
         }
     }
+}
+
+fn copy_file_durable(source: &Path, target: &Path) -> Result<(), String> {
+    fs::copy(source, target).map_err(|error| error.to_string())?;
+    fs::OpenOptions::new()
+        .read(true)
+        .open(target)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    sync_parent_directory(target)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn read_required_object(path: &Path) -> Result<Map<String, Value>, String> {
@@ -782,6 +898,94 @@ mod tests {
         let plan = audit_storage(&root).expect("blocked audit");
         assert_eq!(plan.blocked_reasons.get("unsupported_schema"), Some(&1));
         assert_eq!(fs::read(path).expect("unchanged bytes"), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_storage_migration_is_rolled_back_idempotently() {
+        let root = std::env::temp_dir().join(format!(
+            "openagent-storage-interrupted-migration-{}",
+            now_ms()
+        ));
+        let session_dir = legacy_session(&root, "session_interrupted_fixture", "before");
+        let state_path = session_dir.join("state.latest.json");
+        let before = fs::read(&state_path).expect("legacy bytes");
+        let plan = audit_storage(&root).expect("migration plan");
+        let migration_id = format!("migration_interrupted_{}", now_ms());
+        let mut manifest = StorageMigrationManifest {
+            schema_version: STORAGE_MIGRATION_SCHEMA.to_string(),
+            migration_id,
+            target_schema_set: STORAGE_SCHEMA_SET.to_string(),
+            status: "applying".to_string(),
+            created_at_ms: now_ms(),
+            completed_at_ms: None,
+            rolled_back_at_ms: None,
+            action_count: plan.actions.len(),
+            changed_file_count: 0,
+            backup_file_count: 0,
+            actions: plan.actions,
+            error_code: None,
+        };
+        backup_migration_files(&root, &mut manifest).expect("backup");
+        write_migration_manifest(&root, &manifest).expect("manifest");
+        assert!(
+            apply_migration_actions(&root, &manifest.actions, Some(1)).is_err(),
+            "fixture must leave a partially applied migration"
+        );
+        assert_ne!(
+            fs::read(&state_path).expect("partially migrated bytes"),
+            before
+        );
+
+        recover_incomplete_storage_migrations(&root).expect("startup recovery");
+        assert_eq!(fs::read(&state_path).expect("restored bytes"), before);
+        assert!(!session_dir.join("session.json").exists());
+        let recovered =
+            read_migration_manifest(&root, &manifest.migration_id).expect("recovered manifest");
+        assert_eq!(recovered.status, "failed_rolled_back");
+        assert_eq!(
+            recovered.error_code.as_deref(),
+            Some("migration_interrupted")
+        );
+
+        recover_incomplete_storage_migrations(&root).expect("idempotent startup recovery");
+        assert_eq!(fs::read(state_path).expect("still restored"), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_audit_accepts_known_transcript_versions_and_blocks_future_schema() {
+        let root = std::env::temp_dir().join(format!("openagent-storage-transcript-{}", now_ms()));
+        let session_dir = legacy_session(&root, "session_transcript_fixture", "transcript");
+        fs::write(
+            session_dir.join("transcript.jsonl"),
+            [
+                r#"{"role":"user","content":"legacy"}"#,
+                r#"{"schema_version":"openagent.message.v1","role":"user","content":"v1"}"#,
+                r#"{"schema_version":"openagent.message.v2","info":{"id":"msg_v2"}}"#,
+                r#"{"schema_version":"openagent.message_part.v2","part":{"id":"part_v2"}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("compatible transcript");
+        let compatible = audit_storage(&root).expect("compatible audit");
+        assert_eq!(compatible.compatible_legacy_record_count, 2);
+        assert!(
+            !compatible
+                .blocked_reasons
+                .contains_key("unsupported_transcript_schema")
+        );
+
+        fs::write(
+            session_dir.join("transcript.jsonl"),
+            r#"{"schema_version":"openagent.message.v99","role":"user","content":"future"}"#,
+        )
+        .expect("future transcript");
+        let blocked = audit_storage(&root).expect("future audit");
+        assert_eq!(
+            blocked.blocked_reasons.get("unsupported_transcript_schema"),
+            Some(&1)
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

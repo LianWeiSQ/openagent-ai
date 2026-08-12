@@ -7,6 +7,7 @@ use openagent_mcp::{
     normalize_tool_call_result, sanitize_mcp_observation_value, sanitize_mcp_trace_value,
     timeout_seconds, tool_allowed, transport_candidates, unavailable_tool_result,
 };
+use openagent_tools::{ToolRegistry, ToolRiskTier};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -110,6 +111,15 @@ fn mcp_runtime_fixture_matches_legacy_oracle() -> Result<(), Box<dyn Error>> {
     );
 
     let bridge_definition = mcp_tool_definition(descriptor, "remote-mcp");
+    assert!(bridge_definition.execution_schema.read_only);
+    assert!(!bridge_definition.dangerous);
+    let mut governed = ToolRegistry::new();
+    governed
+        .register_governed(bridge_definition.clone())
+        .expect("read-only MCP tool is governance-valid");
+    let manifest = governed.governance_manifest();
+    assert!(manifest.passed, "{:?}", manifest.violations);
+    assert_eq!(manifest.tools[0].risk_tier, ToolRiskTier::ExternalRead);
     assert_eq!(
         json!({
             "id": bridge_definition.id,
@@ -155,6 +165,36 @@ fn mcp_runtime_fixture_matches_legacy_oracle() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+#[test]
+fn unannotated_mcp_tools_fail_closed_as_privileged_external_mutations() {
+    let server = load_mcp_config_from_value(&raw_config())
+        .expect("config")
+        .servers
+        .remove(0);
+    let descriptor = build_tool_descriptors_from_values(
+        &server,
+        &[json!({
+            "name": "Data-Action",
+            "description": "No safety annotations.",
+            "inputSchema": {"type": "object"}
+        })],
+    )
+    .remove(0);
+    let definition = mcp_tool_definition(&descriptor, "remote-mcp");
+    assert!(definition.dangerous);
+    assert!(!definition.execution_schema.read_only);
+    assert!(definition.execution_schema.mutates_external);
+
+    let mut registry = ToolRegistry::new();
+    registry
+        .register_governed(definition)
+        .expect("conservatively privileged MCP definition is valid");
+    let manifest = registry.governance_manifest();
+    assert_eq!(manifest.tools[0].risk_tier, ToolRiskTier::Privileged);
+    assert_eq!(manifest.tools[0].default_actions["PLAN_ONLY"], "ask");
+    assert_eq!(manifest.tools[0].default_actions["READONLY"], "deny");
 }
 
 #[test]

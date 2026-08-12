@@ -9,6 +9,21 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+mod quality_gate;
+pub use quality_gate::*;
+mod bad_case;
+pub use bad_case::*;
+mod fault_injection;
+pub use fault_injection::*;
+mod evidence;
+pub use evidence::*;
+mod regression;
+pub use regression::*;
+mod load_test;
+pub use load_test::*;
+mod release_bundle;
+pub use release_bundle::*;
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const FIXTURE_ROOT: &str = "/tmp/openagent-rust-rewrite-fixture-goal13";
 

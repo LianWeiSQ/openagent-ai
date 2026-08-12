@@ -1,0 +1,16 @@
+{
+  "schema_version": "openharness.privacy_audit.report.v1",
+  "audit_id": "ci-privacy-contract",
+  "cases": [
+    {
+      "case_id": "runtime.deadline",
+      "scanner_version": "contract-scanner-v1",
+      "violations": []
+    },
+    {
+      "case_id": "telemetry.collector-outage",
+      "scanner_version": "contract-scanner-v1",
+      "violations": []
+    }
+  ]
+}

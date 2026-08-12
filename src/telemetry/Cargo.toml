@@ -1,0 +1,26 @@
+[package]
+name = "openagent-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-prometheus.workspace = true
+opentelemetry_sdk.workspace = true
+prometheus.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+serde_yaml.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

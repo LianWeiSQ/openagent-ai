@@ -27,6 +27,7 @@ User task
 | `src/tools` | Tool registry, built-in tools, and workspace runtime |
 | `src/provider` | Provider adapters, tool-call assembly, capability negotiation, and stream normalization |
 | `src/session` | Session store, trace, observability, and replay evidence |
+| `src/telemetry` | Task/Run contract, W3C propagation, OTel export, Prometheus metrics, and redaction policy |
 | `src/mcp` | MCP config, discovery, auth, and tool bridge contracts |
 | `swarm` | Agent-agnostic swarm runner orchestration |
 | `eval` | Eval runner, CI gate, and benchmark integrations |
@@ -42,6 +43,7 @@ The HTTP runtime is split by service ownership:
 | Module | Responsibility |
 | --- | --- |
 | `bridge_routes` | HTTP routing, protocol discovery, JSON/SSE transport |
+| `bad_case_runtime` | sanitized Run capture, triage state, and regression-fixture promotion |
 | `turn_runtime` | turn queue, workers, leases, and restart recovery |
 | `provider_runtime` | provider catalog, configuration, validation, retry/fallback |
 | `mcp_runtime` | MCP server lifecycle, OAuth, discovery, and execution |

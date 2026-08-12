@@ -1365,26 +1365,68 @@ pub fn build_result_metadata(
 
 #[must_use]
 pub fn mcp_tool_definition(descriptor: &RemoteMcpToolDescriptor, group: &str) -> ToolDefinition {
+    let read_only = mcp_execution_flag(descriptor, "read_only", "readOnlyHint").unwrap_or(false);
+    let mutates_workspace =
+        mcp_execution_flag(descriptor, "mutates_workspace", "mutatesWorkspaceHint")
+            .unwrap_or(false);
+    let mutates_session =
+        mcp_execution_flag(descriptor, "mutates_session", "mutatesSessionHint").unwrap_or(false);
+    // An MCP tool without an explicit read-only declaration is treated as an
+    // external mutation. This makes unknown remote tools approval-gated rather
+    // than trusting an omitted annotation.
+    let mutates_external =
+        mcp_execution_flag(descriptor, "mutates_external", "mutatesExternalHint")
+            .unwrap_or(!read_only);
+    let dangerous_hint = mcp_execution_flag(descriptor, "dangerous", "destructiveHint")
+        .or_else(|| mcp_annotation_bool(descriptor, "dangerous"))
+        .unwrap_or(false);
+    let requires_user_interaction = mcp_execution_flag(
+        descriptor,
+        "requires_user_interaction",
+        "requiresUserInteractionHint",
+    )
+    .unwrap_or(false);
     ToolDefinition {
         id: descriptor.dynamic_name.clone(),
         description: descriptor.description.clone(),
         parameter_schema: descriptor.input_schema.clone(),
-        dangerous: true,
+        dangerous: dangerous_hint
+            || !read_only
+            || mutates_workspace
+            || mutates_session
+            || mutates_external,
         group: group.to_string(),
         execution_scope: ToolExecutionScope::Agnostic,
         execution_schema: ToolExecutionSchema {
-            read_only: false,
-            mutates_workspace: false,
-            mutates_session: false,
-            mutates_external: false,
+            read_only,
+            mutates_workspace,
+            mutates_session,
+            mutates_external,
             external_io: true,
-            requires_user_interaction: false,
+            requires_user_interaction,
             concurrency: ToolConcurrency::Unknown,
             batch_group: group.to_string(),
             conflict_key_template: None,
             max_parallelism: None,
         },
     }
+}
+
+fn mcp_execution_flag(
+    descriptor: &RemoteMcpToolDescriptor,
+    execution_key: &str,
+    annotation_key: &str,
+) -> Option<bool> {
+    descriptor
+        .raw_metadata
+        .get("execution")
+        .and_then(|execution| execution.get(execution_key))
+        .and_then(Value::as_bool)
+        .or_else(|| mcp_annotation_bool(descriptor, annotation_key))
+}
+
+fn mcp_annotation_bool(descriptor: &RemoteMcpToolDescriptor, key: &str) -> Option<bool> {
+    descriptor.annotations.get(key).and_then(Value::as_bool)
 }
 
 #[must_use]

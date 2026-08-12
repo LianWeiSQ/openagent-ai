@@ -10,13 +10,16 @@ rust-version.workspace = true
 openagent-bridge-server.workspace = true
 openagent-bridge-server-client.workspace = true
 openagent-core.workspace = true
+openagent-eval.workspace = true
 openagent-lsp.workspace = true
 openagent-mcp.workspace = true
 openagent-protocol.workspace = true
 openagent-provider.workspace = true
 openagent-session.workspace = true
+openagent-telemetry.workspace = true
 openagent-tools.workspace = true
 base64.workspace = true
+fs2.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
@@ -24,9 +27,6 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
 url.workspace = true
-
-[dev-dependencies]
-openagent-eval.workspace = true
 
 [lib]
 path = "src/http_runtime.rs"

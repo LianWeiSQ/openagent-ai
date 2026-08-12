@@ -1,0 +1,25 @@
+{
+  "schema_version": "openharness.load_test.baseline.v1",
+  "baseline_id": "ci-bridge-turn-local-v1",
+  "workload_id": "ci-bridge-turn-v1",
+  "workload_fingerprint": "a0c5ee2031a38848eb8f168dfe36cf3ce8ddb4d4613cafb249b3ca9e58242c4b",
+  "accepted_at_ms": 1786116781071,
+  "metrics": {
+    "total_requests": 6,
+    "successful_requests": 6,
+    "failed_requests": 0,
+    "success_rate": 1.0,
+    "elapsed_ms": 6551,
+    "requests_per_second": 0.9158907037093572,
+    "p50_duration_ms": 370,
+    "p95_duration_ms": 395,
+    "p99_duration_ms": 395,
+    "total_input_tokens": 42,
+    "total_output_tokens": 36,
+    "total_tokens": 78,
+    "total_cost_microunits": 0,
+    "average_tokens_per_request": 13.0,
+    "average_cost_microunits_per_request": 0.0
+  },
+  "content_fingerprint": "2e51ec0596c1b5b8c174fbf6eb5a8690f1b484e081442344d3c0cce6928c0eae"
+}

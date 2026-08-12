@@ -1,0 +1,19 @@
+{
+  "schema_version": "openharness.quality_gate.policy.v1",
+  "policy_id": "openharness-ci-contract-v1",
+  "min_success_rate": 1.0,
+  "max_degraded_rate": 0.0,
+  "min_trace_completeness": 1.0,
+  "max_privacy_violations": 0,
+  "max_status_regressions": 0,
+  "max_budget_regressions": 0,
+  "max_p95_duration_regression_ratio": 0.0,
+  "max_total_token_regression_ratio": 0.0,
+  "max_total_cost_regression_ratio": 0.0,
+  "require_case_links": true,
+  "require_provenance": true,
+  "required_critical_cases": [
+    "runtime.deadline",
+    "telemetry.collector-outage"
+  ]
+}

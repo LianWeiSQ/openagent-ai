@@ -1,0 +1,34 @@
+{
+  "schema_version": "openharness.load_test.plan.v1",
+  "workload_id": "ci-bridge-turn-v1",
+  "mode": "bridge_turn",
+  "base_url": "http://127.0.0.1:18787",
+  "workspace": ".",
+  "auth_token_env": "OPENHARNESS_LOAD_TOKEN",
+  "method": "POST",
+  "path": "/ignored-in-bridge-turn-mode",
+  "request_body": {
+    "input": "read the current todo state",
+    "permission": "READONLY",
+    "tool_call": {
+      "call_id": "load_todoread",
+      "name": "todoread",
+      "input": {}
+    }
+  },
+  "concurrency": 2,
+  "requests_per_worker": 3,
+  "duration_seconds": null,
+  "think_time_ms": 10,
+  "request_timeout_ms": 30000,
+  "max_response_bytes": 1048576,
+  "use_system_proxy": false,
+  "min_success_rate": 1.0,
+  "max_p95_duration_ms": 5000,
+  "max_p99_duration_ms": 10000,
+  "max_average_tokens_per_request": 20.0,
+  "max_average_cost_microunits_per_request": 0.0,
+  "max_p95_regression_ratio": 10.0,
+  "max_token_regression_ratio": 0.0,
+  "max_cost_regression_ratio": 0.0
+}

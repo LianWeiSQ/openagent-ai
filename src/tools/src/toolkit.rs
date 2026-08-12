@@ -25,6 +25,7 @@ use openagent_protocol::{
     ChatMessage, PermissionAction, PermissionRuleset, Role, ToolCall, ToolConcurrency,
     ToolExecutionSchema, ToolExecutionScope, ToolResult, ToolSchema, Usage,
 };
+use openagent_telemetry::canonical_json_fingerprint;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -33,6 +34,7 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const TASK_TOOL_ID: &str = "task";
 pub const WEB_FETCH_TOOL_ID: &str = "web_fetch";
 pub const LSP_TOOL_ID: &str = "lsp";
+pub const TOOL_GOVERNANCE_SCHEMA_VERSION: &str = "openharness.tool_governance.v1";
 pub const DEFAULT_BUILD_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/build.txt");
 
 const EXPLORE_AGENT_PROMPT: &str = include_str!("../../../skill/prompts/explore.txt");
@@ -255,6 +257,47 @@ impl ToolDefinition {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRiskTier {
+    ReadOnly,
+    ExternalRead,
+    Mutating,
+    Privileged,
+}
+
+impl ToolRiskTier {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::ExternalRead => "external_read",
+            Self::Mutating => "mutating",
+            Self::Privileged => "privileged",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ToolGovernanceEntryV1 {
+    pub tool_id: String,
+    pub group: String,
+    pub risk_tier: ToolRiskTier,
+    pub dangerous: bool,
+    pub execution_scope: ToolExecutionScope,
+    pub execution_schema: ToolExecutionSchema,
+    pub default_actions: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ToolGovernanceManifestV1 {
+    pub schema_version: String,
+    pub tool_set_fingerprint: String,
+    pub passed: bool,
+    pub violations: Vec<String>,
+    pub tools: Vec<ToolGovernanceEntryV1>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolDefinition>,
@@ -278,6 +321,52 @@ impl ToolRegistry {
         self.tools.insert(tool.id.clone(), tool);
     }
 
+    /// Register one dynamically discovered tool only when the complete registry
+    /// remains governance-valid. Existing identifiers cannot be replaced by a
+    /// dynamic registration.
+    pub fn register_governed(&mut self, tool: ToolDefinition) -> Result<(), Vec<String>> {
+        self.register_governed_batch([tool])
+    }
+
+    /// Atomically register a dynamically discovered tool batch.
+    ///
+    /// This is intended for MCP/plugin discovery where partially exposing a
+    /// server's catalog would make the advertised Tool Set differ from the
+    /// executable one. On failure, the registry is left unchanged.
+    pub fn register_governed_batch(
+        &mut self,
+        tools: impl IntoIterator<Item = ToolDefinition>,
+    ) -> Result<(), Vec<String>> {
+        let candidates = tools.into_iter().collect::<Vec<_>>();
+        let mut violations = Vec::new();
+        let mut candidate_ids = BTreeSet::new();
+        for tool in &candidates {
+            if self.tools.contains_key(&tool.id) {
+                violations.push(format!(
+                    "dynamic tool {} conflicts with an existing tool identifier",
+                    tool.id
+                ));
+            }
+            if !candidate_ids.insert(tool.id.clone()) {
+                violations.push(format!(
+                    "dynamic tool batch contains duplicate identifier: {}",
+                    tool.id
+                ));
+            }
+        }
+        let manifest = tool_governance_manifest(self.tools.values().chain(candidates.iter()));
+        violations.extend(manifest.violations);
+        violations.sort();
+        violations.dedup();
+        if !violations.is_empty() {
+            return Err(violations);
+        }
+        for tool in candidates {
+            self.tools.insert(tool.id.clone(), tool);
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn get(&self, tool_id: &str) -> Option<&ToolDefinition> {
         self.tools.get(tool_id)
@@ -293,12 +382,133 @@ impl ToolRegistry {
     }
 
     #[must_use]
+    pub fn governance_manifest(&self) -> ToolGovernanceManifestV1 {
+        tool_governance_manifest(self.tools.values())
+    }
+
+    #[must_use]
     pub fn tool_schemas(&self, execution_mode: &str) -> Vec<ToolSchema> {
         self.tools
             .values()
             .filter(|tool| tool_available(tool, execution_mode))
             .map(ToolDefinition::tool_schema)
             .collect()
+    }
+}
+
+#[must_use]
+pub fn tool_risk_tier(tool: &ToolDefinition) -> ToolRiskTier {
+    if tool.execution_schema.read_only {
+        if tool.execution_schema.external_io || tool.execution_scope == ToolExecutionScope::HostOnly
+        {
+            ToolRiskTier::ExternalRead
+        } else {
+            ToolRiskTier::ReadOnly
+        }
+    } else if tool.execution_schema.mutates_external
+        || (tool.dangerous && tool.execution_schema.external_io)
+        || (tool.dangerous && tool.execution_scope == ToolExecutionScope::HostOnly)
+    {
+        ToolRiskTier::Privileged
+    } else if tool.execution_schema.mutates_workspace
+        || tool.execution_schema.mutates_session
+        || tool.dangerous
+    {
+        ToolRiskTier::Mutating
+    } else {
+        ToolRiskTier::ExternalRead
+    }
+}
+
+#[must_use]
+pub fn tool_governance_manifest<'a>(
+    tools: impl IntoIterator<Item = &'a ToolDefinition>,
+) -> ToolGovernanceManifestV1 {
+    let mut entries = Vec::new();
+    let mut violations = Vec::new();
+    for tool in tools {
+        let risk_tier = tool_risk_tier(tool);
+        let default_actions = [
+            PermissionRuleset::Full,
+            PermissionRuleset::Readonly,
+            PermissionRuleset::PlanOnly,
+            PermissionRuleset::None,
+        ]
+        .into_iter()
+        .map(|ruleset| {
+            let name = ruleset.as_str().to_string();
+            let mut manager = PermissionManager::new();
+            manager.set_ruleset(ruleset);
+            let action = manager.decide(&json!({"name": tool.id, "input": {}}));
+            (name, permission_action_name(&action).to_string())
+        })
+        .collect::<BTreeMap<_, _>>();
+
+        if tool.id.trim().is_empty()
+            || tool.description.trim().is_empty()
+            || tool.group.trim().is_empty()
+        {
+            violations.push(format!(
+                "tool {} must declare a non-empty id, description, and group",
+                tool.id
+            ));
+        }
+        if tool.parameter_schema.get("type").and_then(Value::as_str) != Some("object") {
+            violations.push(format!(
+                "tool {} parameters must use an object schema",
+                tool.id
+            ));
+        }
+        if tool.execution_schema.read_only
+            && (tool.execution_schema.mutates_workspace || tool.execution_schema.mutates_external)
+        {
+            violations.push(format!(
+                "tool {} declares read_only with workspace or external mutation",
+                tool.id
+            ));
+        }
+        if (tool.execution_schema.mutates_workspace || tool.execution_schema.mutates_external)
+            && !tool.dangerous
+        {
+            violations.push(format!(
+                "state-changing tool {} must be marked dangerous",
+                tool.id
+            ));
+        }
+        if (tool.execution_schema.mutates_workspace || tool.execution_schema.mutates_external)
+            && default_actions.get("READONLY").map(String::as_str) == Some("allow")
+        {
+            violations.push(format!(
+                "state-changing tool {} must not be allowed by READONLY",
+                tool.id
+            ));
+        }
+        if tool.dangerous && default_actions.get("PLAN_ONLY").map(String::as_str) == Some("allow") {
+            violations.push(format!(
+                "dangerous tool {} must require approval or be denied by PLAN_ONLY",
+                tool.id
+            ));
+        }
+        entries.push(ToolGovernanceEntryV1 {
+            tool_id: tool.id.clone(),
+            group: tool.group.clone(),
+            risk_tier,
+            dangerous: tool.dangerous,
+            execution_scope: tool.execution_scope.clone(),
+            execution_schema: tool.execution_schema.clone(),
+            default_actions,
+        });
+    }
+    entries.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
+    violations.sort();
+    violations.dedup();
+    let fingerprint_value = serde_json::to_value(&entries).unwrap_or(Value::Null);
+    ToolGovernanceManifestV1 {
+        schema_version: TOOL_GOVERNANCE_SCHEMA_VERSION.to_string(),
+        tool_set_fingerprint: canonical_json_fingerprint(&fingerprint_value),
+        passed: violations.is_empty(),
+        violations,
+        tools: entries,
     }
 }
 
@@ -1989,6 +2199,12 @@ impl LocalWorkspaceRuntime {
         _timeout_ms: u64,
     ) -> ToolResultValue<CommandResult> {
         let resolved_cwd = self.resolve_path(cwd, true)?;
+        if !resolved_cwd.is_dir() {
+            return Err(format!(
+                "working directory no longer exists or is not a directory: {}",
+                path_to_string(&resolved_cwd)
+            ));
+        }
         let output = shell_command(command)
             .current_dir(&resolved_cwd)
             .output()
@@ -2257,6 +2473,11 @@ impl Toolkit {
     }
 
     #[must_use]
+    pub fn governance_manifest(&self) -> ToolGovernanceManifestV1 {
+        self.registry.governance_manifest()
+    }
+
+    #[must_use]
     pub fn execute(
         &self,
         name: &str,
@@ -2294,14 +2515,18 @@ impl Toolkit {
             return result;
         }
 
+        let governance_metadata = tool_governance_metadata(tool, &input, ctx);
         ctx.call_id = call_id.to_string();
         match execute_builtin(name, input, ctx) {
-            Ok(output) => self.finish_tool_result(tool, call_id, output, ctx),
+            Ok(output) => self.finish_tool_result(tool, call_id, output, governance_metadata, ctx),
             Err(error) => ToolResult {
                 call_id: call_id.to_string(),
                 output: String::new(),
                 error: Some(error),
-                metadata: BTreeMap::from([("tool".to_string(), json!(tool.id))]),
+                metadata: governance_metadata
+                    .into_iter()
+                    .chain([("tool".to_string(), json!(tool.id))])
+                    .collect(),
             },
         }
     }
@@ -2348,6 +2573,7 @@ impl Toolkit {
         tool: &ToolDefinition,
         call_id: &str,
         output: ToolOutput,
+        governance_metadata: BTreeMap<String, Value>,
         ctx: &ToolContext,
     ) -> ToolResult {
         let truncated_output = truncate_output(
@@ -2357,6 +2583,9 @@ impl Toolkit {
         );
         let output_truncated = truncated_output.truncated;
         let mut metadata = output.metadata;
+        for (key, value) in governance_metadata {
+            metadata.entry(key).or_insert(value);
+        }
         metadata
             .entry("tool".to_string())
             .or_insert_with(|| json!(tool.id));
@@ -2439,6 +2668,74 @@ fn permission_gate(
     }
 }
 
+fn tool_governance_metadata(
+    tool: &ToolDefinition,
+    input: &Value,
+    ctx: &ToolContext,
+) -> BTreeMap<String, Value> {
+    let requested = ctx
+        .permission_manager
+        .as_ref()
+        .map(|manager| manager.decide(&json!({"name": tool.id, "input": input})));
+    let (requested_action, effective_action, enforced, approval_bypassed) = match requested {
+        Some(PermissionAction::Ask) if ctx.dangerously_skip_permissions => {
+            ("ask", "allow", true, true)
+        }
+        Some(PermissionAction::Allow) => ("allow", "allow", true, false),
+        Some(PermissionAction::Ask) => ("ask", "ask", true, false),
+        Some(PermissionAction::Deny) => ("deny", "deny", true, false),
+        None => ("unmanaged", "allow", false, false),
+    };
+    governance_receipt_metadata(
+        tool,
+        requested_action,
+        effective_action,
+        enforced,
+        approval_bypassed,
+        "permission_rules",
+    )
+}
+
+fn governance_receipt_metadata(
+    tool: &ToolDefinition,
+    requested_action: &str,
+    effective_action: &str,
+    enforced: bool,
+    approval_bypassed: bool,
+    source: &str,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            "governance_schema_version".to_string(),
+            json!(TOOL_GOVERNANCE_SCHEMA_VERSION),
+        ),
+        ("governance_source".to_string(), json!(source)),
+        ("governance_enforced".to_string(), json!(enforced)),
+        (
+            "governance_requested_action".to_string(),
+            json!(requested_action),
+        ),
+        (
+            "governance_effective_action".to_string(),
+            json!(effective_action),
+        ),
+        (
+            "governance_approval_bypassed".to_string(),
+            json!(approval_bypassed),
+        ),
+        (
+            "governance_risk_tier".to_string(),
+            json!(tool_risk_tier(tool).as_str()),
+        ),
+        ("governance_dangerous".to_string(), json!(tool.dangerous)),
+        ("governance_group".to_string(), json!(tool.group)),
+        (
+            "governance_execution_scope".to_string(),
+            serde_json::to_value(&tool.execution_scope).unwrap_or(Value::Null),
+        ),
+    ])
+}
+
 struct PermissionFailure {
     action: PermissionAction,
     message: &'static str,
@@ -2453,35 +2750,36 @@ fn permission_tool_result(
     call_id: &str,
     failure: PermissionFailure,
 ) -> ToolResult {
+    let action = permission_action_name(&failure.action);
+    let mut metadata =
+        governance_receipt_metadata(tool, action, action, true, false, "permission_rules");
+    metadata.extend(BTreeMap::from([
+        ("tool".to_string(), json!(tool.id)),
+        ("permission_action".to_string(), json!(action)),
+        ("permission_pattern".to_string(), json!(pattern_for(input))),
+        (
+            "permission_required".to_string(),
+            json!(failure.requires_approval),
+        ),
+        (
+            "requires_approval".to_string(),
+            json!(failure.requires_approval),
+        ),
+        (
+            "dangerously_skip_permissions".to_string(),
+            json!(failure.dangerously_skip_permissions),
+        ),
+        ("dangerous".to_string(), json!(tool.dangerous)),
+        ("group".to_string(), json!(tool.group)),
+        ("call_id".to_string(), json!(call_id)),
+        ("input".to_string(), input.clone()),
+        ("error_kind".to_string(), json!(failure.error_kind)),
+    ]));
     ToolResult {
         call_id: call_id.to_string(),
         output: String::new(),
         error: Some(format!("{}: {}", failure.message, tool.id)),
-        metadata: BTreeMap::from([
-            ("tool".to_string(), json!(tool.id)),
-            (
-                "permission_action".to_string(),
-                json!(permission_action_name(&failure.action)),
-            ),
-            ("permission_pattern".to_string(), json!(pattern_for(input))),
-            (
-                "permission_required".to_string(),
-                json!(failure.requires_approval),
-            ),
-            (
-                "requires_approval".to_string(),
-                json!(failure.requires_approval),
-            ),
-            (
-                "dangerously_skip_permissions".to_string(),
-                json!(failure.dangerously_skip_permissions),
-            ),
-            ("dangerous".to_string(), json!(tool.dangerous)),
-            ("group".to_string(), json!(tool.group)),
-            ("call_id".to_string(), json!(call_id)),
-            ("input".to_string(), input.clone()),
-            ("error_kind".to_string(), json!(failure.error_kind)),
-        ]),
+        metadata,
     }
 }
 
@@ -2571,17 +2869,20 @@ fn skill_restriction_tool_result(
     message: &'static str,
     patterns: Vec<String>,
 ) -> ToolResult {
+    let mut metadata =
+        governance_receipt_metadata(tool, "deny", "deny", true, false, "skill_restriction");
+    metadata.extend(BTreeMap::from([
+        ("tool".to_string(), json!(tool.id)),
+        ("error_kind".to_string(), json!("skill_tool_restricted")),
+        ("skill_tool_patterns".to_string(), json!(patterns)),
+        ("call_id".to_string(), json!(call_id)),
+        ("input".to_string(), input.clone()),
+    ]));
     ToolResult {
         call_id: call_id.to_string(),
         output: String::new(),
         error: Some(format!("{message}: {}", tool.id)),
-        metadata: BTreeMap::from([
-            ("tool".to_string(), json!(tool.id)),
-            ("error_kind".to_string(), json!("skill_tool_restricted")),
-            ("skill_tool_patterns".to_string(), json!(patterns)),
-            ("call_id".to_string(), json!(call_id)),
-            ("input".to_string(), input.clone()),
-        ]),
+        metadata,
     }
 }
 
@@ -2953,10 +3254,34 @@ fn read_tool(input: Value, ctx: &mut ToolContext) -> ToolResultValue<ToolOutput>
     let formatted = format_read_output_from_text(&text, offset, limit);
     ctx.remember_read(&target);
     warm_lsp_after_read(&root, &target);
-    let mut output = ToolOutput::new(display_path(&root, &target), formatted.output);
+    let displayed_path = display_path(&root, &target);
+    // Preserve the semantic amount read separately from the rendered tool
+    // output.  The Desktop can now present an accurate per-file and per-run
+    // reading total without counting XML framing or truncation notices.
+    let lines_read = formatted
+        .output
+        .lines()
+        .filter(|line| {
+            let Some((prefix, _)) = line.split_once('|') else {
+                return false;
+            };
+            prefix.len() == 5 && prefix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .count();
+    let mut output = ToolOutput::new(displayed_path.clone(), formatted.output);
     output
         .metadata
         .insert("preview".to_string(), json!(formatted.preview));
+    output
+        .metadata
+        .insert("file_path".to_string(), json!(displayed_path));
+    output
+        .metadata
+        .insert("read_lines".to_string(), json!(lines_read));
+    output.metadata.insert(
+        "read_start_line".to_string(),
+        json!(offset.saturating_add(1)),
+    );
     output.truncated = formatted.truncated;
     Ok(output)
 }

@@ -68,22 +68,26 @@ State says whether work can progress. Phase says where a crash occurred:
 
 `RecoveryPolicy` combines state, phase, attempt, lease, and effect receipt:
 
-| Crash point | Recovery |
-| --- | --- |
-| durable queue | resume |
-| approval/question wait | resume without calling the model |
-| provider request | retry while under the attempt limit |
-| compaction | retry because the boundary write is atomic |
-| subagent wait | resume from the child session |
-| tool with committed effect | resume using the stored result |
-| tool with no committed effect | retry if no effect was claimed |
-| tool with claimed but uncommitted effect | interrupt as ambiguous |
-| terminal state | ignore |
+| Surface / failure window | Durable source of truth | Recovery action | Automatic replay |
+| --- | --- | --- | --- |
+| Bridge process exits before a queued turn starts | queued payload, turn job, lifecycle record, lease | reclaim the stale lease and resume the queue | yes, because provider/tool work has not started |
+| Bridge process exits during a provider request | lifecycle phase, attempt, retry payload, context receipt | mark the orphaned turn `interrupted` with `recovery=retry` | no; the client explicitly retries because the remote outcome may be unknown |
+| Provider returns a retryable HTTP/network failure | run events, retry payload, context receipt | bounded same-model retry/fallback or `POST /api/turns/{id}/retry` | yes only for a classified response/transport failure; the same context pack is reused |
+| Client HTTP/SSE connection disappears | Bridge event ledger and turn job | keep the turn running; reconnect with `last_event_id` and query turn status | no new Turn is created |
+| Tool has no claimed effect | lifecycle phase | retry while under the attempt limit | yes |
+| Tool effect receipt is `claimed` | private effect receipt | interrupt as `effect_uncertain` | no; duplicate execution is refused |
+| Tool effect receipt is `committed` | private receipt including stored result | reuse the stored result and continue | the tool itself is not executed again |
+| Approval wait | session metadata plus approval execution record | restore `waiting`, list the pending request, and accept the response | provider/tool execution resumes only after the response |
+| Question wait | session metadata plus question execution record | restore `waiting`, list the pending request, and accept the answer | provider/tool execution resumes only after the answer |
+| Compaction write | atomic state/checkpoint records | rebuild or retry the boundary | yes |
+| Subagent wait | child session and task execution record | resume from the durable child state | no duplicate child is created |
+| Terminal execution | lifecycle record | return the stored result/status | never |
 
 HTTP startup reconciles persisted turn jobs before serving them. A live
 approval or question remains `waiting`; an orphaned running turn becomes
 `interrupted` and retains `recovery=retry|resume|interrupt` so a client can
-offer the correct next action.
+offer the correct next action. Queue recovery does not overwrite a durable
+approval/question wait in the same session.
 
 ## Leases And Heartbeats
 
@@ -216,6 +220,9 @@ HTTP tests cover:
 - root-isolated worker quotas;
 - queue expiry and stale/live lease behavior;
 - persisted queue recovery after restart;
-- approval/question pause and resume;
+- approval/question pause and resume across process restart;
+- client event-stream disconnect and cursor-based reconnect;
 - idempotent turn submission with one provider request;
+- a committed tool effect submitted again before and after restart without a
+  second side effect;
 - catalog rebuild and search before and after runtime restart.

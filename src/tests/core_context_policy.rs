@@ -201,6 +201,42 @@ fn context_pack_long_session_build_stays_within_regression_budget() {
 }
 
 #[test]
+fn provider_context_previews_large_tool_results_without_losing_the_transcript() {
+    let full_tool_output = (0..24)
+        .map(|index| format!("line-{index}: {}", "x".repeat(96)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let pack = ContextPackBuilder::new(Some(ContextPackBuildOptions {
+        trace_only: false,
+        tool_context_preview_bytes: 500,
+        tool_context_preview_lines: 6,
+        tool_context_line_max_chars: 32,
+        ..ContextPackBuildOptions::default()
+    }))
+    .build(ContextPackInput {
+        messages: vec![chat(Role::Tool, &full_tool_output)],
+        ..ContextPackInput::default()
+    });
+
+    let preview = pack.messages.first().expect("tool preview");
+    assert!(preview.content.len() <= 500);
+    assert!(preview.content.contains("line-0:"));
+    assert!(preview.content.contains("line-23:"));
+    assert!(preview.content.contains("tool-output lines omitted"));
+    assert_ne!(preview.content, full_tool_output);
+    let trace = pack
+        .trace
+        .iter()
+        .find(|entry| entry.kind == "tool_result")
+        .expect("tool trace");
+    assert!(trace.truncated);
+    assert_eq!(
+        trace.truncation_reason.as_deref(),
+        Some("tool_output_preview")
+    );
+}
+
+#[test]
 fn production_provider_boundaries_accept_only_verified_context_packs() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -569,6 +605,48 @@ fn history_materialization_classifies_system_sources_and_remaps_positions()
 }
 
 #[test]
+fn history_materialization_omits_the_prefix_covered_by_a_compaction_boundary() {
+    let mut user = chat(Role::User, "Analyse the repository");
+    user.metadata
+        .insert("message_id".to_string(), json!("message-1"));
+    let mut assistant = chat(Role::Assistant, "I will inspect the files.");
+    assistant
+        .metadata
+        .insert("message_id".to_string(), json!("message-2"));
+    let mut tool_result = chat(Role::Tool, "large tool output");
+    tool_result
+        .metadata
+        .insert("message_id".to_string(), json!("message-3"));
+    let mut boundary = chat(Role::System, "Task and completed work summary");
+    boundary.metadata.extend(BTreeMap::from([
+        ("kind".to_string(), json!("compaction_boundary")),
+        ("message_id".to_string(), json!("compact-4")),
+        ("compacted_until_message_id".to_string(), json!("message-3")),
+    ]));
+    let mut recent = chat(Role::Assistant, "Continue from the summary.");
+    recent
+        .metadata
+        .insert("message_id".to_string(), json!("message-5"));
+
+    let history =
+        materialize_context_history(vec![user, assistant, tool_result, boundary, recent.clone()]);
+
+    assert_eq!(history.messages, vec![recent]);
+    assert_eq!(
+        history.message_index_map,
+        vec![None, None, None, None, Some(0)]
+    );
+    assert_eq!(history.message_position_map, vec![0, 0, 0, 0, 0, 1]);
+    assert_eq!(
+        history
+            .work_state
+            .as_ref()
+            .map(|work_state| work_state.summary.as_str()),
+        Some("Task and completed work summary")
+    );
+}
+
+#[test]
 fn stable_prefix_partitions_messages_and_semantically_dedupes_static_context() {
     let mut shared_instruction = ContextItem::new(
         "instruction:workspace:a",
@@ -880,7 +958,10 @@ fn model_aware_context_budget_drops_old_tool_output_and_is_deterministic()
         Some(&json!({
             "context_budget": {
                 "input_safety_margin_tokens": 20,
-                "bytes_per_token": 3
+                "bytes_per_token": 3,
+                "tool_context_preview_bytes": 1000000,
+                "tool_context_preview_lines": 1000000,
+                "tool_context_line_max_chars": 1000000
             }
         })),
         &model,
@@ -1338,6 +1419,9 @@ fn core_context_policy_fixture() -> Result<Value, Box<dyn Error>> {
     let context_pack = ContextPackBuilder::new(Some(ContextPackBuildOptions {
         token_budget: Some(150),
         bytes_per_token: 4,
+        tool_context_preview_bytes: 4096,
+        tool_context_preview_lines: 40,
+        tool_context_line_max_chars: 240,
         trace_only: true,
         model_id: Some("fixture-model".to_string()),
         context_window: Some(200),

@@ -592,6 +592,9 @@ pub fn context_pack_build_options_for_model(
             .enabled
             .then(|| compute_input_limit_tokens(model, &budget)),
         bytes_per_token: budget.bytes_per_token,
+        tool_context_preview_bytes: budget.tool_context_preview_bytes,
+        tool_context_preview_lines: budget.tool_context_preview_lines,
+        tool_context_line_max_chars: budget.tool_context_line_max_chars,
         trace_only,
         model_id: Some(model.id.clone()),
         context_window: Some(model.context_window),
@@ -1189,6 +1192,14 @@ impl ContextPack {
 pub struct ContextPackBuildOptions {
     pub token_budget: Option<u64>,
     pub bytes_per_token: u64,
+    /// Maximum bytes from an individual tool result that are sent back to a
+    /// provider. The complete result remains in the session transcript.
+    pub tool_context_preview_bytes: u64,
+    /// Maximum number of lines from an individual tool result included in the
+    /// provider context.
+    pub tool_context_preview_lines: u64,
+    /// Maximum characters retained for each included tool-result line.
+    pub tool_context_line_max_chars: u64,
     pub trace_only: bool,
     pub model_id: Option<String>,
     pub context_window: Option<u64>,
@@ -1201,6 +1212,9 @@ impl Default for ContextPackBuildOptions {
         Self {
             token_budget: None,
             bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+            tool_context_preview_bytes: DEFAULT_TOOL_CONTEXT_PREVIEW_BYTES,
+            tool_context_preview_lines: DEFAULT_TOOL_CONTEXT_PREVIEW_LINES,
+            tool_context_line_max_chars: DEFAULT_TOOL_CONTEXT_LINE_MAX_CHARS,
             trace_only: true,
             model_id: None,
             context_window: None,
@@ -1233,6 +1247,13 @@ impl ContextPackBuilder {
         let mut items = self.collect_items_with_system(&input, system.as_ref());
         items = self.semantic_dedupe_items(self.dedupe_items(items));
         items = self.with_estimates(items);
+        // Tool output is persisted in full for inspection and replay, but it
+        // must not be allowed to consume an entire model window on the next
+        // agent step. This projection is intentionally applied only to the
+        // provider-facing pack (not trace-only diagnostics).
+        if !self.options.trace_only {
+            items = self.limit_tool_result_context(items);
+        }
         let fixed_overhead_tokens = estimate_context_pack_fixed_overhead(
             &input.tools,
             &input.model_options,
@@ -1416,6 +1437,34 @@ impl ContextPackBuilder {
                     );
                 }
                 item
+            })
+            .collect()
+    }
+
+    fn limit_tool_result_context(&self, items: Vec<ContextItem>) -> Vec<ContextItem> {
+        let max_bytes = self.options.tool_context_preview_bytes as usize;
+        let max_lines = self.options.tool_context_preview_lines as usize;
+        let max_line_chars = self.options.tool_context_line_max_chars as usize;
+        items
+            .into_iter()
+            .map(|item| {
+                if item.kind != "tool_result"
+                    || item.content.len() <= max_bytes
+                        && item.content.lines().count() <= max_lines
+                        && item
+                            .content
+                            .lines()
+                            .all(|line| line.chars().count() <= max_line_chars)
+                {
+                    return item;
+                }
+                truncate_tool_result_context_item(
+                    &item,
+                    max_bytes,
+                    max_lines,
+                    max_line_chars,
+                    self.options.bytes_per_token,
+                )
             })
             .collect()
     }
@@ -1966,6 +2015,91 @@ fn truncate_required_context_item(
     fitted
 }
 
+fn truncate_tool_result_context_item(
+    item: &ContextItem,
+    max_bytes: usize,
+    max_lines: usize,
+    max_line_chars: usize,
+    bytes_per_token: u64,
+) -> ContextItem {
+    let original_bytes = item.content.len();
+    let original_token_estimate = item.token_estimate;
+    let mut lines = item
+        .content
+        .lines()
+        .map(|line| truncate_tool_result_line(line, max_line_chars))
+        .collect::<Vec<_>>();
+    let original_line_count = lines.len();
+    if lines.len() > max_lines {
+        let head_count = max_lines.div_ceil(2);
+        let tail_count = max_lines.saturating_sub(head_count);
+        let omitted = lines.len().saturating_sub(head_count + tail_count);
+        let mut selected = Vec::with_capacity(head_count + tail_count + 1);
+        selected.extend(lines.drain(..head_count));
+        selected.push(format!(
+            "[... {omitted} tool-output lines omitted from model context ...]"
+        ));
+        if tail_count > 0 {
+            selected.extend(
+                lines
+                    .into_iter()
+                    .rev()
+                    .take(tail_count)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        lines = selected;
+    }
+    let line_window = lines.join("\n");
+    let content = truncate_context_head_tail(&line_window, max_bytes.max(1), false);
+    let mut truncated = item.clone();
+    truncated.content = content;
+    truncated
+        .metadata
+        .insert("context_truncated".to_string(), Value::Bool(true));
+    truncated.metadata.insert(
+        "context_truncation_reason".to_string(),
+        Value::String("tool_output_preview".to_string()),
+    );
+    truncated.metadata.insert(
+        "context_truncation_strategy".to_string(),
+        Value::String("line_window_head_tail".to_string()),
+    );
+    truncated.metadata.insert(
+        "context_original_token_estimate".to_string(),
+        json!(original_token_estimate),
+    );
+    truncated
+        .metadata
+        .insert("context_original_bytes".to_string(), json!(original_bytes));
+    truncated.metadata.insert(
+        "context_original_line_count".to_string(),
+        json!(original_line_count),
+    );
+    truncated.metadata.insert(
+        "context_retained_bytes".to_string(),
+        json!(truncated.content.len()),
+    );
+    truncated.token_estimate =
+        estimate_context_message_tokens(&item_to_message(&truncated), bytes_per_token);
+    truncated
+}
+
+fn truncate_tool_result_line(line: &str, max_chars: usize) -> String {
+    if line.chars().count() <= max_chars {
+        return line.to_string();
+    }
+    let marker = "… [line truncated]";
+    let retained = max_chars.saturating_sub(marker.chars().count()).max(1);
+    format!(
+        "{}{}",
+        line.chars().take(retained).collect::<String>(),
+        marker
+    )
+}
+
 fn required_context_truncation_strategy(item: &ContextItem) -> (&'static str, bool) {
     if item.kind.starts_with("attachment_") {
         ("attachment_header_head_tail", true)
@@ -2367,11 +2501,20 @@ struct ContextSystemMaterialization {
 #[must_use]
 pub fn materialize_context_history(messages: Vec<ChatMessage>) -> ContextHistoryMaterialization {
     let mut materialized = ContextHistoryMaterialization::default();
+    let compacted_until = latest_compaction_boundary_cutoff(&messages);
     for (index, message) in messages.into_iter().enumerate() {
         materialized
             .message_position_map
             .push(materialized.messages.len());
         materialized.message_index_map.push(None);
+        // A compaction boundary is a durable replacement for the preceding
+        // transcript. Keeping both the boundary's work state and the original
+        // messages defeats compaction and eventually recreates the same
+        // oversized provider request. The transcript remains on disk; only
+        // the provider-facing projection omits the summarized prefix.
+        if compacted_until.is_some_and(|cutoff| index <= cutoff) {
+            continue;
+        }
         if message.role != Role::System {
             materialized.message_index_map[index] = Some(materialized.messages.len());
             materialized.messages.push(message);
@@ -2428,6 +2571,27 @@ pub fn materialize_context_history(messages: Vec<ChatMessage>) -> ContextHistory
         .message_position_map
         .push(materialized.messages.len());
     materialized
+}
+
+fn latest_compaction_boundary_cutoff(messages: &[ChatMessage]) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(boundary_index, boundary)| {
+            if boundary.metadata.get("kind").and_then(Value::as_str) != Some("compaction_boundary")
+            {
+                return None;
+            }
+            let compacted_until = boundary
+                .metadata
+                .get("compacted_until_message_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?;
+            messages[..boundary_index].iter().rposition(|message| {
+                message.metadata.get("message_id").and_then(Value::as_str) == Some(compacted_until)
+            })
+        })
 }
 
 fn context_work_state_from_boundary(message: ChatMessage) -> ContextWorkState {

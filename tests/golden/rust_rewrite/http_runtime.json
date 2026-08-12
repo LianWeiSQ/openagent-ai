@@ -86,7 +86,15 @@
       "auth_required": false,
       "bridge_server": "openagent-bridge-server",
       "ok": true,
-      "service": "openagent-http-runtime"
+      "service": "openagent-http-runtime",
+      "telemetry": {
+        "enabled": true,
+        "error": null,
+        "prometheus_configured": true,
+        "shutdown_failures": 0,
+        "trace_export_configured": false,
+        "trace_export_failures": 0
+      }
     },
     "smoke_command": [
       "docker",
@@ -131,7 +139,15 @@
       "auth_required": true,
       "bridge_server": "openagent-bridge-server",
       "ok": true,
-      "service": "openagent-http-runtime"
+      "service": "openagent-http-runtime",
+      "telemetry": {
+        "enabled": true,
+        "error": null,
+        "prometheus_configured": true,
+        "shutdown_failures": 0,
+        "trace_export_configured": false,
+        "trace_export_failures": 0
+      }
     },
     "routes": {
       "health": {
@@ -140,7 +156,7 @@
       },
       "options": {
         "headers": {
-          "Access-Control-Allow-Headers": "Authorization, Content-Type, X-OpenAgent-Token",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, Traceparent, Tracestate, X-OpenAgent-Token",
           "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
           "Access-Control-Max-Age": "600"
         },

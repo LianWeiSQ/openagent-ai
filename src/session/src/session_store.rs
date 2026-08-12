@@ -14,6 +14,7 @@ use openagent_protocol::{
     ChatMessage, MessageInfo, MessagePart, MessagePartKind, MessageStatus, MessageWithParts, Role,
     Usage, message_parts_to_chat_messages,
 };
+use openagent_telemetry::TaskContractV1;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -144,6 +145,12 @@ pub struct SessionEventRecord {
     pub timestamp_ms: u64,
     pub session_id: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
     pub kind: String,
     pub status: String,
     pub duration_ms: Option<u64>,
@@ -345,6 +352,46 @@ impl FileSessionStore {
         session: &mut Session,
         options: StartRunOptions,
     ) -> SessionResult<SessionStoreMetadata> {
+        self.start_run_internal(session, options, None)
+    }
+
+    pub fn start_run_with_contract(
+        &self,
+        session: &mut Session,
+        options: StartRunOptions,
+        contract: &TaskContractV1,
+    ) -> SessionResult<SessionStoreMetadata> {
+        contract.validate()?;
+        if contract.session_id != session.id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "task contract session_id does not match the session",
+            )
+            .into());
+        }
+        if contract.run_id != options.run_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "task contract run_id does not match the run options",
+            )
+            .into());
+        }
+        if contract.trace.trace_id != options.trace_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "task contract trace_id does not match the run options",
+            )
+            .into());
+        }
+        self.start_run_internal(session, options, Some(contract))
+    }
+
+    fn start_run_internal(
+        &self,
+        session: &mut Session,
+        options: StartRunOptions,
+        contract: Option<&TaskContractV1>,
+    ) -> SessionResult<SessionStoreMetadata> {
         let started = options.started_at_ms.unwrap_or_else(now_ms);
         fs::create_dir_all(self.session_dir(&session.id))?;
         fs::create_dir_all(self.run_dir(&session.id, &options.run_id))?;
@@ -372,6 +419,7 @@ impl FileSessionStore {
                 "provider_id": options.provider_id,
                 "permission": options.permission,
                 "max_steps": options.max_steps,
+                "task_contract": contract,
                 "status": "running",
                 "started_at_ms": started,
                 "ended_at_ms": Value::Null,
@@ -392,12 +440,20 @@ impl FileSessionStore {
             "run.started",
             SessionEventOptions {
                 kind: "run".to_string(),
+                trace_id: Some(options.trace_id.clone()),
+                span_id: contract.map(|value| value.trace.span_id.clone()),
                 attributes: BTreeMap::from([
                     ("agent_name".to_string(), json!(options.agent_name)),
                     ("model_id".to_string(), json!(options.model_id)),
                     ("provider_id".to_string(), json!(options.provider_id)),
                     ("permission".to_string(), json!(options.permission)),
                     ("max_steps".to_string(), json!(options.max_steps)),
+                    (
+                        "task_contract_schema".to_string(),
+                        contract
+                            .map(|value| json!(value.schema_version))
+                            .unwrap_or(Value::Null),
+                    ),
                 ]),
                 ..SessionEventOptions::default()
             },
@@ -469,6 +525,9 @@ impl FileSessionStore {
             timestamp_ms: options.timestamp_ms.unwrap_or_else(now_ms),
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
+            trace_id: options.trace_id,
+            span_id: options.span_id,
+            parent_span_id: options.parent_span_id,
             kind: options.kind,
             status: if options.status == "error" {
                 "error"
@@ -1839,6 +1898,9 @@ impl FileSessionStore {
 pub struct SessionEventOptions {
     pub kind: String,
     pub status: String,
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
     pub attributes: BTreeMap<String, Value>,
     pub duration_ms: Option<u64>,
     pub timestamp_ms: Option<u64>,
@@ -1849,6 +1911,9 @@ impl Default for SessionEventOptions {
         Self {
             kind: "event".to_string(),
             status: "ok".to_string(),
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
             attributes: BTreeMap::new(),
             duration_ms: None,
             timestamp_ms: None,
@@ -2766,6 +2831,7 @@ pub struct RuntimeLogger<'a> {
     base_dir: PathBuf,
     run_id: Option<String>,
     trace_id: Option<String>,
+    span_id: Option<String>,
 }
 
 impl<'a> RuntimeLogger<'a> {
@@ -2784,11 +2850,18 @@ impl<'a> RuntimeLogger<'a> {
             base_dir: base_dir.into(),
             run_id,
             trace_id,
+            span_id: None,
         };
         if logger.config.enabled {
             logger.ensure_metadata_root();
         }
         logger
+    }
+
+    #[must_use]
+    pub fn with_span_id(mut self, span_id: Option<String>) -> Self {
+        self.span_id = span_id;
+        self
     }
 
     pub fn log(
@@ -2815,7 +2888,7 @@ impl<'a> RuntimeLogger<'a> {
             session_id: self.session_id.clone(),
             run_id: self.run_id.clone(),
             trace_id: self.trace_id.clone(),
-            span_id: None,
+            span_id: self.span_id.clone(),
             attributes: sanitize_value_map(attributes, DEFAULT_FIELD_PREVIEW_CHARS),
         };
         self.record(&record)?;
@@ -2845,6 +2918,7 @@ impl<'a> RuntimeLogger<'a> {
             object.insert("level".to_string(), json!(self.config.level));
             object.insert("run_id".to_string(), json!(self.run_id));
             object.insert("trace_id".to_string(), json!(self.trace_id));
+            object.insert("span_id".to_string(), json!(self.span_id));
             object.insert(
                 "jsonl_path".to_string(),
                 jsonl_path.map_or(Value::Null, Value::String),

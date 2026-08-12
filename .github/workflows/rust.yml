@@ -7,6 +7,8 @@ on:
       - "Cargo.lock"
       - "cli/**"
       - "eval/**"
+      - "doc/**"
+      - "observability/**"
       - "runtime/**"
       - "skill/**"
       - "src/**"
@@ -21,6 +23,8 @@ on:
       - "Cargo.lock"
       - "cli/**"
       - "eval/**"
+      - "doc/**"
+      - "observability/**"
       - "runtime/**"
       - "skill/**"
       - "src/**"
@@ -42,3 +46,76 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Assemble release evidence
+        run: |
+          mkdir -p target/release-readiness
+          cargo run -p openagent-eval --bin openharness-evidence -- \
+            eval/fixtures/release-contract/request.json \
+            target/release-readiness/evidence.json
+          cargo run -p openagent-eval --bin openharness-quality-gate -- \
+            eval/fixtures/release-contract/policy.json \
+            target/release-readiness/evidence.json \
+            target/release-readiness/quality-gate-decision.json
+      - name: Execute critical fault injection plan
+        run: |
+          cargo run -p openagent-eval --bin openharness-fault-plan -- \
+            eval/fault-injection-v1.json \
+            eval/policies/release-v1.json \
+            target/release-readiness/fault-injection-report.json \
+            --execute-critical
+      - name: Replay promoted bad-case regression fixtures
+        run: |
+          cargo run -p openagent-eval --bin openharness-regression -- \
+            validate eval/fixtures/regression-contract/dataset.json
+          cargo run -p openagent-eval --bin openharness-regression -- \
+            replay-observations \
+            eval/fixtures/regression-contract/dataset.json \
+            eval/fixtures/regression-contract/observations.json \
+            target/release-readiness/regression-replay-report.json
+      - name: Run Bridge load and baseline acceptance
+        env:
+          OPENHARNESS_LOAD_TOKEN: ci-local-load-token
+        run: |
+          cargo build -p openagent-http-runtime
+          mkdir -p target/load-acceptance/workspace target/load-acceptance/sessions
+          printf '%s\n' "$OPENHARNESS_LOAD_TOKEN" > target/load-acceptance/auth-token
+          target/debug/openagent-http-runtime \
+            --host 127.0.0.1 \
+            --port 18787 \
+            --workspace target/load-acceptance/workspace \
+            --session-root target/load-acceptance/sessions \
+            --auth-token-file target/load-acceptance/auth-token \
+            --no-mdns \
+            > target/release-readiness/load-bridge.log 2>&1 &
+          bridge_pid=$!
+          trap 'kill "$bridge_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 100); do
+            if curl --noproxy '*' -fsS \
+              -H "Authorization: Bearer $OPENHARNESS_LOAD_TOKEN" \
+              http://127.0.0.1:18787/api/health >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$ready" -ne 1 ]; then
+            exit 1
+          fi
+          cargo run -p openagent-eval --bin openharness-load -- \
+            run \
+            eval/load/ci-bridge-turn.json \
+            target/release-readiness/load-test-report.json \
+            eval/load/ci-bridge-turn-baseline.json
+      - name: Seal release readiness manifest
+        run: |
+          cargo run -p openagent-eval --bin openharness-release-bundle -- \
+            eval/fixtures/release-contract/readiness-request.json \
+            target/release-readiness/manifest.json
+      - name: Upload release readiness evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openharness-release-readiness
+          path: target/release-readiness/
+          if-no-files-found: error

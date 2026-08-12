@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! HTTP runtime service contracts for the Rust rewrite.
 
 use std::{
@@ -7,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -53,15 +55,21 @@ use openagent_provider::{
     normalize_anthropic_response, normalize_gemini_events, normalize_openai_chat_response,
     normalize_openai_chat_sse_chunks, normalize_openai_responses_response,
     normalize_openai_responses_stream_events, normalize_provider, openagent_context_model,
-    openagent_text_model_supported, provider_capabilities, provider_default_base_url,
-    provider_default_model, provider_label, provider_requires_api_key, summarize_http_error_body,
-    tool_call_dialect_from_options, tool_call_policy_from_options,
+    provider_capabilities, provider_default_base_url, provider_default_model, provider_label,
+    provider_requires_api_key, summarize_http_error_body, tool_call_dialect_from_options,
+    tool_call_policy_from_options,
 };
 use openagent_session::{
     DurableExecutionRecord, DurableExecutionStore, DurableSessionCatalog, EffectClaim,
     ExecutionKind, ExecutionLease, ExecutionPhase, ExecutionStatus, FileSessionStore, NewExecution,
     RecoveryDisposition, RecoveryPolicy, Session, SessionCheckpointRecord, SessionEventOptions,
     SessionPartOptions, SessionStatus, StartRunOptions, TodoItem as SessionTodoItem,
+};
+use openagent_telemetry::{
+    AgentIdentity, ExecutionState as TelemetryExecutionState, MetricDimensions, ModelIdentity,
+    OpenHarnessSpan, OutcomeReason, RunOutcome, RunSurface, RuntimeBudgets, SpanKind,
+    TaskContractV1, TelemetryAttributes, TelemetryConfig, TelemetryRuntime, TraceContext,
+    VersionIdentity, canonical_json_fingerprint,
 };
 use openagent_tools::{
     DEFAULT_BUILD_AGENT_PROMPT, SessionRunnerFacade, SkillPermissionRule, TASK_TOOL_ID,
@@ -73,6 +81,7 @@ use openagent_tools::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+mod bad_case_runtime;
 mod bridge_routes;
 mod capability_runtime;
 mod git_runtime;
@@ -84,6 +93,7 @@ mod storage_runtime;
 mod terminal_runtime;
 mod turn_runtime;
 
+use bad_case_runtime::*;
 use bridge_routes::*;
 pub use bridge_routes::{
     CliRunResult, HttpResponseSpec, command_text_from_args, docker_smoke_command, dockerfile_lines,
@@ -128,6 +138,7 @@ const DEFAULT_TASK_RUN_LOCK_STALE_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_BACKGROUND_TASK_WORKER_POLL_MS: u64 = 100;
 const DEFAULT_MAX_SUBAGENT_DEPTH: u64 = 3;
 const TURN_INTERRUPTED_ERROR: &str = "turn interrupted";
+const TURN_DEADLINE_EXCEEDED_ERROR: &str = "turn deadline exceeded";
 const TURN_JOB_INDEX_FILE: &str = ".openagent-runtime/turn_jobs.json";
 const TURN_QUEUE_DIR: &str = ".openagent-runtime/turn_queue";
 const TURN_QUEUE_LEASE_DIR: &str = ".openagent-runtime/turn_queue_leases";
@@ -137,8 +148,14 @@ const TURN_QUEUE_PAYLOAD_SCHEMA_VERSION: u64 = 1;
 const TURN_QUEUE_LEASE_SCHEMA_VERSION: u64 = 1;
 const TURN_RETRY_PAYLOAD_SCHEMA_VERSION: u64 = 1;
 const INTERNAL_TURN_RETRY_KEY: &str = "_openagent_retry";
-const DEFAULT_PROVIDER_REQUEST_RETRIES: u64 = 1;
+const INTERNAL_TRACE_CONTEXT_KEY: &str = "_openagent_trace_context";
+const INTERNAL_QUEUE_WAIT_MS_KEY: &str = "_openagent_queue_wait_ms";
+// A proxy-side 5xx is commonly transient. Four total attempts balance
+// recovery against keeping an interactive turn responsive; deployments can
+// still lower or raise this through OPENAGENT_PROVIDER_RETRIES (capped below).
+const DEFAULT_PROVIDER_REQUEST_RETRIES: u64 = 3;
 const MAX_PROVIDER_REQUEST_RETRIES: u64 = 3;
+const DEFAULT_AUTO_COMPACTION_RECENT_MESSAGES: usize = 24;
 const MAX_PROVIDER_FALLBACK_MODELS: usize = 3;
 const DEFAULT_MANUAL_TURN_RETRIES: u64 = 3;
 const MAX_MANUAL_TURN_RETRIES: u64 = 5;
@@ -159,6 +176,584 @@ pub const fn crate_name() -> &'static str {
 #[must_use]
 pub fn command_name() -> &'static str {
     "openagent-http-runtime"
+}
+
+static HTTP_TELEMETRY_RUNTIME: OnceLock<Result<TelemetryRuntime, String>> = OnceLock::new();
+
+fn http_telemetry_runtime() -> Result<&'static TelemetryRuntime, &'static str> {
+    HTTP_TELEMETRY_RUNTIME
+        .get_or_init(|| {
+            let mut config = TelemetryConfig::from_env();
+            if std::env::var("OPENHARNESS_PROMETHEUS_ENABLED").is_err() {
+                config.prometheus_enabled = true;
+            }
+            TelemetryRuntime::initialize(config).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+#[derive(Debug)]
+struct RuntimeSpanObservation {
+    span: Option<OpenHarnessSpan>,
+    context: TraceContext,
+    parent_span_id: Option<String>,
+    started: Instant,
+}
+
+fn start_http_runtime_span(
+    name: &str,
+    kind: SpanKind,
+    parent: &TraceContext,
+    attributes: TelemetryAttributes,
+) -> RuntimeSpanObservation {
+    let started = Instant::now();
+    let parent_span_id = Some(parent.span_id.clone());
+    match http_telemetry_runtime().and_then(|runtime| {
+        runtime
+            .start_span(name, kind, Some(parent), attributes)
+            .map_err(|_| "failed to start telemetry span")
+    }) {
+        Ok(span) => RuntimeSpanObservation {
+            context: span.context().clone(),
+            span: Some(span),
+            parent_span_id,
+            started,
+        },
+        Err(_) => RuntimeSpanObservation {
+            span: None,
+            context: parent.child(),
+            parent_span_id,
+            started,
+        },
+    }
+}
+
+fn runtime_task_contract_for_run(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+) -> Option<TaskContractV1> {
+    let path = store
+        .root
+        .join(session_id)
+        .join("runs")
+        .join(run_id)
+        .join("run.json");
+    let raw = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&raw).ok()?;
+    serde_json::from_value(value.get("task_contract")?.clone()).ok()
+}
+
+fn start_run_child_span(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    name: &str,
+    kind: SpanKind,
+    attributes: TelemetryAttributes,
+) -> Option<RuntimeSpanObservation> {
+    let contract = runtime_task_contract_for_run(store, session_id, run_id)?;
+    Some(start_http_runtime_span(
+        name,
+        kind,
+        &contract.trace,
+        attributes,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_runtime_span(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    event: &str,
+    kind: &str,
+    status: &str,
+    observation: RuntimeSpanObservation,
+    state: TelemetryExecutionState,
+    outcome: Option<RunOutcome>,
+    reason: OutcomeReason,
+    mut attributes: BTreeMap<String, Value>,
+) {
+    let duration_ms = u64::try_from(observation.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    attributes.insert("span_name".to_string(), json!(event));
+    let context = observation.context;
+    let parent_span_id = observation.parent_span_id;
+    if let Some(span) = observation.span {
+        span.end_state(state, outcome, reason);
+    }
+    let _ = store.record_event(
+        session_id,
+        run_id,
+        event,
+        SessionEventOptions {
+            kind: kind.to_string(),
+            status: status.to_string(),
+            trace_id: Some(context.trace_id),
+            span_id: Some(context.span_id),
+            parent_span_id,
+            attributes,
+            duration_ms: Some(duration_ms),
+            ..SessionEventOptions::default()
+        },
+    );
+    if let Ok(runtime) = http_telemetry_runtime()
+        && let Some(metrics) = runtime.metrics()
+    {
+        metrics.record_stage(kind, status, duration_ms as f64 / 1_000.0);
+    }
+}
+
+fn telemetry_turn_result(
+    result: &Result<Value, String>,
+) -> (
+    TelemetryExecutionState,
+    Option<RunOutcome>,
+    OutcomeReason,
+    String,
+) {
+    match result {
+        Err(error) if is_turn_interrupted_error(error) => (
+            TelemetryExecutionState::Interrupted,
+            Some(RunOutcome::Interrupted),
+            OutcomeReason::UserCancelled,
+            "interrupted".to_string(),
+        ),
+        Err(error) => {
+            let reason = if error.contains("provider") {
+                OutcomeReason::ProviderExhausted
+            } else if error.contains("max_steps") {
+                OutcomeReason::LoopLimit
+            } else {
+                OutcomeReason::InternalError
+            };
+            (
+                TelemetryExecutionState::Failed,
+                Some(RunOutcome::Failed),
+                reason,
+                "failed".to_string(),
+            )
+        }
+        Ok(payload) => {
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed")
+                .to_ascii_lowercase();
+            let reason = payload
+                .get("reason_code")
+                .and_then(Value::as_str)
+                .map(outcome_reason_from_code)
+                .unwrap_or(OutcomeReason::None);
+            match status.as_str() {
+                "queued" => (
+                    TelemetryExecutionState::Queued,
+                    None,
+                    OutcomeReason::None,
+                    status,
+                ),
+                "running" => (
+                    TelemetryExecutionState::Running,
+                    None,
+                    OutcomeReason::None,
+                    status,
+                ),
+                value if value.starts_with("waiting") || value == "paused" => (
+                    TelemetryExecutionState::Waiting,
+                    None,
+                    OutcomeReason::None,
+                    status,
+                ),
+                "cancelled" | "canceled" => (
+                    TelemetryExecutionState::Cancelled,
+                    Some(RunOutcome::Cancelled),
+                    OutcomeReason::UserCancelled,
+                    status,
+                ),
+                "interrupted" => (
+                    TelemetryExecutionState::Interrupted,
+                    Some(RunOutcome::Interrupted),
+                    OutcomeReason::ProcessInterrupted,
+                    status,
+                ),
+                "failed" | "error" => (
+                    TelemetryExecutionState::Failed,
+                    Some(RunOutcome::Failed),
+                    if reason == OutcomeReason::None {
+                        OutcomeReason::InternalError
+                    } else {
+                        reason
+                    },
+                    status,
+                ),
+                _ if payload.get("outcome").and_then(Value::as_str) == Some("degraded") => (
+                    TelemetryExecutionState::Completed,
+                    Some(RunOutcome::Degraded),
+                    if reason == OutcomeReason::None {
+                        OutcomeReason::Other
+                    } else {
+                        reason
+                    },
+                    status,
+                ),
+                _ => (
+                    TelemetryExecutionState::Completed,
+                    Some(RunOutcome::Success),
+                    OutcomeReason::None,
+                    status,
+                ),
+            }
+        }
+    }
+}
+
+fn outcome_reason_from_code(code: &str) -> OutcomeReason {
+    match code {
+        "provider_fallback" => OutcomeReason::ProviderFallback,
+        "provider_exhausted" => OutcomeReason::ProviderExhausted,
+        "context_truncated" => OutcomeReason::ContextTruncated,
+        "partial_tool_failure" | "tool_error" => OutcomeReason::PartialToolFailure,
+        "tool_denied" | "permission_denied" => OutcomeReason::ToolDenied,
+        "tool_timeout" => OutcomeReason::ToolTimeout,
+        "mcp_unavailable" => OutcomeReason::McpUnavailable,
+        "deadline_exceeded" => OutcomeReason::DeadlineExceeded,
+        "total_tokens_exceeded" | "cost_exceeded" | "tool_calls_exceeded" | "budget_exhausted" => {
+            OutcomeReason::BudgetExhausted
+        }
+        "max_steps" | "loop_limit" => OutcomeReason::LoopLimit,
+        "queue_timeout" => OutcomeReason::QueueTimeout,
+        "user_cancelled" | "question_dismissed" => OutcomeReason::UserCancelled,
+        "process_interrupted" => OutcomeReason::ProcessInterrupted,
+        "invalid_response" => OutcomeReason::InvalidResponse,
+        "internal_error" | "error" => OutcomeReason::InternalError,
+        _ => OutcomeReason::Other,
+    }
+}
+
+fn finalize_unhandled_turn_error(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    error: &str,
+) {
+    let run_path = store
+        .root
+        .join(&session.id)
+        .join("runs")
+        .join(run_id)
+        .join("run.json");
+    let run_record = read_json_file(&run_path);
+    if run_record
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| {
+            matches!(
+                status,
+                "completed" | "failed" | "cancelled" | "canceled" | "interrupted"
+            )
+        })
+    {
+        return;
+    }
+    let reason_code = if error.contains(TURN_DEADLINE_EXCEEDED_ERROR) {
+        "deadline_exceeded"
+    } else if error.contains("provider") {
+        "provider_exhausted"
+    } else if error.contains("budget") {
+        "budget_exhausted"
+    } else {
+        "internal_error"
+    };
+    session.status = SessionStatus::Idle;
+    session.metadata.remove("pending_provider_turn");
+    let _ = store.finish_run(session, run_id, "failed", 0, Some(reason_code), Some(error));
+    let _ = store.save_state(session, Some(run_id));
+}
+
+fn record_http_run_metrics(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    outcome: RunOutcome,
+    reason: OutcomeReason,
+) {
+    let run_path = store
+        .root
+        .join(session_id)
+        .join("runs")
+        .join(run_id)
+        .join("run.json");
+    let mut run_record = read_json_file(&run_path);
+    let metrics_recorded = run_record
+        .get("telemetry_metrics_recorded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let durable_reason_code = run_record
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .filter(|code| outcome_reason_from_code(code) != OutcomeReason::Other)
+        .unwrap_or_else(|| reason.as_str())
+        .to_string();
+    if let Some(object) = run_record.as_object_mut() {
+        object.insert("outcome".to_string(), json!(outcome.as_str()));
+        object.insert("reason_code".to_string(), json!(durable_reason_code));
+        let _ = write_json_value(&run_path, &run_record);
+    }
+    if metrics_recorded {
+        return;
+    }
+    let Some(contract) = run_record
+        .get("task_contract")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskContractV1>(value).ok())
+    else {
+        return;
+    };
+    let Ok(runtime) = http_telemetry_runtime() else {
+        return;
+    };
+    let Some(metrics) = runtime.metrics() else {
+        return;
+    };
+    let ended_at_ms = run_record
+        .get("ended_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(now_ms);
+    let duration_seconds = ended_at_ms.saturating_sub(contract.created_at_ms) as f64 / 1_000.0;
+    metrics.record_run(
+        &MetricDimensions {
+            surface: contract.surface,
+            agent_name: contract.agent.name,
+            agent_version: contract.agent.version,
+            harness_version: contract.versions.harness_version,
+            environment: runtime.config().environment.clone(),
+        },
+        outcome,
+        reason,
+        duration_seconds,
+    );
+    let events_path = run_path.with_file_name("events.jsonl");
+    if let Ok(raw) = fs::read_to_string(events_path) {
+        let mut has_run = false;
+        let mut has_step = false;
+        let mut has_effect = false;
+        for event in raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        {
+            match event.get("event").and_then(Value::as_str) {
+                Some("agent.run.finished") => has_run = true,
+                Some("step.finished") => has_step = true,
+                Some("provider.request.finished" | "tool.execute.finished") => {
+                    has_effect = true;
+                }
+                _ => {}
+            }
+        }
+        let present = u8::from(has_run) + u8::from(has_step) + u8::from(has_effect);
+        metrics.record_trace_completeness(f64::from(present) / 3.0);
+    }
+    if let Some(object) = run_record.as_object_mut() {
+        object.insert("telemetry_metrics_recorded".to_string(), json!(true));
+        object.insert(
+            "telemetry_metrics_recorded_at_ms".to_string(),
+            json!(now_ms()),
+        );
+        let _ = write_json_value(&run_path, &run_record);
+    }
+}
+
+struct ActiveWorkerMetricsGuard;
+
+impl ActiveWorkerMetricsGuard {
+    fn acquire() -> Self {
+        if let Ok(runtime) = http_telemetry_runtime()
+            && let Some(metrics) = runtime.metrics()
+        {
+            metrics.add_active_workers(1);
+        }
+        Self
+    }
+}
+
+impl Drop for ActiveWorkerMetricsGuard {
+    fn drop(&mut self) {
+        if let Ok(runtime) = http_telemetry_runtime()
+            && let Some(metrics) = runtime.metrics()
+        {
+            metrics.add_active_workers(-1);
+        }
+    }
+}
+
+fn telemetry_add_queue_depth(delta: i64) {
+    if let Ok(runtime) = http_telemetry_runtime()
+        && let Some(metrics) = runtime.metrics()
+    {
+        metrics.add_queue_depth(delta);
+    }
+}
+
+fn record_queue_wait_telemetry(
+    store: &FileSessionStore,
+    contract: &TaskContractV1,
+    queue_wait_ms: u64,
+) {
+    let observation = start_http_runtime_span(
+        "queue.wait",
+        SpanKind::Consumer,
+        &contract.trace,
+        TelemetryAttributes::new()
+            .insert_i64(
+                "queue.wait_ms",
+                i64::try_from(queue_wait_ms).unwrap_or(i64::MAX),
+            )
+            .insert("queue.status", "dispatched"),
+    );
+    let context = observation.context;
+    let parent_span_id = observation.parent_span_id;
+    if let Some(span) = observation.span {
+        span.end(RunOutcome::Success, OutcomeReason::None);
+    }
+    let _ = store.record_event(
+        &contract.session_id,
+        &contract.run_id,
+        "queue.wait.finished",
+        SessionEventOptions {
+            kind: "queue".to_string(),
+            status: "dispatched".to_string(),
+            trace_id: Some(context.trace_id),
+            span_id: Some(context.span_id),
+            parent_span_id,
+            duration_ms: Some(queue_wait_ms),
+            attributes: BTreeMap::from([("queue_wait_ms".to_string(), json!(queue_wait_ms))]),
+            ..SessionEventOptions::default()
+        },
+    );
+    telemetry_record_queue_wait("dispatched", queue_wait_ms);
+}
+
+fn telemetry_record_queue_wait(status: &str, queue_wait_ms: u64) {
+    if let Ok(runtime) = http_telemetry_runtime()
+        && let Some(metrics) = runtime.metrics()
+    {
+        metrics.record_queue_wait(status, queue_wait_ms as f64 / 1_000.0);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_interaction_wait_telemetry(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    interaction: &str,
+    created_at_ms: u64,
+    status: &str,
+    state: TelemetryExecutionState,
+    outcome: Option<RunOutcome>,
+    reason: OutcomeReason,
+) {
+    let Some(contract) = runtime_task_contract_for_run(store, session_id, run_id) else {
+        return;
+    };
+    let duration_ms = now_ms().saturating_sub(created_at_ms);
+    let started_at = UNIX_EPOCH + Duration::from_millis(created_at_ms);
+    let attributes = TelemetryAttributes::new()
+        .insert("interaction.type", interaction)
+        .insert("interaction.status", status)
+        .insert_i64(
+            "interaction.wait_ms",
+            i64::try_from(duration_ms).unwrap_or(i64::MAX),
+        );
+    let (span, context) = match http_telemetry_runtime().and_then(|runtime| {
+        runtime
+            .start_span_at(
+                format!("{interaction}.wait"),
+                SpanKind::Internal,
+                Some(&contract.trace),
+                attributes,
+                started_at,
+            )
+            .map_err(|_| "failed to start interaction wait span")
+    }) {
+        Ok(span) => {
+            let context = span.context().clone();
+            (Some(span), context)
+        }
+        Err(_) => (None, contract.trace.child()),
+    };
+    if let Some(span) = span {
+        span.end_state(state, outcome, reason);
+    }
+    let _ = store.record_event(
+        session_id,
+        run_id,
+        &format!("{interaction}.wait.finished"),
+        SessionEventOptions {
+            kind: interaction.to_string(),
+            status: status.to_string(),
+            trace_id: Some(context.trace_id),
+            span_id: Some(context.span_id),
+            parent_span_id: Some(contract.trace.span_id),
+            duration_ms: Some(duration_ms),
+            attributes: BTreeMap::from([("wait_ms".to_string(), json!(duration_ms))]),
+            ..SessionEventOptions::default()
+        },
+    );
+    if let Ok(runtime) = http_telemetry_runtime()
+        && let Some(metrics) = runtime.metrics()
+    {
+        metrics.record_stage(interaction, status, duration_ms as f64 / 1_000.0);
+    }
+}
+
+fn telemetry_health_payload() -> Value {
+    match http_telemetry_runtime() {
+        Ok(runtime) => {
+            let health = runtime.health();
+            json!({
+                "enabled": health.enabled,
+                "trace_export_configured": health.trace_export_configured,
+                "prometheus_configured": health.prometheus_configured,
+                "trace_export_failures": health.trace_export_failures,
+                "shutdown_failures": health.shutdown_failures,
+                "error": Value::Null,
+            })
+        }
+        Err(error) => json!({
+            "enabled": false,
+            "trace_export_configured": false,
+            "prometheus_configured": false,
+            "trace_export_failures": 0,
+            "shutdown_failures": 0,
+            "error": error,
+        }),
+    }
+}
+
+fn telemetry_metrics_response() -> HttpResponseSpec {
+    match http_telemetry_runtime().and_then(|runtime| {
+        runtime
+            .prometheus_text()
+            .map_err(|_| "failed to encode Prometheus metrics")
+    }) {
+        Ok(Some(body)) => HttpResponseSpec {
+            status: 200,
+            content_type: Some("text/plain; version=0.0.4; charset=utf-8".to_string()),
+            headers: Map::new(),
+            body: None,
+            body_text: Some(body),
+        },
+        Ok(None) => json_response(
+            404,
+            json!({"error": "Prometheus metrics are disabled", "code": "metrics_disabled"}),
+        ),
+        Err(error) => json_response(
+            503,
+            json!({"error": error, "code": "telemetry_unavailable"}),
+        ),
+    }
 }
 
 #[must_use]
@@ -241,6 +836,14 @@ impl HttpRuntimeConfig {
 fn list_sessions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Value {
     let root = session_root(config);
     let query = query_param(request_path, "query").unwrap_or_default();
+    // Task agents have their own durable session so cancellation, recovery, and
+    // nested-task state survive a Bridge restart. They are not user-facing
+    // conversations, though: callers see them through the parent session's
+    // task tree. Keep the internal records available for diagnostics only.
+    let include_subagents = matches!(
+        query_param(request_path, "include_subagents").as_deref(),
+        Some("1" | "true" | "yes")
+    );
     let mut sessions = Vec::new();
     if let Ok(entries) = fs::read_dir(&root) {
         for entry in entries.flatten() {
@@ -250,6 +853,9 @@ fn list_sessions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Valu
             }
             let state = read_json_file(&path.join("state.latest.json"));
             if state.as_object().is_none_or(Map::is_empty) {
+                continue;
+            }
+            if !include_subagents && session_state_is_subagent(&state) {
                 continue;
             }
             let summary = session_summary_from_state(&state, &entry.file_name().to_string_lossy());
@@ -264,7 +870,21 @@ fn list_sessions_payload(config: &HttpRuntimeConfig, request_path: &str) -> Valu
             .as_u64()
             .cmp(&left["updated_at_ms"].as_u64())
     });
-    json!({"session_root": root.to_string_lossy(), "query": query, "sessions": sessions})
+    json!({
+        "session_root": root.to_string_lossy(),
+        "query": query,
+        "include_subagents": include_subagents,
+        "sessions": sessions,
+    })
+}
+
+fn session_state_is_subagent(state: &Value) -> bool {
+    state
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("subagent"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn initialize_durable_catalog(config: &HttpRuntimeConfig) -> Result<Value, String> {
@@ -373,16 +993,14 @@ fn persist_session_execution(
 }
 
 // mcp_runtime implementation lives in `mcp_runtime.rs`.
-fn runtime_text_model_supported(model: &str) -> bool {
-    openagent_text_model_supported(model)
-}
-
 fn runtime_image_model_supported(model: &str) -> bool {
     matches!(model, "gpt-image-1.5" | "gpt-image-2")
 }
 
 #[derive(Clone, Debug)]
 struct RuntimeProviderConfig {
+    config_id: String,
+    config_label: String,
     provider: String,
     provider_label: String,
     api_key_env: String,
@@ -401,6 +1019,8 @@ impl RuntimeProviderConfig {
     fn fallback(provider: &str) -> Self {
         let provider = normalize_provider(Some(provider)).unwrap_or_else(|_| "openai".to_string());
         Self {
+            config_id: "runtime".to_string(),
+            config_label: provider_label(&provider).unwrap_or_else(|_| provider.clone()),
             provider_label: provider_label(&provider).unwrap_or_else(|_| provider.clone()),
             api_key_env: default_env_mapping(&provider)
                 .ok()
@@ -449,7 +1069,30 @@ fn runtime_provider_config(
     let provider = normalize_provider(Some(&active_provider_id(provider)))?;
     let env = default_env_mapping(&provider)?;
     let auth_record = runtime_auth_record(&provider);
-    let managed_record = managed_provider_record(managed_state_path);
+    let requested_model = payload
+        .and_then(|payload| payload.get("model"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            session
+                .and_then(|session| session.metadata.get("model"))
+                .and_then(Value::as_str)
+        });
+    ensure_managed_provider_model_is_routed(managed_state_path, requested_model)?;
+    let managed_record = managed_provider_record_for_model(managed_state_path, requested_model);
+    let config_id = managed_record
+        .as_ref()
+        .and_then(|record| record.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("runtime")
+        .to_string();
+    let config_label = managed_record
+        .as_ref()
+        .and_then(|record| record.get("label"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| provider_label(&provider).unwrap_or_else(|_| provider.clone()));
     let sources = RuntimeProviderSources {
         payload,
         session,
@@ -460,13 +1103,17 @@ fn runtime_provider_config(
         .get("api_key")
         .cloned()
         .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
-    let api_key = runtime_provider_field(
-        "api_key",
-        &api_key_env,
-        &["OPENAGENT_API_KEY"],
-        None,
-        sources,
-    );
+    let api_key = if managed_provider_requires_private_key(managed_record.as_ref()) {
+        runtime_provider_explicit_field("api_key", sources)
+    } else {
+        runtime_provider_field(
+            "api_key",
+            &api_key_env,
+            &["OPENAGENT_API_KEY"],
+            None,
+            sources,
+        )
+    };
     let base_url = runtime_provider_field(
         "base_url",
         env.get("base_url")
@@ -528,6 +1175,8 @@ fn runtime_provider_config(
     )
     .expect("wire_api has default");
     Ok(RuntimeProviderConfig {
+        config_id,
+        config_label,
         provider_label: provider_label(&provider).unwrap_or_else(|_| provider.clone()),
         api_key_env,
         api_key: api_key.as_ref().map(|field| field.value.clone()),
@@ -557,6 +1206,36 @@ fn runtime_provider_field(
     provider_env_name: &str,
     generic_env_names: &[&str],
     default: Option<String>,
+    sources: RuntimeProviderSources<'_>,
+) -> Option<RuntimeProviderField> {
+    runtime_provider_explicit_field(field, sources)
+        .or_else(|| env_field(provider_env_name, "env"))
+        .or_else(|| {
+            generic_env_names
+                .iter()
+                .find_map(|name| env_field(name, "env"))
+        })
+        .or_else(|| {
+            sources
+                .auth_record
+                .and_then(|record| record.get(field))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| RuntimeProviderField {
+                    value: value.to_string(),
+                    source: "auth_file".to_string(),
+                })
+        })
+        .or_else(|| {
+            default.map(|value| RuntimeProviderField {
+                value,
+                source: "default".to_string(),
+            })
+        })
+}
+
+fn runtime_provider_explicit_field(
+    field: &str,
     sources: RuntimeProviderSources<'_>,
 ) -> Option<RuntimeProviderField> {
     sources
@@ -590,29 +1269,14 @@ fn runtime_provider_field(
                     source: "bridge_private_state".to_string(),
                 })
         })
-        .or_else(|| env_field(provider_env_name, "env"))
-        .or_else(|| {
-            generic_env_names
-                .iter()
-                .find_map(|name| env_field(name, "env"))
-        })
-        .or_else(|| {
-            sources
-                .auth_record
-                .and_then(|record| record.get(field))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(|value| RuntimeProviderField {
-                    value: value.to_string(),
-                    source: "auth_file".to_string(),
-                })
-        })
-        .or_else(|| {
-            default.map(|value| RuntimeProviderField {
-                value,
-                source: "default".to_string(),
-            })
-        })
+}
+
+fn managed_provider_requires_private_key(record: Option<&Value>) -> bool {
+    record
+        .and_then(|record| record.get("id"))
+        .and_then(Value::as_str)
+        .map(|id| !id.eq_ignore_ascii_case("gpt"))
+        .unwrap_or(false)
 }
 
 fn env_field(name: &str, source: &str) -> Option<RuntimeProviderField> {
@@ -808,6 +1472,22 @@ fn agents_payload(config: &HttpRuntimeConfig) -> Value {
             .map(|profile| runtime_subagent_public_value(&profile)),
     );
     json!({ "agents": agents })
+}
+
+fn tool_governance_payload(config: &HttpRuntimeConfig) -> Value {
+    let mut toolkit = Toolkit::with_builtins();
+    register_task_tool(
+        &mut toolkit.registry,
+        &runtime_task_subagent_descriptors(&workspace(config), None, None),
+    );
+    let _mcp_runtime = register_runtime_mcp_tools(config, &workspace(config), &mut toolkit);
+    serde_json::to_value(toolkit.governance_manifest()).unwrap_or_else(|error| {
+        json!({
+            "schema_version": "openharness.tool_governance.v1",
+            "passed": false,
+            "violations": [format!("failed to serialize tool governance manifest: {error}")],
+        })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1164,6 +1844,28 @@ fn filter_runtime_tools_for_profile(
         .collect()
 }
 
+fn runtime_tool_set_fingerprint(tools: &[ToolSchema]) -> String {
+    canonical_json_fingerprint(&json!(tools))
+}
+
+fn ensure_runtime_tool_set_matches_contract(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    visible_tools: &[ToolSchema],
+) -> Result<(), String> {
+    let contract = runtime_task_contract_for_run(store, session_id, run_id)
+        .ok_or_else(|| "task_contract_missing_for_tool_set_validation".to_string())?;
+    let actual = runtime_tool_set_fingerprint(visible_tools);
+    if actual != contract.versions.tool_set_version {
+        return Err(format!(
+            "tool_set_fingerprint_mismatch: expected={}, actual={}",
+            contract.versions.tool_set_version, actual
+        ));
+    }
+    Ok(())
+}
+
 fn session_metadata_string_list(session: &Session, key: &str) -> Vec<String> {
     session
         .metadata
@@ -1254,6 +1956,65 @@ struct RuntimeMcpRuntime {
     workspace: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+struct CachedRemoteMcpDiscovery {
+    refreshed_at: Instant,
+    transport: McpTransport,
+    descriptors: Vec<RemoteMcpToolDescriptor>,
+}
+
+static REMOTE_MCP_DISCOVERY_CACHE: OnceLock<Mutex<BTreeMap<String, CachedRemoteMcpDiscovery>>> =
+    OnceLock::new();
+
+fn discover_runtime_mcp_descriptors(
+    server: &RemoteMcpServerConfig,
+    workspace: &Path,
+    refresh_ttl_s: f64,
+) -> Result<(McpTransport, Vec<RemoteMcpToolDescriptor>), String> {
+    if server.server_type != McpServerType::Remote {
+        return discover_mcp_server_tools(server, workspace).map(|(transport, tools)| {
+            (
+                transport,
+                build_tool_descriptors_from_values(server, &tools),
+            )
+        });
+    }
+    let key = canonical_json_fingerprint(&json!({
+        "workspace": workspace.to_string_lossy(),
+        "server": server,
+    }));
+    let ttl = Duration::from_secs_f64(refresh_ttl_s.clamp(0.1, 3_600.0));
+    let cache = REMOTE_MCP_DISCOVERY_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(cached) = cache.get(&key)
+        && cached.refreshed_at.elapsed() <= ttl
+    {
+        return Ok((cached.transport, cached.descriptors.clone()));
+    }
+
+    let (transport, tools) = discover_mcp_server_tools(server, workspace)?;
+    let descriptors = build_tool_descriptors_from_values(server, &tools);
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= 64
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.refreshed_at)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            key,
+            CachedRemoteMcpDiscovery {
+                refreshed_at: Instant::now(),
+                transport,
+                descriptors: descriptors.clone(),
+            },
+        );
+    }
+    Ok((transport, descriptors))
+}
+
 fn register_runtime_mcp_tools(
     config: &HttpRuntimeConfig,
     workspace: &Path,
@@ -1277,20 +2038,32 @@ fn register_runtime_mcp_tools(
         if let Some(result) = refresh_mcp_lifecycle_server(server, workspace) {
             match result {
                 Ok(descriptors) => {
-                    for descriptor in &descriptors {
-                        toolkit
-                            .registry
-                            .register(mcp_tool_definition(descriptor, "remote-mcp"));
-                        descriptors_by_name
-                            .insert(descriptor.dynamic_name.clone(), descriptor.clone());
+                    let definitions = descriptors
+                        .iter()
+                        .map(|descriptor| mcp_tool_definition(descriptor, "remote-mcp"));
+                    match toolkit.registry.register_governed_batch(definitions) {
+                        Ok(()) => {
+                            for descriptor in &descriptors {
+                                descriptors_by_name
+                                    .insert(descriptor.dynamic_name.clone(), descriptor.clone());
+                            }
+                            let _ = manager.set_server_tools(
+                                &server.name,
+                                Some(McpTransport::Stdio),
+                                "connected",
+                                Some(now_ms() as f64 / 1000.0),
+                                descriptors,
+                            );
+                        }
+                        Err(violations) => {
+                            let _ = manager.set_server_error(
+                                &server.name,
+                                "governance_rejected",
+                                violations.join("; "),
+                                Some(now_ms() as f64 / 1000.0),
+                            );
+                        }
                     }
-                    let _ = manager.set_server_tools(
-                        &server.name,
-                        Some(McpTransport::Stdio),
-                        "connected",
-                        Some(now_ms() as f64 / 1000.0),
-                        descriptors,
-                    );
                 }
                 Err(error) => {
                     let _ = manager.set_server_error(
@@ -1303,22 +2076,34 @@ fn register_runtime_mcp_tools(
             }
             continue;
         }
-        match discover_mcp_server_tools(server, workspace) {
-            Ok((transport, tools)) => {
-                let descriptors = build_tool_descriptors_from_values(server, &tools);
-                for descriptor in &descriptors {
-                    toolkit
-                        .registry
-                        .register(mcp_tool_definition(descriptor, "remote-mcp"));
-                    descriptors_by_name.insert(descriptor.dynamic_name.clone(), descriptor.clone());
+        match discover_runtime_mcp_descriptors(server, workspace, mcp_config.refresh_ttl_s) {
+            Ok((transport, descriptors)) => {
+                let definitions = descriptors
+                    .iter()
+                    .map(|descriptor| mcp_tool_definition(descriptor, "remote-mcp"));
+                match toolkit.registry.register_governed_batch(definitions) {
+                    Ok(()) => {
+                        for descriptor in &descriptors {
+                            descriptors_by_name
+                                .insert(descriptor.dynamic_name.clone(), descriptor.clone());
+                        }
+                        let _ = manager.set_server_tools(
+                            &server.name,
+                            Some(transport),
+                            "connected",
+                            Some(now_ms() as f64 / 1000.0),
+                            descriptors,
+                        );
+                    }
+                    Err(violations) => {
+                        let _ = manager.set_server_error(
+                            &server.name,
+                            "governance_rejected",
+                            violations.join("; "),
+                            Some(now_ms() as f64 / 1000.0),
+                        );
+                    }
                 }
-                let _ = manager.set_server_tools(
-                    &server.name,
-                    Some(transport),
-                    "connected",
-                    Some(now_ms() as f64 / 1000.0),
-                    descriptors,
-                );
             }
             Err(error) => {
                 let _ = manager.set_server_error(
@@ -2402,6 +3187,18 @@ fn execute_tool_with_receipt(
     effect_scope: &str,
     execute: impl FnOnce() -> ToolResult,
 ) -> ToolResult {
+    let tool_started = Instant::now();
+    let tool_span = start_run_child_span(
+        store,
+        session_id,
+        run_id,
+        "tool.execute",
+        SpanKind::Client,
+        TelemetryAttributes::new()
+            .insert("tool.name", &tool_call.name)
+            .insert("tool.call.id", &tool_call.call_id)
+            .insert("tool.effect_scope", effect_scope),
+    );
     let executions = DurableExecutionStore::new(&store.root);
     let execution = match executions.get(session_id, run_id) {
         Ok(Some(mut record)) => {
@@ -2420,7 +3217,7 @@ fn execute_tool_with_receipt(
         Err(error) => Err(error),
     };
     if let Err(error) = execution {
-        return ToolResult {
+        let result = ToolResult {
             call_id: tool_call.call_id.clone(),
             output: String::new(),
             error: Some(format!("failed to persist tool execution: {error}")),
@@ -2429,72 +3226,210 @@ fn execute_tool_with_receipt(
                 ("effect_error".to_string(), json!(error.to_string())),
             ]),
         };
+        finish_tool_telemetry(
+            store,
+            session_id,
+            run_id,
+            tool_call,
+            effect_scope,
+            tool_started,
+            tool_span,
+            &result,
+        );
+        return result;
     }
     let effect_key = format!(
         "tool:{session_id}:{run_id}:{}:{effect_scope}",
         tool_call.call_id
     );
-    match executions.claim_effect(session_id, run_id, &effect_key, ExecutionPhase::Tool) {
-        Ok(EffectClaim::Acquired(_)) => {
-            let mut result = execute();
-            let serialized = serde_json::to_value(&result).ok();
-            match executions.commit_effect(session_id, run_id, &effect_key, serialized) {
-                Ok(receipt) => {
-                    result
-                        .metadata
-                        .insert("effect_committed".to_string(), json!(true));
-                    result.metadata.insert(
-                        "effect_idempotency_key".to_string(),
-                        json!(receipt.idempotency_key),
-                    );
+    let result =
+        match executions.claim_effect(session_id, run_id, &effect_key, ExecutionPhase::Tool) {
+            Ok(EffectClaim::Acquired(_)) => {
+                let mut result = execute();
+                let serialized = serde_json::to_value(&result).ok();
+                match executions.commit_effect(session_id, run_id, &effect_key, serialized) {
+                    Ok(receipt) => {
+                        result
+                            .metadata
+                            .insert("effect_committed".to_string(), json!(true));
+                        result.metadata.insert(
+                            "effect_idempotency_key".to_string(),
+                            json!(receipt.idempotency_key),
+                        );
+                    }
+                    Err(error) => {
+                        result
+                            .metadata
+                            .insert("effect_committed".to_string(), json!(false));
+                        result
+                            .metadata
+                            .insert("effect_receipt_error".to_string(), json!(error.to_string()));
+                    }
                 }
-                Err(error) => {
-                    result
-                        .metadata
-                        .insert("effect_committed".to_string(), json!(false));
-                    result
-                        .metadata
-                        .insert("effect_receipt_error".to_string(), json!(error.to_string()));
-                }
+                result
             }
-            result
-        }
-        Ok(EffectClaim::AlreadyCommitted(receipt)) => receipt
-            .result
-            .and_then(|value| serde_json::from_value::<ToolResult>(value).ok())
-            .map(|mut result| {
-                result
-                    .metadata
-                    .insert("effect_replayed".to_string(), json!(true));
-                result
-            })
-            .unwrap_or_else(|| ToolResult {
+            Ok(EffectClaim::AlreadyCommitted(receipt)) => receipt
+                .result
+                .and_then(|value| serde_json::from_value::<ToolResult>(value).ok())
+                .map(|mut result| {
+                    result
+                        .metadata
+                        .insert("effect_replayed".to_string(), json!(true));
+                    result
+                })
+                .unwrap_or_else(|| ToolResult {
+                    call_id: tool_call.call_id.clone(),
+                    output: String::new(),
+                    error: Some("committed tool effect is missing its result receipt".to_string()),
+                    metadata: BTreeMap::from([("effect_replayed".to_string(), json!(true))]),
+                }),
+            Ok(EffectClaim::Uncertain(receipt)) => ToolResult {
                 call_id: tool_call.call_id.clone(),
                 output: String::new(),
-                error: Some("committed tool effect is missing its result receipt".to_string()),
-                metadata: BTreeMap::from([("effect_replayed".to_string(), json!(true))]),
-            }),
-        Ok(EffectClaim::Uncertain(receipt)) => ToolResult {
-            call_id: tool_call.call_id.clone(),
-            output: String::new(),
-            error: Some(
-                "tool effect outcome is uncertain after restart; duplicate execution refused"
-                    .to_string(),
-            ),
-            metadata: BTreeMap::from([
-                ("effect_uncertain".to_string(), json!(true)),
-                (
-                    "effect_idempotency_key".to_string(),
-                    json!(receipt.idempotency_key),
+                error: Some(
+                    "tool effect outcome is uncertain after restart; duplicate execution refused"
+                        .to_string(),
                 ),
-            ]),
-        },
-        Err(error) => ToolResult {
-            call_id: tool_call.call_id.clone(),
-            output: String::new(),
-            error: Some(format!("failed to claim tool effect: {error}")),
-            metadata: BTreeMap::from([("effect_committed".to_string(), json!(false))]),
-        },
+                metadata: BTreeMap::from([
+                    ("effect_uncertain".to_string(), json!(true)),
+                    (
+                        "effect_idempotency_key".to_string(),
+                        json!(receipt.idempotency_key),
+                    ),
+                ]),
+            },
+            Err(error) => ToolResult {
+                call_id: tool_call.call_id.clone(),
+                output: String::new(),
+                error: Some(format!("failed to claim tool effect: {error}")),
+                metadata: BTreeMap::from([("effect_committed".to_string(), json!(false))]),
+            },
+        };
+    finish_tool_telemetry(
+        store,
+        session_id,
+        run_id,
+        tool_call,
+        effect_scope,
+        tool_started,
+        tool_span,
+        &result,
+    );
+    result
+}
+
+fn runtime_tool_class(tool_call: &ToolCall, result: &ToolResult) -> &'static str {
+    if tool_call.name == TASK_TOOL_ID {
+        "subagent"
+    } else if matches!(tool_call.name.as_str(), "approval" | "question") {
+        "interaction"
+    } else if tool_call.name == "skill" {
+        "skill"
+    } else if result.metadata.contains_key("server_name")
+        || result.metadata.keys().any(|key| key.starts_with("mcp_"))
+    {
+        "mcp"
+    } else {
+        "builtin"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_tool_telemetry(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    tool_call: &ToolCall,
+    effect_scope: &str,
+    started: Instant,
+    observation: Option<RuntimeSpanObservation>,
+    result: &ToolResult,
+) {
+    let requires_approval = result
+        .metadata
+        .get("requires_approval")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (state, outcome, reason, status) = if requires_approval {
+        (
+            TelemetryExecutionState::Waiting,
+            None,
+            OutcomeReason::None,
+            "waiting",
+        )
+    } else if let Some(error) = result.error.as_deref() {
+        let reason = if error.to_ascii_lowercase().contains("denied") {
+            OutcomeReason::ToolDenied
+        } else if error.to_ascii_lowercase().contains("timeout") {
+            OutcomeReason::ToolTimeout
+        } else {
+            OutcomeReason::PartialToolFailure
+        };
+        (
+            TelemetryExecutionState::Failed,
+            Some(RunOutcome::Failed),
+            reason,
+            "failed",
+        )
+    } else {
+        (
+            TelemetryExecutionState::Completed,
+            Some(RunOutcome::Success),
+            OutcomeReason::None,
+            "success",
+        )
+    };
+    let tool_class = runtime_tool_class(tool_call, result);
+    if let Ok(runtime) = http_telemetry_runtime()
+        && let Some(metrics) = runtime.metrics()
+    {
+        metrics.record_tool(tool_class, status, started.elapsed().as_secs_f64());
+        if tool_class == "mcp" {
+            metrics.record_mcp(status);
+        }
+    }
+    if let Some(observation) = observation {
+        let mut attributes = BTreeMap::from([
+            ("call_id".to_string(), json!(tool_call.call_id)),
+            ("tool_name".to_string(), json!(tool_call.name)),
+            ("tool_class".to_string(), json!(tool_class)),
+            ("effect_scope".to_string(), json!(effect_scope)),
+            (
+                "effect_replayed".to_string(),
+                result
+                    .metadata
+                    .get("effect_replayed")
+                    .cloned()
+                    .unwrap_or(Value::Bool(false)),
+            ),
+        ]);
+        for (source, target) in [
+            ("governance_risk_tier", "governance.risk_tier"),
+            ("governance_requested_action", "governance.requested_action"),
+            ("governance_effective_action", "governance.effective_action"),
+            ("governance_enforced", "governance.enforced"),
+            (
+                "governance_approval_bypassed",
+                "governance.approval_bypassed",
+            ),
+        ] {
+            if let Some(value) = result.metadata.get(source) {
+                attributes.insert(target.to_string(), value.clone());
+            }
+        }
+        finish_runtime_span(
+            store,
+            session_id,
+            run_id,
+            "tool.execute.finished",
+            "tool",
+            status,
+            observation,
+            state,
+            outcome,
+            reason,
+            attributes,
+        );
     }
 }
 
@@ -2512,6 +3447,48 @@ fn session_task_cancel_requested(root: &Path, task_id: &str, run_id: &str) -> bo
         .get("run_id")
         .and_then(Value::as_str)
         .is_none_or(|marked_run_id| marked_run_id.is_empty() || marked_run_id == run_id)
+}
+
+fn ancestor_task_cancel_requested(root: &Path, session: &Session) -> bool {
+    let store = FileSessionStore::new(root.to_path_buf());
+    let mut parent_session_id = session
+        .metadata
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut parent_run_id = session
+        .metadata
+        .get("parent_run_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // A task depth is bounded by governance, but keep this defensive in case
+    // of hand-edited legacy session state.
+    for _ in 0..32 {
+        let (Some(parent_id), Some(parent_run)) =
+            (parent_session_id.as_deref(), parent_run_id.as_deref())
+        else {
+            return false;
+        };
+        if turn_cancel_requested(parent_run)
+            || session_task_cancel_requested(root, parent_id, parent_run)
+        {
+            return true;
+        }
+        let Ok(parent) = store.load_session(parent_id) else {
+            return false;
+        };
+        parent_session_id = parent
+            .metadata
+            .get("parent_session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        parent_run_id = parent
+            .metadata
+            .get("parent_run_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    true
 }
 
 fn write_session_task_cancel_marker(
@@ -2539,9 +3516,23 @@ fn run_session_task_payload(
     task_id: &str,
     body: &str,
 ) -> Result<Value, String> {
-    let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    let mut payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let store = FileSessionStore::new(session_root(config));
     let mut child_session = load_owned_session_task(&store, parent_session_id, task_id)?;
+    if let Some(object) = payload.as_object_mut() {
+        for key in [
+            "deadline_at_ms",
+            "max_total_tokens",
+            "max_cost_microunits",
+            "max_tool_calls",
+        ] {
+            if !object.contains_key(key)
+                && let Some(value) = child_session.metadata.get(key)
+            {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
     let task_status = task_status_value(&child_session);
     if task_status != "queued" {
         return Err(format!("task is not queued: {task_status}"));
@@ -2577,6 +3568,7 @@ fn run_session_task_payload(
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let model_id = model.clone().unwrap_or_else(default_model_id);
     let permission_raw = child_session
         .metadata
         .get("permission")
@@ -2635,13 +3627,23 @@ fn run_session_task_payload(
         }),
     );
     child_session.metadata.remove("cancel_requested_at_ms");
+    let (task_contract, run_span) = build_subagent_run_contract(
+        config,
+        &store,
+        &child_session,
+        &payload,
+        &run_id,
+        &agent_name,
+        &model_id,
+        max_steps,
+    );
     store
-        .start_run(
+        .start_run_with_contract(
             &mut child_session,
             StartRunOptions {
                 run_id: run_id.clone(),
-                trace_id: new_id("trace"),
-                agent_name,
+                trace_id: task_contract.trace.trace_id.clone(),
+                agent_name: agent_name.clone(),
                 model_id: model.clone(),
                 provider_id: Some(provider.clone()),
                 permission: if skip_permissions {
@@ -2650,8 +3652,9 @@ fn run_session_task_payload(
                     permission_raw.clone()
                 },
                 max_steps,
-                started_at_ms: None,
+                started_at_ms: Some(task_contract.created_at_ms),
             },
+            &task_contract,
         )
         .map_err(|error| format!("failed to start task run: {error}"))?;
     let parent_execution_id = child_session
@@ -2799,6 +3802,27 @@ fn run_session_task_payload(
         },
     );
     clear_session_task_cancel_marker(&store.root, task_id);
+    let telemetry_result: Result<Value, String> = Ok(json!({"status": status}));
+    let (telemetry_state, telemetry_outcome, telemetry_reason, telemetry_status) =
+        telemetry_turn_result(&telemetry_result);
+    let terminal_outcome = telemetry_outcome.clone();
+    let terminal_reason = telemetry_reason.clone();
+    finish_runtime_span(
+        &store,
+        &child_session.id,
+        &run_id,
+        "agent.run.finished",
+        "run",
+        &telemetry_status,
+        run_span,
+        telemetry_state,
+        telemetry_outcome,
+        telemetry_reason,
+        BTreeMap::from([("surface".to_string(), json!("subagent"))]),
+    );
+    if let Some(outcome) = terminal_outcome {
+        record_http_run_metrics(&store, &child_session.id, &run_id, outcome, terminal_reason);
+    }
     let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
     let task = session_task_summary_from_state(&session_root(config), &state, task_id);
     Ok(json!({
@@ -6119,6 +7143,230 @@ struct RuntimeProfile {
     thinking: String,
 }
 
+fn trace_context_from_turn_payload(payload: &Value) -> Result<TraceContext, String> {
+    let Some(value) = payload.get(INTERNAL_TRACE_CONTEXT_KEY) else {
+        return Ok(TraceContext::new_root(true));
+    };
+    let context = serde_json::from_value::<TraceContext>(value.clone())
+        .map_err(|error| format!("invalid internal trace context: {error}"))?;
+    context.validate().map_err(|error| error.to_string())?;
+    Ok(context)
+}
+
+fn runtime_model_family(model: &str) -> String {
+    let normalized = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase();
+    for family in [
+        "gpt", "claude", "gemini", "deepseek", "qwen", "llama", "mistral",
+    ] {
+        if normalized.starts_with(family) {
+            return family.to_string();
+        }
+    }
+    "other".to_string()
+}
+
+fn runtime_task_contract(
+    config: &HttpRuntimeConfig,
+    session: &Session,
+    payload: &Value,
+    run_id: &str,
+    profile: &RuntimeProfile,
+    max_steps: u64,
+    trace: TraceContext,
+) -> TaskContractV1 {
+    let agent_profile = runtime_agent_profile_for_session(session);
+    let agent_value = agent_profile.as_ref().map_or_else(
+        || {
+            json!({
+                "id": profile.agent,
+                "variant": profile.variant,
+                "thinking": profile.thinking,
+            })
+        },
+        |agent| {
+            json!({
+                "id": agent.id,
+                "name": agent.name,
+                "description": agent.description,
+                "mode": agent.mode,
+                "permission": agent.permission,
+                "task_permissions": agent.task_permissions,
+                "skills": agent.skills,
+                "skill_roots": agent.skill_roots,
+                "skill_permissions": agent.skill_permissions,
+                "tools": agent.tools,
+                "provider": agent.provider,
+                "model": agent.model,
+                "max_steps": agent.max_steps,
+                "temperature": agent.temperature,
+                "top_p": agent.top_p,
+                "model_options": agent.model_options,
+                "workspace_isolation": agent.workspace_isolation,
+            })
+        },
+    );
+    let prompt = agent_profile
+        .as_ref()
+        .map(|agent| agent.prompt.as_str())
+        .unwrap_or(DEFAULT_BUILD_AGENT_PROMPT);
+    let skill_documents = agent_profile
+        .as_ref()
+        .map(|agent| runtime_preloaded_skill_documents(agent, &session.directory))
+        .unwrap_or_default();
+    let mut toolkit = toolkit_with_runtime_task_tool(session, agent_profile.as_ref());
+    let _mcp_runtime = register_runtime_mcp_tools(config, &session.directory, &mut toolkit);
+    let governance = toolkit.governance_manifest();
+    debug_assert!(governance.passed, "{:?}", governance.violations);
+    let tool_schemas = filter_runtime_tools_for_capabilities(
+        &session_root(config),
+        filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref()),
+    );
+    let agent_version = canonical_json_fingerprint(&agent_value);
+    let prompt_version = canonical_json_fingerprint(&json!(prompt));
+    let skill_set_version = canonical_json_fingerprint(&json!(skill_documents));
+    let tool_set_version = runtime_tool_set_fingerprint(&tool_schemas);
+    let configuration = json!({
+        "runtime": config.to_public_value(),
+        "agent": profile.agent,
+        "model": profile.model,
+        "variant": profile.variant,
+        "thinking": profile.thinking,
+        "max_steps": max_steps,
+        "context_budget": payload.get("context_budget"),
+        "model_options": runtime_provider_model_options(session, payload),
+        "permission": payload.get("permission"),
+        "skip_permissions": payload.get("skip_permissions"),
+    });
+    let versions = VersionIdentity::current_harness(
+        agent_version.clone(),
+        prompt_version,
+        skill_set_version,
+        tool_set_version,
+        &configuration,
+    );
+    let provider = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .or_else(|| session.metadata.get("provider").and_then(Value::as_str))
+        .unwrap_or("openagent")
+        .to_string();
+    let task_id = payload
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(run_id);
+    let mut contract = TaskContractV1::new(
+        task_id,
+        session.id.clone(),
+        run_id,
+        if session
+            .metadata
+            .get("subagent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            RunSurface::Subagent
+        } else {
+            RunSurface::Http
+        },
+        AgentIdentity {
+            name: profile.agent.clone(),
+            version: agent_version,
+        },
+        ModelIdentity {
+            provider,
+            model: profile.model.clone(),
+            family: runtime_model_family(&profile.model),
+        },
+        versions,
+        RuntimeBudgets {
+            deadline_at_ms: payload.get("deadline_at_ms").and_then(Value::as_u64),
+            max_steps: Some(max_steps),
+            max_total_tokens: payload.get("max_total_tokens").and_then(Value::as_u64),
+            max_cost_microunits: payload.get("max_cost_microunits").and_then(Value::as_u64),
+            max_tool_calls: payload.get("max_tool_calls").and_then(Value::as_u64),
+        },
+        trace,
+        now_ms(),
+    );
+    contract.parent_run_id = session
+        .metadata
+        .get("parent_run_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    contract.idempotency_key = payload
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
+    contract
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_subagent_run_contract(
+    config: &HttpRuntimeConfig,
+    store: &FileSessionStore,
+    session: &Session,
+    payload: &Value,
+    run_id: &str,
+    agent_name: &str,
+    model: &str,
+    max_steps: u64,
+) -> (TaskContractV1, RuntimeSpanObservation) {
+    let parent_trace = session
+        .metadata
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .zip(
+            session
+                .metadata
+                .get("parent_run_id")
+                .and_then(Value::as_str),
+        )
+        .and_then(|(parent_session_id, parent_run_id)| {
+            runtime_task_contract_for_run(store, parent_session_id, parent_run_id)
+        })
+        .map(|contract| contract.trace)
+        .unwrap_or_else(|| TraceContext::new_root(true));
+    let mut observation = start_http_runtime_span(
+        "agent.run",
+        SpanKind::Internal,
+        &parent_trace,
+        TelemetryAttributes::new()
+            .insert("run.id", run_id)
+            .insert("session.id", &session.id)
+            .insert("agent.name", agent_name)
+            .insert("gen_ai.request.model", model)
+            .insert("run.surface", "subagent"),
+    );
+    let profile = RuntimeProfile {
+        agent: agent_name.to_string(),
+        model: model.to_string(),
+        variant: "subagent".to_string(),
+        thinking: "default".to_string(),
+    };
+    let contract = runtime_task_contract(
+        config,
+        session,
+        payload,
+        run_id,
+        &profile,
+        max_steps,
+        observation.context.clone(),
+    );
+    if let Some(span) = observation.span.as_mut() {
+        for (key, value) in contract.versions.trace_attributes() {
+            span.set_attribute(key, value);
+        }
+    }
+    (contract, observation)
+}
+
 fn apply_turn_runtime_profile(session: &mut Session, payload: &Value) -> RuntimeProfile {
     let model_was_explicit = payload
         .get("model")
@@ -6281,6 +7529,7 @@ struct OpenAiRuntimeProviderRequest<'a> {
     timeout_s: u64,
     stream: bool,
     context_pack: &'a ContextPack,
+    trace_context: Option<&'a TraceContext>,
 }
 
 struct NativeRuntimeProviderRequest<'a> {
@@ -6291,6 +7540,7 @@ struct NativeRuntimeProviderRequest<'a> {
     timeout_s: u64,
     stream: bool,
     context_pack: &'a ContextPack,
+    trace_context: Option<&'a TraceContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -6305,6 +7555,84 @@ struct RuntimeProviderLoopCarry {
     usage: Usage,
     tool_calls: u64,
     next_step: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeBudgetViolation {
+    code: &'static str,
+    message: String,
+    reason: OutcomeReason,
+}
+
+fn runtime_budget_violation(
+    payload: &Value,
+    usage: &Usage,
+    tool_calls: u64,
+) -> Option<RuntimeBudgetViolation> {
+    if runtime_deadline_exceeded(payload) {
+        return Some(RuntimeBudgetViolation {
+            code: "deadline_exceeded",
+            message: TURN_DEADLINE_EXCEEDED_ERROR.to_string(),
+            reason: OutcomeReason::DeadlineExceeded,
+        });
+    }
+    let total_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+    if let Some(max_total_tokens) = payload.get("max_total_tokens").and_then(Value::as_u64)
+        && total_tokens > max_total_tokens
+    {
+        return Some(RuntimeBudgetViolation {
+            code: "total_tokens_exceeded",
+            message: format!("run token budget exceeded: {total_tokens} > {max_total_tokens}"),
+            reason: OutcomeReason::BudgetExhausted,
+        });
+    }
+    if let Some(max_cost_microunits) = payload.get("max_cost_microunits").and_then(Value::as_u64) {
+        let cost_microunits = if usage.cost.is_finite() && usage.cost > 0.0 {
+            (usage.cost * 1_000_000.0).ceil().min(u64::MAX as f64) as u64
+        } else {
+            0
+        };
+        if cost_microunits > max_cost_microunits {
+            return Some(RuntimeBudgetViolation {
+                code: "cost_exceeded",
+                message: format!(
+                    "run cost budget exceeded: {cost_microunits} > {max_cost_microunits} microunits"
+                ),
+                reason: OutcomeReason::BudgetExhausted,
+            });
+        }
+    }
+    if let Some(max_tool_calls) = payload.get("max_tool_calls").and_then(Value::as_u64)
+        && tool_calls > max_tool_calls
+    {
+        return Some(RuntimeBudgetViolation {
+            code: "tool_calls_exceeded",
+            message: format!("run tool-call budget exceeded: {tool_calls} > {max_tool_calls}"),
+            reason: OutcomeReason::BudgetExhausted,
+        });
+    }
+    None
+}
+
+fn runtime_deadline_exceeded(payload: &Value) -> bool {
+    payload
+        .get("deadline_at_ms")
+        .and_then(Value::as_u64)
+        .is_some_and(|deadline_at_ms| now_ms() >= deadline_at_ms)
+}
+
+fn runtime_provider_timeout_seconds(payload: &Value) -> u64 {
+    let requested = payload
+        .get("timeout_s")
+        .and_then(Value::as_u64)
+        .unwrap_or(60)
+        .max(1);
+    let Some(deadline_at_ms) = payload.get("deadline_at_ms").and_then(Value::as_u64) else {
+        return requested;
+    };
+    let remaining_ms = deadline_at_ms.saturating_sub(now_ms());
+    let remaining_seconds = remaining_ms.saturating_add(999) / 1_000;
+    requested.min(remaining_seconds.max(1))
 }
 
 impl Default for RuntimeProviderLoopCarry {
@@ -6375,6 +7703,24 @@ fn provider_turn_result(
         Some(payload),
         Some(session),
     )?;
+    let mut route_events = [json!({
+        "method": "turn/provider",
+        "params": {
+            "thread_id": session.id.clone(),
+            "session_id": session.id.clone(),
+            "turn_id": run_id,
+            "run_id": run_id,
+            "step": step,
+            "status": "running",
+            "provider": provider_config.provider.clone(),
+            "provider_label": provider_config.provider_label.clone(),
+            "provider_config_id": provider_config.config_id.clone(),
+            "provider_config_label": provider_config.config_label.clone(),
+            "model": provider_config.model.clone(),
+            "wire_api": provider_config.wire_api.clone(),
+        }
+    })];
+    append_bridge_events(&store.root, &session.id, run_id, &mut route_events);
     let model_options = runtime_provider_model_options(session, payload);
     let context_model = runtime_context_model(&provider_config, session, payload);
     let context_budget_options = runtime_context_budget_options(session, payload);
@@ -6512,11 +7858,27 @@ fn provider_turn_result(
         });
     }
     let api_key = provider_config.api_key.clone().unwrap_or_default();
-    let timeout = payload
-        .get("timeout_s")
-        .and_then(Value::as_u64)
-        .unwrap_or(60);
+    let timeout = runtime_provider_timeout_seconds(payload);
     let stream = provider_streaming_enabled_for_turn(payload);
+    let model_family = runtime_model_family(&provider_config.model);
+    let provider_started = Instant::now();
+    let mut provider_span = start_run_child_span(
+        store,
+        &session.id,
+        run_id,
+        "provider.request",
+        SpanKind::Client,
+        TelemetryAttributes::new()
+            .insert("gen_ai.operation.name", "chat")
+            .insert("gen_ai.provider.name", &provider_config.provider)
+            .insert("gen_ai.request.model", &provider_config.model)
+            .insert("model.family", &model_family)
+            .insert_i64("agent.step", i64::try_from(step).unwrap_or(i64::MAX))
+            .insert_bool("gen_ai.request.streaming", stream),
+    );
+    let provider_trace = provider_span
+        .as_ref()
+        .map(|observation| observation.context.clone());
     let result = match provider_config.provider.as_str() {
         "anthropic" => call_anthropic_provider_for_runtime(
             NativeRuntimeProviderRequest {
@@ -6527,6 +7889,7 @@ fn provider_turn_result(
                 timeout_s: timeout,
                 stream,
                 context_pack: &context_pack,
+                trace_context: provider_trace.as_ref(),
             },
             stream_sink,
             should_cancel,
@@ -6541,6 +7904,7 @@ fn provider_turn_result(
                 timeout_s: timeout,
                 stream,
                 context_pack: &context_pack,
+                trace_context: provider_trace.as_ref(),
             },
             stream_sink,
             should_cancel,
@@ -6556,11 +7920,128 @@ fn provider_turn_result(
                 timeout_s: timeout,
                 stream,
                 context_pack: &context_pack,
+                trace_context: provider_trace.as_ref(),
             },
             stream_sink,
             should_cancel,
         ),
-    }?;
+    };
+    let provider_duration_seconds = provider_started.elapsed().as_secs_f64();
+    let result = match result {
+        Ok(result) => {
+            if let Some(observation) = provider_span.as_mut()
+                && let Some(span) = observation.span.as_mut()
+            {
+                span.set_attribute(
+                    "gen_ai.usage.input_tokens",
+                    result.usage.input_tokens.to_string(),
+                );
+                span.set_attribute(
+                    "gen_ai.usage.output_tokens",
+                    result.usage.output_tokens.to_string(),
+                );
+                span.set_attribute("gen_ai.response.finish_reasons", &result.finish_reason);
+            }
+            if let Ok(runtime) = http_telemetry_runtime()
+                && let Some(metrics) = runtime.metrics()
+            {
+                metrics.record_provider(
+                    &provider_config.provider,
+                    &model_family,
+                    "success",
+                    provider_duration_seconds,
+                );
+                metrics.add_tokens(
+                    &provider_config.provider,
+                    &model_family,
+                    "input",
+                    result.usage.input_tokens,
+                );
+                metrics.add_tokens(
+                    &provider_config.provider,
+                    &model_family,
+                    "output",
+                    result.usage.output_tokens,
+                );
+                metrics.add_cost(&provider_config.provider, &model_family, result.usage.cost);
+            }
+            if let Some(observation) = provider_span {
+                finish_runtime_span(
+                    store,
+                    &session.id,
+                    run_id,
+                    "provider.request.finished",
+                    "provider",
+                    "success",
+                    observation,
+                    TelemetryExecutionState::Completed,
+                    Some(RunOutcome::Success),
+                    OutcomeReason::None,
+                    BTreeMap::from([
+                        ("step".to_string(), json!(step)),
+                        ("provider".to_string(), json!(provider_config.provider)),
+                        ("model_family".to_string(), json!(model_family)),
+                        ("input_tokens".to_string(), json!(result.usage.input_tokens)),
+                        (
+                            "output_tokens".to_string(),
+                            json!(result.usage.output_tokens),
+                        ),
+                        (
+                            "tool_call_count".to_string(),
+                            json!(result.tool_calls.len()),
+                        ),
+                    ]),
+                );
+            }
+            result
+        }
+        Err(error) => {
+            let interrupted = is_turn_interrupted_error(&error);
+            let status = if interrupted { "interrupted" } else { "failed" };
+            if let Ok(runtime) = http_telemetry_runtime()
+                && let Some(metrics) = runtime.metrics()
+            {
+                metrics.record_provider(
+                    &provider_config.provider,
+                    &model_family,
+                    status,
+                    provider_duration_seconds,
+                );
+            }
+            if let Some(observation) = provider_span {
+                finish_runtime_span(
+                    store,
+                    &session.id,
+                    run_id,
+                    "provider.request.finished",
+                    "provider",
+                    status,
+                    observation,
+                    if interrupted {
+                        TelemetryExecutionState::Interrupted
+                    } else {
+                        TelemetryExecutionState::Failed
+                    },
+                    Some(if interrupted {
+                        RunOutcome::Interrupted
+                    } else {
+                        RunOutcome::Failed
+                    }),
+                    if interrupted {
+                        OutcomeReason::UserCancelled
+                    } else {
+                        OutcomeReason::ProviderExhausted
+                    },
+                    BTreeMap::from([
+                        ("step".to_string(), json!(step)),
+                        ("provider".to_string(), json!(provider_config.provider)),
+                        ("model_family".to_string(), json!(model_family)),
+                    ]),
+                );
+            }
+            return Err(error);
+        }
+    };
     context_performance.provider_payload_build_us = result.payload_performance.build_us;
     context_performance.provider_payload_serialize_us = result.payload_performance.serialize_us;
     context_performance.provider_payload_bytes = result.payload_performance.bytes;
@@ -6789,6 +8270,7 @@ fn call_anthropic_provider_for_runtime(
         timeout_s,
         stream,
         context_pack,
+        trace_context,
     } = request;
     context_pack
         .validate_provider_input()
@@ -6841,6 +8323,8 @@ fn call_anthropic_provider_for_runtime(
         model,
         NativeProviderAuth::Anthropic,
         &mut stream_sink,
+        trace_context,
+        should_cancel,
     )?;
     let status = response.status();
     let content_type = response_content_type(&response);
@@ -6906,6 +8390,7 @@ fn call_gemini_provider_for_runtime(
         timeout_s,
         stream,
         context_pack,
+        trace_context,
     } = request;
     context_pack
         .validate_provider_input()
@@ -6948,6 +8433,8 @@ fn call_gemini_provider_for_runtime(
         model,
         NativeProviderAuth::Gemini,
         &mut stream_sink,
+        trace_context,
+        should_cancel,
     )?;
     let status = response.status();
     let content_type = response_content_type(&response);
@@ -7055,6 +8542,7 @@ fn call_openai_compatible_provider_for_runtime(
         timeout_s,
         stream,
         context_pack,
+        trace_context,
     } = request;
     context_pack.validate_provider_input()?;
     let messages = context_pack.messages.as_slice();
@@ -7081,6 +8569,7 @@ fn call_openai_compatible_provider_for_runtime(
             tools,
             model_options,
             system_prompt.as_deref(),
+            trace_context,
             &mut stream_sink,
             should_cancel,
         );
@@ -7133,6 +8622,7 @@ fn call_openai_compatible_provider_model(
     tools: &[openagent_protocol::ToolSchema],
     model_options: &BTreeMap<String, Value>,
     system_prompt: Option<&str>,
+    trace_context: Option<&TraceContext>,
     stream_sink: &mut Option<&mut dyn FnMut(&ProviderStreamEvent)>,
     should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<RuntimeProviderResult, RuntimeProviderCallError> {
@@ -7214,6 +8704,8 @@ fn call_openai_compatible_provider_model(
         runtime_provider_request_retries(),
         model,
         stream_sink,
+        trace_context,
+        should_cancel,
     )?;
     let status = response.status();
     let content_type = response
@@ -7298,9 +8790,21 @@ fn runtime_result_with_payload_performance(
 fn runtime_provider_model_candidates(primary_model: &str) -> Vec<String> {
     runtime_provider_model_candidates_with_fallback(
         primary_model,
-        std::env::var("OPENAGENT_PROVIDER_FALLBACK_MODELS")
-            .ok()
+        provider_model_fallbacks_enabled()
+            .then(|| std::env::var("OPENAGENT_PROVIDER_FALLBACK_MODELS").ok())
+            .flatten()
             .as_deref(),
+    )
+}
+
+fn provider_model_fallbacks_enabled() -> bool {
+    matches!(
+        std::env::var("OPENAGENT_ENABLE_PROVIDER_FALLBACKS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
     )
 }
 
@@ -7313,6 +8817,10 @@ fn runtime_provider_model_candidates_with_fallback(
     } else {
         primary_model.trim().to_string()
     };
+    // A model choice in the desktop is an explicit routing decision. Never
+    // silently substitute a different model just because a request is
+    // retryable: model fallbacks are opt-in through the environment for
+    // deployments that deliberately want that policy.
     let configured = configured_fallbacks
         .map(|value| {
             value
@@ -7323,20 +8831,7 @@ fn runtime_provider_model_candidates_with_fallback(
                 .collect::<Vec<_>>()
         })
         .filter(|models| !models.is_empty())
-        .unwrap_or_else(|| {
-            if runtime_text_model_supported(&primary) {
-                match primary.as_str() {
-                    "gpt-5.5" => vec!["gpt-5.4".to_string()],
-                    "gpt-5.4" => vec!["gpt-5.5".to_string()],
-                    "gpt-5.6-sol" => vec!["gpt-5.6-terra".to_string(), "gpt-5.6-luna".to_string()],
-                    "gpt-5.6-terra" => vec!["gpt-5.6-sol".to_string(), "gpt-5.6-luna".to_string()],
-                    "gpt-5.6-luna" => vec!["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()],
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            }
-        });
+        .unwrap_or_default();
     let mut models = Vec::with_capacity(1 + configured.len());
     models.push(primary);
     for model in configured {
@@ -7396,13 +8891,26 @@ fn send_runtime_provider_request(
     max_retries: u64,
     model: &str,
     stream_sink: &mut Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    trace_context: Option<&TraceContext>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<reqwest::blocking::Response, RuntimeProviderCallError> {
     let mut attempt = 0_u64;
     loop {
+        if should_cancel.is_some_and(|cancelled| cancelled()) {
+            return Err(provider_cancelled_error());
+        }
         let mut request = client
             .post(endpoint)
             .bearer_auth(api_key)
             .header("content-type", "application/json");
+        if let Some(context) = trace_context {
+            let mut headers = BTreeMap::new();
+            if context.inject_headers(&mut headers).is_ok() {
+                for (key, value) in headers {
+                    request = request.header(key, value);
+                }
+            }
+        }
         if stream {
             request = request.header("accept", "text/event-stream");
         }
@@ -7421,7 +8929,7 @@ fn send_runtime_provider_request(
                             reason: format!("provider returned HTTP {status}"),
                         });
                     }
-                    thread::sleep(delay);
+                    wait_provider_retry(delay, should_cancel)?;
                     continue;
                 }
                 return Ok(response);
@@ -7438,7 +8946,7 @@ fn send_runtime_provider_request(
                         reason: format!("provider request failed: {error}"),
                     });
                 }
-                thread::sleep(delay);
+                wait_provider_retry(delay, should_cancel)?;
             }
             Err(error) => {
                 return Err(RuntimeProviderCallError {
@@ -7458,6 +8966,28 @@ fn runtime_provider_retry_delay(attempt: u64) -> Duration {
     Duration::from_millis(750 * (1_u64 << attempt.saturating_sub(1).min(3)))
 }
 
+fn provider_cancelled_error() -> RuntimeProviderCallError {
+    RuntimeProviderCallError {
+        message: TURN_INTERRUPTED_ERROR.to_string(),
+        retryable: false,
+    }
+}
+
+fn wait_provider_retry(
+    delay: Duration,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<(), RuntimeProviderCallError> {
+    let started = Instant::now();
+    while started.elapsed() < delay {
+        if should_cancel.is_some_and(|cancelled| cancelled()) {
+            return Err(provider_cancelled_error());
+        }
+        let remaining = delay.saturating_sub(started.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send_runtime_native_provider_request(
     client: &reqwest::blocking::Client,
@@ -7469,9 +8999,14 @@ fn send_runtime_native_provider_request(
     model: &str,
     auth: NativeProviderAuth,
     stream_sink: &mut Option<&mut dyn FnMut(&ProviderStreamEvent)>,
+    trace_context: Option<&TraceContext>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<reqwest::blocking::Response, RuntimeProviderCallError> {
     let mut attempt = 0_u64;
     loop {
+        if should_cancel.is_some_and(|cancelled| cancelled()) {
+            return Err(provider_cancelled_error());
+        }
         let request = client
             .post(endpoint)
             .header("content-type", "application/json");
@@ -7481,6 +9016,14 @@ fn send_runtime_native_provider_request(
                 .header("anthropic-version", "2023-06-01"),
             NativeProviderAuth::Gemini => request.header("x-goog-api-key", api_key),
         };
+        if let Some(context) = trace_context {
+            let mut headers = BTreeMap::new();
+            if context.inject_headers(&mut headers).is_ok() {
+                for (key, value) in headers {
+                    request = request.header(key, value);
+                }
+            }
+        }
         if stream {
             request = request.header("accept", "text/event-stream");
         }
@@ -7499,7 +9042,7 @@ fn send_runtime_native_provider_request(
                             reason: format!("provider returned HTTP {status}"),
                         });
                     }
-                    thread::sleep(delay);
+                    wait_provider_retry(delay, should_cancel)?;
                     continue;
                 }
                 return Ok(response);
@@ -7516,7 +9059,7 @@ fn send_runtime_native_provider_request(
                         reason: error.to_string(),
                     });
                 }
-                thread::sleep(delay);
+                wait_provider_retry(delay, should_cancel)?;
             }
             Err(error) => {
                 return Err(RuntimeProviderCallError {
@@ -8036,6 +9579,12 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         mut events,
         mut carry,
     } = input;
+    if !session.directory.is_dir() {
+        return Err(format!(
+            "session workspace no longer exists or is not a directory: {}. Reopen the project from an existing folder before running tools.",
+            session.directory.display()
+        ));
+    }
     sync_plugin_runtime_metadata(config, session);
     let max_steps = provider_max_steps(payload);
     let agent_profile = runtime_agent_profile_for_session(session);
@@ -8045,6 +9594,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         &store.root,
         filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref()),
     );
+    ensure_runtime_tool_set_matches_contract(store, &session.id, run_id, &visible_tools)?;
     let visible_tool_names = visible_tools
         .iter()
         .map(|tool| tool.name.clone())
@@ -8071,8 +9621,20 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         &mut persisted_events,
     );
     while carry.next_step <= max_steps {
+        if let Some(violation) = runtime_budget_violation(payload, &carry.usage, carry.tool_calls) {
+            return finish_provider_loop_budget_exhausted(
+                store,
+                session,
+                run_id,
+                events,
+                &mut persisted_events,
+                carry,
+                violation,
+            );
+        }
         if turn_cancel_requested(run_id)
             || session_task_cancel_requested(&store.root, &session.id, run_id)
+            || ancestor_task_cancel_requested(&store.root, session)
         {
             return finish_provider_loop_interrupted(
                 store,
@@ -8086,12 +9648,13 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         let step = carry.next_step;
         let assistant_index = session.messages.len() as u64;
         let assistant_message_id = runtime_turn_message_id(run_id, "assistant", step);
-        runtime_record_step_started(store, &session.id, run_id, step, None);
+        let mut step_span = runtime_record_step_started(store, &session.id, run_id, step, None);
         let mut streamed_text = false;
         let mut reasoning_chars = 0_u64;
         let mut last_reasoning_heartbeat_chars = 0_u64;
         let session_id = session.id.clone();
         let root = store.root.clone();
+        let task_ancestry = session.clone();
         let mut on_provider_stream = |event: &ProviderStreamEvent| match event {
             ProviderStreamEvent::TextDelta { text } if !text.is_empty() => {
                 streamed_text = true;
@@ -8142,6 +9705,11 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                 model,
                 reason,
             } => {
+                if let Ok(runtime) = http_telemetry_runtime()
+                    && let Some(metrics) = runtime.metrics()
+                {
+                    metrics.record_retry("provider", "transient_error");
+                }
                 events.push(json!({
                     "method": "turn/retrying",
                     "params": {
@@ -8195,6 +9763,17 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                 to_model,
                 reason,
             } => {
+                if let Ok(runtime) = http_telemetry_runtime()
+                    && let Some(metrics) = runtime.metrics()
+                {
+                    metrics.record_fallback(
+                        payload
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .unwrap_or("default"),
+                        "provider_error",
+                    );
+                }
                 events.push(json!({
                     "method": "turn/fallback",
                     "params": {
@@ -8221,8 +9800,10 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             _ => {}
         };
         let should_cancel = || {
-            turn_cancel_requested(run_id)
+            runtime_deadline_exceeded(payload)
+                || turn_cancel_requested(run_id)
                 || session_task_cancel_requested(&store.root, &session_id, run_id)
+                || ancestor_task_cancel_requested(&root, &task_ancestry)
         };
         let provider_result = match provider_turn_result(
             RuntimeProviderTurnInput {
@@ -8239,7 +9820,44 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             Some(&should_cancel),
         ) {
             Ok(result) => result,
+            Err(_error) if runtime_deadline_exceeded(payload) => {
+                finish_runtime_step_span(
+                    store,
+                    &session.id,
+                    run_id,
+                    step,
+                    step_span.take(),
+                    TelemetryExecutionState::Failed,
+                    Some(RunOutcome::Failed),
+                    OutcomeReason::DeadlineExceeded,
+                    "failed",
+                );
+                return finish_provider_loop_budget_exhausted(
+                    store,
+                    session,
+                    run_id,
+                    events,
+                    &mut persisted_events,
+                    carry,
+                    RuntimeBudgetViolation {
+                        code: "deadline_exceeded",
+                        message: TURN_DEADLINE_EXCEEDED_ERROR.to_string(),
+                        reason: OutcomeReason::DeadlineExceeded,
+                    },
+                );
+            }
             Err(error) if is_turn_interrupted_error(&error) => {
+                finish_runtime_step_span(
+                    store,
+                    &session.id,
+                    run_id,
+                    step,
+                    step_span.take(),
+                    TelemetryExecutionState::Interrupted,
+                    Some(RunOutcome::Interrupted),
+                    OutcomeReason::UserCancelled,
+                    "interrupted",
+                );
                 return finish_provider_loop_interrupted(
                     store,
                     session,
@@ -8249,9 +9867,44 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                     "interrupt requested",
                 );
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                finish_runtime_step_span(
+                    store,
+                    &session.id,
+                    run_id,
+                    step,
+                    step_span.take(),
+                    TelemetryExecutionState::Failed,
+                    Some(RunOutcome::Failed),
+                    OutcomeReason::ProviderExhausted,
+                    "failed",
+                );
+                return Err(error);
+            }
         };
         add_usage(&mut carry.usage, &provider_result.usage);
+        if let Some(violation) = runtime_budget_violation(payload, &carry.usage, carry.tool_calls) {
+            finish_runtime_step_span(
+                store,
+                &session.id,
+                run_id,
+                step,
+                step_span.take(),
+                TelemetryExecutionState::Failed,
+                Some(RunOutcome::Failed),
+                violation.reason.clone(),
+                "failed",
+            );
+            return finish_provider_loop_budget_exhausted(
+                store,
+                session,
+                run_id,
+                events,
+                &mut persisted_events,
+                carry,
+                violation,
+            );
+        }
         if provider_result.source == "provider_missing_api_key" {
             events.push(json!({
                 "method": "runtime/warning",
@@ -8314,6 +9967,17 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             &provider_result.finish_reason,
         );
         if step_outcome.is_complete() {
+            finish_runtime_step_span(
+                store,
+                &session.id,
+                run_id,
+                step,
+                step_span.take(),
+                TelemetryExecutionState::Completed,
+                Some(RunOutcome::Success),
+                OutcomeReason::None,
+                "success",
+            );
             return finish_provider_loop(
                 store,
                 session,
@@ -8341,12 +10005,36 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         };
         for tool_call in &provider_result.tool_calls {
             carry.tool_calls = carry.tool_calls.saturating_add(1);
+            if let Some(violation) =
+                runtime_budget_violation(payload, &carry.usage, carry.tool_calls)
+            {
+                finish_runtime_step_span(
+                    store,
+                    &session.id,
+                    run_id,
+                    step,
+                    step_span.take(),
+                    TelemetryExecutionState::Failed,
+                    Some(RunOutcome::Failed),
+                    violation.reason.clone(),
+                    "failed",
+                );
+                return finish_provider_loop_budget_exhausted(
+                    store,
+                    session,
+                    run_id,
+                    events,
+                    &mut persisted_events,
+                    carry,
+                    violation,
+                );
+            }
             let pending_carry = RuntimeProviderLoopCarry {
                 tool_calls: carry.tool_calls,
                 next_step: step.saturating_add(1),
                 ..resume_carry.clone()
             };
-            if let Some(paused) = execute_provider_tool_call(
+            let tool_execution = execute_provider_tool_call(
                 store,
                 session,
                 run_id,
@@ -8364,8 +10052,37 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
                 step_start_checkpoint.as_deref(),
                 &mut events,
                 &mut persisted_events,
-            )? {
-                return Ok(paused);
+            );
+            match tool_execution {
+                Ok(Some(paused)) => {
+                    finish_runtime_step_span(
+                        store,
+                        &session.id,
+                        run_id,
+                        step,
+                        step_span.take(),
+                        TelemetryExecutionState::Waiting,
+                        None,
+                        OutcomeReason::None,
+                        "waiting",
+                    );
+                    return Ok(paused);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    finish_runtime_step_span(
+                        store,
+                        &session.id,
+                        run_id,
+                        step,
+                        step_span.take(),
+                        TelemetryExecutionState::Failed,
+                        Some(RunOutcome::Failed),
+                        OutcomeReason::PartialToolFailure,
+                        "failed",
+                    );
+                    return Err(error);
+                }
             }
         }
 
@@ -8377,6 +10094,17 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
             step,
             &assistant_message_id,
             step_start_checkpoint.as_deref(),
+        );
+        finish_runtime_step_span(
+            store,
+            &session.id,
+            run_id,
+            step,
+            step_span.take(),
+            TelemetryExecutionState::Completed,
+            Some(RunOutcome::Success),
+            OutcomeReason::None,
+            "success",
         );
         carry.next_step = step.saturating_add(1);
     }
@@ -8402,6 +10130,7 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         &carry.answer,
     );
     let trace = trace_payload(session, run_id, carry.tool_calls);
+    record_usage_event(store, session, run_id, &usage);
     events.push(
         SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
             .turn_terminal_event(
@@ -8429,6 +10158,11 @@ fn run_provider_loop(input: RuntimeProviderLoopInput<'_>) -> Result<Value, Strin
         "session_id": session.id,
         "turn_id": run_id,
         "status": outcome.event_status,
+        "outcome": "failed",
+        "reason_code": "max_steps",
+        "error": "agent loop exceeded max_steps",
+        "usage": usage,
+        "trace": trace,
         "events": events,
     }))
 }
@@ -8496,7 +10230,9 @@ fn execute_runtime_tool_call(
             }
         }
     }
-    if let Some(result) = execute_runtime_mcp_tool(toolkit, mcp_runtime, tool_call, ctx) {
+    if let Some(result) =
+        execute_runtime_mcp_tool(toolkit, mcp_runtime, tool_call, ctx, task_context.payload)
+    {
         return result;
     }
     if tool_call.name == TASK_TOOL_ID {
@@ -8516,6 +10252,7 @@ fn execute_runtime_mcp_tool(
     mcp_runtime: Option<&RuntimeMcpRuntime>,
     tool_call: &ToolCall,
     ctx: &mut ToolContext,
+    payload: &Value,
 ) -> Option<ToolResult> {
     let runtime = mcp_runtime?;
     let descriptor = runtime.descriptors.get(&tool_call.name)?;
@@ -8533,18 +10270,23 @@ fn execute_runtime_mcp_tool(
         return Some(mcp_bridge_to_tool_result(tool_call, bridge));
     };
     let transport = state.selected_transport.unwrap_or(McpTransport::Http);
+    let mut server_config = state.config.clone();
+    if let Some(deadline_at_ms) = payload.get("deadline_at_ms").and_then(Value::as_u64) {
+        let remaining_ms = deadline_at_ms.saturating_sub(now_ms()).max(1);
+        server_config.timeout_ms = server_config.timeout_ms.min(remaining_ms);
+    }
     if transport == McpTransport::Stdio
         && let Some(result) = execute_runtime_mcp_lifecycle_tool_call(
             tool_call,
             descriptor,
-            &state.config,
+            &server_config,
             &runtime.workspace,
         )
     {
         return Some(result);
     }
     let result = match mcp_json_rpc(
-        &state.config,
+        &server_config,
         transport,
         "tools/call",
         json!({
@@ -8892,6 +10634,18 @@ fn execute_runtime_task_tool_call(
     child_session
         .metadata
         .insert("max_steps".to_string(), json!(child_max_steps));
+    for key in [
+        "deadline_at_ms",
+        "max_total_tokens",
+        "max_cost_microunits",
+        "max_tool_calls",
+    ] {
+        if let Some(value) = task_context.payload.get(key) {
+            child_session
+                .metadata
+                .insert(key.to_string(), value.clone());
+        }
+    }
     if let Some(isolation) = workspace_isolation.as_ref() {
         child_session
             .metadata
@@ -8919,6 +10673,9 @@ fn execute_runtime_task_tool_call(
             .metadata
             .insert("background".to_string(), json!(true));
     } else {
+        child_session
+            .metadata
+            .insert("task_status".to_string(), json!("running"));
         child_session
             .metadata
             .insert("background".to_string(), json!(false));
@@ -8963,6 +10720,21 @@ fn execute_runtime_task_tool_call(
             BTreeMap::from([("subagent_type".to_string(), json!(profile.id.clone()))]),
         );
     }
+
+    // Foreground task calls are synchronous, but they still need the same
+    // durable cancellation primitive as background tasks. Without this lock a
+    // parent can be stopped while descendants keep calling providers and the
+    // task tree falsely remains "running".
+    let _task_run_lock = match claim_session_task_run_lock(task_context.config, &child_session.id) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return runtime_task_tool_error(
+                tool_call,
+                &format!("failed to claim subagent task run: {error}"),
+                BTreeMap::from([("task_id".to_string(), json!(child_session.id.clone()))]),
+            );
+        }
+    };
 
     if background {
         child_session.status = SessionStatus::Idle;
@@ -9025,11 +10797,21 @@ fn execute_runtime_task_tool_call(
         };
     }
 
-    if let Err(error) = task_context.store.start_run(
+    let (task_contract, run_span) = build_subagent_run_contract(
+        task_context.config,
+        task_context.store,
+        &child_session,
+        task_context.payload,
+        &child_run_id,
+        &profile.id,
+        &child_model,
+        child_max_steps,
+    );
+    if let Err(error) = task_context.store.start_run_with_contract(
         &mut child_session,
         StartRunOptions {
             run_id: child_run_id.clone(),
-            trace_id: new_id("trace"),
+            trace_id: task_contract.trace.trace_id.clone(),
             agent_name: profile.id.clone(),
             model_id: Some(child_model.clone()),
             provider_id: Some(child_provider.clone()),
@@ -9039,8 +10821,9 @@ fn execute_runtime_task_tool_call(
                 child_permission.as_str().to_string()
             },
             max_steps: child_max_steps,
-            started_at_ms: None,
+            started_at_ms: Some(task_contract.created_at_ms),
         },
+        &task_contract,
     ) {
         return runtime_task_tool_error(
             tool_call,
@@ -9067,6 +10850,23 @@ fn execute_runtime_task_tool_call(
         events: Vec::new(),
         carry: RuntimeProviderLoopCarry::default(),
     });
+    let (telemetry_state, telemetry_outcome, telemetry_reason, telemetry_status) =
+        telemetry_turn_result(&child_result);
+    let terminal_outcome = telemetry_outcome.clone();
+    let terminal_reason = telemetry_reason.clone();
+    finish_runtime_span(
+        task_context.store,
+        &child_session.id,
+        &child_run_id,
+        "agent.run.finished",
+        "run",
+        &telemetry_status,
+        run_span,
+        telemetry_state,
+        telemetry_outcome,
+        telemetry_reason,
+        BTreeMap::from([("surface".to_string(), json!("subagent"))]),
+    );
     match child_result {
         Ok(value) => {
             let status = value
@@ -9074,6 +10874,24 @@ fn execute_runtime_task_tool_call(
                 .and_then(Value::as_str)
                 .unwrap_or("completed");
             let durable_status = ExecutionStatus::from_runtime(status);
+            child_session
+                .metadata
+                .insert("task_status".to_string(), json!(status));
+            if durable_status.is_terminal() {
+                child_session.status = SessionStatus::Idle;
+            }
+            let _ = task_context
+                .store
+                .save_state(&child_session, Some(&child_run_id));
+            if let Some(outcome) = terminal_outcome.clone() {
+                record_http_run_metrics(
+                    task_context.store,
+                    &child_session.id,
+                    &child_run_id,
+                    outcome,
+                    terminal_reason.clone(),
+                );
+            }
             let _ = persist_task_execution(
                 &task_context.store.root,
                 &task_context.parent_session.id,
@@ -9179,6 +10997,30 @@ fn execute_runtime_task_tool_call(
             }
         }
         Err(error) => {
+            child_session.status = SessionStatus::Idle;
+            child_session
+                .metadata
+                .insert("task_status".to_string(), json!("failed"));
+            let _ = task_context.store.finish_run(
+                &child_session,
+                &child_run_id,
+                "failed",
+                1,
+                Some("error"),
+                Some(&error),
+            );
+            let _ = task_context
+                .store
+                .save_state(&child_session, Some(&child_run_id));
+            if let Some(outcome) = terminal_outcome {
+                record_http_run_metrics(
+                    task_context.store,
+                    &child_session.id,
+                    &child_run_id,
+                    outcome,
+                    terminal_reason,
+                );
+            }
             let _ = persist_task_execution(
                 &task_context.store.root,
                 &task_context.parent_session.id,
@@ -9639,10 +11481,18 @@ fn runtime_auto_compaction_boundary(
         .filter_map(|(index, message)| (message.role == Role::User).then_some(index))
         .collect::<Vec<_>>();
     let keep_recent_user_turns = keep_recent_user_turns.max(1) as usize;
-    if user_positions.len() <= keep_recent_user_turns {
-        return None;
-    }
-    let preserve_from = user_positions[user_positions.len() - keep_recent_user_turns];
+    let preserve_from = if user_positions.len() > keep_recent_user_turns {
+        user_positions[user_positions.len() - keep_recent_user_turns]
+    } else {
+        // Agent/subagent work frequently has one user prompt followed by many
+        // assistant/tool messages. Waiting for another user turn means that
+        // this exact long-running shape can never compact, even after context
+        // pressure has started dropping history. Keep a recent suffix and
+        // summarize the older prefix instead.
+        messages
+            .len()
+            .checked_sub(DEFAULT_AUTO_COMPACTION_RECENT_MESSAGES)?
+    };
     (0..preserve_from).rev().find_map(|index| {
         let message_id = messages[index]
             .metadata
@@ -11283,13 +13133,33 @@ fn runtime_record_step_started(
     run_id: &str,
     step: u64,
     checkpoint_id: Option<&str>,
-) {
+) -> Option<RuntimeSpanObservation> {
+    let observation = start_run_child_span(
+        store,
+        session_id,
+        run_id,
+        "agent.step",
+        SpanKind::Internal,
+        TelemetryAttributes::new()
+            .insert_i64("agent.step", i64::try_from(step).unwrap_or(i64::MAX))
+            .insert_bool("checkpoint.present", checkpoint_id.is_some()),
+    );
+    let correlation = observation.as_ref().map(|item| {
+        (
+            item.context.trace_id.clone(),
+            item.context.span_id.clone(),
+            item.parent_span_id.clone(),
+        )
+    });
     let _ = store.record_event(
         session_id,
         run_id,
         "step.started",
         SessionEventOptions {
             kind: "step".to_string(),
+            trace_id: correlation.as_ref().map(|item| item.0.clone()),
+            span_id: correlation.as_ref().map(|item| item.1.clone()),
+            parent_span_id: correlation.and_then(|item| item.2),
             attributes: BTreeMap::from([
                 ("step".to_string(), json!(step)),
                 ("checkpoint_id".to_string(), json!(checkpoint_id)),
@@ -11297,6 +13167,36 @@ fn runtime_record_step_started(
             ..SessionEventOptions::default()
         },
     );
+    observation
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_runtime_step_span(
+    store: &FileSessionStore,
+    session_id: &str,
+    run_id: &str,
+    step: u64,
+    observation: Option<RuntimeSpanObservation>,
+    state: TelemetryExecutionState,
+    outcome: Option<RunOutcome>,
+    reason: OutcomeReason,
+    status: &str,
+) {
+    if let Some(observation) = observation {
+        finish_runtime_span(
+            store,
+            session_id,
+            run_id,
+            "step.finished",
+            "step",
+            status,
+            observation,
+            state,
+            outcome,
+            reason,
+            BTreeMap::from([("step".to_string(), json!(step))]),
+        );
+    }
 }
 
 fn finish_provider_loop(
@@ -11335,6 +13235,16 @@ fn finish_provider_loop(
     );
     let trace = trace_payload(session, run_id, carry.tool_calls);
     record_usage_event(store, session, run_id, &usage);
+    let degraded_reason = runtime_degraded_reason(&events);
+    let durable_outcome = if degraded_reason.is_some() {
+        "degraded"
+    } else {
+        "success"
+    };
+    let durable_reason = degraded_reason
+        .as_ref()
+        .map(OutcomeReason::as_str)
+        .unwrap_or("none");
     events.push(
         SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
             .turn_terminal_event(
@@ -11367,10 +13277,14 @@ fn finish_provider_loop(
         "session_id": session.id,
         "turn_id": run_id,
         "status": outcome.event_status.clone(),
+        "outcome": durable_outcome,
+        "reason_code": durable_reason,
         "turn": {
             "id": run_id,
             "session_id": session.id,
             "status": outcome.event_status.clone(),
+            "outcome": durable_outcome,
+            "reason_code": durable_reason,
             "final_answer": events.last().and_then(|event| event.get("params")).and_then(|params| params.get("final_answer")).cloned().unwrap_or_else(|| json!("")),
             "final_result": final_result,
             "agent": session_text_metadata(session, "agent", "server"),
@@ -11381,6 +13295,140 @@ fn finish_provider_loop(
             "trace": trace,
         },
         "events": events
+    }))
+}
+
+fn runtime_degraded_reason(events: &[Value]) -> Option<OutcomeReason> {
+    if events
+        .iter()
+        .any(|event| event.get("method").and_then(Value::as_str) == Some("turn/fallback"))
+    {
+        return Some(OutcomeReason::ProviderFallback);
+    }
+    if events
+        .iter()
+        .any(|event| event.get("method").and_then(Value::as_str) == Some("item/toolCall/failed"))
+    {
+        return Some(OutcomeReason::PartialToolFailure);
+    }
+    if events.iter().any(|event| {
+        event.get("method").and_then(Value::as_str) == Some("runtime/warning")
+            && event.pointer("/params/code").and_then(Value::as_str)
+                == Some("provider_missing_api_key")
+    }) {
+        return Some(OutcomeReason::ProviderExhausted);
+    }
+    None
+}
+
+fn finish_provider_loop_budget_exhausted(
+    store: &FileSessionStore,
+    session: &mut Session,
+    run_id: &str,
+    mut events: Vec<Value>,
+    persisted_events: &mut usize,
+    carry: RuntimeProviderLoopCarry,
+    violation: RuntimeBudgetViolation,
+) -> Result<Value, String> {
+    session.status = SessionStatus::Idle;
+    session.metadata.remove("pending_provider_turn");
+    let outcome = SessionRunnerFacade::failed_turn_outcome(
+        carry.next_step,
+        violation.code,
+        &violation.message,
+    );
+    let _ = store.finish_run(
+        session,
+        run_id,
+        &outcome.run_status,
+        outcome.steps,
+        Some(violation.code),
+        Some(&violation.message),
+    );
+    let usage = usage_value_from_provider(
+        &carry.usage,
+        carry.tool_calls,
+        &latest_user_message(session),
+        &carry.answer,
+    );
+    record_usage_event(store, session, run_id, &usage);
+    let trace = trace_payload(session, run_id, carry.tool_calls);
+    let budget_span = start_run_child_span(
+        store,
+        &session.id,
+        run_id,
+        "budget.check",
+        SpanKind::Internal,
+        TelemetryAttributes::new()
+            .insert("budget.status", "exhausted")
+            .insert("budget.reason_code", violation.code),
+    );
+    if let Some(observation) = budget_span {
+        finish_runtime_span(
+            store,
+            &session.id,
+            run_id,
+            "budget.exhausted",
+            "budget",
+            "failed",
+            observation,
+            TelemetryExecutionState::Failed,
+            Some(RunOutcome::Failed),
+            violation.reason.clone(),
+            BTreeMap::from([
+                ("reason_code".to_string(), json!(violation.code)),
+                (
+                    "total_tokens".to_string(),
+                    json!(
+                        carry
+                            .usage
+                            .input_tokens
+                            .saturating_add(carry.usage.output_tokens)
+                    ),
+                ),
+                ("tool_calls".to_string(), json!(carry.tool_calls)),
+            ]),
+        );
+    }
+    events.push(
+        SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
+            .turn_terminal_event(
+                &outcome.event_method,
+                run_id,
+                &outcome.event_status,
+                false,
+                true,
+                false,
+                BTreeMap::from([
+                    ("error".to_string(), json!(violation.message)),
+                    ("reason_code".to_string(), json!(violation.code)),
+                    ("usage".to_string(), usage.clone()),
+                    ("trace".to_string(), trace.clone()),
+                ]),
+            ),
+    );
+    append_unpersisted_bridge_events(
+        &store.root,
+        &session.id,
+        run_id,
+        &mut events,
+        persisted_events,
+    );
+    Ok(json!({
+        "session_id": session.id,
+        "turn_id": run_id,
+        "status": "failed",
+        "reason_code": violation.code,
+        "error": violation.message,
+        "turn": {
+            "id": run_id,
+            "session_id": session.id,
+            "status": "failed",
+            "reason_code": violation.code,
+            "usage": usage,
+            "trace": trace,
+        },
+        "events": events,
     }))
 }
 
@@ -11428,15 +13476,31 @@ fn start_turn_response(
     session_id: &str,
     request_path: &str,
     body: &str,
+    headers: &BTreeMap<String, String>,
 ) -> HttpResponseSpec {
     let mut payload: Value = match serde_json::from_str(body) {
         Ok(payload) => payload,
         Err(error) => return json_response(400, json!({"error": error.to_string()})),
     };
-    if let Some(object) = payload.as_object_mut() {
-        object.remove(INTERNAL_TURN_RETRY_KEY);
-    }
-    if turn_async_requested(request_path, &payload) {
+    let trace_context = match TraceContext::from_headers(headers) {
+        Ok(Some(parent)) => parent.child(),
+        Ok(None) => TraceContext::new_root(true),
+        Err(error) => {
+            return json_response(
+                400,
+                json!({"error": error.to_string(), "code": "invalid_trace_context"}),
+            );
+        }
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return json_response(400, json!({"error": "turn payload must be an object"}));
+    };
+    object.remove(INTERNAL_TURN_RETRY_KEY);
+    object.insert(
+        INTERNAL_TRACE_CONTEXT_KEY.to_string(),
+        serde_json::to_value(&trace_context).unwrap_or(Value::Null),
+    );
+    let mut response = if turn_async_requested(request_path, &payload) {
         match start_turn_async_payload(config, session_id, payload) {
             Ok((status, payload)) => json_response(status, payload),
             Err(error) => session_error_response(error),
@@ -11446,7 +13510,14 @@ fn start_turn_response(
             Ok(payload) => json_response(200, payload),
             Err(error) => session_error_response(error),
         }
+    };
+    let mut trace_headers = BTreeMap::new();
+    if trace_context.inject_headers(&mut trace_headers).is_ok() {
+        for (key, value) in trace_headers {
+            response.headers.insert(key, json!(value));
+        }
     }
+    response
 }
 
 fn start_turn_sync_payload(
@@ -11628,7 +13699,13 @@ fn start_turn_async_payload_trusted(
                 ExecutionPhase::Provider,
                 Some("turn_started"),
             )?;
-            spawn_async_turn_worker(config, session_id.to_string(), run_id.clone(), payload)?;
+            spawn_async_turn_worker(
+                config,
+                session_id.to_string(),
+                run_id.clone(),
+                payload,
+                None,
+            )?;
             ("running", None, None)
         }
         TurnJobRegistration::Existing { job } => {
@@ -11714,7 +13791,8 @@ fn spawn_async_turn_worker(
     config: &HttpRuntimeConfig,
     session_id: String,
     run_id: String,
-    payload: Value,
+    mut payload: Value,
+    queued_at_ms: Option<u64>,
 ) -> Result<(), String> {
     let thread_config = config.clone();
     let thread_session_id = session_id;
@@ -11722,6 +13800,12 @@ fn spawn_async_turn_worker(
     thread::Builder::new()
         .name(format!("openagent-turn-{thread_run_id}"))
         .spawn(move || {
+            let _active_worker_metrics = ActiveWorkerMetricsGuard::acquire();
+            let queue_wait_ms =
+                queued_at_ms.map_or(0, |queued_at_ms| now_ms().saturating_sub(queued_at_ms));
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(INTERNAL_QUEUE_WAIT_MS_KEY.to_string(), json!(queue_wait_ms));
+            }
             let _ = persist_session_execution(
                 &session_root(&thread_config),
                 &thread_session_id,
@@ -11858,24 +13942,71 @@ fn start_turn_payload_inner(
     let runtime_profile = apply_turn_runtime_profile(&mut session, &payload);
     let run_id = run_id_override.unwrap_or_else(|| new_id("turn"));
     let max_steps = provider_max_steps(&payload);
-    session.status = SessionStatus::Running;
-    let _ = store.start_run(
-        &mut session,
-        StartRunOptions {
-            run_id: run_id.clone(),
-            trace_id: new_id("trace"),
-            agent_name: runtime_profile.agent.clone(),
-            model_id: Some(runtime_profile.model.clone()),
-            provider_id: Some("openagent".to_string()),
-            permission: if skip_permissions {
-                format!("auto_allow:{}", permission_ruleset.as_str())
-            } else {
-                permission_ruleset.as_str().to_string()
-            },
-            max_steps,
-            started_at_ms: None,
-        },
+    let mut parent_trace_context = trace_context_from_turn_payload(&payload)?;
+    if retry_metadata.is_some() {
+        parent_trace_context = parent_trace_context.child();
+    }
+    let mut run_span = start_http_runtime_span(
+        "agent.run",
+        SpanKind::Server,
+        &parent_trace_context,
+        TelemetryAttributes::new()
+            .insert("run.id", &run_id)
+            .insert("session.id", &session.id)
+            .insert("agent.name", &runtime_profile.agent)
+            .insert(
+                "gen_ai.provider.name",
+                payload
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .or_else(|| session.metadata.get("provider").and_then(Value::as_str))
+                    .unwrap_or("default"),
+            )
+            .insert("gen_ai.request.model", &runtime_profile.model)
+            .insert("run.surface", "http")
+            .insert_bool("run.retry", retry_metadata.is_some()),
     );
+    let task_contract = runtime_task_contract(
+        config,
+        &session,
+        &payload,
+        &run_id,
+        &runtime_profile,
+        max_steps,
+        run_span.context.clone(),
+    );
+    if let Some(span) = run_span.span.as_mut() {
+        for (key, value) in task_contract.versions.trace_attributes() {
+            span.set_attribute(key, value);
+        }
+    }
+    session.status = SessionStatus::Running;
+    store
+        .start_run_with_contract(
+            &mut session,
+            StartRunOptions {
+                run_id: run_id.clone(),
+                trace_id: task_contract.trace.trace_id.clone(),
+                agent_name: runtime_profile.agent.clone(),
+                model_id: Some(runtime_profile.model.clone()),
+                provider_id: Some(task_contract.model.provider.clone()),
+                permission: if skip_permissions {
+                    format!("auto_allow:{}", permission_ruleset.as_str())
+                } else {
+                    permission_ruleset.as_str().to_string()
+                },
+                max_steps,
+                started_at_ms: Some(task_contract.created_at_ms),
+            },
+            &task_contract,
+        )
+        .map_err(|error| format!("failed to persist task contract: {error}"))?;
+    if let Some(queue_wait_ms) = payload
+        .get(INTERNAL_QUEUE_WAIT_MS_KEY)
+        .and_then(Value::as_u64)
+    {
+        record_queue_wait_telemetry(&store, &task_contract, queue_wait_ms);
+    }
     if retry_metadata.is_none() {
         let mut user_metadata = BTreeMap::new();
         if !attachments.is_empty() {
@@ -11945,62 +14076,90 @@ fn start_turn_payload_inner(
             tool_calls.push(auto_runtime_subagent_tool_call(input, &route));
         }
     }
-    if !tool_calls.is_empty() {
-        return run_http_tool_turn(
+    let result = if !tool_calls.is_empty() {
+        run_http_tool_turn(
             config,
             &store,
             &mut session,
             &run_id,
+            &payload,
             tool_calls,
             permission_ruleset,
             skip_permissions,
-        );
+        )
+    } else {
+        let _ = runtime_profile;
+        let mut initial_events = vec![turn_started_event(&session, &run_id)];
+        if let Some(retry) = retry_metadata.as_ref() {
+            let retry_of_turn_id = retry
+                .get("retry_of_turn_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let retry_root_turn_id = retry
+                .get("retry_root_turn_id")
+                .and_then(Value::as_str)
+                .unwrap_or(retry_of_turn_id);
+            let retry_count = retry
+                .get("retry_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let max_retries = retry
+                .get("max_retries")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(runtime_manual_turn_retries);
+            initial_events.push(json!({
+                "method": "turn/retried",
+                "params": {
+                    "thread_id": session.id.clone(),
+                    "session_id": session.id.clone(),
+                    "turn_id": run_id,
+                    "run_id": run_id,
+                    "status": "running",
+                    "retry_of_turn_id": retry_of_turn_id,
+                    "retry_root_turn_id": retry_root_turn_id,
+                    "retry_count": retry_count,
+                    "max_retries": max_retries,
+                }
+            }));
+        }
+        run_provider_loop(RuntimeProviderLoopInput {
+            config,
+            store: &store,
+            session: &mut session,
+            run_id: &run_id,
+            payload: &payload,
+            permission_ruleset,
+            skip_permissions,
+            events: initial_events,
+            carry: RuntimeProviderLoopCarry::default(),
+        })
+    };
+    if let Err(error) = result.as_ref() {
+        finalize_unhandled_turn_error(&store, &mut session, &run_id, error);
     }
-    let _ = runtime_profile;
-    let mut initial_events = vec![turn_started_event(&session, &run_id)];
-    if let Some(retry) = retry_metadata {
-        let retry_of_turn_id = retry
-            .get("retry_of_turn_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let retry_root_turn_id = retry
-            .get("retry_root_turn_id")
-            .and_then(Value::as_str)
-            .unwrap_or(retry_of_turn_id);
-        let retry_count = retry
-            .get("retry_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        let max_retries = retry
-            .get("max_retries")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(runtime_manual_turn_retries);
-        initial_events.push(json!({
-            "method": "turn/retried",
-            "params": {
-                "thread_id": session.id.clone(),
-                "session_id": session.id.clone(),
-                "turn_id": run_id,
-                "run_id": run_id,
-                "status": "running",
-                "retry_of_turn_id": retry_of_turn_id,
-                "retry_root_turn_id": retry_root_turn_id,
-                "retry_count": retry_count,
-                "max_retries": max_retries,
-            }
-        }));
+    let (state, outcome, reason, status) = telemetry_turn_result(&result);
+    let terminal_outcome = outcome.clone();
+    let terminal_reason = reason.clone();
+    finish_runtime_span(
+        &store,
+        session_id,
+        &run_id,
+        "agent.run.finished",
+        "run",
+        &status,
+        run_span,
+        state,
+        outcome,
+        reason,
+        BTreeMap::from([
+            ("surface".to_string(), json!("http")),
+            ("retry".to_string(), json!(retry_metadata.is_some())),
+        ]),
+    );
+    if let Some(outcome) = terminal_outcome {
+        record_http_run_metrics(&store, session_id, &run_id, outcome, terminal_reason);
     }
-    run_provider_loop(RuntimeProviderLoopInput {
-        config,
-        store: &store,
-        session: &mut session,
-        run_id: &run_id,
-        payload: &payload,
-        permission_ruleset,
-        skip_permissions,
-        events: initial_events,
-        carry: RuntimeProviderLoopCarry::default(),
-    })
+    result
 }
 
 fn validate_start_turn_payload(payload: &Value) -> Result<(), String> {
@@ -12014,6 +14173,20 @@ fn validate_start_turn_payload(payload: &Value) -> Result<(), String> {
     }
     let _ = turn_attachments_from_payload(payload)?;
     let _ = permission_ruleset_for_turn(payload)?;
+    for key in [
+        "deadline_at_ms",
+        "max_steps",
+        "max_total_tokens",
+        "max_cost_microunits",
+        "max_tool_calls",
+        "timeout_s",
+    ] {
+        if let Some(value) = payload.get(key)
+            && value.as_u64().is_none()
+        {
+            return Err(format!("{key} must be a non-negative integer"));
+        }
+    }
     Ok(())
 }
 
@@ -12301,14 +14474,7 @@ fn record_async_turn_failure(
         .unwrap_or(0);
     let max_retries = runtime_manual_turn_retries();
     let resumable = retryable && saved_retry.is_some() && retry_count < max_retries;
-    let _ = store.finish_run(
-        &session,
-        run_id,
-        &outcome.run_status,
-        outcome.steps,
-        Some(&outcome.finish_reason),
-        outcome.error.as_deref(),
-    );
+    finalize_unhandled_turn_error(&store, &mut session, run_id, error);
     let _ = store.save_state(&session, Some(run_id));
     let mut events = vec![
         SessionRunnerFacade::new(session.directory.clone(), session.id.clone())
@@ -12428,6 +14594,11 @@ fn retry_turn_response(config: &HttpRuntimeConfig, turn_id: &str) -> HttpRespons
                 .unwrap_or(false)
             {
                 remove_turn_retry_payload(&root, turn_id);
+                if let Ok(runtime) = http_telemetry_runtime()
+                    && let Some(metrics) = runtime.metrics()
+                {
+                    metrics.record_retry("run", "manual_retry");
+                }
             }
             if let Some(object) = response.as_object_mut() {
                 object.insert("retry_of_turn_id".to_string(), json!(turn_id));
@@ -12477,11 +14648,13 @@ fn record_turn_interrupted(
     events
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_http_tool_turn(
     config: &HttpRuntimeConfig,
     store: &FileSessionStore,
     session: &mut Session,
     run_id: &str,
+    payload: &Value,
     tool_calls: Vec<ToolCall>,
     permission_ruleset: PermissionRuleset,
     skip_permissions: bool,
@@ -12489,8 +14662,12 @@ fn run_http_tool_turn(
     let agent_profile = runtime_agent_profile_for_session(session);
     let mut toolkit = toolkit_with_runtime_task_tool(session, agent_profile.as_ref());
     let mcp_runtime = register_runtime_mcp_tools(config, &session.directory, &mut toolkit);
+    let visible_tools = filter_runtime_tools_for_capabilities(
+        &store.root,
+        filter_runtime_tools_for_profile(toolkit.get_all_tools("local"), agent_profile.as_ref()),
+    );
+    ensure_runtime_tool_set_matches_contract(store, &session.id, run_id, &visible_tools)?;
     let tool_call_count = tool_calls.len() as u64;
-    let empty_payload = json!({});
     let mut ctx = runtime_session_runner_facade(
         session,
         agent_profile.as_ref(),
@@ -12499,6 +14676,7 @@ fn run_http_tool_turn(
     )
     .tool_context();
     let mut events = vec![turn_started_event(session, run_id)];
+    let mut persisted_events = 0_usize;
     let assistant_message_id = runtime_turn_message_id(run_id, "assistant", tool_call_count.max(1));
     let start_checkpoint = runtime_create_step_checkpoint(
         store,
@@ -12509,7 +14687,30 @@ fn run_http_tool_turn(
         "step_start",
         &assistant_message_id,
     );
-    runtime_record_step_started(store, &session.id, run_id, 1, start_checkpoint.as_deref());
+    let mut step_span =
+        runtime_record_step_started(store, &session.id, run_id, 1, start_checkpoint.as_deref());
+    if let Some(violation) = runtime_budget_violation(payload, &Usage::default(), tool_call_count) {
+        finish_runtime_step_span(
+            store,
+            &session.id,
+            run_id,
+            1,
+            step_span.take(),
+            TelemetryExecutionState::Failed,
+            Some(RunOutcome::Failed),
+            violation.reason.clone(),
+            "failed",
+        );
+        return finish_provider_loop_budget_exhausted(
+            store,
+            session,
+            run_id,
+            events,
+            &mut persisted_events,
+            RuntimeProviderLoopCarry::default(),
+            violation,
+        );
+    }
 
     for (index, tool_call) in tool_calls.into_iter().enumerate() {
         let step = index as u64 + 1;
@@ -12536,7 +14737,7 @@ fn run_http_tool_turn(
                         store,
                         parent_session: session,
                         parent_run_id: run_id,
-                        payload: &empty_payload,
+                        payload,
                         skip_permissions,
                     },
                 )
@@ -12619,6 +14820,17 @@ fn run_http_tool_turn(
                 }
             }));
             append_bridge_events(&store.root, &session.id, run_id, &mut events);
+            finish_runtime_step_span(
+                store,
+                &session.id,
+                run_id,
+                1,
+                step_span.take(),
+                TelemetryExecutionState::Waiting,
+                None,
+                OutcomeReason::None,
+                "waiting",
+            );
             return Ok(json!({
                 "session_id": session.id,
                 "turn_id": run_id,
@@ -12637,9 +14849,35 @@ fn run_http_tool_turn(
             &mut tool_result,
             &mut events,
         )?;
+        if let Some(violation) = runtime_budget_violation(payload, &Usage::default(), step) {
+            finish_runtime_step_span(
+                store,
+                &session.id,
+                run_id,
+                1,
+                step_span.take(),
+                TelemetryExecutionState::Failed,
+                Some(RunOutcome::Failed),
+                violation.reason.clone(),
+                "failed",
+            );
+            return finish_provider_loop_budget_exhausted(
+                store,
+                session,
+                run_id,
+                events,
+                &mut persisted_events,
+                RuntimeProviderLoopCarry {
+                    tool_calls: step,
+                    ..RuntimeProviderLoopCarry::default()
+                },
+                violation,
+            );
+        }
     }
 
-    let answer = if tool_calls_completed_successfully(&events) {
+    let tools_succeeded = tool_calls_completed_successfully(&events);
+    let answer = if tools_succeeded {
         "tool execution completed".to_string()
     } else {
         "tool execution failed".to_string()
@@ -12677,10 +14915,23 @@ fn run_http_tool_turn(
             ),
     );
     append_bridge_events(&store.root, &session.id, run_id, &mut events);
+    finish_runtime_step_span(
+        store,
+        &session.id,
+        run_id,
+        1,
+        step_span.take(),
+        TelemetryExecutionState::Completed,
+        Some(RunOutcome::Success),
+        OutcomeReason::None,
+        "success",
+    );
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
         "status": "completed",
+        "outcome": if tools_succeeded { "success" } else { "degraded" },
+        "reason_code": if tools_succeeded { "none" } else { "partial_tool_failure" },
         "final_result": final_result,
         "events": events,
     }))
@@ -12752,6 +15003,28 @@ fn respond_approval_payload(
             ..SessionEventOptions::default()
         },
     );
+    record_interaction_wait_telemetry(
+        &store,
+        &session.id,
+        &run_id,
+        "approval",
+        approval
+            .get("created_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(now_ms),
+        if action == "allow" {
+            "allowed"
+        } else {
+            "denied"
+        },
+        TelemetryExecutionState::Completed,
+        None,
+        if action == "allow" {
+            OutcomeReason::None
+        } else {
+            OutcomeReason::ToolDenied
+        },
+    );
     persist_interaction_execution(
         &store.root,
         &session.id,
@@ -12780,6 +15053,14 @@ fn respond_approval_payload(
         let agent_profile = runtime_agent_profile_for_session(&session);
         let mut toolkit = toolkit_with_runtime_task_tool(&session, agent_profile.as_ref());
         let mcp_runtime = register_runtime_mcp_tools(config, &session.directory, &mut toolkit);
+        let visible_tools = filter_runtime_tools_for_capabilities(
+            &store.root,
+            filter_runtime_tools_for_profile(
+                toolkit.get_all_tools("local"),
+                agent_profile.as_ref(),
+            ),
+        );
+        ensure_runtime_tool_set_matches_contract(&store, &session.id, &run_id, &visible_tools)?;
         let pending_payload = session
             .metadata
             .get("pending_provider_turn")
@@ -12878,6 +15159,10 @@ fn respond_approval_payload(
                 carry: resume.carry,
             });
             mark_turn_job_status_from_result(config, &run_id, &result);
+            let (_, outcome, reason, _) = telemetry_turn_result(&result);
+            if let Some(outcome) = outcome {
+                record_http_run_metrics(&store, &session.id, &run_id, outcome, reason);
+            }
             return result;
         }
         let failed = tool_result.error.is_some();
@@ -12960,6 +15245,14 @@ fn respond_approval_payload(
     let _ = store.save_state(&session, Some(&run_id));
     append_bridge_events(&store.root, &session.id, &run_id, &mut events);
     mark_turn_job_status(config, &run_id, response_status);
+    let (outcome, reason) = if action != "allow" {
+        (RunOutcome::Failed, OutcomeReason::ToolDenied)
+    } else if response_status == "failed" {
+        (RunOutcome::Failed, OutcomeReason::PartialToolFailure)
+    } else {
+        (RunOutcome::Success, OutcomeReason::None)
+    };
+    record_http_run_metrics(&store, &session.id, &run_id, outcome, reason);
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
@@ -13020,6 +15313,28 @@ fn respond_question_payload(
         .get("dismissed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    record_interaction_wait_telemetry(
+        &store,
+        &session.id,
+        &run_id,
+        "question",
+        question
+            .get("created_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(now_ms),
+        if dismissed { "dismissed" } else { "answered" },
+        if dismissed {
+            TelemetryExecutionState::Cancelled
+        } else {
+            TelemetryExecutionState::Completed
+        },
+        dismissed.then_some(RunOutcome::Cancelled),
+        if dismissed {
+            OutcomeReason::UserCancelled
+        } else {
+            OutcomeReason::None
+        },
+    );
     persist_interaction_execution(
         &store.root,
         &session.id,
@@ -13080,6 +15395,13 @@ fn respond_question_payload(
         let _ = store.save_state(&session, Some(&run_id));
         append_bridge_events(&store.root, &session.id, &run_id, &mut events);
         mark_turn_job_status(config, &run_id, "failed");
+        record_http_run_metrics(
+            &store,
+            &session.id,
+            &run_id,
+            RunOutcome::Cancelled,
+            OutcomeReason::UserCancelled,
+        );
         return Ok(json!({
             "session_id": session.id,
             "turn_id": run_id,
@@ -13151,6 +15473,10 @@ fn respond_question_payload(
             carry: resume.carry,
         });
         mark_turn_job_status_from_result(config, &run_id, &result);
+        let (_, outcome, reason, _) = telemetry_turn_result(&result);
+        if let Some(outcome) = outcome {
+            record_http_run_metrics(&store, &session.id, &run_id, outcome, reason);
+        }
         return result;
     }
     session.status = SessionStatus::Idle;
@@ -13179,6 +15505,13 @@ fn respond_question_payload(
     );
     append_bridge_events(&store.root, &session.id, &run_id, &mut events);
     mark_turn_job_status(config, &run_id, "completed");
+    record_http_run_metrics(
+        &store,
+        &session.id,
+        &run_id,
+        RunOutcome::Success,
+        OutcomeReason::None,
+    );
     Ok(json!({
         "session_id": session.id,
         "turn_id": run_id,
@@ -14346,6 +16679,96 @@ while True:
     }
 
     #[test]
+    fn turn_budget_fields_require_non_negative_integers() {
+        for key in [
+            "deadline_at_ms",
+            "max_steps",
+            "max_total_tokens",
+            "max_cost_microunits",
+            "max_tool_calls",
+            "timeout_s",
+        ] {
+            let mut payload = json!({"input": "validate budgets"});
+            payload[key] = json!("1");
+            assert_eq!(
+                validate_start_turn_payload(&payload),
+                Err(format!("{key} must be a non-negative integer"))
+            );
+            payload[key] = json!(-1);
+            assert_eq!(
+                validate_start_turn_payload(&payload),
+                Err(format!("{key} must be a non-negative integer"))
+            );
+            payload[key] = json!(1);
+            assert!(validate_start_turn_payload(&payload).is_ok());
+        }
+    }
+
+    #[test]
+    fn runtime_budget_policy_bounds_provider_time_and_retry_waits() {
+        let deadline_payload = json!({
+            "timeout_s": 60,
+            "deadline_at_ms": now_ms().saturating_add(1_200),
+        });
+        assert!(runtime_provider_timeout_seconds(&deadline_payload) <= 2);
+        let violation = runtime_budget_violation(
+            &json!({"max_total_tokens": 9}),
+            &Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                cost: 0.0,
+            },
+            0,
+        )
+        .expect("token budget violation");
+        assert_eq!(violation.code, "total_tokens_exceeded");
+        assert_eq!(violation.reason, OutcomeReason::BudgetExhausted);
+
+        let cancelled = || true;
+        let started = Instant::now();
+        let error = wait_provider_retry(Duration::from_secs(1), Some(&cancelled))
+            .expect_err("cancelled retry wait");
+        assert_eq!(error.message, TURN_INTERRUPTED_ERROR);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn auto_compaction_boundary_handles_a_single_long_user_turn() {
+        let mut messages = Vec::new();
+        for index in 0..40 {
+            let role = if index == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            let mut message = runtime_chat_message(role, format!("step {index}"));
+            message
+                .metadata
+                .insert("message_id".to_string(), json!(format!("message-{index}")));
+            messages.push(message);
+        }
+
+        let boundary = runtime_auto_compaction_boundary(&messages, 1)
+            .expect("long single-turn task should get a compaction boundary");
+        assert_eq!(boundary.0, 15);
+        assert_eq!(boundary.1, "message-15");
+    }
+
+    #[test]
+    fn auto_compaction_boundary_preserves_short_single_user_turns() {
+        let mut messages = Vec::new();
+        for index in 0..DEFAULT_AUTO_COMPACTION_RECENT_MESSAGES {
+            let mut message = runtime_chat_message(Role::Assistant, format!("step {index}"));
+            message
+                .metadata
+                .insert("message_id".to_string(), json!(format!("message-{index}")));
+            messages.push(message);
+        }
+
+        assert!(runtime_auto_compaction_boundary(&messages, 1).is_none());
+    }
+
+    #[test]
     fn runtime_provider_fallback_candidates_filter_unsupported_models() {
         assert_eq!(
             runtime_provider_model_candidates_with_fallback(
@@ -14360,12 +16783,29 @@ while True:
         );
         assert_eq!(
             runtime_provider_model_candidates_with_fallback("gpt-5.6-sol", None),
-            vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+            vec!["gpt-5.6-sol"]
         );
         assert_eq!(
             runtime_provider_model_candidates_with_fallback("custom-child-model", None),
             vec!["custom-child-model"]
         );
+    }
+
+    #[test]
+    fn ancestor_task_cancel_marker_is_visible_to_descendants() {
+        let root = std::env::temp_dir().join(format!("openagent-task-cascade-{}", now_ms()));
+        fs::create_dir_all(root.join("parent-task")).expect("task directory");
+        write_session_task_cancel_marker(&root, "parent-task", "turn-parent")
+            .expect("cancel marker");
+        let mut child = Session::new("child-task", root.join("workspace"));
+        child
+            .metadata
+            .insert("parent_session_id".to_string(), json!("parent-task"));
+        child
+            .metadata
+            .insert("parent_run_id".to_string(), json!("turn-parent"));
+        assert!(ancestor_task_cancel_requested(&root, &child));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -15018,6 +17458,53 @@ while True:
         )
         .expect("mcp tool turn");
         assert_eq!(turn["status"], "completed");
+        let run_id = turn["run_id"]
+            .as_str()
+            .or_else(|| turn["turn_id"].as_str())
+            .expect("turn run id");
+        let store = FileSessionStore::new(session_root.clone());
+        let persisted_session = store.load_session(session_id).expect("persisted session");
+        let agent_profile = runtime_agent_profile_for_session(&persisted_session);
+        let mut governed_toolkit =
+            toolkit_with_runtime_task_tool(&persisted_session, agent_profile.as_ref());
+        let runtime = register_runtime_mcp_tools(
+            &config,
+            &persisted_session.directory,
+            &mut governed_toolkit,
+        )
+        .expect("registered MCP runtime");
+        assert!(
+            runtime
+                .descriptors
+                .contains_key("mcp_tool_local_tools_stdio_echo")
+        );
+        let manifest = governed_toolkit.governance_manifest();
+        assert!(manifest.passed, "{:?}", manifest.violations);
+        assert!(manifest.tools.iter().any(|tool| {
+            tool.tool_id == "mcp_tool_local_tools_stdio_echo"
+                && tool.risk_tier == openagent_tools::ToolRiskTier::Privileged
+        }));
+        let visible_tools = filter_runtime_tools_for_capabilities(
+            &store.root,
+            filter_runtime_tools_for_profile(
+                governed_toolkit.get_all_tools("local"),
+                agent_profile.as_ref(),
+            ),
+        );
+        ensure_runtime_tool_set_matches_contract(&store, session_id, run_id, &visible_tools)
+            .expect("persisted Tool Set fingerprint matches executable catalog");
+        let mut incomplete_tools = visible_tools.clone();
+        incomplete_tools.retain(|tool| tool.name != "mcp_tool_local_tools_stdio_echo");
+        assert!(
+            ensure_runtime_tool_set_matches_contract(
+                &store,
+                session_id,
+                run_id,
+                &incomplete_tools,
+            )
+            .expect_err("catalog drift must fail closed")
+            .contains("tool_set_fingerprint_mismatch")
+        );
         let completed = turn["events"]
             .as_array()
             .expect("events")
@@ -15758,6 +18245,79 @@ fn escape_json_string(value: &str) -> String {
     }
 
     #[test]
+    fn runtime_budgets_fail_terminally_before_provider_or_tool_side_effects() {
+        let root = std::env::temp_dir().join(format!("openagent-http-budgets-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        )
+        .expect("create session");
+        let session_id = created["session_id"].as_str().expect("session id");
+
+        let expired = start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "do not call the provider",
+                "deadline_at_ms": now_ms().saturating_sub(1),
+            })),
+        )
+        .expect("expired deadline is a deterministic terminal result");
+        assert_eq!(expired["status"], "failed");
+        assert_eq!(expired["reason_code"], "deadline_exceeded");
+
+        let blocked_path = workspace.join("budget-blocked.txt");
+        let tool_limited = start_turn_payload(
+            &config,
+            session_id,
+            &stable_json_dumps(&json!({
+                "input": "do not execute this tool",
+                "permission": "FULL",
+                "dangerously_skip_permissions": true,
+                "max_tool_calls": 0,
+                "tool_call": {
+                    "call_id": "call_budget_blocked",
+                    "name": "write",
+                    "input": {"file_path": "budget-blocked.txt", "content": "must not exist\n"}
+                }
+            })),
+        )
+        .expect("tool budget is a deterministic terminal result");
+        assert_eq!(tool_limited["status"], "failed");
+        assert_eq!(tool_limited["reason_code"], "tool_calls_exceeded");
+        assert!(
+            !blocked_path.exists(),
+            "tool ran after its budget was exhausted"
+        );
+
+        let store = FileSessionStore::new(session_root);
+        for result in [&expired, &tool_limited] {
+            let run_id = result["turn_id"].as_str().expect("turn id");
+            let run = read_json_file(
+                &store
+                    .root
+                    .join(session_id)
+                    .join("runs")
+                    .join(run_id)
+                    .join("run.json"),
+            );
+            assert_eq!(run["status"], "failed");
+            assert_eq!(run["outcome"], "failed");
+            assert_eq!(run["reason_code"], result["reason_code"]);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn durable_goal_lifecycle_persists_and_enters_context_pack() {
         let root = std::env::temp_dir().join(format!("openagent-http-goal-{}", now_ms()));
         let workspace = root.join("workspace");
@@ -16096,6 +18656,37 @@ fn escape_json_string(value: &str) -> String {
             .expect("nested waiting task");
         assert_eq!(waiting["title"], "Wait for approval");
         assert_eq!(waiting["canonical_status"], "waiting");
+
+        let sessions_request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/sessions".to_string(),
+            headers: BTreeMap::new(),
+            body: String::new(),
+        };
+        let visible_sessions = route_http_request(&sessions_request, &config)
+            .body
+            .expect("visible sessions");
+        let visible_ids = visible_sessions["sessions"]
+            .as_array()
+            .expect("visible session records")
+            .iter()
+            .filter_map(|session| session["session_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(visible_ids, vec![parent_id]);
+        assert_eq!(visible_sessions["include_subagents"], false);
+
+        let diagnostic_sessions_request = HttpRequest {
+            path: "/api/sessions?include_subagents=true".to_string(),
+            ..sessions_request.clone()
+        };
+        let diagnostic_sessions = route_http_request(&diagnostic_sessions_request, &config)
+            .body
+            .expect("diagnostic sessions");
+        assert_eq!(
+            diagnostic_sessions["sessions"].as_array().map(Vec::len),
+            Some(4)
+        );
+        assert_eq!(diagnostic_sessions["include_subagents"], true);
 
         let restarted_config = HttpRuntimeConfig {
             workspace: Some(workspace.to_string_lossy().to_string()),

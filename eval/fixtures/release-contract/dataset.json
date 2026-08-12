@@ -1,0 +1,7 @@
+{
+  "version": "ci-contract-v1",
+  "cases": [
+    "runtime.deadline",
+    "telemetry.collector-outage"
+  ]
+}

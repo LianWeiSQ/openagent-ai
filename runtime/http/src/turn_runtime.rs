@@ -452,6 +452,7 @@ pub(super) fn register_turn_job(
             .entry(turn_queue_key(&root, session_id))
             .or_default()
             .push_back(queued_job.expect("queued job"));
+        telemetry_add_queue_depth(1);
     }
     persist_turn_job_snapshot(&root, snapshot);
     if queue {
@@ -740,11 +741,14 @@ pub(super) fn release_queued_turn_lease(root: &Path, turn_id: &str) {
 }
 
 pub(super) fn remove_queued_turn_from_memory(turn_id: &str) {
+    let mut removed = 0_usize;
     if let Ok(mut queues) = queued_turns().lock() {
         let empty_sessions = queues
             .iter_mut()
             .filter_map(|(session_id, queue)| {
+                let before = queue.len();
                 queue.retain(|queued| queued.turn_id != turn_id);
+                removed = removed.saturating_add(before.saturating_sub(queue.len()));
                 if queue.is_empty() {
                     Some(session_id.clone())
                 } else {
@@ -755,6 +759,9 @@ pub(super) fn remove_queued_turn_from_memory(turn_id: &str) {
         for session_id in empty_sessions {
             queues.remove(&session_id);
         }
+    }
+    if removed > 0 {
+        telemetry_add_queue_depth(-i64::try_from(removed).unwrap_or(i64::MAX));
     }
 }
 
@@ -859,7 +866,9 @@ pub(super) fn expire_queued_turns_locked(config: &HttpRuntimeConfig, now: u64) -
     for queued in &expired {
         mark_turn_job_status_at_root(&root, &queued.turn_id, "expired");
         remove_queued_turn_payload(&root, &queued.turn_id);
+        telemetry_record_queue_wait("timeout", now.saturating_sub(queued.queued_at_ms));
     }
+    telemetry_add_queue_depth(-i64::try_from(expired.len()).unwrap_or(i64::MAX));
     expired.len()
 }
 
@@ -906,6 +915,7 @@ pub(super) fn pop_next_schedulable_queued_turn(
             }
             queued
         }?;
+        telemetry_add_queue_depth(-1);
         let now = now_ms();
         let mut snapshot = None;
         let mut should_start = false;
@@ -959,6 +969,7 @@ pub(super) fn start_next_queued_turns(config: &HttpRuntimeConfig) {
             queued.session_id.clone(),
             queued.turn_id.clone(),
             queued.payload,
+            Some(queued.queued_at_ms),
         ) {
             record_async_turn_failure(config, &queued.session_id, &queued.turn_id, &error);
             mark_turn_job_status(config, &queued.turn_id, "failed");
@@ -1519,6 +1530,8 @@ pub(super) fn recover_persisted_queued_turns(config: &HttpRuntimeConfig) -> Vec<
             if recovered_sessions.contains(&job.session_id)
                 && job.status != ExecutionStatus::Queued
                 && !job.status.is_terminal()
+                && !(job.status == ExecutionStatus::Waiting
+                    && persisted_turn_wait_is_resumable(&root, job))
             {
                 let decision = RecoveryPolicy::default().classify(&turn_execution_record(job), now);
                 job.status = ExecutionStatus::Interrupted;

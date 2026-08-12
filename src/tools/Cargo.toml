@@ -10,6 +10,7 @@ rust-version.workspace = true
 openagent-core.workspace = true
 openagent-lsp.workspace = true
 openagent-protocol.workspace = true
+openagent-telemetry.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["blocking", "socks"] }
 serde.workspace = true

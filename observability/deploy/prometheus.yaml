@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+  external_labels:
+    service: openharness
+
+rule_files:
+  - /etc/prometheus/rules/openharness-alerts.yaml
+
+scrape_configs:
+  - job_name: openharness
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/openharness-metrics-token
+    static_configs:
+      - targets: ["host.docker.internal:8787"]
+        labels:
+          environment: local-compose
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]

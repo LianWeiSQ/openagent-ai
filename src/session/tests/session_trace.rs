@@ -17,6 +17,10 @@ use openagent_session::{
     load_trace_summary, output_stats, render_trace_summary, sanitize_observation_value,
     sanitize_trace_value, step_usage_warnings,
 };
+use openagent_telemetry::{
+    AgentIdentity, ModelIdentity, RunSurface, RuntimeBudgets, TaskContractV1, TraceContext,
+    VersionIdentity,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -83,6 +87,82 @@ fn session_trace_observability_fixture_matches_legacy_oracle() {
         fixture["runtime_warnings"]["formatted"],
         json!(format_runtime_warning_event(&warning.to_event()).expect("warning formats"))
     );
+}
+
+#[test]
+fn file_session_store_persists_validated_task_contract() {
+    let root = unique_temp_dir("openagent-session-contract");
+    let store = FileSessionStore::new(root.join("sessions"));
+    let mut session = Session::new("session_contract", root.join("workspace"));
+    let trace = TraceContext::new_root(true);
+    let contract = TaskContractV1::new(
+        "task_contract",
+        session.id.clone(),
+        "run_contract",
+        RunSurface::Http,
+        AgentIdentity {
+            name: "server".to_string(),
+            version: "agent-v1".to_string(),
+        },
+        ModelIdentity {
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            family: "gpt".to_string(),
+        },
+        VersionIdentity::current_harness(
+            "agent-v1",
+            "prompt-v1",
+            "skills-v1",
+            "tools-v1",
+            &json!({"temperature": 0}),
+        ),
+        RuntimeBudgets {
+            max_steps: Some(4),
+            ..RuntimeBudgets::default()
+        },
+        trace.clone(),
+        1_781_840_000_000,
+    );
+    let metadata = store
+        .start_run_with_contract(
+            &mut session,
+            StartRunOptions {
+                run_id: contract.run_id.clone(),
+                trace_id: trace.trace_id,
+                agent_name: contract.agent.name.clone(),
+                model_id: Some(contract.model.model.clone()),
+                provider_id: Some(contract.model.provider.clone()),
+                permission: "FULL".to_string(),
+                max_steps: 4,
+                started_at_ms: Some(contract.created_at_ms),
+            },
+            &contract,
+        )
+        .expect("contract run starts");
+    let run: Value = serde_json::from_str(
+        &fs::read_to_string(PathBuf::from(metadata.run_dir).join("run.json"))
+            .expect("run record reads"),
+    )
+    .expect("run record parses");
+    assert_eq!(
+        run["task_contract"]["schema_version"],
+        json!("openharness.task.v1")
+    );
+    assert_eq!(run["trace_id"], json!(contract.trace.trace_id));
+    assert_eq!(
+        run["task_contract"]["versions"]["config_fingerprint"],
+        json!(contract.versions.config_fingerprint)
+    );
+    let run_event: Value = serde_json::from_str(
+        fs::read_to_string(metadata.ledger_path)
+            .expect("run event reads")
+            .lines()
+            .next()
+            .expect("run event exists"),
+    )
+    .expect("run event parses");
+    assert_eq!(run_event["trace_id"], json!(contract.trace.trace_id));
+    assert_eq!(run_event["span_id"], json!(contract.trace.span_id));
 }
 
 #[test]
@@ -1070,7 +1150,8 @@ fn observability_logging_and_warnings_write_sanitized_records() {
             &root,
             Some("run_fixture".to_string()),
             Some("trace_fixture".to_string()),
-        );
+        )
+        .with_span_id(Some("span_fixture".to_string()));
         assert!(
             logger
                 .log(
@@ -1094,6 +1175,11 @@ fn observability_logging_and_warnings_write_sanitized_records() {
             .expect("warning log records");
     }
     assert_eq!(metadata["runtime_logging"]["record_count"], 1);
+    assert_eq!(metadata["runtime_logging"]["span_id"], "span_fixture");
+    assert_eq!(
+        metadata["runtime_logging"]["records"][0]["span_id"],
+        "span_fixture"
+    );
     assert_eq!(
         metadata["runtime_logging"]["records"][0]["attributes"]["authorization"],
         "[redacted]"

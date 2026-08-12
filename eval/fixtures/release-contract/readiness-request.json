@@ -1,0 +1,23 @@
+{
+  "schema_version": "openharness.release_readiness.request.v1",
+  "release_id": "ci-production-contract-v1",
+  "tier": "ci",
+  "source_revision": "ci-contract",
+  "image_digest": null,
+  "quality_policy_path": "policy.json",
+  "quality_evidence_path": "../../../target/release-readiness/evidence.json",
+  "quality_decision_path": "../../../target/release-readiness/quality-gate-decision.json",
+  "fault_report_path": "../../../target/release-readiness/fault-injection-report.json",
+  "regression_report_path": "../../../target/release-readiness/regression-replay-report.json",
+  "load_report_path": "../../../target/release-readiness/load-test-report.json",
+  "soak_report_path": null,
+  "observability_asset_paths": [
+    "../../../observability/deploy/compose.yaml",
+    "../../../observability/deploy/otel-collector.yaml",
+    "../../../observability/deploy/prometheus.yaml",
+    "../../../observability/deploy/tempo.yaml",
+    "../../../observability/deploy/loki.yaml",
+    "../../../observability/grafana/dashboards/openharness-runtime.json",
+    "../../../observability/prometheus/openharness-alerts.yaml"
+  ]
+}

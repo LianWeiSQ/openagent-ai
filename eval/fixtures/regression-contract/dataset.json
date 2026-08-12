@@ -1,0 +1,13 @@
+{
+  "schema_version": "openharness.regression_dataset.v1",
+  "dataset_id": "release-regressions",
+  "dataset_version": "release-suite-v4",
+  "dataset_fingerprint": "0678facced5ee89643322d922ca20d0b2a76283c703b03790ef5eca91d7be718",
+  "fixtures": [
+    {
+      "fixture_id": "runtime.deadline.bad-case-42",
+      "path": "deadline.json",
+      "content_fingerprint": "f715d3de2989527587f2b89463fae82ff8fb221b3f28be41c4204a2524de0921"
+    }
+  ]
+}
