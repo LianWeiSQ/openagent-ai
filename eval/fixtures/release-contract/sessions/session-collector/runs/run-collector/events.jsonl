@@ -1,0 +1,3 @@
+{"event":"agent.run.finished","trace_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","span_id":"4444444444444444"}
+{"event":"step.finished","trace_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","span_id":"5555555555555555"}
+{"event":"provider.request.finished","trace_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","span_id":"6666666666666666"}

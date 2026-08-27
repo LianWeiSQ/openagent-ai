@@ -1,0 +1,22 @@
+{
+  "session_id": "session-deadline",
+  "run_id": "run-deadline",
+  "outcome": "failed",
+  "reason_code": "deadline_exceeded",
+  "task_contract": {
+    "session_id": "session-deadline",
+    "run_id": "run-deadline",
+    "trace": {
+      "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "span_id": "aaaaaaaaaaaaaaaa"
+    },
+    "versions": {
+      "harness_version": "0.1.0-ci",
+      "agent_version": "agent-ci",
+      "prompt_version": "prompt-ci",
+      "skill_set_version": "skills-ci",
+      "tool_set_version": "tools-ci",
+      "config_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  }
+}

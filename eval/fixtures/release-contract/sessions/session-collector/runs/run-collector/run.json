@@ -1,0 +1,22 @@
+{
+  "session_id": "session-collector",
+  "run_id": "run-collector",
+  "outcome": "success",
+  "reason_code": "none",
+  "task_contract": {
+    "session_id": "session-collector",
+    "run_id": "run-collector",
+    "trace": {
+      "trace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "span_id": "bbbbbbbbbbbbbbbb"
+    },
+    "versions": {
+      "harness_version": "0.1.0-ci",
+      "agent_version": "agent-ci",
+      "prompt_version": "prompt-ci",
+      "skill_set_version": "skills-ci",
+      "tool_set_version": "tools-ci",
+      "config_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  }
+}

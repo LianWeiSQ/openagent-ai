@@ -20,6 +20,8 @@ build/
 target/
 *.egg-info/
 runs/
+!eval/fixtures/release-contract/sessions/*/runs/
+!eval/fixtures/release-contract/sessions/*/runs/**
 jobs/
 tests/.tmp/
 tests/workdir/
