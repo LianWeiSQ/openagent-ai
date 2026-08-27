@@ -11186,58 +11186,52 @@ fn execute_runtime_mcp_lifecycle_tool_call(
     let fingerprint = mcp_server_fingerprint(server);
     let mut registry = mcp_lifecycle_registry().lock().ok()?;
     let mut remove_entry = false;
-    let result = match registry.get_mut(&key) {
-        Some(entry) => {
-            if entry.config_fingerprint != fingerprint {
-                remove_entry = true;
-                let mut result = unavailable_tool_result(&tool_call.name);
-                result.error = Some(
-                    "MCP local lifecycle process config changed; restart the server and retry."
-                        .to_string(),
-                );
-                result
-            } else if !entry.session.running() {
-                remove_entry = true;
-                let mut result = unavailable_tool_result(&tool_call.name);
-                result.error = Some(
-                    "MCP local lifecycle process exited; restart the server and retry.".to_string(),
-                );
-                result
-            } else {
-                let pid = entry.session.pid();
-                match entry.session.request(
-                    "tools/call",
-                    json!({
-                        "name": descriptor.original_name,
-                        "arguments": tool_call.input.clone(),
-                    }),
-                ) {
-                    Ok(value) => {
-                        entry.last_refreshed_at_ms = now_ms();
-                        let mut result = normalize_tool_call_result(
-                            descriptor,
-                            Some(McpTransport::Stdio),
-                            &value,
-                        );
-                        result
-                            .metadata
-                            .insert("mcp_lifecycle_reused".to_string(), json!(true));
-                        result
-                            .metadata
-                            .insert("mcp_lifecycle_pid".to_string(), json!(pid));
-                        result
-                    }
-                    Err(error) => {
-                        remove_entry = true;
-                        let mut result = unavailable_tool_result(&tool_call.name);
-                        result.error =
-                            Some(format!("MCP local lifecycle tools/call failed: {error}"));
-                        result
-                    }
+    let result = {
+        let entry = registry.get_mut(&key)?;
+        if entry.config_fingerprint != fingerprint {
+            remove_entry = true;
+            let mut result = unavailable_tool_result(&tool_call.name);
+            result.error = Some(
+                "MCP local lifecycle process config changed; restart the server and retry."
+                    .to_string(),
+            );
+            result
+        } else if !entry.session.running() {
+            remove_entry = true;
+            let mut result = unavailable_tool_result(&tool_call.name);
+            result.error = Some(
+                "MCP local lifecycle process exited; restart the server and retry.".to_string(),
+            );
+            result
+        } else {
+            let pid = entry.session.pid();
+            match entry.session.request(
+                "tools/call",
+                json!({
+                    "name": descriptor.original_name,
+                    "arguments": tool_call.input.clone(),
+                }),
+            ) {
+                Ok(value) => {
+                    entry.last_refreshed_at_ms = now_ms();
+                    let mut result =
+                        normalize_tool_call_result(descriptor, Some(McpTransport::Stdio), &value);
+                    result
+                        .metadata
+                        .insert("mcp_lifecycle_reused".to_string(), json!(true));
+                    result
+                        .metadata
+                        .insert("mcp_lifecycle_pid".to_string(), json!(pid));
+                    result
+                }
+                Err(error) => {
+                    remove_entry = true;
+                    let mut result = unavailable_tool_result(&tool_call.name);
+                    result.error = Some(format!("MCP local lifecycle tools/call failed: {error}"));
+                    result
                 }
             }
         }
-        None => return None,
     };
     if remove_entry {
         if let Some(entry) = registry.remove(&key) {
