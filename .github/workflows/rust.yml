@@ -36,7 +36,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -114,7 +114,7 @@ jobs:
             target/release-readiness/manifest.json
       - name: Upload release readiness evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openharness-release-readiness
           path: target/release-readiness/
