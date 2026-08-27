@@ -76,6 +76,7 @@ pub(crate) const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/models [id]", "list models or set the current model"),
     ("/agents", "list available agent profiles"),
     ("/agent <id>", "set the current agent profile"),
+    ("/skills [query]", "show project and user skills"),
     ("/variant <name>", "set the current model variant"),
     ("/themes", "open theme picker"),
     (

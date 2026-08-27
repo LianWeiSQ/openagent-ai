@@ -1310,6 +1310,24 @@ fn binary_models_catalog_and_backlog_commands_are_deep_local_workflows()
             .is_some_and(|items| { items.iter().any(|item| item == "plugin") })
     );
 
+    let openapi = run_openagent(["generate", "openapi"], None)?;
+    assert!(openapi.status.success());
+    let openapi_payload: Value = serde_json::from_slice(&openapi.stdout)?;
+    assert_eq!(openapi_payload["openapi"], "3.1.0");
+    assert_eq!(
+        openapi_payload["x-openagent-contract-schema"],
+        "openagent.bridge_api_contract.v1"
+    );
+    assert_eq!(
+        openapi_payload["paths"]["/api/sessions/{session_id}/turns"]["post"]["operationId"],
+        "startTurn"
+    );
+    assert!(
+        openapi_payload["paths"]
+            .as_object()
+            .is_some_and(|paths| paths.len() >= 80)
+    );
+
     let _ = fs::remove_dir_all(temp);
     Ok(())
 }
@@ -1718,6 +1736,73 @@ fn binary_agent_registry_exposes_builtin_subagents() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn binary_agents_option_loads_inline_json_and_yaml_file_profiles() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-startup-agents")?;
+    let inline = r#"{"inline-reviewer":{"description":"Inline reviewer","mode":"subagent","permission":"READONLY","prompt":"Review inline changes."}}"#;
+    let inline_list = run_openagent_vec(vec![
+        "agent".to_string(),
+        "list".to_string(),
+        "--workspace".to_string(),
+        path_str(&temp).to_string(),
+        "--agents".to_string(),
+        inline.to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ])?;
+    assert!(
+        inline_list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inline_list.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&inline_list.stdout)?;
+    let inline_profile = payload["agents"]
+        .as_array()
+        .and_then(|agents| agents.iter().find(|agent| agent["id"] == "inline-reviewer"))
+        .ok_or("missing inline startup agent")?;
+    assert_eq!(inline_profile["mode"], "subagent");
+    assert_eq!(inline_profile["permission"], "READONLY");
+
+    let yaml_path = temp.join("agents.yaml");
+    fs::write(
+        &yaml_path,
+        "agents:\n  - id: yaml-researcher\n    name: YAML Researcher\n    description: File researcher\n    mode: subagent\n    permission: READONLY\n    prompt: Research from YAML.\n",
+    )?;
+    let yaml_list = run_openagent_vec(vec![
+        "agent".to_string(),
+        "list".to_string(),
+        "--workspace".to_string(),
+        path_str(&temp).to_string(),
+        "--agents".to_string(),
+        "agents.yaml".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ])?;
+    assert!(
+        yaml_list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&yaml_list.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&yaml_list.stdout)?;
+    assert!(
+        payload["agents"]
+            .as_array()
+            .is_some_and(|agents| agents.iter().any(|agent| agent["id"] == "yaml-researcher"))
+    );
+
+    let invalid = run_openagent_vec(vec![
+        "agent".to_string(),
+        "list".to_string(),
+        "--agents".to_string(),
+        "{not-json}".to_string(),
+    ])?;
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid inline --agents JSON"));
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
 fn binary_agent_registry_loads_opencode_markdown_agents() -> Result<(), Box<dyn Error>> {
     let temp = temp_dir("openagent-cli-opencode-agent-md")?;
     let session_root = temp.join("sessions");
@@ -1966,6 +2051,231 @@ fn binary_run_executes_task_subagent_tool() -> Result<(), Box<dyn Error>> {
                 && message["content"] == "Find the important files and summarize them."
         })
     }));
+
+    let _ = fs::remove_dir_all(temp);
+    Ok(())
+}
+
+#[test]
+fn binary_run_queues_and_controls_background_task_locally() -> Result<(), Box<dyn Error>> {
+    let temp = temp_dir("openagent-cli-background-task")?;
+    let session_root = temp.join("sessions");
+    let output = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "run",
+            "--skip-doctor",
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--permission",
+            "FULL",
+            "--format",
+            "json",
+            "queue",
+            "this",
+        ])
+        .env_clear()
+        .env("OPENAGENT_LOCAL_BACKGROUND_WORKER", "0")
+        .env(
+            "OPENAGENT_MOCK_TOOL_CALLS",
+            r#"[{"call_id":"call_background_task","name":"task","input":{"description":"Background exploration","prompt":"Explore in the background.","subagent_type":"explore","background":true}}]"#,
+        )
+        .env("OPENAGENT_MOCK_ANSWER", "parent accepted background task")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let queued = events
+        .iter()
+        .find(|event| {
+            event["method"] == "item/toolCall/completed" && event["params"]["name"] == "task"
+        })
+        .ok_or("missing queued task result")?;
+    assert_eq!(queued["params"]["metadata"]["status"], "queued");
+    assert_eq!(queued["params"]["metadata"]["background"], true);
+    assert_eq!(queued["params"]["metadata"]["worker_started"], false);
+    let task_id = queued["params"]["metadata"]["task_id"]
+        .as_str()
+        .ok_or("missing task id")?;
+    let completed = events
+        .iter()
+        .find(|event| event["method"] == "turn/completed")
+        .ok_or("missing parent completion")?;
+    let parent_session_id = completed["params"]["session_id"]
+        .as_str()
+        .ok_or("missing parent session id")?;
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(task_id).join("state.latest.json"),
+    )?)?;
+    assert_eq!(state["status"], "idle");
+    assert_eq!(state["metadata"]["task_status"], "queued");
+    assert_eq!(state["metadata"]["background"], true);
+    assert_eq!(state["metadata"]["parent_session_id"], parent_session_id);
+    assert_eq!(state["metadata"]["max_steps"], 40);
+    assert_eq!(
+        state["metadata"]["_openagent_budget_profile"],
+        "subagent-quick-40"
+    );
+    assert!(state["metadata"]["max_elapsed_ms"].as_u64().is_some());
+    assert!(state["metadata"]["max_total_tokens"].as_u64().is_some());
+    assert!(state["metadata"]["max_tool_calls"].as_u64().is_some());
+    assert!(state["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "user" && message["content"] == "Explore in the background."
+        })
+    }));
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "task",
+            "list",
+            "--session",
+            parent_session_id,
+            "--session-root",
+            path_str(&session_root),
+            "--format",
+            "json",
+        ])
+        .output()?;
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout)?;
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["flat_tasks"][0]["task_id"], task_id);
+    assert_eq!(listed["flat_tasks"][0]["canonical_status"], "queued");
+
+    let canceled = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "task",
+            "cancel",
+            task_id,
+            "--session-root",
+            path_str(&session_root),
+            "--format",
+            "json",
+        ])
+        .output()?;
+    assert!(
+        canceled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&canceled.stderr)
+    );
+    let canceled: Value = serde_json::from_slice(&canceled.stdout)?;
+    assert_eq!(canceled["status"], "canceled");
+
+    let resumed = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "task",
+            "resume",
+            task_id,
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--format",
+            "json",
+        ])
+        .env("OPENAGENT_LOCAL_BACKGROUND_WORKER", "0")
+        .output()?;
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let resumed: Value = serde_json::from_slice(&resumed.stdout)?;
+    assert_eq!(resumed["status"], "queued");
+    assert_eq!(resumed["resumed"], true);
+
+    let provider_response = json!({
+        "id": "resp_local_background_task",
+        "output_text": "background exploration complete",
+        "usage": {"input_tokens": 2, "output_tokens": 3}
+    })
+    .to_string();
+    let (provider_port, provider_server, provider_requests) =
+        serve_http_capture_once_on_free_port("application/json", provider_response)?;
+    let provider_url = format!("http://127.0.0.1:{provider_port}");
+    let auth_path = temp.join("background-auth.json");
+    fs::write(
+        &auth_path,
+        serde_json::to_string_pretty(&json!({
+            "providers": {
+                "openai": {
+                    "provider": "openai",
+                    "type": "api",
+                    "api_key": "background-auth-secret",
+                    "base_url": provider_url,
+                    "model": "gpt-5.5",
+                    "wire_api": "responses"
+                }
+            }
+        }))?,
+    )?;
+    let started = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "task",
+            "start",
+            task_id,
+            "--workspace",
+            path_str(&temp),
+            "--session-root",
+            path_str(&session_root),
+            "--auth-file",
+            path_str(&auth_path),
+            "--format",
+            "json",
+        ])
+        .env_clear()
+        .output()?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let started: Value = serde_json::from_slice(&started.stdout)?;
+    assert!(started["worker_pid"].as_u64().is_some_and(|pid| pid > 0));
+
+    let waited = Command::new(env!("CARGO_BIN_EXE_openagent"))
+        .args([
+            "task",
+            "wait",
+            task_id,
+            "--session-root",
+            path_str(&session_root),
+            "--timeout-ms",
+            "10000",
+            "--format",
+            "json",
+        ])
+        .output()?;
+    assert!(
+        waited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["status"], "completed");
+    assert_eq!(waited["completed"], true);
+    provider_server
+        .join()
+        .map_err(|_| "background provider server panicked")??;
+    let provider_request_count = provider_requests
+        .lock()
+        .map_err(|error| error.to_string())?
+        .len();
+    assert_eq!(provider_request_count, 1);
+
+    let completed_state: Value = serde_json::from_str(&fs::read_to_string(
+        session_root.join(task_id).join("state.latest.json"),
+    )?)?;
+    assert_eq!(completed_state["metadata"]["task_status"], "completed");
 
     let _ = fs::remove_dir_all(temp);
     Ok(())
@@ -4058,13 +4368,23 @@ while True:
 
 fn read_http_request_body(stream: &mut std::net::TcpStream) -> Result<String, String> {
     let mut buffer = [0_u8; 8192];
-    let read = stream
-        .read(&mut buffer)
-        .map_err(|error| error.to_string())?;
-    let raw = String::from_utf8_lossy(&buffer[..read]).to_string();
-    let (headers, body) = raw
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "invalid HTTP request".to_string())?;
+    let mut raw = Vec::new();
+    let header_end = loop {
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("HTTP request ended before headers completed".to_string());
+        }
+        raw.extend_from_slice(&buffer[..read]);
+        if let Some(index) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index;
+        }
+        if raw.len() > 1024 * 1024 {
+            return Err("HTTP request headers exceeded 1 MiB".to_string());
+        }
+    };
+    let headers = String::from_utf8_lossy(&raw[..header_end]);
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -4073,8 +4393,8 @@ fn read_http_request_body(stream: &mut std::net::TcpStream) -> Result<String, St
                 .then(|| value.trim().parse::<usize>().ok())
                 .flatten()
         })
-        .unwrap_or(body.len());
-    let mut body = body.as_bytes().to_vec();
+        .unwrap_or(raw.len().saturating_sub(header_end + 4));
+    let mut body = raw[(header_end + 4)..].to_vec();
     while body.len() < content_length {
         let read = stream
             .read(&mut buffer)

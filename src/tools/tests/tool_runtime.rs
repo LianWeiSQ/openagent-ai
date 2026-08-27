@@ -740,6 +740,30 @@ fn file_tools_enforce_path_safety_read_before_write_and_metadata() -> Result<(),
     );
     assert_eq!(edit.metadata["replace_all"], json!(false));
 
+    fs::write(root.join("tail.txt"), "first\nlast\n")?;
+    let tail_read = toolkit.execute(
+        "read",
+        json!({"file_path": "tail.txt"}),
+        "call_tail_read",
+        &mut ctx,
+    );
+    assert!(tail_read.error.is_none());
+    let tail_edit = toolkit.execute(
+        "edit",
+        json!({
+            "file_path": "tail.txt",
+            "old_string": "last\n",
+            "new_string": "changed",
+        }),
+        "call_tail_edit",
+        &mut ctx,
+    );
+    assert!(tail_edit.error.is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("tail.txt"))?,
+        "first\nchanged\n"
+    );
+
     let write_new = toolkit.execute(
         "write",
         json!({"file_path": "new.txt", "content": "fresh"}),
@@ -1659,11 +1683,17 @@ fn skill_tool_lists_builtin_skills_and_workspace_overrides() -> Result<(), Box<d
         .insert("include_builtin_skills".to_string(), json!(false));
     let hidden = toolkit.execute(
         "skill",
-        json!({"query": "openai-docs"}),
+        json!({"name": "openai-docs"}),
         "call_skill_builtin_disabled",
         &mut disabled,
     );
-    assert!(hidden.output.contains("No skills matched query"));
+    assert!(
+        hidden
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("not found")),
+        "{hidden:?}"
+    );
 
     fs::remove_dir_all(root)?;
     Ok(())

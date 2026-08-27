@@ -259,6 +259,29 @@ pub(super) fn max_running_turn_workers(config: &HttpRuntimeConfig) -> usize {
     config.max_running_turn_workers.max(1)
 }
 
+fn estimated_turn_duration_ms_from_jobs(jobs: &[TurnJobSnapshot]) -> u64 {
+    const DEFAULT_ESTIMATE_MS: u64 = 60_000;
+    const MIN_ESTIMATE_MS: u64 = 5_000;
+    const MAX_ESTIMATE_MS: u64 = 30 * 60 * 1000;
+    let mut durations = jobs
+        .iter()
+        .filter(|job| job.status.is_terminal())
+        .map(|job| job.updated_at_ms.saturating_sub(job.started_at_ms))
+        .filter(|duration| *duration > 0)
+        .collect::<Vec<_>>();
+    if durations.is_empty() {
+        return DEFAULT_ESTIMATE_MS;
+    }
+    durations.sort_unstable();
+    durations[durations.len() / 2].clamp(MIN_ESTIMATE_MS, MAX_ESTIMATE_MS)
+}
+
+pub(super) fn estimated_turn_wait_ms(config: &HttpRuntimeConfig, queue_position: usize) -> u64 {
+    let root = session_root(config);
+    let jobs = read_turn_job_index(&root);
+    estimated_turn_duration_ms_from_jobs(&jobs).saturating_mul(queue_position as u64)
+}
+
 pub(super) fn turn_queue_timeout_ms(config: &HttpRuntimeConfig) -> u64 {
     config.turn_queue_timeout_ms.max(1)
 }
@@ -1205,6 +1228,8 @@ pub(super) fn list_turn_jobs_payload(config: &HttpRuntimeConfig, request_path: &
         .count();
     let active_count = running_count + queued_count;
     let queue_positions = queued_turn_positions();
+    let estimated_turn_duration_ms = estimated_turn_duration_ms_from_jobs(&jobs);
+    let session_store = FileSessionStore::new(root.clone());
     json!({
         "turns": jobs
             .iter()
@@ -1216,11 +1241,38 @@ pub(super) fn list_turn_jobs_payload(config: &HttpRuntimeConfig, request_path: &
                     && let Some(object) = value.as_object_mut()
                 {
                     object.insert("queue_position".to_string(), json!(position));
+                    let estimated_wait_ms = estimated_turn_duration_ms
+                        .saturating_mul(*position as u64);
+                    object.insert("estimated_wait_ms".to_string(), json!(estimated_wait_ms));
+                    object.insert(
+                        "estimated_start_at_ms".to_string(),
+                        json!(now.saturating_add(estimated_wait_ms)),
+                    );
+                    object.insert(
+                        "queue_wait_elapsed_ms".to_string(),
+                        json!(now.saturating_sub(job.started_at_ms)),
+                    );
                 }
                 if job.status == ExecutionStatus::Queued
                     && let Some(object) = value.as_object_mut()
                 {
                     object.insert("payload_persisted".to_string(), json!(payload_persisted));
+                }
+                if let Some(object) = value.as_object_mut() {
+                    let budget = runtime_task_contract_for_run(
+                        &session_store,
+                        &job.session_id,
+                        &job.turn_id,
+                    )
+                    .and_then(|contract| serde_json::to_value(contract.budgets).ok())
+                    .or_else(|| {
+                        read_turn_retry_payload(&root, &job.turn_id)
+                            .and_then(|saved| saved.get("payload").cloned())
+                            .map(|payload| runtime_budget_projection(&payload))
+                    });
+                    if let Some(budget) = budget {
+                        object.insert("budget".to_string(), budget);
+                    }
                 }
                 value
             })
@@ -1234,6 +1286,7 @@ pub(super) fn list_turn_jobs_payload(config: &HttpRuntimeConfig, request_path: &
             "max_queued_turns_per_session": config.max_queued_turns_per_session,
             "max_running_turn_workers": max_running_turn_workers(config),
             "running_turn_workers": global_running_turn_workers,
+            "estimated_turn_duration_ms": estimated_turn_duration_ms,
             "turn_queue_lease_stale_ms": config.turn_queue_lease_stale_ms,
             "turn_queue_timeout_ms": turn_queue_timeout_ms(config),
             "expired_queued_turns": expired_count,

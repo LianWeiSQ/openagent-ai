@@ -843,6 +843,18 @@ fn file_session_store_compaction_boundary_skips_compacted_context() {
     assert_eq!(projected[0].content, "Summary of compacted context.");
     assert_eq!(projected[1].content, "fresh context");
 
+    store
+        .undo_compaction_boundary("session_compact", "run_compact_undo", &boundary_id)
+        .expect("compaction boundary undo appends a tombstone");
+    let restored = store
+        .list_messages_with_parts("session_compact", None, None)
+        .expect("restored messages load");
+    assert_eq!(restored.len(), 3);
+    let restored = message_parts_to_chat_messages(&restored);
+    assert_eq!(restored[0].content, "old context");
+    assert_eq!(restored[1].content, "also old");
+    assert_eq!(restored[2].content, "fresh context");
+
     fs::remove_dir_all(root).expect("temporary session store is removed");
 }
 

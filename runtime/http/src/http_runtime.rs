@@ -22,11 +22,11 @@ use openagent_bridge_server::{
     record_control_response_payload, tui_control_request_for_path,
 };
 use openagent_core::{
-    ContextAttachment, ContextAttachmentKind, ContextBudgetOptions, ContextCheckpoint,
-    ContextFailure, ContextFailureCode, ContextItem, ContextPack, ContextPackBuildOptions,
-    ContextPackBuilder, ContextPackInput, ContextPackPerformance, ContextPackReceipt,
-    ContextPackTraceEntry, ContextSystemDiagnostics, ContextSystemSources, ContextTodo,
-    ContextWorkState, DurableGoal, DurableGoalStatus, DurablePlan, DurablePlanStatus,
+    CONTEXT_PRIORITY_WORK_STATE, ContextAttachment, ContextAttachmentKind, ContextBudgetOptions,
+    ContextCheckpoint, ContextFailure, ContextFailureCode, ContextItem, ContextPack,
+    ContextPackBuildOptions, ContextPackBuilder, ContextPackInput, ContextPackPerformance,
+    ContextPackReceipt, ContextPackTraceEntry, ContextSystemDiagnostics, ContextSystemSources,
+    ContextTodo, ContextWorkState, DurableGoal, DurableGoalStatus, DurablePlan, DurablePlanStatus,
     PermissionManager, SkillDocument, SkillRegistry, SkillRegistryOptions,
     context_pack_build_options_for_model, load_context_budget_options, materialize_context_history,
     permission_rule, skill_document_model_invocable, skill_info_model_invocable,
@@ -44,7 +44,8 @@ use openagent_mcp::{
 };
 use openagent_protocol::{
     ChatMessage, MessagePartKind, MessageStatus, Model, PermissionRuleset, Role, ToolCall,
-    ToolResult, ToolSchema, Usage, WorkState, render_work_state,
+    ToolResult, ToolSchema, Usage, WorkState, bridge_api_contract, bridge_error_retryable,
+    bridge_openapi_document, render_work_state,
 };
 use openagent_provider::{
     AnthropicLanguageModelConfig, GeminiLanguageModelConfig, OpenAiLanguageModelConfig,
@@ -84,6 +85,7 @@ use serde_json::{Map, Value, json};
 mod bad_case_runtime;
 mod bridge_routes;
 mod capability_runtime;
+mod context_memory_runtime;
 mod git_runtime;
 mod mcp_runtime;
 mod performance_runtime;
@@ -102,6 +104,7 @@ pub use bridge_routes::{
     run_cli,
 };
 use capability_runtime::*;
+use context_memory_runtime::*;
 use git_runtime::*;
 use mcp_runtime::*;
 use performance_runtime::*;
@@ -166,11 +169,92 @@ const DEFAULT_MAX_QUEUED_TURNS_PER_SESSION: usize = 8;
 const DEFAULT_MAX_RUNNING_TURN_WORKERS: usize = 4;
 const DEFAULT_TURN_QUEUE_LEASE_STALE_MS: u64 = 30_000;
 const DEFAULT_TURN_QUEUE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
-const UNBOUNDED_MAX_STEPS: u64 = u64::MAX / 4;
+const DEFAULT_MAIN_MAX_STEPS: u64 = 80;
+const DEFAULT_MAIN_MAX_ELAPSED_MS: u64 = 2 * 60 * 60 * 1000;
+const DEFAULT_MAIN_MAX_TOTAL_TOKENS: u64 = 4_000_000;
+const DEFAULT_MAIN_MAX_COST_MICROUNITS: u64 = 20_000_000;
+const DEFAULT_MAIN_MAX_TOOL_CALLS: u64 = 400;
+const QUICK_SUBAGENT_MAX_STEPS: u64 = 40;
+const QUICK_SUBAGENT_MAX_ELAPSED_MS: u64 = 45 * 60 * 1000;
+const QUICK_SUBAGENT_MAX_TOTAL_TOKENS: u64 = 1_000_000;
+const QUICK_SUBAGENT_MAX_COST_MICROUNITS: u64 = 5_000_000;
+const QUICK_SUBAGENT_MAX_TOOL_CALLS: u64 = 160;
+const EXTENDED_SUBAGENT_MAX_STEPS: u64 = 150;
+const EXTENDED_SUBAGENT_MAX_ELAPSED_MS: u64 = 4 * 60 * 60 * 1000;
+const EXTENDED_SUBAGENT_MAX_TOTAL_TOKENS: u64 = 8_000_000;
+const EXTENDED_SUBAGENT_MAX_COST_MICROUNITS: u64 = 40_000_000;
+const EXTENDED_SUBAGENT_MAX_TOOL_CALLS: u64 = 750;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
     CRATE_NAME
+}
+
+/// Returns the durable task tree for a local CLI session without requiring an
+/// HTTP round trip. CLI and Bridge callers intentionally share the same
+/// projection so task status cannot drift between entry points.
+#[must_use]
+pub fn local_session_tasks(config: &HttpRuntimeConfig, session_id: &str) -> Value {
+    session_tasks_payload(config, session_id)
+}
+
+/// Waits for a durable local task to reach a terminal state.
+pub fn local_wait_session_task(
+    config: &HttpRuntimeConfig,
+    parent_session_id: &str,
+    task_id: &str,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    wait_session_task_payload(
+        config,
+        parent_session_id,
+        task_id,
+        &json!({"timeout_ms": timeout_ms}).to_string(),
+    )
+}
+
+/// Requests cancellation through the same durable marker used by Bridge.
+pub fn local_cancel_session_task(
+    config: &HttpRuntimeConfig,
+    parent_session_id: &str,
+    task_id: &str,
+) -> Result<Value, String> {
+    cancel_session_task_payload(config, parent_session_id, task_id)
+}
+
+/// Requeues a failed or cancelled durable task for a local worker.
+pub fn local_resume_session_task(
+    config: &HttpRuntimeConfig,
+    parent_session_id: &str,
+    task_id: &str,
+) -> Result<Value, String> {
+    resume_session_task_payload(config, parent_session_id, task_id)
+}
+
+/// Runs all currently queued background tasks once. This is used by the
+/// short-lived local CLI worker process; the long-running Bridge server uses
+/// the same worker function on its polling loop.
+pub fn run_local_background_task_worker_once(config: &HttpRuntimeConfig) -> Result<(), String> {
+    run_background_task_worker_once(config)
+}
+
+#[must_use]
+pub fn local_subagent_runtime_budget(subagent_id: &str, max_steps: Option<u64>) -> Value {
+    let (profile, defaults) = subagent_budget_defaults_for_id(subagent_id);
+    let explicit_max_steps = max_steps.filter(|value| *value > 0);
+    json!({
+        "max_steps": explicit_max_steps.unwrap_or(defaults[0]),
+        "max_elapsed_ms": defaults[1],
+        "max_total_tokens": defaults[2],
+        "max_cost_microunits": defaults[3],
+        "max_tool_calls": defaults[4],
+        "_openagent_budget_profile": profile,
+        "_openagent_budget_source": if explicit_max_steps.is_some() {
+            "agent_profile_with_runtime_defaults"
+        } else {
+            "runtime_profile_default"
+        },
+    })
 }
 
 #[must_use]
@@ -768,6 +852,8 @@ pub struct HttpRuntimeConfig {
     pub workspace: Option<String>,
     pub session_store_root: Option<String>,
     pub mcp_config: Option<String>,
+    pub startup_agents: Option<Value>,
+    pub startup_agents_error: Option<String>,
     pub auth_token: Option<String>,
     pub auth_username: Option<String>,
     pub auth_password: Option<String>,
@@ -788,6 +874,8 @@ impl Default for HttpRuntimeConfig {
             workspace: None,
             session_store_root: None,
             mcp_config: None,
+            startup_agents: None,
+            startup_agents_error: None,
             auth_token: None,
             auth_username: None,
             auth_password: None,
@@ -820,6 +908,8 @@ impl HttpRuntimeConfig {
             "port": self.port,
             "workspace": self.workspace,
             "session_store_root": self.session_store_root,
+            "startup_agents_configured": self.startup_agents.is_some(),
+            "startup_agents_valid": self.startup_agents_error.is_none(),
             "auth_required": self.auth_required(),
             "auth_basic_enabled": self.auth_password.as_ref().is_some_and(|value| !value.is_empty()),
             "cors_origin": self.cors_origin,
@@ -1457,6 +1547,89 @@ fn extract_openai_model_ids(value: &Value) -> Vec<String> {
         .collect()
 }
 
+fn load_runtime_agents_source(source: &str, workspace: &Path) -> Result<Value, String> {
+    let trimmed = source.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return serde_json::from_str::<Value>(trimmed)
+            .map_err(|error| format!("invalid inline --agents JSON: {error}"));
+    }
+    let raw_path = PathBuf::from(trimmed);
+    let path = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        let workspace_path = workspace.join(&raw_path);
+        if workspace_path.is_file() {
+            workspace_path
+        } else {
+            raw_path
+        }
+    };
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read --agents {}: {error}", path.display()))?;
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("yaml" | "yml") => serde_yaml::from_str::<Value>(&raw)
+            .map_err(|error| format!("invalid --agents YAML {}: {error}", path.display())),
+        _ => serde_json::from_str::<Value>(&raw)
+            .map_err(|error| format!("invalid --agents JSON {}: {error}", path.display())),
+    }
+}
+
+fn runtime_agent_profile_values(value: &Value) -> Vec<(String, Value)> {
+    if let Some(agents) = value.get("agents") {
+        return runtime_agent_profile_values(agents);
+    }
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.is_object())
+            .map(|(index, item)| {
+                let id = item
+                    .get("id")
+                    .or_else(|| item.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("agent-{}", index + 1));
+                (id, item.clone())
+            })
+            .collect();
+    }
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    if [
+        "id",
+        "name",
+        "description",
+        "mode",
+        "prompt",
+        "model",
+        "provider",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        let id = object
+            .get("id")
+            .or_else(|| object.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("agent")
+            .to_string();
+        return vec![(id, value.clone())];
+    }
+    object
+        .iter()
+        .filter_map(|(id, profile)| {
+            let mut profile = profile.as_object()?.clone();
+            profile.entry("id".to_string()).or_insert_with(|| json!(id));
+            profile
+                .entry("name".to_string())
+                .or_insert_with(|| json!(id));
+            Some((id.clone(), Value::Object(profile)))
+        })
+        .collect()
+}
+
 fn agents_payload(config: &HttpRuntimeConfig) -> Value {
     let mut agents = vec![json!({
         "id": "server",
@@ -1466,7 +1639,7 @@ fn agents_payload(config: &HttpRuntimeConfig) -> Value {
         "default": true,
     })];
     agents.extend(
-        runtime_subagent_profiles(&workspace(config))
+        runtime_subagent_profiles(&workspace(config), config.startup_agents.as_ref())
             .into_iter()
             .filter(|profile| !profile.hidden)
             .map(|profile| runtime_subagent_public_value(&profile)),
@@ -1478,7 +1651,12 @@ fn tool_governance_payload(config: &HttpRuntimeConfig) -> Value {
     let mut toolkit = Toolkit::with_builtins();
     register_task_tool(
         &mut toolkit.registry,
-        &runtime_task_subagent_descriptors(&workspace(config), None, None),
+        &runtime_task_subagent_descriptors(
+            &workspace(config),
+            config.startup_agents.as_ref(),
+            None,
+            None,
+        ),
     );
     let _mcp_runtime = register_runtime_mcp_tools(config, &workspace(config), &mut toolkit);
     serde_json::to_value(toolkit.governance_manifest()).unwrap_or_else(|error| {
@@ -1516,14 +1694,20 @@ struct RuntimeSubagentProfile {
     source_path: Option<PathBuf>,
 }
 
-fn runtime_subagent_profiles(workspace: &Path) -> Vec<RuntimeSubagentProfile> {
-    runtime_agent_profiles(workspace)
+fn runtime_subagent_profiles(
+    workspace: &Path,
+    startup_agents: Option<&Value>,
+) -> Vec<RuntimeSubagentProfile> {
+    runtime_agent_profiles(workspace, startup_agents)
         .into_iter()
         .filter(|profile| runtime_is_subagent_mode(&profile.mode))
         .collect()
 }
 
-fn runtime_agent_profiles(workspace: &Path) -> Vec<RuntimeSubagentProfile> {
+fn runtime_agent_profiles(
+    workspace: &Path,
+    startup_agents: Option<&Value>,
+) -> Vec<RuntimeSubagentProfile> {
     let mut profiles = builtin_runtime_subagent_profiles()
         .into_iter()
         .map(|profile| (profile.id.clone(), profile))
@@ -1547,6 +1731,15 @@ fn runtime_agent_profiles(workspace: &Path) -> Vec<RuntimeSubagentProfile> {
             && !profile.disabled
         {
             profiles.insert(profile.id.clone(), profile);
+        }
+    }
+    if let Some(startup_agents) = startup_agents {
+        for (fallback_id, value) in runtime_agent_profile_values(startup_agents) {
+            if let Some(profile) = runtime_agent_profile_from_value(&value, &fallback_id, None)
+                && !profile.disabled
+            {
+                profiles.insert(profile.id.clone(), profile);
+            }
         }
     }
     profiles.into_values().collect()
@@ -1683,26 +1876,35 @@ fn runtime_agent_profile_from_value(
     })
 }
 
-fn runtime_subagent_profile(id: &str, workspace: &Path) -> Option<RuntimeSubagentProfile> {
+fn runtime_subagent_profile(
+    id: &str,
+    workspace: &Path,
+    startup_agents: Option<&Value>,
+) -> Option<RuntimeSubagentProfile> {
     let normalized = sanitize_runtime_agent_id(id);
-    runtime_subagent_profiles(workspace)
+    runtime_subagent_profiles(workspace, startup_agents)
         .into_iter()
         .find(|profile| profile.id == normalized || profile.name.eq_ignore_ascii_case(id))
 }
 
-fn runtime_agent_profile(id: &str, workspace: &Path) -> Option<RuntimeSubagentProfile> {
+fn runtime_agent_profile(
+    id: &str,
+    workspace: &Path,
+    startup_agents: Option<&Value>,
+) -> Option<RuntimeSubagentProfile> {
     let normalized = sanitize_runtime_agent_id(id);
-    runtime_agent_profiles(workspace)
+    runtime_agent_profiles(workspace, startup_agents)
         .into_iter()
         .find(|profile| profile.id == normalized || profile.name.eq_ignore_ascii_case(id))
 }
 
 fn runtime_task_subagent_descriptors(
     workspace: &Path,
+    startup_agents: Option<&Value>,
     agent_profile: Option<&RuntimeSubagentProfile>,
     parent_session: Option<&Session>,
 ) -> Vec<TaskSubagentDescriptor> {
-    runtime_subagent_profiles(workspace)
+    runtime_subagent_profiles(workspace, startup_agents)
         .into_iter()
         .filter(|profile| !profile.hidden)
         .filter(|profile| {
@@ -1729,7 +1931,10 @@ fn runtime_agent_profile_for_session(session: &Session) -> Option<RuntimeSubagen
         .and_then(|profile| profile.get("id"))
         .and_then(Value::as_str)
         .or_else(|| session.metadata.get("agent").and_then(Value::as_str));
-    if let Some(profile) = profile_id.and_then(|id| runtime_agent_profile(id, &session.directory)) {
+    let startup_agents = session.metadata.get("startup_agents");
+    if let Some(profile) =
+        profile_id.and_then(|id| runtime_agent_profile(id, &session.directory, startup_agents))
+    {
         return Some(profile);
     }
     if let Some(profile_value) = session.metadata.get("agent_profile") {
@@ -1751,11 +1956,16 @@ fn skills_payload(config: &HttpRuntimeConfig) -> Value {
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    let workspace = fs::canonicalize(&workspace).unwrap_or(workspace);
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|path| fs::canonicalize(&path).ok().or(Some(path)))
+        .unwrap_or_else(|| PathBuf::from("."));
     let runtime = plugin_runtime_options(config);
     let registry = SkillRegistry::new_with_options(
-        Some(workspace),
+        Some(workspace.clone()),
         Option::<Vec<String>>::None,
-        Option::<PathBuf>::None,
+        Some(home.clone()),
         SkillRegistryOptions {
             include_builtin_skills: true,
         },
@@ -1764,14 +1974,61 @@ fn skills_payload(config: &HttpRuntimeConfig) -> Value {
     .with_disabled_names(runtime.disabled_skills);
     let mut report = registry.report(None, None);
     report.skills.retain(skill_info_model_invocable);
+    let mut scope_counts = BTreeMap::<String, u64>::new();
+    let skills = report
+        .skills
+        .into_iter()
+        .map(|skill| {
+            let scope = skill_configuration_scope(&skill.location, &workspace, &home);
+            *scope_counts.entry(scope.to_string()).or_default() += 1;
+            let mut value = serde_json::to_value(skill).unwrap_or_else(|_| json!({}));
+            value["scope"] = json!(scope);
+            value
+        })
+        .collect::<Vec<_>>();
     json!({
-        "skills": report.skills,
+        "workspace": workspace.to_string_lossy(),
+        "skills": skills,
+        "scopes": scope_counts,
         "loaded_count": report.loaded_count,
         "scanned_files": report.scanned_files,
         "invalid_count": report.invalid_count,
         "duplicate_count": report.duplicate_count,
         "issues": report.issues,
     })
+}
+
+fn skill_configuration_scope(location: &str, workspace: &Path, home: &Path) -> &'static str {
+    let location = fs::canonicalize(location).unwrap_or_else(|_| PathBuf::from(location));
+    let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    const CONFIG_DIRS: &[&str] = &[".openagent", ".agents", ".opencode", ".claude"];
+    for ancestor in workspace.ancestors() {
+        if ancestor == home.as_path() {
+            break;
+        }
+        if CONFIG_DIRS
+            .iter()
+            .any(|directory| location.starts_with(ancestor.join(directory)))
+        {
+            return "project";
+        }
+    }
+    if CONFIG_DIRS
+        .iter()
+        .any(|directory| location.starts_with(home.join(directory)))
+    {
+        return "user";
+    }
+    if location
+        .components()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|parts| parts[0].as_os_str() == "skill" && parts[1].as_os_str() == "openagent")
+    {
+        return "bundled";
+    }
+    "external"
 }
 
 fn lsp_status_payload(config: &HttpRuntimeConfig) -> Result<Value, String> {
@@ -1944,7 +2201,12 @@ fn toolkit_with_runtime_task_tool(
     let mut toolkit = Toolkit::with_builtins();
     register_task_tool(
         &mut toolkit.registry,
-        &runtime_task_subagent_descriptors(&session.directory, agent_profile, Some(session)),
+        &runtime_task_subagent_descriptors(
+            &session.directory,
+            session.metadata.get("startup_agents"),
+            agent_profile,
+            Some(session),
+        ),
     );
     toolkit
 }
@@ -2349,6 +2611,11 @@ fn create_session_payload(config: &HttpRuntimeConfig, body: &str) -> Result<Valu
     session
         .metadata
         .insert("created_by".to_string(), json!("openagent-http-runtime"));
+    if let Some(startup_agents) = config.startup_agents.as_ref() {
+        session
+            .metadata
+            .insert("startup_agents".to_string(), startup_agents.clone());
+    }
     if let Some(title) = payload
         .get("title")
         .and_then(Value::as_str)
@@ -2481,6 +2748,11 @@ fn update_session_payload(
     let mut session = store
         .load_session(session_id)
         .map_err(|error| error.to_string())?;
+    if let Some(startup_agents) = config.startup_agents.as_ref() {
+        session
+            .metadata
+            .insert("startup_agents".to_string(), startup_agents.clone());
+    }
     if let Some(title) = payload.get("title").and_then(Value::as_str) {
         let title = title.trim();
         if title.is_empty() {
@@ -2985,6 +3257,71 @@ fn session_tasks_payload(config: &HttpRuntimeConfig, session_id: &str) -> Value 
     })
 }
 
+fn session_control_plane_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let turns = list_turn_jobs_payload(config, &format!("/api/turns?session_id={session_id}"));
+    let tasks = session_tasks_payload(config, session_id);
+    let task_status_counts = tasks
+        .get("status_counts")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let retryable_turn_count = turns
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|turn| {
+            turn.get("status").and_then(Value::as_str) == Some("failed")
+                && read_turn_retry_payload(
+                    &session_root(config),
+                    turn["turn_id"].as_str().unwrap_or_default(),
+                )
+                .is_some()
+        })
+        .count();
+    let running_turns = turns
+        .get("running_count")
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    let queued_turns = turns
+        .get("queued_count")
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    Ok(json!({
+        "schema_version": "openagent.task_control_plane.v1",
+        "session_id": session_id,
+        "generated_at_ms": now_ms(),
+        "turns": turns,
+        "tasks": tasks,
+        "summary": {
+            "running_turns": running_turns,
+            "queued_turns": queued_turns,
+            "retryable_turns": retryable_turn_count,
+            "task_status_counts": task_status_counts,
+        },
+        "capabilities": {
+            "queue_position": true,
+            "estimated_wait": true,
+            "runtime_budget": true,
+            "cascade_cancel": true,
+            "turn_retry": true,
+            "task_resume": true,
+            "strict_model_routing": !provider_model_fallbacks_enabled(),
+        },
+        "actions": {
+            "interrupt_turn": "/api/turns/{turn_id}/interrupt",
+            "retry_turn": "/api/turns/{turn_id}/retry",
+            "cancel_task": format!("/api/sessions/{session_id}/tasks/{{task_id}}/cancel"),
+            "resume_task": format!("/api/sessions/{session_id}/tasks/{{task_id}}/resume"),
+        },
+    }))
+}
+
 fn task_tree_for_parent(all_tasks: &[Value], parent_session_id: &str) -> Vec<Value> {
     let mut visited = BTreeSet::new();
     task_tree_for_parent_inner(all_tasks, parent_session_id, &mut visited)
@@ -3464,19 +3801,36 @@ fn ancestor_task_cancel_requested(root: &Path, session: &Session) -> bool {
     // A task depth is bounded by governance, but keep this defensive in case
     // of hand-edited legacy session state.
     for _ in 0..32 {
-        let (Some(parent_id), Some(parent_run)) =
-            (parent_session_id.as_deref(), parent_run_id.as_deref())
-        else {
+        let Some(parent_id) = parent_session_id.as_deref() else {
             return false;
         };
-        if turn_cancel_requested(parent_run)
-            || session_task_cancel_requested(root, parent_id, parent_run)
-        {
-            return true;
+        if let Some(parent_run) = parent_run_id.as_deref() {
+            if turn_cancel_requested(parent_run)
+                || session_task_cancel_requested(root, parent_id, parent_run)
+            {
+                return true;
+            }
         }
         let Ok(parent) = store.load_session(parent_id) else {
             return false;
         };
+        if matches!(parent.status, SessionStatus::Stop)
+            || matches!(
+                parent
+                    .metadata
+                    .get("task_status")
+                    .and_then(Value::as_str)
+                    .map(canonical_task_status),
+                Some("cancelled")
+            )
+            || parent
+                .metadata
+                .get("cancel_requested_at_ms")
+                .and_then(Value::as_u64)
+                .is_some()
+        {
+            return true;
+        }
         parent_session_id = parent
             .metadata
             .get("parent_session_id")
@@ -3522,9 +3876,13 @@ fn run_session_task_payload(
     if let Some(object) = payload.as_object_mut() {
         for key in [
             "deadline_at_ms",
+            "max_elapsed_ms",
+            "max_steps",
             "max_total_tokens",
             "max_cost_microunits",
             "max_tool_calls",
+            "_openagent_budget_profile",
+            "_openagent_budget_source",
         ] {
             if !object.contains_key(key)
                 && let Some(value) = child_session.metadata.get(key)
@@ -3533,6 +3891,8 @@ fn run_session_task_payload(
             }
         }
     }
+    apply_queued_subagent_runtime_budget_defaults(&mut payload, &child_session);
+    activate_runtime_budget(&mut payload);
     let task_status = task_status_value(&child_session);
     if task_status != "queued" {
         return Err(format!("task is not queued: {task_status}"));
@@ -4130,6 +4490,10 @@ fn cancel_session_task_payload(
             "task cannot be canceled from status: {task_status}"
         ));
     }
+    let cascade_descendant_count = session_tasks_payload(config, task_id)
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
     let lock_path = task_run_lock_path(config, task_id);
     let state = read_json_file(&session_root(config).join(task_id).join("state.latest.json"));
     let run_id = state
@@ -4174,9 +4538,12 @@ fn cancel_session_task_payload(
             "task_id": task_id,
             "run_id": run_id,
             "status": "cancel_requested",
+            "cascade": true,
+            "cascade_descendant_count": cascade_descendant_count,
             "task": task,
         }));
     }
+    write_session_task_cancel_marker(&store.root, task_id, &run_id)?;
     child_session.status = SessionStatus::Idle;
     child_session
         .metadata
@@ -4217,6 +4584,8 @@ fn cancel_session_task_payload(
         "task_id": task_id,
         "run_id": run_id,
         "status": "canceled",
+        "cascade": true,
+        "cascade_descendant_count": cascade_descendant_count,
         "task": task,
     }))
 }
@@ -4308,6 +4677,20 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
         ),
         None => None,
     };
+    let memory = boundary_message_id
+        .as_deref()
+        .map(|boundary_message_id| {
+            persist_workspace_memory_from_compaction(
+                &store,
+                &session,
+                &run_id,
+                boundary_message_id,
+                &summary,
+                None,
+                false,
+            )
+        })
+        .transpose()?;
     session.status = SessionStatus::Idle;
     session.metadata.insert(
         "compact".to_string(),
@@ -4318,6 +4701,7 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
             "format": "session_summary_v1",
             "compacted_until_message_id": compacted_until_message_id,
             "boundary_message_id": boundary_message_id,
+            "memory_id": memory.as_ref().and_then(|entry| entry.get("id")).cloned(),
         }),
     );
     store
@@ -4334,6 +4718,208 @@ fn compact_session_payload(config: &HttpRuntimeConfig, session_id: &str) -> Resu
         "session_id": session.id,
         "status": "compacted",
         "summary": session.metadata.get("compact").cloned().unwrap_or(Value::Null),
+        "memory": memory,
+        "compactions": session_compactions_payload(config, session_id)?,
+    }))
+}
+
+fn session_compactions_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+) -> Result<Value, String> {
+    if !session_state_exists(config, session_id) {
+        return Err("session_not_found".to_string());
+    }
+    let root = session_root(config);
+    let transcript = read_jsonl_values(&root.join(session_id).join("transcript.jsonl"));
+    let mut boundaries = BTreeMap::<String, Value>::new();
+    let mut tombstones = BTreeMap::<String, u64>::new();
+    for value in transcript {
+        match value.get("schema_version").and_then(Value::as_str) {
+            Some("openagent.message.v2")
+                if value.pointer("/info/metadata/kind").and_then(Value::as_str)
+                    == Some("compaction_boundary") =>
+            {
+                let Some(boundary_id) = value.pointer("/info/id").and_then(Value::as_str) else {
+                    continue;
+                };
+                boundaries.insert(
+                    boundary_id.to_string(),
+                    json!({
+                        "boundary_message_id": boundary_id,
+                        "created_at_ms": value.pointer("/info/created_at_ms").and_then(Value::as_u64).unwrap_or_default(),
+                        "run_id": value.pointer("/info/run_id").cloned().unwrap_or(Value::Null),
+                        "metadata": value.pointer("/info/metadata").cloned().unwrap_or_else(|| json!({})),
+                    }),
+                );
+            }
+            Some("openagent.message_part.v2") => {
+                let Some(boundary_id) = value.pointer("/part/message_id").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(boundary) = boundaries.get_mut(boundary_id) else {
+                    continue;
+                };
+                let kind = value.pointer("/part/kind").and_then(Value::as_str);
+                if kind == Some("compaction") {
+                    if let Some(object) = boundary.as_object_mut() {
+                        object.insert(
+                            "compaction".to_string(),
+                            value
+                                .pointer("/part/content")
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                } else if kind == Some("text")
+                    && let Some(summary) = value.pointer("/part/content").and_then(Value::as_str)
+                    && let Some(object) = boundary.as_object_mut()
+                {
+                    object.insert("summary".to_string(), json!(summary));
+                }
+            }
+            Some("openagent.message_tombstone.v2") => {
+                if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
+                    tombstones.insert(
+                        message_id.to_string(),
+                        value
+                            .get("timestamp_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut compactions = boundaries.into_values().collect::<Vec<_>>();
+    compactions.sort_by_key(|boundary| {
+        boundary
+            .get("created_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    });
+    let active_boundary_id = compactions.iter().rev().find_map(|boundary| {
+        let boundary_id = boundary
+            .get("boundary_message_id")
+            .and_then(Value::as_str)?;
+        (!tombstones.contains_key(boundary_id)).then(|| boundary_id.to_string())
+    });
+    for boundary in &mut compactions {
+        let Some(object) = boundary.as_object_mut() else {
+            continue;
+        };
+        let boundary_id = object
+            .get("boundary_message_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let undone_at_ms = tombstones.get(boundary_id).copied();
+        let active = active_boundary_id.as_deref() == Some(boundary_id);
+        object.insert("active".to_string(), json!(active));
+        object.insert("undone".to_string(), json!(undone_at_ms.is_some()));
+        object.insert("undone_at_ms".to_string(), json!(undone_at_ms));
+        object.insert("can_undo".to_string(), json!(active));
+        object.insert(
+            "status".to_string(),
+            json!(if active {
+                "active"
+            } else if undone_at_ms.is_some() {
+                "undone"
+            } else {
+                "superseded"
+            }),
+        );
+    }
+    compactions.reverse();
+    Ok(json!({
+        "schema_version": "openagent.compaction_history.v1",
+        "session_id": session_id,
+        "active_boundary_message_id": active_boundary_id,
+        "count": compactions.len(),
+        "compactions": compactions,
+    }))
+}
+
+fn undo_session_compaction_payload(
+    config: &HttpRuntimeConfig,
+    session_id: &str,
+    boundary_message_id: &str,
+) -> Result<Value, String> {
+    let store = FileSessionStore::new(session_root(config));
+    let session = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    if matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::Paused
+    ) {
+        return Err("session must be idle before undoing compaction".to_string());
+    }
+    let before = session_compactions_payload(config, session_id)?;
+    let active_boundary = before
+        .get("active_boundary_message_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if active_boundary != boundary_message_id {
+        return Err("only the active compaction boundary can be undone".to_string());
+    }
+    persist_session_execution(
+        &store.root,
+        session_id,
+        ExecutionStatus::Running,
+        ExecutionPhase::Compaction,
+        Some("compaction_undo_started"),
+    )?;
+    let run_id = new_id("compact_undo");
+    store
+        .undo_compaction_boundary(session_id, &run_id, boundary_message_id)
+        .map_err(|error| format!("failed to undo compaction: {error}"))?;
+    mark_workspace_memory_boundary_undone(&store, &session, boundary_message_id)?;
+    let mut restored = store
+        .load_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let after = session_compactions_payload(config, session_id)?;
+    restored.metadata.insert(
+        "compact_last_undo".to_string(),
+        json!({
+            "boundary_message_id": boundary_message_id,
+            "run_id": run_id,
+            "undone_at_ms": now_ms(),
+        }),
+    );
+    if let Some(active) = after
+        .get("compactions")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("active").and_then(Value::as_bool) == Some(true))
+        })
+    {
+        restored
+            .metadata
+            .insert("compact".to_string(), active.clone());
+    } else {
+        restored.metadata.remove("compact");
+    }
+    store
+        .save_state(&restored, Some(&run_id))
+        .map_err(|error| error.to_string())?;
+    persist_session_execution(
+        &store.root,
+        session_id,
+        ExecutionStatus::Waiting,
+        ExecutionPhase::Scheduling,
+        Some("compaction_undo_completed"),
+    )?;
+    Ok(json!({
+        "schema_version": "openagent.compaction_undo.v1",
+        "session_id": session_id,
+        "status": "restored",
+        "undone_boundary_message_id": boundary_message_id,
+        "restored_message_count": restored.messages.len(),
+        "compactions": after,
     }))
 }
 
@@ -6932,7 +7518,45 @@ fn session_task_summary_from_state(root: &Path, state: &Value, fallback_id: &str
         })
         .cloned()
         .unwrap_or(Value::Null);
-    let progress = session_task_progress(&run_dir, &run_summary, &run_record, canonical_status);
+    let mut progress = session_task_progress(&run_dir, &run_summary, &run_record, canonical_status);
+    let budget = runtime_task_contract_for_run(
+        &FileSessionStore::new(root.to_path_buf()),
+        &session_id,
+        &run_id,
+    )
+    .and_then(|contract| serde_json::to_value(contract.budgets).ok())
+    .unwrap_or_else(|| {
+        runtime_budget_projection(&json!({
+            "_openagent_budget_profile": metadata.get("_openagent_budget_profile").cloned().unwrap_or(Value::Null),
+            "_openagent_budget_source": metadata.get("_openagent_budget_source").cloned().unwrap_or(Value::Null),
+            "deadline_at_ms": metadata.get("deadline_at_ms").cloned().unwrap_or(Value::Null),
+            "max_elapsed_ms": metadata.get("max_elapsed_ms").cloned().unwrap_or(Value::Null),
+            "max_steps": metadata.get("max_steps").cloned().unwrap_or(Value::Null),
+            "max_total_tokens": metadata.get("max_total_tokens").cloned().unwrap_or(Value::Null),
+            "max_cost_microunits": metadata.get("max_cost_microunits").cloned().unwrap_or(Value::Null),
+            "max_tool_calls": metadata.get("max_tool_calls").cloned().unwrap_or(Value::Null),
+        }))
+    });
+    let max_steps = budget
+        .get("max_steps")
+        .and_then(Value::as_u64)
+        .or_else(|| metadata.get("max_steps").and_then(Value::as_u64));
+    let completed_steps = progress
+        .get("completed_steps")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if let Some(object) = progress.as_object_mut() {
+        object.insert(
+            "remaining_steps".to_string(),
+            json!(max_steps.map(|limit| limit.saturating_sub(completed_steps))),
+        );
+    }
+    let available_actions = match canonical_status {
+        "queued" => vec!["start", "promote", "cancel"],
+        "running" | "waiting" => vec!["wait", "cancel"],
+        "failed" | "cancelled" => vec!["resume"],
+        _ => Vec::new(),
+    };
     let failure = if canonical_status == "failed" {
         json!({
             "message": run_record.get("error").cloned().unwrap_or(Value::Null),
@@ -6963,6 +7587,8 @@ fn session_task_summary_from_state(root: &Path, state: &Value, fallback_id: &str
         "model": metadata.get("model").cloned().unwrap_or(Value::Null),
         "permission": metadata.get("permission").cloned().unwrap_or(Value::Null),
         "max_steps": metadata.get("max_steps").cloned().unwrap_or(Value::Null),
+        "budget": budget,
+        "available_actions": available_actions,
         "workspace": state.get("workspace").cloned().unwrap_or(Value::Null),
         "workspace_isolation": metadata.get("workspace_isolation").cloned().unwrap_or(Value::Null),
         "task_depth": metadata.get("task_depth").cloned().unwrap_or(Value::Null),
@@ -7236,6 +7862,9 @@ fn runtime_task_contract(
         "model": profile.model,
         "variant": profile.variant,
         "thinking": profile.thinking,
+        "context_window": payload.get("context_window"),
+        "model_preferences": payload.get("model_preferences"),
+        "routing_policy": if provider_model_fallbacks_enabled() { "explicit_fallbacks_enabled" } else { "strict_selected_model" },
         "max_steps": max_steps,
         "context_budget": payload.get("context_budget"),
         "model_options": runtime_provider_model_options(session, payload),
@@ -7285,7 +7914,16 @@ fn runtime_task_contract(
         },
         versions,
         RuntimeBudgets {
+            profile: payload
+                .get("_openagent_budget_profile")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            source: payload
+                .get("_openagent_budget_source")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
             deadline_at_ms: payload.get("deadline_at_ms").and_then(Value::as_u64),
+            max_elapsed_ms: payload.get("max_elapsed_ms").and_then(Value::as_u64),
             max_steps: Some(max_steps),
             max_total_tokens: payload.get("max_total_tokens").and_then(Value::as_u64),
             max_cost_microunits: payload.get("max_cost_microunits").and_then(Value::as_u64),
@@ -7426,7 +8064,7 @@ fn session_text_metadata(session: &Session, key: &str, default: &str) -> String 
         .unwrap_or_else(|| default.to_string())
 }
 
-fn turn_started_event(session: &Session, run_id: &str) -> Value {
+fn turn_started_event(session: &Session, run_id: &str, payload: &Value) -> Value {
     let profile = RuntimeProfile {
         agent: session_text_metadata(session, "agent", "server"),
         model: session_text_metadata(session, "model", &default_model_id()),
@@ -7447,6 +8085,10 @@ fn turn_started_event(session: &Session, run_id: &str) -> Value {
             "provider_id": "openagent",
             "variant": profile.variant,
             "thinking": profile.thinking,
+            "context_window": payload.get("context_window").cloned().unwrap_or(Value::Null),
+            "model_preferences": payload.get("model_preferences").cloned().unwrap_or(Value::Null),
+            "routing_policy": if provider_model_fallbacks_enabled() { "explicit_fallbacks_enabled" } else { "strict_selected_model" },
+            "budget": runtime_budget_projection(payload),
         },
     })
 }
@@ -9358,7 +10000,230 @@ fn provider_max_steps_with_env(payload: &Value, env_max_steps: Option<&str>) -> 
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|value| *value > 0)
         })
-        .unwrap_or(UNBOUNDED_MAX_STEPS)
+        .unwrap_or(DEFAULT_MAIN_MAX_STEPS)
+}
+
+fn positive_env_u64(key: &str, fallback: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn insert_runtime_budget_default(object: &mut Map<String, Value>, key: &str, value: u64) {
+    if !object.contains_key(key) {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+fn apply_main_runtime_budget_defaults(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let request_supplied_budget = [
+        "deadline_at_ms",
+        "max_elapsed_ms",
+        "max_steps",
+        "maxSteps",
+        "max_total_tokens",
+        "max_cost_microunits",
+        "max_tool_calls",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+    if !object.contains_key("max_steps") {
+        let max_steps = object
+            .get("maxSteps")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                positive_env_u64("OPENAGENT_BRIDGE_MAX_STEPS", DEFAULT_MAIN_MAX_STEPS)
+            });
+        object.insert("max_steps".to_string(), json!(max_steps));
+    }
+    insert_runtime_budget_default(
+        object,
+        "max_elapsed_ms",
+        positive_env_u64(
+            "OPENAGENT_BRIDGE_MAX_ELAPSED_MS",
+            DEFAULT_MAIN_MAX_ELAPSED_MS,
+        ),
+    );
+    insert_runtime_budget_default(
+        object,
+        "max_total_tokens",
+        positive_env_u64(
+            "OPENAGENT_BRIDGE_MAX_TOTAL_TOKENS",
+            DEFAULT_MAIN_MAX_TOTAL_TOKENS,
+        ),
+    );
+    insert_runtime_budget_default(
+        object,
+        "max_cost_microunits",
+        positive_env_u64(
+            "OPENAGENT_BRIDGE_MAX_COST_MICROUNITS",
+            DEFAULT_MAIN_MAX_COST_MICROUNITS,
+        ),
+    );
+    insert_runtime_budget_default(
+        object,
+        "max_tool_calls",
+        positive_env_u64(
+            "OPENAGENT_BRIDGE_MAX_TOOL_CALLS",
+            DEFAULT_MAIN_MAX_TOOL_CALLS,
+        ),
+    );
+    object
+        .entry("_openagent_budget_profile".to_string())
+        .or_insert_with(|| json!("main-80"));
+    object
+        .entry("_openagent_budget_source".to_string())
+        .or_insert_with(|| {
+            json!(if request_supplied_budget {
+                "request_with_runtime_defaults"
+            } else {
+                "runtime_default"
+            })
+        });
+}
+
+fn subagent_budget_defaults_for_id(profile_id: &str) -> (&'static str, [u64; 5]) {
+    match profile_id {
+        "explore" | "scout" | "plan" | "planner" => (
+            "subagent-quick-40",
+            [
+                QUICK_SUBAGENT_MAX_STEPS,
+                QUICK_SUBAGENT_MAX_ELAPSED_MS,
+                QUICK_SUBAGENT_MAX_TOTAL_TOKENS,
+                QUICK_SUBAGENT_MAX_COST_MICROUNITS,
+                QUICK_SUBAGENT_MAX_TOOL_CALLS,
+            ],
+        ),
+        "general" => (
+            "subagent-extended-150",
+            [
+                EXTENDED_SUBAGENT_MAX_STEPS,
+                EXTENDED_SUBAGENT_MAX_ELAPSED_MS,
+                EXTENDED_SUBAGENT_MAX_TOTAL_TOKENS,
+                EXTENDED_SUBAGENT_MAX_COST_MICROUNITS,
+                EXTENDED_SUBAGENT_MAX_TOOL_CALLS,
+            ],
+        ),
+        _ => (
+            "subagent-standard-80",
+            [
+                DEFAULT_MAIN_MAX_STEPS,
+                DEFAULT_MAIN_MAX_ELAPSED_MS,
+                DEFAULT_MAIN_MAX_TOTAL_TOKENS,
+                DEFAULT_MAIN_MAX_COST_MICROUNITS,
+                DEFAULT_MAIN_MAX_TOOL_CALLS,
+            ],
+        ),
+    }
+}
+
+fn subagent_budget_defaults(profile: &RuntimeSubagentProfile) -> (&'static str, [u64; 5]) {
+    subagent_budget_defaults_for_id(&profile.id)
+}
+
+fn apply_queued_subagent_runtime_budget_defaults(payload: &mut Value, session: &Session) {
+    let subagent_id = session
+        .metadata
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or("subagent");
+    let configured_max_steps = session.metadata.get("max_steps").and_then(Value::as_u64);
+    let defaults = local_subagent_runtime_budget(subagent_id, configured_max_steps);
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "max_steps",
+        "max_elapsed_ms",
+        "max_total_tokens",
+        "max_cost_microunits",
+        "max_tool_calls",
+        "_openagent_budget_profile",
+        "_openagent_budget_source",
+    ] {
+        if !object.contains_key(key)
+            && let Some(value) = defaults.get(key)
+        {
+            object.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+fn apply_subagent_runtime_budget_defaults(payload: &mut Value, profile: &RuntimeSubagentProfile) {
+    let (budget_profile, defaults) = subagent_budget_defaults(profile);
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.remove("deadline_at_ms");
+    object.insert(
+        "max_steps".to_string(),
+        json!(profile.max_steps.unwrap_or(defaults[0])),
+    );
+    object.insert("max_elapsed_ms".to_string(), json!(defaults[1]));
+    object.insert("max_total_tokens".to_string(), json!(defaults[2]));
+    object.insert("max_cost_microunits".to_string(), json!(defaults[3]));
+    object.insert("max_tool_calls".to_string(), json!(defaults[4]));
+    object.insert(
+        "_openagent_budget_profile".to_string(),
+        json!(budget_profile),
+    );
+    object.insert(
+        "_openagent_budget_source".to_string(),
+        json!(if profile.max_steps.is_some() {
+            "agent_profile_with_runtime_defaults"
+        } else {
+            "runtime_profile_default"
+        }),
+    );
+}
+
+fn activate_runtime_budget(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let started_at_ms = now_ms();
+    object
+        .entry("_openagent_budget_started_at_ms".to_string())
+        .or_insert_with(|| json!(started_at_ms));
+    if !object.contains_key("deadline_at_ms")
+        && let Some(max_elapsed_ms) = object.get("max_elapsed_ms").and_then(Value::as_u64)
+    {
+        object.insert(
+            "deadline_at_ms".to_string(),
+            json!(started_at_ms.saturating_add(max_elapsed_ms)),
+        );
+    }
+}
+
+fn runtime_budget_projection(payload: &Value) -> Value {
+    let deadline_at_ms = payload.get("deadline_at_ms").and_then(Value::as_u64);
+    json!({
+        "schema_version": "openagent.runtime_budget.v1",
+        "profile": payload
+            .get("_openagent_budget_profile")
+            .and_then(Value::as_str)
+            .unwrap_or("custom"),
+        "source": payload
+            .get("_openagent_budget_source")
+            .and_then(Value::as_str)
+            .unwrap_or("request"),
+        "started_at_ms": payload
+            .get("_openagent_budget_started_at_ms")
+            .and_then(Value::as_u64),
+        "deadline_at_ms": deadline_at_ms,
+        "remaining_elapsed_ms": deadline_at_ms.map(|deadline| deadline.saturating_sub(now_ms())),
+        "max_elapsed_ms": payload.get("max_elapsed_ms").and_then(Value::as_u64),
+        "max_steps": provider_max_steps(payload),
+        "max_total_tokens": payload.get("max_total_tokens").and_then(Value::as_u64),
+        "max_cost_microunits": payload.get("max_cost_microunits").and_then(Value::as_u64),
+        "max_tool_calls": payload.get("max_tool_calls").and_then(Value::as_u64),
+    })
 }
 
 fn add_usage(total: &mut Usage, item: &Usage) {
@@ -10424,17 +11289,20 @@ fn execute_runtime_task_tool_call(
     };
     let description =
         runtime_task_input_string(input, "description").unwrap_or_else(|_| subagent_type.clone());
-    let profile =
-        match runtime_subagent_profile(&subagent_type, &task_context.parent_session.directory) {
-            Some(profile) => profile,
-            None => {
-                return runtime_task_tool_error(
-                    tool_call,
-                    &format!("subagent profile not found: {subagent_type}"),
-                    BTreeMap::from([("subagent_type".to_string(), json!(subagent_type))]),
-                );
-            }
-        };
+    let profile = match runtime_subagent_profile(
+        &subagent_type,
+        &task_context.parent_session.directory,
+        task_context.parent_session.metadata.get("startup_agents"),
+    ) {
+        Some(profile) => profile,
+        None => {
+            return runtime_task_tool_error(
+                tool_call,
+                &format!("subagent profile not found: {subagent_type}"),
+                BTreeMap::from([("subagent_type".to_string(), json!(subagent_type))]),
+            );
+        }
+    };
     let child_permission = profile.permission.clone();
     let child_provider = profile
         .provider
@@ -10474,9 +11342,12 @@ fn execute_runtime_task_tool_call(
                 .map(str::to_string)
         })
         .unwrap_or_else(default_model_id);
-    let child_max_steps = profile
-        .max_steps
-        .unwrap_or_else(|| provider_max_steps(task_context.payload));
+    let mut child_budget_payload = provider_resume_payload(task_context.payload);
+    apply_subagent_runtime_budget_defaults(&mut child_budget_payload, &profile);
+    if !background {
+        activate_runtime_budget(&mut child_budget_payload);
+    }
+    let child_max_steps = provider_max_steps(&child_budget_payload);
     let task_id = input
         .get("task_id")
         .and_then(Value::as_str)
@@ -10636,11 +11507,14 @@ fn execute_runtime_task_tool_call(
         .insert("max_steps".to_string(), json!(child_max_steps));
     for key in [
         "deadline_at_ms",
+        "max_elapsed_ms",
         "max_total_tokens",
         "max_cost_microunits",
         "max_tool_calls",
+        "_openagent_budget_profile",
+        "_openagent_budget_source",
     ] {
-        if let Some(value) = task_context.payload.get(key) {
+        if let Some(value) = child_budget_payload.get(key) {
             child_session
                 .metadata
                 .insert(key.to_string(), value.clone());
@@ -10801,7 +11675,7 @@ fn execute_runtime_task_tool_call(
         task_context.config,
         task_context.store,
         &child_session,
-        task_context.payload,
+        &child_budget_payload,
         &child_run_id,
         &profile.id,
         &child_model,
@@ -10835,16 +11709,12 @@ fn execute_runtime_task_tool_call(
         .store
         .append_message(&child_session, &user, &child_run_id, user_index);
 
-    let mut child_payload = provider_resume_payload(task_context.payload);
-    if let Some(object) = child_payload.as_object_mut() {
-        object.insert("max_steps".to_string(), json!(child_max_steps));
-    }
     let child_result = run_provider_loop(RuntimeProviderLoopInput {
         config: task_context.config,
         store: task_context.store,
         session: &mut child_session,
         run_id: &child_run_id,
-        payload: &child_payload,
+        payload: &child_budget_payload,
         permission_ruleset: child_permission,
         skip_permissions: task_context.skip_permissions,
         events: Vec::new(),
@@ -11151,6 +12021,8 @@ struct RuntimeContextReplaySpec {
     todos: Vec<ContextTodo>,
     checkpoints: Vec<ContextCheckpoint>,
     tool_manifests: Vec<ContextItem>,
+    #[serde(default)]
+    memory_items: Vec<ContextItem>,
     work_state: Option<ContextWorkState>,
     #[serde(default)]
     goal: Option<DurableGoal>,
@@ -11210,6 +12082,7 @@ fn runtime_context_pack_for_agent_timed(
     let checkpoints = runtime_context_checkpoints(store, session);
     let goal = session_goal(session).ok().flatten();
     let plan = session_plan(session).ok().flatten();
+    let memory_items = runtime_workspace_memory_context_items(store, session);
     let materialize_us = elapsed_micros(materialize_started);
     let source_message_count = materialized.source_message_count as u64;
     let build_started = Instant::now();
@@ -11227,7 +12100,7 @@ fn runtime_context_pack_for_agent_timed(
         metadata: runtime_context_metadata(goal.as_ref(), plan.as_ref()),
         runtime_context: None,
         sandbox_metadata: None,
-        extra_items: Vec::new(),
+        extra_items: memory_items,
     });
     runtime_apply_context_system_diagnostics(session, pack.system_diagnostics.as_ref());
     let mut performance = ContextPackPerformance::new();
@@ -11266,6 +12139,7 @@ fn runtime_context_replay_spec(
         todos: runtime_context_todos(&session.todos),
         checkpoints: runtime_context_checkpoints(store, session),
         tool_manifests: runtime_mcp_tool_manifest_items(mcp_runtime, &pack.tools),
+        memory_items: runtime_workspace_memory_context_items(store, session),
         work_state: materialized.work_state,
         goal: session_goal(session).ok().flatten(),
         plan: session_plan(session).ok().flatten(),
@@ -11332,7 +12206,7 @@ fn runtime_context_pack_from_replay_spec(
         metadata: runtime_context_metadata(spec.goal.as_ref(), spec.plan.as_ref()),
         runtime_context: None,
         sandbox_metadata: None,
-        extra_items: Vec::new(),
+        extra_items: spec.memory_items.clone(),
     });
     runtime_apply_context_system_diagnostics(session, pack.system_diagnostics.as_ref());
     pack
@@ -11417,6 +12291,16 @@ fn runtime_auto_compact_context(
             boundary_metadata,
         )
         .map_err(|error| format!("failed to create automatic compaction boundary: {error}"))?;
+    let state_value = serde_json::to_value(&state).map_err(|error| error.to_string())?;
+    let memory = persist_workspace_memory_from_compaction(
+        store,
+        session,
+        run_id,
+        &boundary_message_id,
+        &summary,
+        Some(&state_value),
+        true,
+    )?;
     let compacted_at_ms = now_ms();
     session.metadata.insert(
         "compact".to_string(),
@@ -11429,6 +12313,7 @@ fn runtime_auto_compact_context(
             "compacted_until_message_id": compacted_until_message_id,
             "format": "structured_work_state",
             "message_count": session.messages.len(),
+            "memory_id": memory.get("id").cloned().unwrap_or(Value::Null),
             "reason": reason,
             "run_id": run_id,
             "source": source,
@@ -11444,6 +12329,7 @@ fn runtime_auto_compact_context(
         "compacted_message_count": compacted_message_count,
         "compacted_until_message_id": compacted_until_message_id,
         "reason": reason,
+        "memory_id": memory.get("id").cloned().unwrap_or(Value::Null),
         "source": source,
         "step": step,
         "summary_tokens_estimate": summary_token_budget,
@@ -12148,6 +13034,8 @@ fn runtime_available_skill_infos(
 }
 
 fn runtime_subagent_public_value(profile: &RuntimeSubagentProfile) -> Value {
+    let (budget_profile, budget_defaults) = subagent_budget_defaults(profile);
+    let effective_max_steps = profile.max_steps.unwrap_or(budget_defaults[0]);
     json!({
         "id": profile.id.clone(),
         "name": profile.name.clone(),
@@ -12161,8 +13049,18 @@ fn runtime_subagent_public_value(profile: &RuntimeSubagentProfile) -> Value {
         "tools": profile.tools.clone(),
         "provider": profile.provider.clone(),
         "model": profile.model.clone(),
-        "max_steps": profile.max_steps,
-        "steps": profile.max_steps,
+        "max_steps": effective_max_steps,
+        "steps": effective_max_steps,
+        "budget": {
+            "schema_version": "openagent.runtime_budget.v1",
+            "profile": budget_profile,
+            "source": if profile.max_steps.is_some() { "agent_profile_with_runtime_defaults" } else { "runtime_profile_default" },
+            "max_steps": effective_max_steps,
+            "max_elapsed_ms": budget_defaults[1],
+            "max_total_tokens": budget_defaults[2],
+            "max_cost_microunits": budget_defaults[3],
+            "max_tool_calls": budget_defaults[4],
+        },
         "temperature": profile.temperature,
         "top_p": profile.top_p,
         "color": profile.color.clone(),
@@ -13523,8 +14421,9 @@ fn start_turn_response(
 fn start_turn_sync_payload(
     config: &HttpRuntimeConfig,
     session_id: &str,
-    payload: Value,
+    mut payload: Value,
 ) -> Result<Value, String> {
+    apply_main_runtime_budget_defaults(&mut payload);
     validate_start_turn_payload(&payload)?;
     if !session_state_exists(config, session_id) {
         return Err("session_not_found".to_string());
@@ -13576,6 +14475,8 @@ fn start_turn_sync_payload(
                 "queued": true,
                 "queue_position": queue_position,
                 "queue_reason": queue_reason,
+                "estimated_wait_ms": estimated_turn_wait_ms(config, queue_position),
+                "budget": runtime_budget_projection(&payload),
                 "deduplicated": false,
                 "turn": job.to_value(),
                 "events": [],
@@ -13631,8 +14532,9 @@ fn start_turn_async_payload(
 fn start_turn_async_payload_trusted(
     config: &HttpRuntimeConfig,
     session_id: &str,
-    payload: Value,
+    mut payload: Value,
 ) -> Result<(u16, Value), String> {
+    apply_main_runtime_budget_defaults(&mut payload);
     validate_start_turn_payload(&payload)?;
     if !session_state_exists(config, session_id) {
         return Err("session_not_found".to_string());
@@ -13640,6 +14542,7 @@ fn start_turn_async_payload_trusted(
     let run_id = new_id("turn");
     let idempotency_key = turn_idempotency_key(&payload, &run_id);
     let attempt = turn_attempt(&payload);
+    let budget = runtime_budget_projection(&payload);
     let root = session_root(config);
     persist_turn_retry_payload(&root, session_id, &run_id, &payload)?;
     let registration = match register_turn_job(config, session_id, &run_id, payload.clone()) {
@@ -13755,6 +14658,7 @@ fn start_turn_async_payload_trusted(
             ("queued", Some(queue_position), Some(queue_reason))
         }
     };
+    let estimated_wait_ms = queue_position.map(|position| estimated_turn_wait_ms(config, position));
     Ok((
         202,
         json!({
@@ -13769,6 +14673,8 @@ fn start_turn_async_payload_trusted(
             "attempt": attempt,
             "queue_position": queue_position,
             "queue_reason": queue_reason,
+            "estimated_wait_ms": estimated_wait_ms,
+            "budget": budget.clone(),
             "scheduler": {
                 "max_queued_turns_per_session": config.max_queued_turns_per_session,
                 "max_running_turn_workers": max_running_turn_workers(config),
@@ -13781,6 +14687,8 @@ fn start_turn_async_payload_trusted(
                 "status": status,
                 "queue_position": queue_position,
                 "queue_reason": queue_reason,
+                "estimated_wait_ms": estimated_wait_ms,
+                "budget": budget,
             },
             "events": [],
         }),
@@ -13900,9 +14808,11 @@ fn mark_turn_job_status_from_result(
 fn start_turn_payload_inner(
     config: &HttpRuntimeConfig,
     session_id: &str,
-    payload: Value,
+    mut payload: Value,
     run_id_override: Option<String>,
 ) -> Result<Value, String> {
+    apply_main_runtime_budget_defaults(&mut payload);
+    activate_runtime_budget(&mut payload);
     validate_start_turn_payload(&payload)?;
     let retry_metadata = payload
         .get(INTERNAL_TURN_RETRY_KEY)
@@ -14065,6 +14975,7 @@ fn start_turn_payload_inner(
         let agent_profile = runtime_agent_profile_for_session(&session);
         let descriptors = runtime_task_subagent_descriptors(
             &session.directory,
+            session.metadata.get("startup_agents"),
             agent_profile.as_ref(),
             Some(&session),
         );
@@ -14089,7 +15000,7 @@ fn start_turn_payload_inner(
         )
     } else {
         let _ = runtime_profile;
-        let mut initial_events = vec![turn_started_event(&session, &run_id)];
+        let mut initial_events = vec![turn_started_event(&session, &run_id, &payload)];
         if let Some(retry) = retry_metadata.as_ref() {
             let retry_of_turn_id = retry
                 .get("retry_of_turn_id")
@@ -14175,10 +15086,12 @@ fn validate_start_turn_payload(payload: &Value) -> Result<(), String> {
     let _ = permission_ruleset_for_turn(payload)?;
     for key in [
         "deadline_at_ms",
+        "max_elapsed_ms",
         "max_steps",
         "max_total_tokens",
         "max_cost_microunits",
         "max_tool_calls",
+        "context_window",
         "timeout_s",
     ] {
         if let Some(value) = payload.get(key)
@@ -14186,6 +15099,11 @@ fn validate_start_turn_payload(payload: &Value) -> Result<(), String> {
         {
             return Err(format!("{key} must be a non-negative integer"));
         }
+    }
+    if let Some(preferences) = payload.get("model_preferences")
+        && !preferences.is_object()
+    {
+        return Err("model_preferences must be an object".to_string());
     }
     Ok(())
 }
@@ -14400,9 +15318,62 @@ fn turn_event_recorded(root: &Path, session_id: &str, turn_id: &str, method: &st
         .any(|event| event.get("method").and_then(Value::as_str) == Some(method))
 }
 
+fn terminal_turn_status_from_events(
+    root: &Path,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<String> {
+    read_bridge_event_values(root, session_id, turn_id)
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.get("method").and_then(Value::as_str) {
+            Some("turn/interrupted") => Some("interrupted".to_string()),
+            Some("turn/failed") => Some("failed".to_string()),
+            Some("turn/completed") => Some(
+                event
+                    .get("params")
+                    .and_then(|params| params.get("status"))
+                    .and_then(Value::as_str)
+                    .filter(|status| turn_job_status_terminal(status))
+                    .unwrap_or("completed")
+                    .to_string(),
+            ),
+            _ => None,
+        })
+}
+
+fn reconcile_turn_job_status_from_events(
+    config: &HttpRuntimeConfig,
+    root: &Path,
+    turn_id: &str,
+    mut job: Value,
+) -> Value {
+    let status = job
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("running");
+    if turn_job_status_terminal(status) {
+        return job;
+    }
+    let Some(session_id) = job.get("session_id").and_then(Value::as_str) else {
+        return job;
+    };
+    let Some(terminal_status) = terminal_turn_status_from_events(root, session_id, turn_id) else {
+        return job;
+    };
+    mark_turn_job_status(config, turn_id, &terminal_status);
+    if let Some(object) = job.as_object_mut() {
+        object.insert("status".to_string(), json!(terminal_status));
+        object.insert("phase".to_string(), json!("finalize"));
+    }
+    job
+}
+
 fn turn_status_payload(config: &HttpRuntimeConfig, turn_id: &str) -> Result<Value, String> {
     expire_queued_turns(config);
+    let root = session_root(config);
     if let Some(job) = turn_job_payload(turn_id) {
+        let job = reconcile_turn_job_status_from_events(config, &root, turn_id, job);
         return Ok(json!({
             "turn_id": turn_id,
             "status": job.get("status").cloned().unwrap_or_else(|| json!("running")),
@@ -14410,8 +15381,8 @@ fn turn_status_payload(config: &HttpRuntimeConfig, turn_id: &str) -> Result<Valu
             "source": "runtime_job_registry",
         }));
     }
-    let root = session_root(config);
     if let Some(job) = persisted_turn_job_payload(&root, turn_id) {
+        let job = reconcile_turn_job_status_from_events(config, &root, turn_id, job);
         return Ok(json!({
             "turn_id": turn_id,
             "status": job.get("status").cloned().unwrap_or_else(|| json!("interrupted")),
@@ -14675,7 +15646,7 @@ fn run_http_tool_turn(
         skip_permissions,
     )
     .tool_context();
-    let mut events = vec![turn_started_event(session, run_id)];
+    let mut events = vec![turn_started_event(session, run_id, payload)];
     let mut persisted_events = 0_usize;
     let assistant_message_id = runtime_turn_message_id(run_id, "assistant", tool_call_count.max(1));
     let start_checkpoint = runtime_create_step_checkpoint(
@@ -16491,6 +17462,116 @@ mod tests {
     }
 
     #[test]
+    fn bridge_skills_route_reports_configuration_scope() {
+        let root = std::env::temp_dir().join(format!("openagent-http-skills-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let project_skill = workspace.join(".agents/skills/review/SKILL.md");
+        let user_skill = root.join("home/.agents/skills/personal/SKILL.md");
+        fs::create_dir_all(project_skill.parent().expect("project skill parent"))
+            .expect("project skill directory");
+        fs::create_dir_all(user_skill.parent().expect("user skill parent"))
+            .expect("user skill directory");
+        fs::write(
+            &project_skill,
+            "---\nname: review\ndescription: Review project changes\n---\nReview carefully.\n",
+        )
+        .expect("project skill");
+        fs::write(
+            &user_skill,
+            "---\nname: personal\ndescription: User preferences\n---\nUse preferences.\n",
+        )
+        .expect("user skill");
+        assert_eq!(
+            skill_configuration_scope(
+                &project_skill.to_string_lossy(),
+                &workspace,
+                &root.join("home")
+            ),
+            "project"
+        );
+        assert_eq!(
+            skill_configuration_scope(
+                &user_skill.to_string_lossy(),
+                &workspace,
+                &root.join("home")
+            ),
+            "user"
+        );
+
+        let response = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: "/api/skills".to_string(),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &HttpRuntimeConfig {
+                workspace: Some(workspace.to_string_lossy().to_string()),
+                ..HttpRuntimeConfig::default()
+            },
+        );
+        assert_eq!(response.status, 200);
+        let payload = response.body.expect("skills body");
+        assert!(payload["skills"].as_array().is_some_and(|skills| {
+            skills
+                .iter()
+                .any(|skill| skill["name"] == "review" && skill["scope"] == "project")
+        }));
+        assert_eq!(payload["scopes"]["project"], 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bridge_agents_option_registers_and_persists_startup_subagents() {
+        let root = std::env::temp_dir().join(format!("openagent-http-agents-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let inline = r#"{"runtime-reviewer":{"description":"Runtime reviewer","mode":"subagent","permission":"READONLY","prompt":"Review runtime changes."}}"#;
+        let (mut config, _, _) = parse_cli_args(&[
+            "--workspace".to_string(),
+            workspace.to_string_lossy().to_string(),
+            "--session-root".to_string(),
+            sessions.to_string_lossy().to_string(),
+            "--agents".to_string(),
+            inline.to_string(),
+        ]);
+        assert!(config.startup_agents_error.is_none());
+        assert!(config.startup_agents.is_some());
+        config.auth_token = None;
+
+        let agents = agents_payload(&config);
+        assert!(agents["agents"].as_array().is_some_and(|agents| {
+            agents
+                .iter()
+                .any(|agent| agent["id"] == "runtime-reviewer" && agent["mode"] == "subagent")
+        }));
+        let created = create_session_payload(
+            &config,
+            &json!({"cwd": workspace.to_string_lossy()}).to_string(),
+        )
+        .expect("create session with startup agents");
+        let session_id = created["session_id"].as_str().expect("session id");
+        let state = FileSessionStore::new(&sessions)
+            .load_session(session_id)
+            .expect("load session");
+        assert_eq!(
+            state.metadata["startup_agents"]["runtime-reviewer"]["mode"],
+            "subagent"
+        );
+
+        let (invalid, _, _) = parse_cli_args(&["--agents".to_string(), "{not-json}".to_string()]);
+        assert!(invalid.startup_agents.is_none());
+        assert!(
+            invalid
+                .startup_agents_error
+                .as_deref()
+                .is_some_and(|error| error.contains("invalid inline --agents JSON"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn bridge_auth_token_can_be_loaded_from_file_without_cli_secret() {
         let path = std::env::temp_dir().join(format!(
             "openagent-bridge-auth-{}-{}.token",
@@ -16659,19 +17740,16 @@ while True:
     }
 
     #[test]
-    fn provider_max_steps_matches_opencode_unbounded_default() {
-        assert_eq!(provider_max_steps(&json!({})), UNBOUNDED_MAX_STEPS);
+    fn provider_max_steps_uses_explicit_main_task_budget() {
+        assert_eq!(provider_max_steps_with_env(&json!({}), None), 80);
         assert_eq!(
-            provider_max_steps(&json!({"max_steps": 0})),
-            UNBOUNDED_MAX_STEPS
+            provider_max_steps_with_env(&json!({"max_steps": 0}), None),
+            80
         );
         assert_eq!(provider_max_steps(&json!({"max_steps": 25})), 25);
         assert_eq!(provider_max_steps(&json!({"maxSteps": 100})), 100);
         assert_eq!(provider_max_steps_with_env(&json!({}), Some("8")), 8);
-        assert_eq!(
-            provider_max_steps_with_env(&json!({}), Some("0")),
-            UNBOUNDED_MAX_STEPS
-        );
+        assert_eq!(provider_max_steps_with_env(&json!({}), Some("0")), 80);
         assert_eq!(
             provider_max_steps_with_env(&json!({"max_steps": 25}), Some("8")),
             25
@@ -16679,9 +17757,62 @@ while True:
     }
 
     #[test]
+    fn main_runtime_budget_defaults_are_finite_and_visible() {
+        let mut payload = json!({"input": "govern this task"});
+        apply_main_runtime_budget_defaults(&mut payload);
+        assert_eq!(payload.get("max_steps").and_then(Value::as_u64), Some(80));
+        assert_eq!(
+            payload.get("max_elapsed_ms").and_then(Value::as_u64),
+            Some(DEFAULT_MAIN_MAX_ELAPSED_MS)
+        );
+        assert_eq!(
+            payload
+                .get("_openagent_budget_profile")
+                .and_then(Value::as_str),
+            Some("main-80")
+        );
+        activate_runtime_budget(&mut payload);
+        let projection = runtime_budget_projection(&payload);
+        assert_eq!(
+            projection.get("max_steps").and_then(Value::as_u64),
+            Some(80)
+        );
+        assert!(
+            projection
+                .get("deadline_at_ms")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn builtin_subagents_use_40_80_150_step_profiles() {
+        let profiles = builtin_runtime_subagent_profiles()
+            .into_iter()
+            .map(|profile| (profile.id.clone(), profile))
+            .collect::<BTreeMap<_, _>>();
+        for (id, expected) in [
+            ("explore", 40),
+            ("scout", 40),
+            ("coder", 80),
+            ("general", 150),
+        ] {
+            let profile = profiles.get(id).expect("built-in subagent");
+            let mut payload = json!({});
+            apply_subagent_runtime_budget_defaults(&mut payload, profile);
+            assert_eq!(
+                payload.get("max_steps").and_then(Value::as_u64),
+                Some(expected),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
     fn turn_budget_fields_require_non_negative_integers() {
         for key in [
             "deadline_at_ms",
+            "max_elapsed_ms",
             "max_steps",
             "max_total_tokens",
             "max_cost_microunits",
@@ -16766,6 +17897,96 @@ while True:
         }
 
         assert!(runtime_auto_compaction_boundary(&messages, 1).is_none());
+    }
+
+    #[test]
+    fn compaction_history_memory_and_undo_survive_runtime_restart() {
+        let root = std::env::temp_dir().join(format!("openagent-context-governance-{}", now_ms()));
+        let workspace = root.join("workspace");
+        let session_root = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let created = create_session_payload(
+            &config,
+            &stable_json_dumps(&json!({"cwd": workspace.to_string_lossy()})),
+        )
+        .expect("create session");
+        let session_id = created["session_id"].as_str().expect("session id");
+        let store = FileSessionStore::new(session_root.clone());
+        let mut session = store.load_session(session_id).expect("load session");
+        for (index, content) in [
+            "Remember the runtime owns state.",
+            "Keep strict model routing.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut message = runtime_chat_message(Role::User, content.to_string());
+            message.metadata.insert(
+                "message_id".to_string(),
+                json!(format!("context-governance-{index}")),
+            );
+            session.add(message.clone());
+            store
+                .append_message(&session, &message, "run_seed", index as u64)
+                .expect("append seed message");
+        }
+        store
+            .save_state(&session, None)
+            .expect("save seeded session");
+
+        let compacted = compact_session_payload(&config, session_id).expect("compact session");
+        let boundary_id = compacted["summary"]["boundary_message_id"]
+            .as_str()
+            .expect("boundary id");
+        assert_eq!(compacted["compactions"]["count"], 1);
+        assert_eq!(compacted["memory"]["active"], true);
+
+        let mut compacted_session = store.load_session(session_id).expect("compacted session");
+        let pack = runtime_context_pack_for_agent(
+            &store,
+            &mut compacted_session,
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            ContextPackBuildOptions {
+                trace_only: false,
+                ..ContextPackBuildOptions::default()
+            },
+        );
+        assert!(
+            pack.trace
+                .iter()
+                .any(|entry| entry.kind == "memory" && entry.included)
+        );
+
+        let restored = undo_session_compaction_payload(&config, session_id, boundary_id)
+            .expect("undo compaction");
+        assert_eq!(restored["status"], "restored");
+        assert_eq!(restored["restored_message_count"], 2);
+        let memories = workspace_memories_payload(&config, session_id).expect("memory projection");
+        assert_eq!(memories["active_count"], 0);
+
+        let restarted_config = HttpRuntimeConfig {
+            workspace: Some(workspace.to_string_lossy().to_string()),
+            session_store_root: Some(session_root.to_string_lossy().to_string()),
+            ..HttpRuntimeConfig::default()
+        };
+        let history = session_compactions_payload(&restarted_config, session_id)
+            .expect("compaction history after restart");
+        assert_eq!(history["active_boundary_message_id"], Value::Null);
+        assert_eq!(history["compactions"][0]["status"], "undone");
+        let restored_session = FileSessionStore::new(session_root)
+            .load_session(session_id)
+            .expect("restored session after restart");
+        assert_eq!(restored_session.messages.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -18656,6 +19877,30 @@ fn escape_json_string(value: &str) -> String {
             .expect("nested waiting task");
         assert_eq!(waiting["title"], "Wait for approval");
         assert_eq!(waiting["canonical_status"], "waiting");
+        assert_eq!(running["available_actions"], json!(["wait", "cancel"]));
+        assert_eq!(running["budget"]["max_steps"], 80);
+
+        let control_plane = route_http_request(
+            &HttpRequest {
+                method: "GET".to_string(),
+                path: format!("/api/sessions/{parent_id}/control-plane"),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+            &config,
+        );
+        assert_eq!(control_plane.status, 200);
+        let control_plane = control_plane.body.expect("control plane");
+        assert_eq!(
+            control_plane["schema_version"],
+            "openagent.task_control_plane.v1"
+        );
+        assert_eq!(control_plane["tasks"]["count"], 3);
+        assert_eq!(control_plane["capabilities"]["cascade_cancel"], true);
+        assert_eq!(
+            control_plane["capabilities"]["strict_model_routing"],
+            !provider_model_fallbacks_enabled()
+        );
 
         let sessions_request = HttpRequest {
             method: "GET".to_string(),
@@ -18698,6 +19943,16 @@ fn escape_json_string(value: &str) -> String {
             .expect("restored task tree");
         assert_eq!(restored["tree"], payload["tree"]);
         assert_eq!(restored["status_counts"], payload["status_counts"]);
+
+        let canceled =
+            cancel_session_task_payload(&restarted_config, parent_id, "session_task_tree_running")
+                .expect("cancel parent task");
+        assert_eq!(canceled["cascade"], true);
+        assert_eq!(canceled["cascade_descendant_count"], 1);
+        let child = store
+            .load_session("session_task_tree_waiting")
+            .expect("load descendant task");
+        assert!(ancestor_task_cancel_requested(&store.root, &child));
 
         let _ = fs::remove_dir_all(root);
     }

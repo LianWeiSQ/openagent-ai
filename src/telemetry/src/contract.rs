@@ -133,8 +133,12 @@ impl OutcomeReason {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct RuntimeBudgets {
+    pub profile: Option<String>,
+    pub source: Option<String>,
     pub deadline_at_ms: Option<u64>,
+    pub max_elapsed_ms: Option<u64>,
     pub max_steps: Option<u64>,
     pub max_total_tokens: Option<u64>,
     pub max_cost_microunits: Option<u64>,

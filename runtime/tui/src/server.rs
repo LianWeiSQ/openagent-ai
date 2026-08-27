@@ -1,8 +1,12 @@
-use std::{collections::BTreeSet, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use openagent_bridge_server_client::{
     RemoteAuth, RemoteRuntimeClient, RemoteTurnRequest, event_sequence, events_from_payload,
-    turn_id_from_payload,
+    session_id_from_payload, turn_id_from_payload,
 };
 use serde_json::{Map, Value, json};
 
@@ -57,6 +61,16 @@ pub struct BridgeTerminalHandler {
     last_global_event_id: u64,
     pending_events: Vec<Value>,
     seen_events: BTreeSet<String>,
+    active_bash: Option<ActiveBashSession>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveBashSession {
+    terminal_id: String,
+    session_id: String,
+    call_id: String,
+    cursor: u64,
+    finishing: bool,
 }
 
 impl BridgeTerminalHandler {
@@ -77,6 +91,7 @@ impl BridgeTerminalHandler {
             last_global_event_id: 0,
             pending_events: Vec::new(),
             seen_events: BTreeSet::new(),
+            active_bash: None,
         };
         if handler.current_session.is_none() && (handler.continue_last || handler.fork_next) {
             let session_id = handler.client.select_session(
@@ -144,6 +159,107 @@ impl BridgeTerminalHandler {
             }
         }
         output
+    }
+
+    fn poll_bash_events(&mut self) -> Result<Vec<Value>, String> {
+        let Some(active) = self.active_bash.clone() else {
+            return Ok(Vec::new());
+        };
+        let snapshot = self
+            .client
+            .terminal_session_snapshot(&active.terminal_id, active.cursor)?;
+        let mut events = Vec::new();
+        let cursor = snapshot
+            .get("cursor")
+            .and_then(Value::as_u64)
+            .unwrap_or(active.cursor);
+        for chunk in snapshot
+            .get("chunks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let text = chunk
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if text.is_empty() {
+                continue;
+            }
+            events.push(json!({
+                "method": "item/toolCall/delta",
+                "params": {
+                    "session_id": active.session_id,
+                    "call_id": active.call_id,
+                    "name": "bash",
+                    "stream": chunk.get("stream").and_then(Value::as_str).unwrap_or("stdout"),
+                    "delta": text,
+                }
+            }));
+        }
+        let running = snapshot
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(current) = self.active_bash.as_mut() {
+            current.cursor = cursor;
+        }
+        if running {
+            return Ok(events);
+        }
+        if !active.finishing {
+            if let Some(current) = self.active_bash.as_mut() {
+                current.finishing = true;
+            }
+            return Ok(events);
+        }
+        let status = snapshot
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("failed");
+        let failed = !matches!(status, "completed");
+        events.push(json!({
+            "method": if failed { "item/toolCall/failed" } else { "item/toolCall/completed" },
+            "params": {
+                "session_id": active.session_id,
+                "call_id": active.call_id,
+                "name": "bash",
+                "output": "",
+                "error": if failed { Some(format!("bash exited with status {status}")) } else { None },
+                "metadata": {
+                    "mode": "direct",
+                    "exit_code": snapshot.get("exit_code").cloned().unwrap_or(Value::Null),
+                }
+            }
+        }));
+        let _ = self.client.close_terminal_session(&active.terminal_id);
+        self.active_bash = None;
+        Ok(events)
+    }
+
+    fn resolve_session_id(&self, requested: &str) -> Result<String, String> {
+        if let Ok(payload) = self.client.get_session(requested) {
+            return Ok(session_id_from_payload(&payload).unwrap_or_else(|| requested.to_string()));
+        }
+        let mut sessions = self.client.search_sessions(requested)?;
+        if sessions.is_empty() {
+            sessions = self.client.list_sessions()?;
+        }
+        let mut matches = sessions
+            .iter()
+            .filter_map(session_id_from_payload)
+            .filter(|session_id| session_id == requested || session_id.starts_with(requested))
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        match matches.as_slice() {
+            [session_id] => Ok(session_id.clone()),
+            [] => Err(format!("session not found: {requested}")),
+            _ => Err(format!(
+                "session prefix is ambiguous: {requested} ({} matches)",
+                matches.len()
+            )),
+        }
     }
 
     fn turn_options(&self) -> Value {
@@ -413,6 +529,103 @@ fn mcp_endpoint_label(server: &Value) -> String {
     }
 }
 
+fn skill_status_lines(payload: &Value, query: &str) -> Vec<TimelineLine> {
+    let normalized_query = query.trim().to_ascii_lowercase();
+    let mut skills = payload
+        .get("skills")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|skill| {
+            if normalized_query.is_empty() {
+                return true;
+            }
+            ["name", "description", "location", "scope"]
+                .iter()
+                .any(|key| {
+                    skill
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&normalized_query))
+                })
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| {
+        skill_scope_rank(left)
+            .cmp(&skill_scope_rank(right))
+            .then_with(|| {
+                left.get("name")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("name").and_then(Value::as_str))
+            })
+    });
+    if skills.is_empty() {
+        return vec![TimelineLine::new(
+            "status",
+            if normalized_query.is_empty() {
+                "skills: none".to_string()
+            } else {
+                format!("skills matching `{}`: none", query.trim())
+            },
+            false,
+        )];
+    }
+    let mut counts = BTreeMap::<String, usize>::new();
+    for skill in &skills {
+        *counts
+            .entry(
+                skill
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .unwrap_or("external")
+                    .to_string(),
+            )
+            .or_default() += 1;
+    }
+    let summary = ["project", "user", "external", "bundled"]
+        .into_iter()
+        .filter_map(|scope| counts.get(scope).map(|count| format!("{scope} {count}")))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let mut lines = vec![TimelineLine::new(
+        "status",
+        format!("skills: {} ({summary})", skills.len()),
+        true,
+    )];
+    lines.extend(skills.into_iter().map(|skill| {
+        let scope = skill
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("external");
+        let name = skill.get("name").and_then(Value::as_str).unwrap_or("skill");
+        let description = skill
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let location = skill
+            .get("location")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        TimelineLine::new(
+            "skill",
+            format!("[{scope}] {name} — {description}\n{location}"),
+            false,
+        )
+    }));
+    lines
+}
+
+fn skill_scope_rank(skill: &Value) -> u8 {
+    match skill.get("scope").and_then(Value::as_str) {
+        Some("project") => 0,
+        Some("user") => 1,
+        Some("external") => 2,
+        Some("bundled") => 3,
+        _ => 4,
+    }
+}
+
 impl TerminalEventHandler for BridgeTerminalHandler {
     fn initial_lines(&mut self) -> Vec<TimelineLine> {
         let mut lines = vec![TimelineLine::new(
@@ -439,7 +652,9 @@ impl TerminalEventHandler for BridgeTerminalHandler {
 
     fn poll_bridge_events(&mut self) -> Result<Vec<Value>, String> {
         let events = self.client.global_events(self.last_global_event_id)?;
-        Ok(self.filter_new_events(events))
+        let mut events = self.filter_new_events(events);
+        events.extend(self.poll_bash_events()?);
+        Ok(events)
     }
 
     fn poll_control_request(&mut self) -> Result<Option<Value>, String> {
@@ -484,29 +699,56 @@ impl TerminalEventHandler for BridgeTerminalHandler {
     fn handle_submit(&mut self, prompt: &str) -> Result<Vec<TimelineLine>, String> {
         let session_id = self.ensure_session()?;
         let mut lines = Vec::new();
-        let mut options = self.turn_options();
-        let (outbound_prompt, attachments) = if let Some(command) = prompt
+        let options = self.turn_options();
+        if let Some(command) = prompt
             .trim()
             .strip_prefix('!')
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            options["tool_call"] = json!({
-                "call_id": format!("call_bash_{}", std::process::id()),
-                "name": "bash",
-                "input": {"command": command},
+            if self.active_bash.is_some() {
+                return Err("a Bash Mode command is already running".to_string());
+            }
+            let terminal = self
+                .client
+                .start_terminal_session(Some(&session_id), None)?;
+            let terminal_id = terminal
+                .get("terminal_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Bridge did not return a terminal id".to_string())?
+                .to_string();
+            let call_id = format!("call_bash_{terminal_id}");
+            if let Err(error) = self.client.terminal_session_input(
+                &terminal_id,
+                &format!("{command}\nexit\n"),
+                false,
+            ) {
+                let _ = self.client.close_terminal_session(&terminal_id);
+                return Err(error);
+            }
+            self.active_bash = Some(ActiveBashSession {
+                terminal_id,
+                session_id: session_id.clone(),
+                call_id: call_id.clone(),
+                cursor: 0,
+                finishing: false,
             });
-            lines.push(TimelineLine::new(
-                "status",
-                format!("bash tool queued: {command}"),
-                true,
-            ));
-            (format!("Run shell command:\n{command}"), Vec::new())
-        } else {
-            let expanded = expand_file_attachments(&self.workspace, prompt);
-            lines.extend(expanded.lines);
-            (expanded.prompt, expanded.attachments)
-        };
+            self.pending_events.push(json!({
+                "method": "item/toolCall/started",
+                "params": {
+                    "session_id": session_id,
+                    "call_id": call_id,
+                    "name": "bash",
+                    "input": {"command": command},
+                    "mode": "direct",
+                }
+            }));
+            return Ok(lines);
+        }
+        let expanded = expand_file_attachments(&self.workspace, prompt);
+        lines.extend(expanded.lines);
+        let outbound_prompt = expanded.prompt;
+        let attachments = expanded.attachments;
         let request = RemoteTurnRequest::new(outbound_prompt)
             .with_attachments(attachments)
             .with_options(options);
@@ -568,7 +810,8 @@ impl TerminalEventHandler for BridgeTerminalHandler {
                     true,
                 )]);
             }
-            self.current_session = Some(session_id.to_string());
+            let session_id = self.resolve_session_id(session_id)?;
+            self.current_session = Some(session_id.clone());
             return Ok(vec![TimelineLine::new(
                 "status",
                 format!("current session: {session_id}"),
@@ -721,10 +964,22 @@ impl TerminalEventHandler for BridgeTerminalHandler {
             let session_id = self.require_current_session()?;
             let payload = self.client.compact_session(&session_id)?;
             return Ok(vec![TimelineLine::new(
-                "status",
-                format!("compacted session: {}", compact_json(&payload["summary"])),
-                true,
+                "compact",
+                payload["summary"]
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| compact_json(&payload["summary"])),
+                false,
             )]);
+        }
+        if command == "/skills" || command.starts_with("/skills ") {
+            let query = command
+                .strip_prefix("/skills")
+                .map(str::trim)
+                .unwrap_or_default();
+            let payload = self.client.skills()?;
+            return Ok(skill_status_lines(&payload, query));
         }
         if command == "/details" {
             let session_id = self.require_current_session()?;
@@ -861,7 +1116,7 @@ impl TerminalEventHandler for BridgeTerminalHandler {
         }
         Ok(vec![TimelineLine::new(
             "status",
-            "commands: /sessions [query], /resume <id>, /transcript [limit], /rename <title>, /new, /fork, /children, /parent, /archive, /delete, /share, /unshare, /compact, /status, /files [query], /attach <path[:range]>, /mcp [list|show|test|start|stop|restart|enable|disable], /models [id], /agents, /agent <id>, /variant <name>, /thinking <level>, /themes [name], /theme-scheme [system|light|dark|cycle], /config, /keybinds, /interrupt [turn_id], /allow, /deny, /answer, /dismiss, /exit",
+            "commands: /sessions [query], /resume <id>, /transcript [limit], /rename <title>, /new, /fork, /children, /parent, /archive, /delete, /share, /unshare, /compact, /status, /files [query], /attach <path[:range]>, /skills [query], /mcp [list|show|test|start|stop|restart|enable|disable], /models [id], /agents, /agent <id>, /variant <name>, /thinking <level>, /themes [name], /theme-scheme [system|light|dark|cycle], /config, /keybinds, /interrupt [turn_id], /allow, /deny, /answer, /dismiss, /exit",
             false,
         )])
     }

@@ -121,7 +121,7 @@ fn terminal_ui_loop<H: TerminalEventHandler>(
     state.timeline.extend(handler.initial_lines());
     state.timeline.push(TimelineLine::new(
         "status",
-        "Type a prompt, /sessions, /resume <id>, /new, /fork, /interrupt, or /exit.",
+        "Type a prompt, /sessions, /resume <id>, /skills, /new, /fork, /interrupt, or /exit.",
         true,
     ));
     apply_handler_output(&mut state, handler, Vec::new());
@@ -171,6 +171,17 @@ pub(crate) fn handle_key_event<H: TerminalEventHandler>(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+        if state.hidden_compact_output.is_some() {
+            state.compact_output_expanded = !state.compact_output_expanded;
+            state.status = if state.compact_output_expanded {
+                "compact summary expanded".to_string()
+            } else {
+                "compact summary hidden".to_string()
+            };
+        }
+        return Ok(false);
+    }
     let approval_start = state.approval_responses.len();
     let question_start = state.question_responses.len();
     if state.handle_interaction_key(&key) {
@@ -209,6 +220,20 @@ pub(crate) fn handle_key_event<H: TerminalEventHandler>(
         if let Err(error) = state.edit_input_with_external_editor() {
             state.timeline.push(TimelineLine::new("error", error, true));
         }
+        return Ok(false);
+    }
+    if (key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j'))
+    {
+        state.input_buffer.push('\n');
+        state.status = if state.input_buffer.trim_start().starts_with('!') {
+            "Bash Mode multiline".to_string()
+        } else {
+            "multiline prompt".to_string()
+        };
         return Ok(false);
     }
     match key.code {
@@ -355,7 +380,19 @@ pub(crate) fn apply_handler_output<H: TerminalEventHandler>(
     handler: &mut H,
     lines: Vec<TimelineLine>,
 ) {
-    state.timeline.extend(lines);
+    for line in lines {
+        if line.kind == "compact" {
+            state.hidden_compact_output = Some(line);
+            state.compact_output_expanded = false;
+            state.timeline.push(TimelineLine::new(
+                "status",
+                "context compacted · Ctrl+R to view summary",
+                false,
+            ));
+        } else {
+            state.timeline.push(line);
+        }
+    }
     apply_bridge_event_values(state, handler.drain_bridge_events());
 }
 

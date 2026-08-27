@@ -165,19 +165,7 @@ pub(super) fn generate_command(args: &[String]) -> CliRunResult {
     if args.first().map(String::as_str) == Some("acp") {
         return acp_command(&["manifest".to_string()]);
     }
-    CliRunResult::ok_json(&json!({
-        "openapi": "3.1.0",
-        "info": {"title": "OpenAgent Bridge API", "version": env!("CARGO_PKG_VERSION")},
-        "paths": {
-            "/api/health": {"get": {"operationId": "health"}},
-            "/api/events": {"get": {"operationId": "globalEvents"}},
-            "/api/sessions": {"get": {"operationId": "listSessions"}, "post": {"operationId": "createSession"}},
-            "/api/sessions/{session_id}/turns": {"post": {"operationId": "startTurn"}},
-            "/api/turns/{turn_id}/events": {"get": {"operationId": "turnEvents"}},
-            "/api/turns/{turn_id}/interrupt": {"post": {"operationId": "interruptTurn"}},
-            "/tui/control/next": {"get": {"operationId": "nextTuiControl"}}
-        }
-    }))
+    CliRunResult::ok_json(&bridge_openapi_document())
 }
 
 pub(super) fn console_command(args: &[String]) -> CliRunResult {

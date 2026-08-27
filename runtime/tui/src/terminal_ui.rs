@@ -1,6 +1,6 @@
 //! Terminal UI state for the Rust rewrite.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 #[cfg(test)]
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -130,6 +130,10 @@ pub struct TuiState {
     pub model_picker: Option<ModelPickerState>,
     pub agent_picker: Option<AgentPickerState>,
     pub choice_picker: Option<ChoicePickerState>,
+    pub streaming_tool_lines: BTreeMap<String, usize>,
+    pub streaming_assistant_line: Option<usize>,
+    pub hidden_compact_output: Option<TimelineLine>,
+    pub compact_output_expanded: bool,
 }
 
 impl TuiState {
@@ -160,6 +164,10 @@ impl TuiState {
             model_picker: None,
             agent_picker: None,
             choice_picker: None,
+            streaming_tool_lines: BTreeMap::new(),
+            streaming_assistant_line: None,
+            hidden_compact_output: None,
+            compact_output_expanded: false,
         }
     }
 

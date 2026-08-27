@@ -2,8 +2,8 @@ use openagent_bridge_server_client::session_id_from_payload;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use serde_json::Value;
 
@@ -21,27 +21,45 @@ use crate::{
 
 pub(crate) fn draw_terminal_frame(frame: &mut ratatui::Frame<'_>, title: &str, state: &TuiState) {
     let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let has_interaction = state.active_interaction_focus().is_some();
     let has_file_picker = state.file_picker.is_some();
     let has_session_picker = state.session_picker.is_some();
     let has_model_picker = state.model_picker.is_some();
     let has_agent_picker = state.agent_picker.is_some();
     let has_choice_picker = state.choice_picker.is_some();
-    let mut constraints = vec![Constraint::Length(3), Constraint::Min(5)];
-    if has_interaction
+    let compact_layout = area.width < 36 || area.height < 9;
+    let input_lines = state.input_buffer.lines().count().max(1) as u16;
+    let header_height: u16 = if compact_layout { 1 } else { 3 };
+    let input_height = if compact_layout {
+        1
+    } else {
+        input_lines.saturating_add(2).clamp(3, 8)
+    };
+    let wants_dock = has_interaction
         || has_file_picker
         || has_session_picker
         || has_model_picker
         || has_agent_picker
-        || has_choice_picker
-    {
+        || has_choice_picker;
+    let show_dock =
+        wants_dock && area.height >= header_height.saturating_add(input_height).saturating_add(5);
+    let mut constraints = vec![Constraint::Length(header_height), Constraint::Min(1)];
+    if show_dock {
         constraints.push(Constraint::Length(9));
     }
-    constraints.push(Constraint::Length(3));
+    constraints.push(Constraint::Length(input_height));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
+    let header_block = if compact_layout {
+        Block::default()
+    } else {
+        Block::default().borders(Borders::ALL).title("Bridge")
+    };
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             title.to_string(),
@@ -51,48 +69,209 @@ pub(crate) fn draw_terminal_frame(frame: &mut ratatui::Frame<'_>, title: &str, s
         ),
         Span::raw(format!("  status: {}", state.status)),
     ]))
-    .block(Block::default().borders(Borders::ALL).title("Bridge"));
+    .block(header_block);
     frame.render_widget(header, chunks[0]);
 
-    let visible = state.timeline.iter().rev().take(200).rev().map(|line| {
-        let style = timeline_style(&state.config, line.kind.as_str());
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                format!("[{}] ", line.kind),
-                style.add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(line.text.clone()),
-        ]))
-    });
-    let timeline = List::new(visible.collect::<Vec<_>>())
-        .block(Block::default().borders(Borders::ALL).title("Timeline"));
+    let timeline_block = if compact_layout {
+        Block::default()
+    } else {
+        Block::default().borders(Borders::ALL).title("Timeline")
+    };
+    let timeline_border_height = if compact_layout { 0 } else { 2 };
+    let timeline_border_width = if compact_layout { 0 } else { 2 };
+    let timeline_width = chunks[1].width.saturating_sub(timeline_border_width).max(1);
+    let timeline_height = chunks[1].height.saturating_sub(timeline_border_height);
+    let timeline_lines = timeline_render_lines(state);
+    let rendered_height = timeline_lines
+        .iter()
+        .map(|line| {
+            let width = line.width().max(1) as u16;
+            width.div_ceil(timeline_width)
+        })
+        .fold(0_u16, u16::saturating_add);
+    let timeline_text = Text::from(timeline_lines);
+    let mut timeline = Paragraph::new(timeline_text)
+        .block(timeline_block)
+        .wrap(Wrap { trim: false });
+    timeline = timeline.scroll((rendered_height.saturating_sub(timeline_height), 0));
     frame.render_widget(timeline, chunks[1]);
 
-    let prompt_index = if has_interaction {
+    let prompt_index = if show_dock && has_interaction {
         draw_interaction_dock(frame, chunks[2], state);
         3
-    } else if has_choice_picker {
+    } else if show_dock && has_choice_picker {
         draw_choice_picker_dock(frame, chunks[2], state);
         3
-    } else if has_agent_picker {
+    } else if show_dock && has_agent_picker {
         draw_agent_picker_dock(frame, chunks[2], state);
         3
-    } else if has_model_picker {
+    } else if show_dock && has_model_picker {
         draw_model_picker_dock(frame, chunks[2], state);
         3
-    } else if has_session_picker {
+    } else if show_dock && has_session_picker {
         draw_session_picker_dock(frame, chunks[2], state);
         3
-    } else if has_file_picker {
+    } else if show_dock && has_file_picker {
         draw_file_picker_dock(frame, chunks[2], state);
         3
     } else {
         2
     };
+    let prompt_title = if state.input_buffer.trim_start().starts_with('!') {
+        "Bash Mode · Shift+Enter/Ctrl+J newline"
+    } else {
+        "Prompt · Shift+Enter/Ctrl+J newline"
+    };
+    let input_block = if compact_layout {
+        Block::default()
+    } else {
+        Block::default().borders(Borders::ALL).title(prompt_title)
+    };
     let input = Paragraph::new(state.input_buffer.as_str())
-        .block(Block::default().borders(Borders::ALL).title("Prompt"))
+        .block(input_block)
         .wrap(Wrap { trim: false });
     frame.render_widget(input, chunks[prompt_index]);
+}
+
+fn timeline_render_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let mut entries = state
+        .timeline
+        .iter()
+        .rev()
+        .take(200)
+        .rev()
+        .collect::<Vec<_>>();
+    if state.compact_output_expanded
+        && let Some(compact) = state.hidden_compact_output.as_ref()
+    {
+        entries.push(compact);
+    }
+    let mut output = Vec::new();
+    for entry in entries {
+        let style = timeline_style(&state.config, entry.kind.as_str());
+        let mut rendered = markdown_lines(&entry.text, style);
+        if rendered.is_empty() {
+            rendered.push(Line::default());
+        }
+        for (index, line) in rendered.into_iter().enumerate() {
+            let mut spans = Vec::new();
+            if index == 0 {
+                spans.push(Span::styled(
+                    format!("[{}] ", entry.kind),
+                    style.add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw("  "));
+            }
+            spans.extend(line.spans);
+            output.push(Line::from(spans));
+        }
+    }
+    output
+}
+
+fn markdown_lines(text: &str, base: Style) -> Vec<Line<'static>> {
+    let mut output = Vec::new();
+    let mut code_fence = false;
+    for raw in text.lines() {
+        let trimmed = raw.trim_start();
+        if let Some(language) = trimmed.strip_prefix("```") {
+            code_fence = !code_fence;
+            output.push(Line::from(Span::styled(
+                if code_fence {
+                    format!("┌─ {}", language.trim())
+                } else {
+                    "└─".to_string()
+                },
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else if code_fence {
+            output.push(Line::from(Span::styled(
+                format!("│ {raw}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if let Some(heading) = trimmed.strip_prefix("### ") {
+            output.push(Line::from(Span::styled(
+                heading.to_string(),
+                base.add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(heading) = trimmed
+            .strip_prefix("## ")
+            .or_else(|| trimmed.strip_prefix("# "))
+        {
+            output.push(Line::from(Span::styled(
+                heading.to_string(),
+                base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            let mut spans = vec![Span::styled("• ", base.add_modifier(Modifier::BOLD))];
+            spans.extend(inline_markdown_spans(item, base));
+            output.push(Line::from(spans));
+        } else if let Some(quote) = trimmed.strip_prefix("> ") {
+            let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::Cyan))];
+            spans.extend(inline_markdown_spans(quote, base));
+            output.push(Line::from(spans));
+        } else if matches!(trimmed, "---" | "***" | "___") {
+            output.push(Line::from(Span::styled(
+                "────────────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            output.push(Line::from(inline_markdown_spans(raw, base)));
+        }
+    }
+    output
+}
+
+fn inline_markdown_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut output = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let bold = rest.find("**");
+        let code = rest.find('`');
+        let next = match (bold, code) {
+            (Some(left), Some(right)) => left.min(right),
+            (Some(index), None) | (None, Some(index)) => index,
+            (None, None) => {
+                output.push(Span::styled(rest.to_string(), base));
+                break;
+            }
+        };
+        if next > 0 {
+            output.push(Span::styled(rest[..next].to_string(), base));
+            rest = &rest[next..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("**") {
+            if let Some(end) = after.find("**") {
+                output.push(Span::styled(
+                    after[..end].to_string(),
+                    base.add_modifier(Modifier::BOLD),
+                ));
+                rest = &after[end + 2..];
+            } else {
+                output.push(Span::styled(rest.to_string(), base));
+                break;
+            }
+        } else if let Some(after) = rest.strip_prefix('`') {
+            if let Some(end) = after.find('`') {
+                output.push(Span::styled(
+                    after[..end].to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                rest = &after[end + 1..];
+            } else {
+                output.push(Span::styled(rest.to_string(), base));
+                break;
+            }
+        }
+    }
+    output
 }
 
 fn draw_choice_picker_dock(

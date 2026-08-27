@@ -31,12 +31,30 @@ checkpoint APIs for clients.
 
 ## Current Contract
 
-`GET /api/protocol` is the machine-readable source for endpoint and event
-discovery. The stable route groups are:
+`GET /api/protocol` is the machine-readable compatibility handshake for endpoint and event
+discovery. It also returns the versioned compatibility manifest defined in
+[`runtime/http/bridge-compatibility.json`](../runtime/http/bridge-compatibility.json):
+the manifest schema, Runtime build version, supported client protocol range,
+event schema, and stable capability IDs. Product clients must validate this
+manifest before starting session/turn/event controllers. A reachable health
+endpoint alone does not prove client compatibility.
+
+The complete operation and error catalog is owned by
+[`src/protocol/bridge-api-contract.json`](../src/protocol/bridge-api-contract.json).
+The shared `openagent-protocol` crate validates that compact artifact and
+projects it as OpenAPI 3.1. Both `GET /api/openapi.json` and
+`openagent generate openapi` return that same projection; clients must not
+maintain an independent route list. The current catalog covers every Bridge,
+SSE, and TUI control operation rather than only the session happy path.
+
+Manifest fields are additive within protocol v1. Removing or renaming a
+required event field, endpoint, event method, or capability ID requires a new
+versioned contract and a tested client compatibility matrix. The stable route
+groups are:
 
 | Area | Endpoints |
 | --- | --- |
-| Discovery | `GET /api/health`, `GET /api/protocol` |
+| Discovery | `GET /api/health`, `GET /api/protocol`, `GET /api/openapi.json` |
 | Providers | `GET /api/providers`, `PUT /api/providers/config`, `POST /api/providers/validate`, `GET /api/models` |
 | Sessions | `GET\|POST /api/sessions`, `GET\|PATCH\|DELETE /api/sessions/{session_id}` |
 | Durable catalog | `GET /api/session-catalog`, `POST /api/session-catalog/rebuild`, `GET /api/sessions/{session_id}/executions` |
@@ -49,6 +67,26 @@ discovery. The stable route groups are:
 | Terminal and LSP | persistent terminal sessions, one-shot terminal compatibility, LSP status/doctor/query |
 | MCP | server lifecycle, discovery, remote OAuth login/refresh/revoke/callback |
 | Extensions | agents, capabilities, plugins, skills, performance, and storage migration |
+
+### Error envelope
+
+JSON responses with an HTTP status of 400 or greater use the additive
+`openagent.bridge_error.v1` envelope:
+
+```json
+{
+  "error": "human-readable diagnostic",
+  "code": "session_not_found",
+  "error_schema_version": "openagent.bridge_error.v1",
+  "retryable": false
+}
+```
+
+Existing domain fields such as `turn_id`, `status`, `error_code`, and queue
+limits remain intact. `code` is the stable reason identifier clients should
+branch on; `error` is diagnostic text and must not be parsed as state. The
+allowed codes, HTTP status, retry semantics, and descriptions are generated in
+the OpenAPI `x-openagent-error-catalog` extension.
 
 The event stream uses Codex-like method names:
 

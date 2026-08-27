@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+pub const BRIDGE_API_CONTRACT_SOURCE: &str = include_str!("../bridge-api-contract.json");
 
 pub const RUNTIME_OPTION_KEYS: &[&str] = &[
     "compaction",
@@ -20,6 +21,307 @@ pub const RUNTIME_OPTION_KEYS: &[&str] = &[
 #[must_use]
 pub const fn crate_name() -> &'static str {
     CRATE_NAME
+}
+
+/// Returns the checked-in Bridge operation and error catalog shared by Runtime and CLI.
+///
+/// The source artifact intentionally remains JSON so non-Rust clients can verify or generate
+/// their request surface from the exact same contract.
+#[must_use]
+pub fn bridge_api_contract() -> Value {
+    let contract = serde_json::from_str::<Value>(BRIDGE_API_CONTRACT_SOURCE)
+        .expect("checked-in Bridge API contract must be valid JSON");
+    validate_bridge_api_contract(&contract)
+        .expect("checked-in Bridge API contract must satisfy its invariants");
+    contract
+}
+
+/// Returns the catalogued retry policy for a stable Bridge error code.
+#[must_use]
+pub fn bridge_error_retryable(code: &str) -> Option<bool> {
+    bridge_api_contract()["errors"]
+        .as_array()?
+        .iter()
+        .find_map(|row| {
+            let row = row.as_array()?;
+            (row.first()?.as_str()? == code)
+                .then(|| row.get(2)?.as_bool())
+                .flatten()
+        })
+}
+
+/// Validates the compact Bridge API catalog before it is projected as OpenAPI.
+pub fn validate_bridge_api_contract(contract: &Value) -> Result<(), String> {
+    let object = contract
+        .as_object()
+        .ok_or_else(|| "Bridge API contract must be an object".to_string())?;
+    for (key, expected) in [
+        ("schema_version", "openagent.bridge_api_contract.v1"),
+        ("openapi_version", "3.1.0"),
+        ("error_schema_version", "openagent.bridge_error.v1"),
+    ] {
+        if object.get(key).and_then(Value::as_str) != Some(expected) {
+            return Err(format!("Bridge API contract {key} must be {expected}"));
+        }
+    }
+    let api_version = object
+        .get("api_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if api_version.is_empty() {
+        return Err("Bridge API contract api_version must not be empty".to_string());
+    }
+    let expected_operation_fields = [
+        "method",
+        "path",
+        "operation_id",
+        "domain",
+        "success_status",
+        "response_kind",
+    ];
+    let operation_fields = object
+        .get("operation_fields")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Bridge API contract operation_fields must be an array".to_string())?;
+    if operation_fields
+        .iter()
+        .filter_map(Value::as_str)
+        .ne(expected_operation_fields)
+    {
+        return Err("Bridge API contract operation_fields are unsupported".to_string());
+    }
+    let operations = object
+        .get("operations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Bridge API contract operations must be an array".to_string())?;
+    if operations.is_empty() {
+        return Err("Bridge API contract must declare operations".to_string());
+    }
+    let mut operation_ids = BTreeSet::new();
+    let mut method_paths = BTreeSet::new();
+    for operation in operations {
+        let row = operation
+            .as_array()
+            .filter(|row| row.len() == expected_operation_fields.len())
+            .ok_or_else(|| "Bridge API operation rows must contain six values".to_string())?;
+        let method = row[0]
+            .as_str()
+            .filter(|method| matches!(*method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE"))
+            .ok_or_else(|| "Bridge API operation method is unsupported".to_string())?;
+        let path = row[1]
+            .as_str()
+            .filter(|path| path.starts_with('/'))
+            .ok_or_else(|| "Bridge API operation path must start with /".to_string())?;
+        if path.matches('{').count() != path.matches('}').count() {
+            return Err(format!(
+                "Bridge API operation path has unbalanced parameters: {path}"
+            ));
+        }
+        let operation_id = row[2]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Bridge API operation_id must not be empty".to_string())?;
+        let domain = row[3]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Bridge API operation domain must not be empty".to_string())?;
+        let status = row[4]
+            .as_u64()
+            .filter(|status| (100..600).contains(status))
+            .ok_or_else(|| "Bridge API success_status is invalid".to_string())?;
+        let response_kind = row[5]
+            .as_str()
+            .filter(|kind| matches!(*kind, "json" | "sse" | "text"))
+            .ok_or_else(|| "Bridge API response_kind is unsupported".to_string())?;
+        if !operation_ids.insert(operation_id.to_string()) {
+            return Err(format!("duplicate Bridge API operation_id: {operation_id}"));
+        }
+        if !method_paths.insert(format!("{method} {path}")) {
+            return Err(format!("duplicate Bridge API method/path: {method} {path}"));
+        }
+        let _ = (domain, status, response_kind);
+    }
+
+    let expected_error_fields = ["code", "http_status", "retryable", "description"];
+    let error_fields = object
+        .get("error_fields")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Bridge API contract error_fields must be an array".to_string())?;
+    if error_fields
+        .iter()
+        .filter_map(Value::as_str)
+        .ne(expected_error_fields)
+    {
+        return Err("Bridge API contract error_fields are unsupported".to_string());
+    }
+    let errors = object
+        .get("errors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Bridge API contract errors must be an array".to_string())?;
+    let mut error_codes = BTreeSet::new();
+    for error in errors {
+        let row = error
+            .as_array()
+            .filter(|row| row.len() == expected_error_fields.len())
+            .ok_or_else(|| "Bridge API error rows must contain four values".to_string())?;
+        let code = row[0]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Bridge API error code must not be empty".to_string())?;
+        let status = row[1]
+            .as_u64()
+            .filter(|status| (400..600).contains(status))
+            .ok_or_else(|| "Bridge API error status is invalid".to_string())?;
+        if row[2].as_bool().is_none() || row[3].as_str().is_none_or(str::is_empty) {
+            return Err(format!("Bridge API error definition is incomplete: {code}"));
+        }
+        if !error_codes.insert(code.to_string()) {
+            return Err(format!("duplicate Bridge API error code: {code}"));
+        }
+        let _ = status;
+    }
+    for required in [
+        "invalid_request",
+        "unauthorized",
+        "endpoint_not_found",
+        "session_not_found",
+        "internal_error",
+        "upstream_unavailable",
+    ] {
+        if !error_codes.contains(required) {
+            return Err(format!("Bridge API error catalog is missing {required}"));
+        }
+    }
+    Ok(())
+}
+
+/// Projects the compact shared contract as a complete OpenAPI 3.1 document.
+#[must_use]
+pub fn bridge_openapi_document() -> Value {
+    let contract = bridge_api_contract();
+    let mut paths = Map::new();
+    for operation in contract["operations"]
+        .as_array()
+        .expect("validated Bridge operations")
+    {
+        let row = operation
+            .as_array()
+            .expect("validated Bridge operation row");
+        let method = row[0]
+            .as_str()
+            .expect("validated method")
+            .to_ascii_lowercase();
+        let path = row[1].as_str().expect("validated path");
+        let operation_id = row[2].as_str().expect("validated operation id");
+        let domain = row[3].as_str().expect("validated domain");
+        let success_status = row[4].as_u64().expect("validated status").to_string();
+        let response_kind = row[5].as_str().expect("validated response kind");
+        let media_type = match response_kind {
+            "sse" => "text/event-stream",
+            "text" => "text/plain",
+            _ => "application/json",
+        };
+        let response_schema = if response_kind == "json" {
+            serde_json::json!({"type": "object", "additionalProperties": true})
+        } else {
+            serde_json::json!({"type": "string"})
+        };
+        let parameters = path
+            .split('/')
+            .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string", "minLength": 1},
+                    "x-openagent-catch-all": name == "control_path",
+                })
+            })
+            .collect::<Vec<_>>();
+        let content = Value::Object(Map::from_iter([(
+            media_type.to_string(),
+            serde_json::json!({"schema": response_schema}),
+        )]));
+        let success_response = serde_json::json!({
+            "description": "Successful Runtime response",
+            "content": content,
+        });
+        let responses = Value::Object(Map::from_iter([
+            (success_status, success_response),
+            (
+                "default".to_string(),
+                serde_json::json!({"$ref": "#/components/responses/BridgeError"}),
+            ),
+        ]));
+        let mut operation_object = serde_json::json!({
+            "operationId": operation_id,
+            "tags": [domain],
+            "x-openagent-domain": domain,
+            "x-openagent-response-kind": response_kind,
+            "responses": responses,
+        });
+        if !parameters.is_empty() {
+            operation_object["parameters"] = Value::Array(parameters);
+        }
+        if path == "/api/mcp/oauth/callback" {
+            operation_object["security"] = Value::Array(Vec::new());
+        }
+        paths
+            .entry(path.to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .expect("path item must be an object")
+            .insert(method, operation_object);
+    }
+    let error_codes = contract["errors"]
+        .as_array()
+        .expect("validated Bridge errors")
+        .iter()
+        .filter_map(|row| row.as_array()?.first()?.as_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "openapi": contract["openapi_version"],
+        "info": {
+            "title": "OpenAgent Bridge API",
+            "version": contract["api_version"],
+        },
+        "servers": [{"url": "http://127.0.0.1:8787"}],
+        "security": [{"bearerAuth": []}, {"bridgeToken": []}],
+        "paths": Value::Object(paths),
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer"},
+                "bridgeToken": {"type": "apiKey", "in": "header", "name": "X-OpenAgent-Token"},
+            },
+            "schemas": {
+                "BridgeError": {
+                    "type": "object",
+                    "required": ["error", "code", "error_schema_version", "retryable"],
+                    "properties": {
+                        "error": {"type": "string"},
+                        "code": {"type": "string", "enum": error_codes},
+                        "error_schema_version": {"const": contract["error_schema_version"]},
+                        "retryable": {"type": "boolean"},
+                        "details": {"type": ["object", "null"], "additionalProperties": true},
+                    },
+                    "additionalProperties": true,
+                },
+            },
+            "responses": {
+                "BridgeError": {
+                    "description": "Stable Bridge error envelope",
+                    "content": {
+                        "application/json": {"schema": {"$ref": "#/components/schemas/BridgeError"}},
+                    },
+                },
+            },
+        },
+        "x-openagent-contract-schema": contract["schema_version"],
+        "x-openagent-error-schema": contract["error_schema_version"],
+        "x-openagent-error-catalog": contract["errors"],
+    })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -1180,5 +1482,48 @@ mod tests {
             call_id: "call_fixture_read".to_string(),
         };
         assert_eq!(call.key(), "read:{\"path\": \"README.md\"}");
+    }
+
+    #[test]
+    fn bridge_api_contract_generates_complete_openapi_surface() {
+        let contract = bridge_api_contract();
+        assert_eq!(
+            contract["schema_version"],
+            "openagent.bridge_api_contract.v1"
+        );
+        assert!(
+            contract["operations"]
+                .as_array()
+                .is_some_and(|operations| operations.len() >= 100)
+        );
+        let openapi = bridge_openapi_document();
+        assert_eq!(openapi["openapi"], "3.1.0");
+        assert_eq!(
+            openapi["x-openagent-error-schema"],
+            "openagent.bridge_error.v1"
+        );
+        for (path, method, operation_id) in [
+            ("/api/protocol", "get", "getProtocol"),
+            ("/api/openapi.json", "get", "getOpenApi"),
+            ("/api/sessions/{session_id}/turns", "post", "startTurn"),
+            ("/api/turns/{turn_id}/events", "get", "getTurnEvents"),
+            (
+                "/api/sessions/{session_id}/tasks/{task_id}/resume",
+                "post",
+                "resumeSessionTask",
+            ),
+        ] {
+            assert_eq!(openapi["paths"][path][method]["operationId"], operation_id);
+        }
+        assert_eq!(
+            openapi["components"]["schemas"]["BridgeError"]["required"],
+            json!(["error", "code", "error_schema_version", "retryable"])
+        );
+        assert_eq!(bridge_error_retryable("turn_queue_full"), Some(true));
+        assert_eq!(
+            bridge_error_retryable("turn_retry_limit_reached"),
+            Some(false)
+        );
+        assert_eq!(bridge_error_retryable("unknown"), None);
     }
 }

@@ -5009,6 +5009,8 @@ fn iter_pattern_matches(base_dir: &Path, seen: &mut BTreeSet<PathBuf>) -> Vec<Pa
     for parts in [
         [".openagent", "skill"],
         [".openagent", "skills"],
+        [".agents", "skill"],
+        [".agents", "skills"],
         [".opencode", "skill"],
         [".opencode", "skills"],
         [".claude", "skills"],
@@ -5052,22 +5054,40 @@ fn append_skill_roots(session_root: &Path, roots: &[String], result: &mut Vec<Pa
 
 fn recursive_skill_files(root: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
-    if root.is_file() {
-        if root.file_name().and_then(OsStr::to_str) == Some("SKILL.md") {
-            result.push(canonicalize_existing(root));
+    let mut visited_directories = BTreeSet::new();
+    let mut seen_files = BTreeSet::new();
+    collect_skill_files(
+        &canonicalize_existing(root),
+        &mut visited_directories,
+        &mut seen_files,
+        &mut result,
+    );
+    result
+}
+
+fn collect_skill_files(
+    root: &Path,
+    visited_directories: &mut BTreeSet<PathBuf>,
+    seen_files: &mut BTreeSet<PathBuf>,
+    result: &mut Vec<PathBuf>,
+) {
+    let resolved = canonicalize_existing(root);
+    if resolved.is_file() {
+        if resolved.file_name().and_then(OsStr::to_str) == Some("SKILL.md")
+            && seen_files.insert(resolved.clone())
+        {
+            result.push(resolved);
         }
-        return result;
+        return;
     }
-    let mut entries = read_dir_paths(root);
+    if !resolved.is_dir() || !visited_directories.insert(resolved.clone()) {
+        return;
+    }
+    let mut entries = read_dir_paths(&resolved);
     entries.sort();
     for entry in entries {
-        if entry.is_dir() {
-            result.extend(recursive_skill_files(&entry));
-        } else if entry.file_name().and_then(OsStr::to_str) == Some("SKILL.md") {
-            result.push(canonicalize_existing(&entry));
-        }
+        collect_skill_files(&entry, visited_directories, seen_files, result);
     }
-    result
 }
 
 fn to_skill_info(document: &SkillDocument, score: Option<i64>) -> SkillInfo {

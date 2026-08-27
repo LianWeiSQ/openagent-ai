@@ -367,6 +367,10 @@ impl RemoteRuntimeClient {
         self.json("GET", "/api/protocol", None)
     }
 
+    pub fn openapi(&self) -> Result<Value, String> {
+        self.json("GET", "/api/openapi.json", None)
+    }
+
     pub fn models(&self) -> Result<Value, String> {
         self.json("GET", "/api/models", None)
     }
@@ -377,6 +381,10 @@ impl RemoteRuntimeClient {
 
     pub fn agents(&self) -> Result<Value, String> {
         self.json("GET", "/api/agents", None)
+    }
+
+    pub fn skills(&self) -> Result<Value, String> {
+        self.json("GET", "/api/skills", None)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Value>, String> {
@@ -693,6 +701,60 @@ impl RemoteRuntimeClient {
             body["timeout_ms"] = json!(timeout_ms);
         }
         self.json("POST", "/api/terminal/run", Some(body))
+    }
+
+    pub fn start_terminal_session(
+        &self,
+        session_id: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<Value, String> {
+        let mut body = json!({});
+        if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+            body["session_id"] = json!(session_id);
+        }
+        if let Some(cwd) = cwd {
+            body["cwd"] = json!(cwd.to_string_lossy());
+        }
+        self.json("POST", "/api/terminal/sessions", Some(body))
+    }
+
+    pub fn terminal_session_input(
+        &self,
+        terminal_id: &str,
+        input: &str,
+        append_newline: bool,
+    ) -> Result<Value, String> {
+        self.json(
+            "POST",
+            &format!("/api/terminal/sessions/{}/input", quote_path(terminal_id)),
+            Some(json!({
+                "input": input,
+                "append_newline": append_newline,
+            })),
+        )
+    }
+
+    pub fn terminal_session_snapshot(
+        &self,
+        terminal_id: &str,
+        after: u64,
+    ) -> Result<Value, String> {
+        self.json(
+            "GET",
+            &format!(
+                "/api/terminal/sessions/{}?after={after}",
+                quote_path(terminal_id)
+            ),
+            None,
+        )
+    }
+
+    pub fn close_terminal_session(&self, terminal_id: &str) -> Result<Value, String> {
+        self.json(
+            "DELETE",
+            &format!("/api/terminal/sessions/{}", quote_path(terminal_id)),
+            None,
+        )
     }
 
     pub fn mcp_status(&self, refresh: bool) -> Result<Value, String> {
@@ -1073,7 +1135,14 @@ pub fn session_id_from_payload(payload: &Value) -> Option<String> {
     payload
         .get("session_id")
         .or_else(|| payload.get("id"))
-        .or_else(|| payload.get("session").and_then(|session| session.get("id")))
+        .or_else(|| {
+            payload.get("session").and_then(|session| {
+                session
+                    .get("session_id")
+                    .or_else(|| session.get("thread_id"))
+                    .or_else(|| session.get("id"))
+            })
+        })
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
@@ -1436,6 +1505,22 @@ mod tests {
                 "model": "gpt-5.5",
                 "thinking": "high",
             })
+        );
+    }
+
+    #[test]
+    fn session_id_parser_accepts_historical_nested_session_shapes() {
+        assert_eq!(
+            session_id_from_payload(&json!({
+                "session": {"session_id": "session_legacy"}
+            })),
+            Some("session_legacy".to_string())
+        );
+        assert_eq!(
+            session_id_from_payload(&json!({
+                "session": {"thread_id": "thread_legacy"}
+            })),
+            Some("thread_legacy".to_string())
         );
     }
 

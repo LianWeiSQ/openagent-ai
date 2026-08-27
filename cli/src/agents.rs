@@ -1,13 +1,17 @@
 use super::prompt::{
     agent_profile_public_value, available_agent_profiles, load_agent_profile_by_name,
+    validate_agents_from_args,
 };
 use super::*;
 
 pub(super) fn agent_command(args: &[String]) -> CliRunResult {
     if args.is_empty() || args.iter().any(|arg| is_help_flag(arg)) {
         return ok_text(
-            "Usage: openagent agent <list|create|show|delete|run> [name] [--model <id>] [--provider <id>] [--mode <primary|subagent|all>] [--permission <ruleset>] [--prompt <text>] [--tool <name>]",
+            "Usage: openagent agent <list|create|show|delete|run> [name] [--agents <json-or-path>] [--model <id>] [--provider <id>] [--mode <primary|subagent|all>] [--permission <ruleset>] [--prompt <text>] [--tool <name>]",
         );
+    }
+    if let Err(error) = validate_agents_from_args(args) {
+        return err_text(2, error);
     }
     match args[0].as_str() {
         "list" | "ls" => {
@@ -22,6 +26,7 @@ pub(super) fn agent_command(args: &[String]) -> CliRunResult {
                 args,
                 &[
                     "--workspace",
+                    "--agents",
                     "--dir",
                     "--model",
                     "-m",
@@ -65,7 +70,8 @@ pub(super) fn agent_command(args: &[String]) -> CliRunResult {
             )
         }
         "show" => {
-            let positionals = positional_args(args, &["--workspace", "--dir", "--format"]);
+            let positionals =
+                positional_args(args, &["--workspace", "--dir", "--agents", "--format"]);
             let Some(name) = positionals.get(1).or_else(|| positionals.first()) else {
                 return err_text(2, "agent show requires a name");
             };
@@ -75,7 +81,8 @@ pub(super) fn agent_command(args: &[String]) -> CliRunResult {
             }
         }
         "delete" | "rm" => {
-            let positionals = positional_args(args, &["--workspace", "--dir", "--format"]);
+            let positionals =
+                positional_args(args, &["--workspace", "--dir", "--agents", "--format"]);
             let Some(name) = positionals.get(1).or_else(|| positionals.first()) else {
                 return err_text(2, "agent delete requires a name");
             };
@@ -88,6 +95,7 @@ pub(super) fn agent_command(args: &[String]) -> CliRunResult {
                 args,
                 &[
                     "--workspace",
+                    "--agents",
                     "--dir",
                     "--session-root",
                     "--format",
@@ -116,6 +124,7 @@ pub(super) fn agent_command(args: &[String]) -> CliRunResult {
                 args,
                 &[
                     "--workspace",
+                    "--agents",
                     "--dir",
                     "--session-root",
                     "--format",

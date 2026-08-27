@@ -4624,7 +4624,7 @@ fn replace_text(content: &str, old: &str, new: &str, replace_all: bool) -> ToolR
         return Err("old_string and new_string must be different".to_string());
     }
     if old.is_empty() {
-        return Ok(new.to_string());
+        return Ok(preserve_trailing_newline(content, new.to_string()));
     }
     let count = content.matches(old).count();
     if count == 0 {
@@ -4636,11 +4636,26 @@ fn replace_text(content: &str, old: &str, new: &str, replace_all: bool) -> ToolR
                 .to_string(),
         );
     }
-    if replace_all {
-        Ok(content.replace(old, new))
+    let edited = if replace_all {
+        content.replace(old, new)
     } else {
-        Ok(content.replacen(old, new, 1))
+        content.replacen(old, new, 1)
+    };
+    Ok(preserve_trailing_newline(content, edited))
+}
+
+fn preserve_trailing_newline(original: &str, mut edited: String) -> String {
+    if edited.ends_with(['\n', '\r']) {
+        return edited;
     }
+    if original.ends_with("\r\n") {
+        edited.push_str("\r\n");
+    } else if original.ends_with('\n') {
+        edited.push('\n');
+    } else if original.ends_with('\r') {
+        edited.push('\r');
+    }
+    edited
 }
 
 fn edited_output(root: &Path, target: &Path, replace_all: bool) -> ToolResultValue<ToolOutput> {
@@ -5339,9 +5354,20 @@ fn shell_command(command: &str) -> Command {
 
 #[cfg(windows)]
 fn shell_command(command: &str) -> Command {
-    let mut shell = Command::new("cmd");
-    shell.arg("/C").arg(command);
+    let program = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    let mut shell = Command::new(program);
+    shell.args(windows_shell_args(command));
     shell
+}
+
+#[cfg(any(windows, test))]
+fn windows_shell_args(command: &str) -> [String; 4] {
+    [
+        "/D".to_string(),
+        "/S".to_string(),
+        "/C".to_string(),
+        command.to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -5352,5 +5378,29 @@ mod tests {
     fn links_to_protocol_crate() {
         assert_eq!(crate_name(), "openagent-tools");
         assert_eq!(protocol_crate_name(), "openagent-protocol");
+    }
+
+    #[test]
+    fn edit_replacement_preserves_lf_and_crlf_file_endings() {
+        assert_eq!(
+            replace_text("alpha\nbeta\n", "beta\n", "gamma", false),
+            Ok("alpha\ngamma\n".to_string())
+        );
+        assert_eq!(
+            replace_text("alpha\r\nbeta\r\n", "beta\r\n", "gamma", false),
+            Ok("alpha\r\ngamma\r\n".to_string())
+        );
+        assert_eq!(
+            replace_text("alpha\nbeta", "beta", "gamma", false),
+            Ok("alpha\ngamma".to_string())
+        );
+    }
+
+    #[test]
+    fn windows_shell_uses_legacy_compatible_comspec_arguments() {
+        assert_eq!(
+            windows_shell_args("echo first\necho second"),
+            ["/D", "/S", "/C", "echo first\necho second"].map(str::to_string)
+        );
     }
 }

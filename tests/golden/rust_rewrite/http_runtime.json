@@ -131,6 +131,8 @@
       "mdns_name": "openagent",
       "port": 8787,
       "session_store_root": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace/.openagent/sessions",
+      "startup_agents_configured": false,
+      "startup_agents_valid": true,
       "turn_queue_lease_stale_ms": 30000,
       "turn_queue_timeout_ms": 1800000,
       "workspace": "/tmp/openagent-rust-rewrite-fixture-goal12/workspace"
@@ -164,7 +166,10 @@
       },
       "unauthorized": {
         "body": {
-          "error": "unauthorized"
+          "code": "unauthorized",
+          "error": "unauthorized",
+          "error_schema_version": "openagent.bridge_error.v1",
+          "retryable": false
         },
         "headers": {
           "WWW-Authenticate": "Bearer realm=\"openagent-bridge\", Basic realm=\"openagent-bridge\""
@@ -173,7 +178,10 @@
       },
       "unknown": {
         "body": {
-          "error": "unknown endpoint"
+          "code": "endpoint_not_found",
+          "error": "unknown endpoint",
+          "error_schema_version": "openagent.bridge_error.v1",
+          "retryable": false
         },
         "status": 404
       }

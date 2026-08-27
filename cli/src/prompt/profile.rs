@@ -144,7 +144,127 @@ pub(crate) fn available_agent_profiles(args: &[String]) -> Vec<RunAgentProfile> 
             profiles.insert(profile.id.clone(), profile);
         }
     }
+    if let Ok(configured) = configured_agent_profiles(args) {
+        for profile in configured.into_iter().filter(|profile| !profile.disabled) {
+            profiles.insert(profile.id.clone(), profile);
+        }
+    }
     profiles.into_values().collect()
+}
+
+pub(crate) fn validate_agents_from_args(args: &[String]) -> Result<(), String> {
+    configured_agent_profiles(args).map(|_| ())
+}
+
+fn configured_agent_profiles(args: &[String]) -> Result<Vec<RunAgentProfile>, String> {
+    let mut profiles = Vec::new();
+    for source in values_for(args, &["--agents"]) {
+        let (value, source_path) = load_agents_source(&source, &workspace_from_args(args))?;
+        for (index, (fallback_id, profile_value)) in
+            agent_profile_values(&value).into_iter().enumerate()
+        {
+            let fallback_id = if fallback_id.trim().is_empty() {
+                format!("agent-{}", index + 1)
+            } else {
+                sanitize_identifier(&fallback_id)
+            };
+            let profile = agent_profile_from_value(
+                &profile_value,
+                source_path.clone(),
+                &fallback_id,
+                &fallback_id,
+                true,
+            )
+            .map_err(|error| format!("invalid --agents profile {fallback_id}: {error}"))?;
+            profiles.push(profile);
+        }
+    }
+    Ok(profiles)
+}
+
+fn load_agents_source(source: &str, workspace: &Path) -> Result<(Value, Option<PathBuf>), String> {
+    let trimmed = source.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return serde_json::from_str::<Value>(trimmed)
+            .map(|value| (value, None))
+            .map_err(|error| format!("invalid inline --agents JSON: {error}"));
+    }
+    let raw_path = PathBuf::from(trimmed);
+    let path = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        let workspace_path = workspace.join(&raw_path);
+        if workspace_path.is_file() {
+            workspace_path
+        } else {
+            raw_path
+        }
+    };
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read --agents {}: {error}", path.display()))?;
+    let value = match path.extension().and_then(|extension| extension.to_str()) {
+        Some("yaml" | "yml") => serde_yaml::from_str::<Value>(&raw)
+            .map_err(|error| format!("invalid --agents YAML {}: {error}", path.display()))?,
+        _ => serde_json::from_str::<Value>(&raw)
+            .map_err(|error| format!("invalid --agents JSON {}: {error}", path.display()))?,
+    };
+    Ok((value, Some(path)))
+}
+
+fn agent_profile_values(value: &Value) -> Vec<(String, Value)> {
+    if let Some(agents) = value.get("agents") {
+        return agent_profile_values(agents);
+    }
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.is_object())
+            .map(|(index, item)| {
+                let id = item
+                    .get("id")
+                    .or_else(|| item.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("agent-{}", index + 1));
+                (id, item.clone())
+            })
+            .collect();
+    }
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    if [
+        "id",
+        "name",
+        "description",
+        "mode",
+        "prompt",
+        "model",
+        "provider",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        let id = object
+            .get("id")
+            .or_else(|| object.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("agent")
+            .to_string();
+        return vec![(id, value.clone())];
+    }
+    object
+        .iter()
+        .filter_map(|(id, profile)| {
+            let mut profile = profile.as_object()?.clone();
+            profile.entry("id".to_string()).or_insert_with(|| json!(id));
+            profile
+                .entry("name".to_string())
+                .or_insert_with(|| json!(id));
+            Some((id.clone(), Value::Object(profile)))
+        })
+        .collect()
 }
 
 fn agent_registry_dirs(args: &[String]) -> Vec<PathBuf> {

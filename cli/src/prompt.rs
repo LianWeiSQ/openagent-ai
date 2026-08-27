@@ -21,6 +21,7 @@ use profile::{
 };
 pub(crate) use profile::{
     agent_profile_public_value, available_agent_profiles, load_agent_profile_by_name,
+    validate_agents_from_args,
 };
 use provider::{add_usage, call_provider_for_run};
 pub(crate) use tool::split_answer_items;
@@ -35,6 +36,9 @@ pub(super) fn run_prompt_command_with_events(
 ) -> CliRunResult {
     if args.iter().any(|arg| is_help_flag(arg)) {
         return ok_text(run_help());
+    }
+    if let Err(error) = validate_agents_from_args(args) {
+        return err_text(2, error);
     }
     let format = value_for(args, &["--format"]).unwrap_or_else(|| "text".to_string());
     if let Some(url) = value_for(args, &["--attach"]) {

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs,
     path::{Path, PathBuf},
@@ -1347,6 +1347,71 @@ fn skill_registry_discovers_builtin_skills_and_workspace_overrides() -> Result<(
             .all()
             .iter()
             .all(|skill| !skill.location.contains("skill/openagent"))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_registry_discovers_agents_scopes_and_follows_symlinks_without_cycles()
+-> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let root = setup_goal6_fixture_named("agents-skills-symlinks")?;
+    let workspace = root.join("repo/project/workspace");
+    let home = root.join("home");
+    let shared = root.join("shared-skills/linked");
+    fs::create_dir_all(&home)?;
+
+    write_skill(
+        &workspace,
+        ".agents/skills/project-agent/SKILL.md",
+        "project-agent",
+        "Project .agents skill",
+        "Project scope.",
+    )?;
+    write_skill(
+        &home,
+        ".agents/skills/user-agent/SKILL.md",
+        "user-agent",
+        "User .agents skill",
+        "User scope.",
+    )?;
+    write_skill(
+        &root,
+        "shared-skills/linked/SKILL.md",
+        "linked-agent",
+        "Symlinked skill",
+        "Linked scope.",
+    )?;
+    let agents_skills = workspace.join(".agents/skills");
+    symlink(&shared, agents_skills.join("linked-agent"))?;
+    symlink(&agents_skills, shared.join("cycle"))?;
+
+    let registry = SkillRegistry::new_with_options(
+        Some(&workspace),
+        None,
+        Some(&home),
+        SkillRegistryOptions {
+            include_builtin_skills: false,
+        },
+    );
+    let report = registry.report(None, None);
+    let names = report
+        .skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(names.contains("project-agent"));
+    assert!(names.contains("user-agent"));
+    assert!(names.contains("linked-agent"));
+    assert_eq!(
+        report
+            .skills
+            .iter()
+            .filter(|skill| skill.name == "linked-agent")
+            .count(),
+        1
     );
     Ok(())
 }

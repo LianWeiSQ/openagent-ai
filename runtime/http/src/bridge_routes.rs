@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const BRIDGE_COMPATIBILITY_MANIFEST: &str = include_str!("../bridge-compatibility.json");
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct HttpResponseSpec {
     pub status: u16,
@@ -72,7 +74,12 @@ pub fn route_unauthorized() -> HttpResponseSpec {
         status: 401,
         content_type: None,
         headers,
-        body: Some(json!({"error": "unauthorized"})),
+        body: Some(json!({
+            "error": "unauthorized",
+            "code": "unauthorized",
+            "error_schema_version": "openagent.bridge_error.v1",
+            "retryable": false,
+        })),
         body_text: None,
     }
 }
@@ -109,18 +116,41 @@ pub fn route_unknown() -> HttpResponseSpec {
         status: 404,
         content_type: None,
         headers: Map::new(),
-        body: Some(json!({"error": "unknown endpoint"})),
+        body: Some(json!({
+            "error": "unknown endpoint",
+            "code": "endpoint_not_found",
+            "error_schema_version": "openagent.bridge_error.v1",
+            "retryable": false,
+        })),
         body_text: None,
     }
 }
 
 #[must_use]
 pub fn bridge_protocol_payload() -> Value {
+    let manifest = serde_json::from_str::<Value>(BRIDGE_COMPATIBILITY_MANIFEST)
+        .expect("checked-in Bridge compatibility manifest must be valid JSON");
+    let api_contract = bridge_api_contract();
     json!({
         "schema_version": 1,
-        "protocol": "openagent.bridge",
+        "manifest_schema_version": manifest["manifest_schema_version"],
+        "protocol": manifest["protocol"],
         "protocol_version": BRIDGE_PROTOCOL_VERSION,
         "event_schema_version": BRIDGE_EVENT_SCHEMA_VERSION,
+        "runtime": {
+            "name": "openharness",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "protocol_range": manifest["protocol_range"],
+        "capabilities": manifest["capabilities"],
+        "api_contract": {
+            "schema_version": api_contract["schema_version"],
+            "api_version": api_contract["api_version"],
+            "openapi_version": api_contract["openapi_version"],
+            "error_schema_version": api_contract["error_schema_version"],
+            "operation_count": api_contract["operations"].as_array().map(Vec::len).unwrap_or_default(),
+            "openapi_endpoint": "/api/openapi.json",
+        },
         "compatibility": {
             "additive_fields": true,
             "required_event_fields": [
@@ -151,6 +181,7 @@ pub fn bridge_protocol_payload() -> Value {
         "endpoints": {
             "health": "GET /api/health",
             "protocol": "GET /api/protocol",
+            "openapi": "GET /api/openapi.json",
             "sessions": "GET|POST /api/sessions (GET hides internal task sessions; pass include_subagents=true for diagnostics)",
             "session": "GET|PATCH|DELETE /api/sessions/{session_id}",
             "session_catalog": "GET /api/session-catalog?query={query}; POST /api/session-catalog/rebuild",
@@ -159,7 +190,7 @@ pub fn bridge_protocol_payload() -> Value {
             "plan": "GET|PUT /api/sessions/{session_id}/plan",
             "tasks": "GET /api/sessions/{session_id}/tasks; POST /api/sessions/{session_id}/tasks/{task_id}/start|wait|promote|cancel|resume (run remains a synchronous compatibility route)",
             "messages": "GET /api/sessions/{session_id}/messages",
-            "context": "GET /api/sessions/{session_id}/context; POST /api/sessions/{session_id}/context/replay",
+            "context": "GET /api/sessions/{session_id}/context; POST /api/sessions/{session_id}/context/replay; GET /api/sessions/{session_id}/context/compactions; POST /api/sessions/{session_id}/context/compactions/{boundary_message_id}/undo; GET /api/sessions/{session_id}/context/memories; PATCH /api/sessions/{session_id}/context/memories/{memory_id}",
             "turns": "GET /api/turns; POST /api/sessions/{session_id}/turns; set body async=true or query ?async=true for 202 accepted background run",
             "turn": "GET /api/turns/{turn_id}",
             "retry": "POST /api/turns/{turn_id}/retry",
@@ -179,6 +210,7 @@ pub fn bridge_protocol_payload() -> Value {
             "capabilities": "GET /api/capabilities; PUT /api/capabilities/{browser|computer|terminal}; POST /api/capabilities/{id}/diagnose",
             "mcp": "GET /api/mcp; POST /api/mcp/servers; PATCH|DELETE /api/mcp/servers/{name}; POST /api/mcp/servers/{name}/test|start|stop|restart; GET /api/mcp/servers/{name}/oauth; POST /api/mcp/servers/{name}/oauth/login|refresh|revoke; GET /api/mcp/oauth/callback",
             "plugins": "GET|POST /api/plugins; PATCH|DELETE /api/plugins/{plugin_id}; POST /api/plugins/{plugin_id}/update; PATCH /api/skills/{skill_name}",
+            "skills": "GET /api/skills (project, user, bundled and external skill scopes)",
             "providers": "GET /api/providers; PUT /api/providers/config; POST /api/providers/validate; GET /api/models (catalog alias)",
             "performance": "GET /api/performance?session_id={session_id}; POST /api/performance/probe?session_id={session_id}",
             "storage": "GET /api/storage; POST /api/storage/audit|migrate|rollback",
@@ -366,6 +398,7 @@ pub fn parse_cli_args(args: &[String]) -> (HttpRuntimeConfig, bool, bool) {
     }
     let mut health_json = false;
     let mut docker_smoke = false;
+    let mut startup_agents_source = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -399,6 +432,12 @@ pub fn parse_cli_args(args: &[String]) -> (HttpRuntimeConfig, bool, bool) {
             "--mcp-config" => {
                 if let Some(value) = args.get(index + 1) {
                     config.mcp_config = Some(value.clone());
+                    index += 1;
+                }
+            }
+            "--agents" => {
+                if let Some(value) = args.get(index + 1) {
+                    startup_agents_source = Some(value.clone());
                     index += 1;
                 }
             }
@@ -487,6 +526,17 @@ pub fn parse_cli_args(args: &[String]) -> (HttpRuntimeConfig, bool, bool) {
         }
         index += 1;
     }
+    if let Some(source) = startup_agents_source {
+        let workspace = config
+            .workspace
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        match load_runtime_agents_source(&source, &workspace) {
+            Ok(value) => config.startup_agents = Some(value),
+            Err(error) => config.startup_agents_error = Some(error),
+        }
+    }
     (config, health_json, docker_smoke)
 }
 
@@ -499,8 +549,15 @@ pub fn run_cli(args: &[String]) -> CliRunResult {
     {
         return CliRunResult {
             exit_code: 0,
-            stdout: "Usage: openagent-http-runtime [--host <host>] [--port <port>] [--workspace <path>] [--session-root <path>] [--mcp-config <json-or-path>] [--auth-token-file <path>] [--auth-token <token>] [-u|--username <name>] [-p|--password <password>] [--cors-origin <origin[,origin...]>] [--mdns-name <name>] [--max-queued-turns-per-session <n>] [--turn-queue-lease-stale-ms <ms>] [--no-mdns] [--health-json]\n".to_string(),
+            stdout: "Usage: openagent-http-runtime [--host <host>] [--port <port>] [--workspace <path>] [--session-root <path>] [--agents <json-or-path>] [--mcp-config <json-or-path>] [--auth-token-file <path>] [--auth-token <token>] [-u|--username <name>] [-p|--password <password>] [--cors-origin <origin[,origin...]>] [--mdns-name <name>] [--max-queued-turns-per-session <n>] [--turn-queue-lease-stale-ms <ms>] [--no-mdns] [--health-json]\n".to_string(),
             stderr: String::new(),
+        };
+    }
+    if let Some(error) = config.startup_agents_error.as_deref() {
+        return CliRunResult {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: format!("{error}\n"),
         };
     }
     if health_json || docker_smoke {
@@ -806,6 +863,7 @@ pub(super) fn route_http_request(
         ("GET", "/api/health") => json_response(200, health_payload(config)),
         ("GET", "/metrics") => telemetry_metrics_response(),
         ("GET", "/api/protocol") => json_response(200, bridge_protocol_payload()),
+        ("GET", "/api/openapi.json") => json_response(200, bridge_openapi_document()),
         ("GET", "/api/models") | ("GET", "/api/providers") => {
             json_response(200, providers_payload(config, &request.path))
         }
@@ -1053,6 +1111,55 @@ pub(super) fn route_dynamic_request(
         && parts[0] == "api"
         && parts[1] == "sessions"
         && parts[3] == "context"
+        && parts[4] == "compactions"
+        && request.method == "GET"
+    {
+        return match session_compactions_payload(config, parts[2]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => session_error_response(error),
+        };
+    }
+    if parts.len() == 5
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "context"
+        && parts[4] == "memories"
+        && request.method == "GET"
+    {
+        return match workspace_memories_payload(config, parts[2]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => session_error_response(error),
+        };
+    }
+    if parts.len() == 6
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "context"
+        && parts[4] == "memories"
+        && request.method == "PATCH"
+    {
+        return match update_workspace_memory_payload(config, parts[2], parts[5], &request.body) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
+    if parts.len() == 7
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "context"
+        && parts[4] == "compactions"
+        && parts[6] == "undo"
+        && request.method == "POST"
+    {
+        return match undo_session_compaction_payload(config, parts[2], parts[5]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => json_response(400, json!({"error": error})),
+        };
+    }
+    if parts.len() == 5
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "context"
         && parts[4] == "replay"
         && request.method == "POST"
     {
@@ -1183,6 +1290,17 @@ pub(super) fn route_dynamic_request(
         && request.method == "GET"
     {
         return json_response(200, session_children_payload(config, parts[2]));
+    }
+    if parts.len() == 4
+        && parts[0] == "api"
+        && parts[1] == "sessions"
+        && parts[3] == "control-plane"
+        && request.method == "GET"
+    {
+        return match session_control_plane_payload(config, parts[2]) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => session_error_response(error),
+        };
     }
     if parts.len() == 4
         && parts[0] == "api"
@@ -1525,13 +1643,51 @@ pub(super) fn authorized(request: &HttpRequest, config: &HttpRuntimeConfig) -> b
     )
 }
 
-pub(super) fn json_response(status: u16, body: Value) -> HttpResponseSpec {
+pub(super) fn json_response(status: u16, mut body: Value) -> HttpResponseSpec {
+    if status >= 400
+        && let Some(object) = body.as_object_mut()
+        && object.contains_key("error")
+    {
+        let code = object
+            .get("code")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("error_code").and_then(Value::as_str))
+            .map(str::to_string)
+            .unwrap_or_else(|| default_bridge_error_code(status).to_string());
+        let retryable =
+            bridge_error_retryable(&code).unwrap_or(matches!(status, 429 | 500 | 502 | 503 | 504));
+        object
+            .entry("code".to_string())
+            .or_insert_with(|| Value::String(code));
+        object
+            .entry("error_schema_version".to_string())
+            .or_insert_with(|| Value::String("openagent.bridge_error.v1".to_string()));
+        object
+            .entry("retryable".to_string())
+            .or_insert_with(|| Value::Bool(retryable));
+    }
     HttpResponseSpec {
         status,
         content_type: Some("application/json; charset=utf-8".to_string()),
         headers: Map::new(),
         body: Some(body),
         body_text: None,
+    }
+}
+
+#[must_use]
+pub(super) const fn default_bridge_error_code(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request",
+        401 => "unauthorized",
+        403 => "forbidden",
+        404 => "resource_not_found",
+        409 => "conflict",
+        429 => "rate_limited",
+        500 => "internal_error",
+        502 => "upstream_unavailable",
+        503 | 504 => "service_unavailable",
+        _ => "request_failed",
     }
 }
 

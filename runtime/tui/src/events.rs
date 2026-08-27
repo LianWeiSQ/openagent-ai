@@ -97,6 +97,7 @@ impl TuiState {
             "turn/approval_requested" => self.apply_approval_requested(event),
             "turn/approval_resolved" => self.apply_approval_resolved(event),
             "item/toolCall/started" => self.apply_tool_started(event),
+            "item/toolCall/delta" => self.apply_tool_delta(event),
             "item/toolCall/completed" => self.apply_tool_finished(event, false),
             "item/toolCall/failed" => self.apply_tool_finished(event, true),
             "item/agentMessage/started" => self.apply_agent_message_started(event),
@@ -141,6 +142,7 @@ impl TuiState {
     fn apply_agent_message_started(&mut self, event: &Value) -> Value {
         let params = object_value(event.get("params"));
         self.update_session_and_turn(&params);
+        self.streaming_assistant_line = None;
         self.status = "assistant streaming".to_string();
         json!({"applied": true, "method": "item/agentMessage/started"})
     }
@@ -158,9 +160,16 @@ impl TuiState {
                     .and_then(Value::as_str)
             })
             .unwrap_or_default();
-        if !text.trim().is_empty() {
-            self.timeline
-                .push(TimelineLine::new("assistant", text.to_string(), false));
+        if !text.is_empty() {
+            if let Some(index) = self.streaming_assistant_line
+                && let Some(line) = self.timeline.get_mut(index)
+            {
+                line.text.push_str(text);
+            } else {
+                self.timeline
+                    .push(TimelineLine::new("assistant", text.to_string(), false));
+                self.streaming_assistant_line = Some(self.timeline.len().saturating_sub(1));
+            }
         }
         self.status = "assistant streaming".to_string();
         json!({"applied": true, "method": "item/agentMessage/delta"})
@@ -169,6 +178,7 @@ impl TuiState {
     fn apply_agent_message_completed(&mut self, event: &Value) -> Value {
         let params = object_value(event.get("params"));
         self.update_session_and_turn(&params);
+        self.streaming_assistant_line = None;
         self.status = "assistant completed".to_string();
         json!({"applied": true, "method": "item/agentMessage/completed"})
     }
@@ -176,10 +186,12 @@ impl TuiState {
     fn apply_turn_completed(&mut self, event: &Value) -> Value {
         let params = object_value(event.get("params"));
         self.update_session_and_turn(&params);
+        let had_streamed_answer = self.streaming_assistant_line.take().is_some();
         if let Some(answer) = params
             .get("final_answer")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
+            && !had_streamed_answer
         {
             self.timeline
                 .push(TimelineLine::new("assistant", answer.to_string(), true));
@@ -246,6 +258,51 @@ impl TuiState {
         json!({"applied": true, "method": "item/toolCall/started"})
     }
 
+    fn apply_tool_delta(&mut self, event: &Value) -> Value {
+        let params = object_value(event.get("params"));
+        self.update_session_and_turn(&params);
+        let call_id = params
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let name = params
+            .get("name")
+            .or_else(|| params.get("tool_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let delta = params
+            .get("delta")
+            .or_else(|| params.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !delta.is_empty() {
+            if let Some(index) = self.streaming_tool_lines.get(call_id).copied()
+                && let Some(line) = self.timeline.get_mut(index)
+            {
+                line.text.push_str(delta);
+            } else {
+                let stream = params
+                    .get("stream")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stdout");
+                let prefix = if stream == "stderr" { "stderr: " } else { "" };
+                self.timeline.push(TimelineLine::new(
+                    if stream == "stderr" {
+                        "warning"
+                    } else {
+                        "tool"
+                    },
+                    format!("{prefix}{delta}"),
+                    false,
+                ));
+                self.streaming_tool_lines
+                    .insert(call_id.to_string(), self.timeline.len().saturating_sub(1));
+            }
+        }
+        self.status = format!("tool streaming: {name}");
+        json!({"applied": true, "method": "item/toolCall/delta"})
+    }
+
     fn apply_tool_finished(&mut self, event: &Value, failed: bool) -> Value {
         let params = object_value(event.get("params"));
         self.update_session_and_turn(&params);
@@ -259,6 +316,11 @@ impl TuiState {
             .or_else(|| params.get("output"))
             .cloned()
             .unwrap_or(Value::Null);
+        let call_id = params
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let had_streamed_output = self.streaming_tool_lines.remove(call_id).is_some();
         self.status = if failed {
             format!("tool failed: {name}")
         } else {
@@ -266,7 +328,11 @@ impl TuiState {
         };
         self.timeline.push(TimelineLine::new(
             if failed { "warning" } else { "status" },
-            format!("{}: {name} {}", self.status, compact_json(&output)),
+            if had_streamed_output || output.is_null() || output.as_str() == Some("") {
+                self.status.clone()
+            } else {
+                format!("{}: {}", self.status, compact_json(&output))
+            },
             failed,
         ));
         if self.show_tool_details {

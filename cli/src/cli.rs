@@ -23,7 +23,9 @@ use openagent_mcp::{
     normalize_tool_call_result, sanitize_mcp_observation_value, unavailable_tool_result,
 };
 use openagent_protocol::ToolResult;
-use openagent_protocol::{ChatMessage, PermissionRuleset, Role, ToolCall, ToolSchema, Usage};
+use openagent_protocol::{
+    ChatMessage, PermissionRuleset, Role, ToolCall, ToolSchema, Usage, bridge_openapi_document,
+};
 use openagent_provider::{
     AnthropicLanguageModelConfig, GeminiLanguageModelConfig, OpenAiLanguageModelConfig,
     ProviderCapability, ProviderStreamEvent, ToolCallDialect, anthropic_model,
@@ -66,6 +68,7 @@ mod prompt;
 mod remote;
 mod sessions;
 mod skills;
+mod tasks;
 mod util;
 
 use agents::{agent_command, agent_registry_dir, plugin_command};
@@ -94,6 +97,7 @@ use sessions::{
     latest_session_id, session_command, session_export, session_import, session_list, share_session,
 };
 use skills::skills_command;
+use tasks::task_command;
 
 use util::*;
 
@@ -142,6 +146,7 @@ const RUN_POSITIONAL_VALUE_FLAGS: &[&str] = &[
     "--timeout-s",
     "--timeout-ms",
     "--agent",
+    "--agents",
     "--title",
     "--attach",
     "--server-token",
@@ -205,6 +210,7 @@ pub fn run_cli_command(argv: &[String]) -> CliRunResult {
         "run" => run_prompt_command(&argv[1..]),
         "client" => client_command(&argv[1..]),
         "session" => session_command(&argv[1..]),
+        "task" | "tasks" => task_command(&argv[1..]),
         "models" => models_command(&argv[1..]),
         "stats" => stats_command(&argv[1..]),
         "command" => custom_command(&argv[1..]),

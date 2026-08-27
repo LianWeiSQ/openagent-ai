@@ -4,9 +4,10 @@ OpenHarness is the Rust agent runtime behind OpenAgent. It owns provider
 streaming, the multi-step agent loop, tools, permissions, sessions, MCP, the
 Bridge HTTP/SSE API, CLI, TUI, swarm orchestration, and eval contracts.
 
-The Desktop product is a separate repository at `../app`. It consumes the
+The sole production Desktop product is the separate repository at `../app`. It consumes the
 Bridge API and bundles the HTTP runtime as a Tauri sidecar; UI code and desktop
-packaging do not belong in this core workspace.
+packaging do not belong in this core workspace. The checked-in `desktop/`
+directory is a legacy prototype only; see `desktop/README.md`.
 
 ## Run
 

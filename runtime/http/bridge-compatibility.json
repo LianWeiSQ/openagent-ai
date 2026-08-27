@@ -1,0 +1,24 @@
+{
+  "manifest_schema_version": "openagent.bridge_manifest.v1",
+  "protocol": "openagent.bridge",
+  "protocol_version": 1,
+  "event_schema_version": "openagent.bridge_event.v1",
+  "api_contract_schema_version": "openagent.bridge_api_contract.v1",
+  "api_version": "1.0.0",
+  "error_schema_version": "openagent.bridge_error.v1",
+  "protocol_range": {
+    "minimum_client_protocol_version": 1,
+    "maximum_client_protocol_version": 1
+  },
+  "capabilities": [
+    "sessions.lifecycle.v1",
+    "turns.jobs.v1",
+    "events.resume.v1",
+    "interactions.v1",
+    "tasks.tree.v2",
+    "providers.connections.v2",
+    "terminal.sessions.v1",
+    "storage.migration.v1",
+    "goals.plans.v1"
+  ]
+}

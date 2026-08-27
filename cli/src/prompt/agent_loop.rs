@@ -1055,17 +1055,10 @@ fn execute_task_tool_call(
         return result;
     }
     let input = &tool_call.input;
-    if input
+    let background = input
         .get("background")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return task_tool_error(
-            tool_call,
-            "background subagent tasks are not implemented yet; omit background or set it to false",
-            BTreeMap::new(),
-        );
-    }
+        .unwrap_or(false);
     let subagent_type = match task_input_string(input, "subagent_type")
         .or_else(|_| task_input_string(input, "agent_type"))
         .or_else(|_| task_input_string(input, "agent"))
@@ -1304,7 +1297,128 @@ fn execute_task_tool_call(
             .metadata
             .insert("task_resumed_at_ms".to_string(), json!(now_ms_cli()));
     }
-    let child_max_steps = child_profile.max_steps.unwrap_or(task_context.max_steps);
+    let child_budget = background.then(|| {
+        openagent_http_runtime::local_subagent_runtime_budget(
+            &child_profile.id,
+            child_profile.max_steps,
+        )
+    });
+    let child_max_steps = child_budget
+        .as_ref()
+        .and_then(|budget| budget.get("max_steps"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| child_profile.max_steps.unwrap_or(task_context.max_steps));
+    child_session
+        .metadata
+        .insert("max_steps".to_string(), json!(child_max_steps));
+    if let Some(budget) = child_budget.as_ref() {
+        for key in [
+            "max_elapsed_ms",
+            "max_total_tokens",
+            "max_cost_microunits",
+            "max_tool_calls",
+            "_openagent_budget_profile",
+            "_openagent_budget_source",
+        ] {
+            if let Some(value) = budget.get(key) {
+                child_session
+                    .metadata
+                    .insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    if let Some(base_url) = value_for(task_context.args, &["--base-url"]) {
+        child_session
+            .metadata
+            .insert("base_url".to_string(), json!(base_url));
+    }
+    if let Some(wire_api) = value_for(task_context.args, &["--wire-api"]) {
+        child_session
+            .metadata
+            .insert("wire_api".to_string(), json!(wire_api));
+    }
+    if background {
+        child_session.status = SessionStatus::Idle;
+        child_session
+            .metadata
+            .insert("task_status".to_string(), json!("queued"));
+        child_session
+            .metadata
+            .insert("background".to_string(), json!(true));
+        child_session
+            .metadata
+            .insert("execution_mode".to_string(), json!("background"));
+        child_session
+            .metadata
+            .insert("queued_at_ms".to_string(), json!(now_ms_cli()));
+        let user_message = chat_message(Role::User, prompt.clone());
+        child_session.add(user_message);
+        if let Err(error) = task_context
+            .store
+            .save_state(&child_session, Some(&child_run_id))
+        {
+            return task_tool_error(
+                tool_call,
+                &format!("failed to queue background subagent session: {error}"),
+                BTreeMap::from([("subagent_type".to_string(), json!(subagent_type))]),
+            );
+        }
+        let worker = crate::tasks::spawn_local_background_task_worker(
+            task_context.args,
+            &child_session.directory,
+            &task_context.store.root,
+            Some(&child_provider),
+        );
+        let (worker_started, worker_pid, worker_error) = match worker {
+            Ok(0) => (false, Value::Null, Value::Null),
+            Ok(pid) => (true, json!(pid), Value::Null),
+            Err(error) => (false, Value::Null, json!(error)),
+        };
+        let output = render_task_output(
+            &child_session.id,
+            "queued",
+            "Background task queued. Use `openagent task show|wait|cancel <task_id>` to control it.",
+        );
+        let mut metadata = BTreeMap::from([
+            ("tool".to_string(), json!(TASK_TOOL_ID)),
+            ("title".to_string(), json!(description)),
+            ("subagent_type".to_string(), json!(subagent_type)),
+            ("task_id".to_string(), json!(child_session.id.clone())),
+            ("session_id".to_string(), json!(child_session.id.clone())),
+            ("run_id".to_string(), json!(child_run_id)),
+            ("status".to_string(), json!("queued")),
+            ("background".to_string(), json!(true)),
+            ("worker_started".to_string(), json!(worker_started)),
+            ("worker_pid".to_string(), worker_pid),
+            ("worker_error".to_string(), worker_error),
+            ("provider".to_string(), json!(child_provider)),
+            ("model".to_string(), json!(child_model)),
+            ("max_steps".to_string(), json!(child_max_steps)),
+            ("task_depth".to_string(), json!(task_depth)),
+            ("task_root_session_id".to_string(), json!(task_root_id)),
+            (
+                "task_parent_session_id".to_string(),
+                json!(task_context.session.id.clone()),
+            ),
+            (
+                "task_lineage_subagents".to_string(),
+                json!(task_lineage_subagents),
+            ),
+            (
+                "agent_profile".to_string(),
+                agent_profile_public_value(&child_profile),
+            ),
+        ]);
+        if let Some(isolation) = workspace_isolation.as_ref() {
+            metadata.insert("workspace_isolation".to_string(), json!(isolation));
+        }
+        return ToolResult {
+            call_id: tool_call.call_id.clone(),
+            output,
+            error: None,
+            metadata,
+        };
+    }
     if let Err(error) = task_context.store.start_run(
         &mut child_session,
         StartRunOptions {

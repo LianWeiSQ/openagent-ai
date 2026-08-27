@@ -1512,6 +1512,68 @@ impl FileSessionStore {
         Ok(message_id)
     }
 
+    pub fn undo_compaction_boundary(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        boundary_message_id: &str,
+    ) -> SessionResult<()> {
+        let transcript = read_jsonl(&self.transcript_path(session_id))?;
+        let mut is_compaction_boundary = false;
+        let mut already_removed = false;
+        for value in &transcript {
+            match value.get("schema_version").and_then(Value::as_str) {
+                Some("openagent.message.v2")
+                    if value.pointer("/info/id").and_then(Value::as_str)
+                        == Some(boundary_message_id) =>
+                {
+                    is_compaction_boundary =
+                        value.pointer("/info/metadata/kind").and_then(Value::as_str)
+                            == Some("compaction_boundary");
+                }
+                Some("openagent.message_tombstone.v2")
+                    if value.get("message_id").and_then(Value::as_str)
+                        == Some(boundary_message_id) =>
+                {
+                    already_removed = true;
+                }
+                _ => {}
+            }
+        }
+        if !is_compaction_boundary {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "compaction boundary not found",
+            )
+            .into());
+        }
+        if already_removed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "compaction boundary is already undone",
+            )
+            .into());
+        }
+        self.append_message_tombstone(session_id, run_id, boundary_message_id)?;
+        self.record_event(
+            session_id,
+            run_id,
+            "compaction.reverted",
+            SessionEventOptions {
+                kind: "compaction".to_string(),
+                attributes: BTreeMap::from([
+                    (
+                        "boundary_message_id".to_string(),
+                        json!(boundary_message_id),
+                    ),
+                    ("reverted_at_ms".to_string(), json!(now_ms())),
+                ]),
+                ..SessionEventOptions::default()
+            },
+        )?;
+        Ok(())
+    }
+
     pub fn truncate_messages_after(
         &self,
         session_id: &str,

@@ -78,6 +78,13 @@ fn bridge_http_routes_are_api_only_and_cover_sse_auth_and_tui_control() -> Resul
     let unauthorized = http_request(port, "GET", "/api/health", &[], "")?;
     assert!(unauthorized.starts_with("HTTP/1.1 401"));
     assert!(unauthorized.contains("WWW-Authenticate: Bearer"));
+    let unauthorized_payload = json_body(&unauthorized)?;
+    assert_eq!(unauthorized_payload["code"], "unauthorized");
+    assert_eq!(
+        unauthorized_payload["error_schema_version"],
+        "openagent.bridge_error.v1"
+    );
+    assert_eq!(unauthorized_payload["retryable"], false);
 
     let basic = http_request(
         port,
@@ -90,6 +97,7 @@ fn bridge_http_routes_are_api_only_and_cover_sse_auth_and_tui_control() -> Resul
 
     let index = authorized_request(port, "GET", "/", "", true)?;
     assert!(index.starts_with("HTTP/1.1 404"));
+    assert_eq!(json_body(&index)?["code"], "endpoint_not_found");
     let unknown = authorized_request(port, "GET", "/bridge-console.js", "", true)?;
     assert!(unknown.starts_with("HTTP/1.1 404"));
 
@@ -678,12 +686,85 @@ fn bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box<dyn
     let client = RemoteRuntimeClient::new(format!("http://127.0.0.1:{port}"))
         .with_auth(RemoteAuth::bearer("secret"));
     let protocol = client.protocol()?;
+    assert_eq!(
+        protocol["manifest_schema_version"],
+        "openagent.bridge_manifest.v1"
+    );
     assert_eq!(protocol["protocol"], "openagent.bridge");
     assert_eq!(protocol["protocol_version"], 1);
     assert_eq!(
         protocol["event_schema_version"],
         "openagent.bridge_event.v1"
     );
+    let checked_manifest: Value =
+        serde_json::from_str(include_str!("../bridge-compatibility.json"))?;
+    assert_eq!(
+        protocol["manifest_schema_version"],
+        checked_manifest["manifest_schema_version"]
+    );
+    assert_eq!(protocol["protocol"], checked_manifest["protocol"]);
+    assert_eq!(
+        protocol["protocol_version"],
+        checked_manifest["protocol_version"]
+    );
+    assert_eq!(
+        protocol["event_schema_version"],
+        checked_manifest["event_schema_version"]
+    );
+    assert_eq!(
+        protocol["protocol_range"],
+        checked_manifest["protocol_range"]
+    );
+    assert_eq!(protocol["capabilities"], checked_manifest["capabilities"]);
+    assert_eq!(
+        protocol["api_contract"]["schema_version"],
+        "openagent.bridge_api_contract.v1"
+    );
+    assert_eq!(
+        protocol["api_contract"]["error_schema_version"],
+        "openagent.bridge_error.v1"
+    );
+    assert!(
+        protocol["api_contract"]["operation_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 100)
+    );
+    assert_eq!(
+        protocol["api_contract"]["openapi_endpoint"],
+        "/api/openapi.json"
+    );
+    assert_eq!(protocol["runtime"]["name"], "openharness");
+    assert!(
+        protocol["runtime"]["version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty())
+    );
+    assert_eq!(
+        protocol["protocol_range"]["minimum_client_protocol_version"],
+        1
+    );
+    assert_eq!(
+        protocol["protocol_range"]["maximum_client_protocol_version"],
+        1
+    );
+    for capability in [
+        "sessions.lifecycle.v1",
+        "turns.jobs.v1",
+        "events.resume.v1",
+        "interactions.v1",
+        "tasks.tree.v2",
+        "providers.connections.v2",
+        "terminal.sessions.v1",
+        "storage.migration.v1",
+        "goals.plans.v1",
+    ] {
+        assert!(
+            protocol["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| capabilities.iter().any(|item| item == capability)),
+            "protocol manifest missing {capability}"
+        );
+    }
     assert!(
         protocol["compatibility"]["required_event_fields"]
             .as_array()
@@ -722,6 +803,26 @@ fn bridge_protocol_contract_and_client_live_subscription() -> Result<(), Box<dyn
         protocol["event_methods"]
             .as_array()
             .is_some_and(|methods| methods.iter().any(|method| method == "turn/fallback"))
+    );
+
+    let openapi = client.openapi()?;
+    assert_eq!(openapi["openapi"], "3.1.0");
+    assert_eq!(
+        openapi["x-openagent-contract-schema"],
+        "openagent.bridge_api_contract.v1"
+    );
+    assert_eq!(
+        openapi["paths"]["/api/sessions/{session_id}/turns"]["post"]["operationId"],
+        "startTurn"
+    );
+    assert_eq!(
+        openapi["paths"]["/api/sessions/{session_id}/tasks/{task_id}/resume"]["post"]["operationId"],
+        "resumeSessionTask"
+    );
+    assert!(
+        openapi["components"]["schemas"]["BridgeError"]["properties"]["code"]["enum"]
+            .as_array()
+            .is_some_and(|codes| codes.iter().any(|code| code == "turn_queue_full"))
     );
 
     let session_id = client.create_session(&workspace, None)?;
@@ -3070,6 +3171,7 @@ fn context_pack_recovers_todo_checkpoint_and_work_state_after_restart() -> Resul
     assert_eq!(receipt["item_kind_counts"]["work_state"], 1);
     assert_eq!(receipt["item_kind_counts"]["todo"], 1);
     assert_eq!(receipt["item_kind_counts"]["checkpoint"], 1);
+    assert_eq!(receipt["item_kind_counts"]["memory"], 1);
     let receipt_text = receipt.to_string();
     assert!(!receipt_text.contains("Keep typed context across restart"));
     assert!(!receipt_text.contains("typed context captured"));
@@ -3086,16 +3188,9 @@ fn context_pack_recovers_todo_checkpoint_and_work_state_after_restart() -> Resul
                 .map(ToString::to_string)
         })
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(prefix_hashes.len(), 1);
-    assert_eq!(recovered_receipts[2]["prefix_cache"]["status"], "reused");
-    assert_eq!(
-        recovered_receipts[2]["prefix_cache"]["reused_from"]["run_id"],
-        first_turn["turn"]["id"]
-    );
-    assert_eq!(
-        recovered_receipts[2]["prefix_cache"]["reused_from"]["step"],
-        2
-    );
+    assert_eq!(prefix_hashes.len(), 2);
+    assert_eq!(recovered_receipts[2]["prefix_cache"]["status"], "changed");
+    assert!(recovered_receipts[2]["prefix_cache"]["reused_from"].is_null());
 
     let _ = fs::remove_dir_all(temp);
     Ok(())

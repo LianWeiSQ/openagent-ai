@@ -242,6 +242,7 @@ pub(super) fn root_help() -> String {
             "session",
             "list, export, import, share, and delete sessions",
         ),
+        ("task", "inspect and control durable local background tasks"),
         ("models", "inspect provider and model metadata"),
         ("stats", "show local session usage statistics"),
         ("command", "manage custom prompt commands"),
@@ -311,6 +312,10 @@ pub(super) fn run_help() -> String {
         ("-m, --model <provider/model>", "provider/model override"),
         ("--provider <id>", "provider override"),
         ("--agent <name>", "agent profile to use"),
+        (
+            "--agents <json-or-path>",
+            "startup subagent profiles as inline JSON or JSON/YAML file",
+        ),
         ("--variant <name>", "provider-specific variant"),
         ("--wire-api <chat|responses>", "OpenAI-compatible wire API"),
         ("--base-url <url>", "provider base URL"),
@@ -384,7 +389,7 @@ pub(super) fn tui_help() -> &'static str {
 
 pub(super) fn serve_help() -> &'static str {
     "Usage: openagent serve [options]\n\n\
-     Options: --host <host>, --port <port>, --workspace <path>, --session-root <path>, --auth-token <token>"
+     Options: --host <host>, --port <port>, --workspace <path>, --session-root <path>, --agents <json-or-path>, --auth-token <token>"
 }
 
 pub(super) fn client_help() -> &'static str {

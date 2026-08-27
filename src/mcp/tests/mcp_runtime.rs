@@ -281,6 +281,55 @@ fn load_mcp_config_accepts_stdio_and_opencode_shapes() -> Result<(), Box<dyn Err
     Ok(())
 }
 
+#[test]
+fn mcp_server_type_is_inferred_from_command_or_url_without_type_field() -> Result<(), Box<dyn Error>>
+{
+    let parsed = load_mcp_config_from_value(&json!({
+        "mcp": {
+            "local-inferred": {
+                "command": "node",
+                "args": ["server.js"]
+            },
+            "remote-inferred": {
+                "url": "https://mcp.example.test/mcp"
+            },
+            "sse-explicit": {
+                "type": "sse",
+                "url": "https://mcp.example.test/events"
+            }
+        }
+    }))?;
+    let local = parsed
+        .servers
+        .iter()
+        .find(|server| server.name == "local-inferred")
+        .ok_or("missing inferred local server")?;
+    assert_eq!(local.server_type, McpServerType::Local);
+    assert_eq!(local.transport, McpTransport::Stdio);
+    assert_eq!(local.command, ["node", "server.js"]);
+
+    let remote = parsed
+        .servers
+        .iter()
+        .find(|server| server.name == "remote-inferred")
+        .ok_or("missing inferred remote server")?;
+    assert_eq!(remote.server_type, McpServerType::Remote);
+    assert_eq!(remote.transport, McpTransport::Auto);
+    assert_eq!(
+        transport_candidates(remote.transport),
+        [McpTransport::Http, McpTransport::Sse]
+    );
+
+    let sse = parsed
+        .servers
+        .iter()
+        .find(|server| server.name == "sse-explicit")
+        .ok_or("missing explicit SSE server")?;
+    assert_eq!(sse.server_type, McpServerType::Remote);
+    assert_eq!(sse.transport, McpTransport::Sse);
+    Ok(())
+}
+
 fn read_fixture() -> Result<Value, Box<dyn Error>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/rust_rewrite/mcp_runtime.json");

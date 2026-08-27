@@ -19,4 +19,5 @@
 
 The React/Tauri Desktop app is intentionally outside this workspace at
 `../app`. Cross-surface behavior should be implemented in a shared Rust crate
-or the Bridge API, not duplicated in the app.
+or the Bridge API, not duplicated in the app. The local `desktop/` directory is
+legacy prototype material and is not a product ownership boundary.

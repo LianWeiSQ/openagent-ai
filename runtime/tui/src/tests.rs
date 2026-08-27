@@ -1195,6 +1195,125 @@ fn key_event_flow_submits_prompt_and_uses_history() {
 }
 
 #[test]
+fn bash_mode_accepts_multiline_input_without_submitting_early() {
+    #[derive(Default)]
+    struct CaptureHandler {
+        prompts: Vec<String>,
+    }
+
+    impl TerminalEventHandler for CaptureHandler {
+        fn handle_submit(&mut self, prompt: &str) -> Result<Vec<TimelineLine>, String> {
+            self.prompts.push(prompt.to_string());
+            Ok(Vec::new())
+        }
+
+        fn handle_command(&mut self, _command: &str) -> Result<Vec<TimelineLine>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    let mut state = TuiState::new();
+    let mut handler = CaptureHandler::default();
+    state.input_buffer = "!printf first".to_string();
+    handle_key_event(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        &mut state,
+        &mut handler,
+    )
+    .expect("multiline newline");
+    for ch in "printf second".chars() {
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            &mut state,
+            &mut handler,
+        )
+        .expect("multiline character");
+    }
+    assert!(handler.prompts.is_empty());
+    assert_eq!(state.input_buffer, "!printf first\nprintf second");
+
+    handle_key_event(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &mut state,
+        &mut handler,
+    )
+    .expect("submit multiline Bash Mode command");
+    assert_eq!(
+        handler.prompts,
+        vec!["!printf first\nprintf second".to_string()]
+    );
+}
+
+#[test]
+fn streamed_tool_output_coalesces_and_compact_summary_toggles_with_ctrl_r() {
+    #[derive(Default)]
+    struct EmptyHandler;
+
+    impl TerminalEventHandler for EmptyHandler {
+        fn handle_submit(&mut self, _prompt: &str) -> Result<Vec<TimelineLine>, String> {
+            Ok(Vec::new())
+        }
+
+        fn handle_command(&mut self, _command: &str) -> Result<Vec<TimelineLine>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    let mut state = TuiState::new();
+    for delta in ["first\n", "second\n"] {
+        let result = state.apply_bridge_event(&json!({
+            "method": "item/toolCall/delta",
+            "params": {
+                "call_id": "call_stream",
+                "name": "bash",
+                "stream": "stdout",
+                "delta": delta,
+            }
+        }));
+        assert_eq!(result["applied"], json!(true));
+    }
+    assert_eq!(
+        state
+            .timeline
+            .iter()
+            .filter(|line| line.kind == "tool")
+            .count(),
+        1
+    );
+    assert!(
+        state
+            .timeline
+            .iter()
+            .any(|line| line.text == "first\nsecond\n")
+    );
+
+    let mut handler = EmptyHandler;
+    apply_handler_output(
+        &mut state,
+        &mut handler,
+        vec![TimelineLine::new(
+            "compact",
+            "private compact summary",
+            false,
+        )],
+    );
+    assert!(
+        !state
+            .timeline
+            .iter()
+            .any(|line| line.text.contains("private compact summary"))
+    );
+    assert!(!state.compact_output_expanded);
+    handle_key_event(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        &mut state,
+        &mut handler,
+    )
+    .expect("expand compact summary");
+    assert!(state.compact_output_expanded);
+}
+
+#[test]
 fn key_event_flow_opens_file_picker_filters_and_attaches() {
     #[derive(Default)]
     struct CaptureHandler {
@@ -2077,6 +2196,93 @@ fn bridge_terminal_keyflow_smoke_uses_real_remote_handler() -> Result<(), Box<dy
 }
 
 #[test]
+fn bridge_terminal_bash_mode_streams_multiline_output_without_a_model_turn()
+-> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
+    let workspace = temp_test_dir("openagent-tui-bridge-bash")?;
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
+        server_url: bridge.server_url.clone(),
+        auth: RemoteAuth::bearer("secret"),
+        workspace: workspace.clone(),
+        session_id: Some("session_smoke".to_string()),
+        ..BridgeTerminalOptions::default()
+    })
+    .map_err(std::io::Error::other)?;
+    let mut state = TuiState::new();
+    state.input_buffer = "!printf first\nprintf second".to_string();
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+    assert_eq!(state.status, "tool running: bash");
+
+    for _ in 0..3 {
+        let events = handler
+            .poll_bridge_events()
+            .map_err(std::io::Error::other)?;
+        apply_bridge_event_values(&mut state, events);
+    }
+    assert!(
+        state
+            .timeline
+            .iter()
+            .any(|line| line.kind == "tool" && line.text == "first\nsecond\n")
+    );
+    assert_eq!(state.status, "tool completed: bash");
+    assert!(bridge.turn_inputs().is_empty());
+    assert_eq!(
+        bridge.terminal_inputs(),
+        vec!["printf first\nprintf second\nexit\n".to_string()]
+    );
+    let requests = bridge.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "POST /api/terminal/sessions")
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request != "POST /api/sessions/session_smoke/turns")
+    );
+
+    bridge.stop();
+    let _ = fs::remove_dir_all(workspace);
+    Ok(())
+}
+
+#[test]
+fn bridge_terminal_resume_resolves_and_validates_historical_session_prefixes()
+-> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
+    let workspace = temp_test_dir("openagent-tui-bridge-resume")?;
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
+        server_url: bridge.server_url.clone(),
+        auth: RemoteAuth::bearer("secret"),
+        workspace: workspace.clone(),
+        ..BridgeTerminalOptions::default()
+    })
+    .map_err(std::io::Error::other)?;
+
+    let lines = handler
+        .handle_command("/resume session_sm")
+        .map_err(std::io::Error::other)?;
+    assert_eq!(handler.current_session(), Some("session_smoke"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text == "current session: session_smoke")
+    );
+    assert!(
+        bridge
+            .requests()
+            .iter()
+            .any(|request| request == "GET /api/sessions?query=session_sm")
+    );
+
+    bridge.stop();
+    let _ = fs::remove_dir_all(workspace);
+    Ok(())
+}
+
+#[test]
 fn bridge_terminal_mcp_lifecycle_controls_remote_bridge() -> Result<(), Box<dyn Error>> {
     let bridge = FakeBridgeServer::start()?;
     let workspace = temp_test_dir("openagent-tui-bridge-mcp")?;
@@ -2420,6 +2626,63 @@ fn bridge_terminal_agent_picker_fetches_and_sets_agent() -> Result<(), Box<dyn E
         recorded
             .iter()
             .any(|request| request == "PATCH /api/sessions/session_smoke")
+    );
+
+    bridge.stop();
+    let _ = fs::remove_dir_all(workspace);
+    Ok(())
+}
+
+#[test]
+fn bridge_terminal_skills_command_groups_project_and_user_configuration()
+-> Result<(), Box<dyn Error>> {
+    let bridge = FakeBridgeServer::start()?;
+    let workspace = temp_test_dir("openagent-tui-bridge-skills")?;
+    let mut handler = BridgeTerminalHandler::connect(BridgeTerminalOptions {
+        server_url: bridge.server_url.clone(),
+        auth: RemoteAuth::bearer("secret"),
+        workspace: workspace.clone(),
+        session_id: Some("session_smoke".to_string()),
+        ..BridgeTerminalOptions::default()
+    })
+    .map_err(std::io::Error::other)?;
+    let mut state = TuiState::new();
+
+    send_key_text("/skills", &mut state, &mut handler)?;
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+
+    assert!(state.timeline.iter().any(|line| {
+        line.text
+            .contains("skills: 3 (project 1 · user 1 · bundled 1)")
+    }));
+    assert!(
+        state
+            .timeline
+            .iter()
+            .any(|line| line.text.contains("[project] review"))
+    );
+    assert!(
+        state
+            .timeline
+            .iter()
+            .any(|line| line.text.contains("[user] personal"))
+    );
+
+    send_key_text("/skills personal", &mut state, &mut handler)?;
+    press_key(KeyCode::Enter, &mut state, &mut handler)?;
+    assert!(
+        state
+            .timeline
+            .last()
+            .is_some_and(|line| line.text.contains("[user] personal"))
+    );
+    assert_eq!(
+        bridge
+            .requests()
+            .iter()
+            .filter(|request| *request == "GET /api/skills")
+            .count(),
+        2
     );
 
     bridge.stop();
@@ -3027,6 +3290,32 @@ fn terminal_render_snapshot_contains_core_regions() {
     assert!(rendered.contains("world"));
 }
 
+#[test]
+fn terminal_markdown_rendering_and_tiny_window_have_no_minimum_size() {
+    let mut state = TuiState::new();
+    state.timeline.push(TimelineLine::new(
+        "assistant",
+        "# Result\n- **done** with `cargo test`\n```text\nok\n```",
+        true,
+    ));
+
+    let backend = TestBackend::new(50, 20);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| draw_terminal_frame(frame, "OpenAgent", &state))
+        .expect("draw markdown frame");
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("Result"));
+    assert!(rendered.contains('•'));
+    assert!(rendered.contains("cargo test"));
+
+    let tiny_backend = TestBackend::new(12, 3);
+    let mut tiny_terminal = Terminal::new(tiny_backend).expect("tiny terminal");
+    tiny_terminal
+        .draw(|frame| draw_terminal_frame(frame, "OA", &state))
+        .expect("tiny frame must render without a minimum-size failure");
+}
+
 fn send_key_text<H: TerminalEventHandler>(
     text: &str,
     state: &mut TuiState,
@@ -3083,6 +3372,8 @@ struct FakeBridgeState {
     mcp_enabled: bool,
     mcp_running: bool,
     mcp_pid: u64,
+    terminal_inputs: Vec<String>,
+    terminal_polls: u64,
 }
 
 struct FakeBridgeServer {
@@ -3194,6 +3485,14 @@ impl FakeBridgeServer {
             .clone()
     }
 
+    fn terminal_inputs(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("bridge state")
+            .terminal_inputs
+            .clone()
+    }
+
     fn stop(mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(self.server_url.trim_start_matches("http://"));
@@ -3217,6 +3516,7 @@ fn handle_fake_bridge_connection(
         ("GET", "/api/health") => write_json(&mut stream, json!({"ok": true})),
         ("GET", "/api/models") => write_json(&mut stream, fake_models_payload()),
         ("GET", "/api/agents") => write_json(&mut stream, fake_agents_payload()),
+        ("GET", "/api/skills") => write_json(&mut stream, fake_skills_payload()),
         ("GET", "/api/mcp") | ("GET", "/api/mcp?refresh=true") => {
             let payload = {
                 let state = state.lock().expect("bridge state");
@@ -3224,6 +3524,38 @@ fn handle_fake_bridge_connection(
             };
             write_json(&mut stream, payload)
         }
+        ("POST", "/api/terminal/sessions") => write_json(
+            &mut stream,
+            json!({
+                "terminal_id": "terminal_smoke",
+                "session_id": "session_smoke",
+                "status": "running",
+                "running": true,
+                "cursor": 0,
+            }),
+        ),
+        ("POST", "/api/terminal/sessions/terminal_smoke/input") => {
+            let payload = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({}));
+            state.lock().expect("bridge state").terminal_inputs.push(
+                payload
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            write_json(
+                &mut stream,
+                json!({
+                    "terminal_id": "terminal_smoke",
+                    "status": "running",
+                    "running": true,
+                }),
+            )
+        }
+        ("DELETE", "/api/terminal/sessions/terminal_smoke") => write_json(
+            &mut stream,
+            json!({"closed": true, "terminal_id": "terminal_smoke"}),
+        ),
         ("POST", "/api/mcp/servers/local-tools/start") => {
             let payload = {
                 let mut state = state.lock().expect("bridge state");
@@ -3273,6 +3605,9 @@ fn handle_fake_bridge_connection(
         }
         ("GET", "/api/sessions") => write_json(&mut stream, json!({"sessions": []})),
         ("GET", "/api/sessions?query=smoke") => {
+            write_json(&mut stream, fake_session_search_payload())
+        }
+        ("GET", "/api/sessions?query=session_sm") => {
             write_json(&mut stream, fake_session_search_payload())
         }
         ("PATCH", "/api/sessions/session_smoke") => {
@@ -3506,6 +3841,41 @@ fn handle_fake_bridge_connection(
             };
             write_sse(&mut stream, &events)
         }
+        _ if method == "GET"
+            && path.starts_with("/api/terminal/sessions/terminal_smoke?after=") =>
+        {
+            let poll = {
+                let mut state = state.lock().expect("bridge state");
+                state.terminal_polls = state.terminal_polls.saturating_add(1);
+                state.terminal_polls
+            };
+            let payload = match poll {
+                1 => json!({
+                    "terminal_id": "terminal_smoke",
+                    "status": "running",
+                    "running": true,
+                    "cursor": 1,
+                    "chunks": [{"sequence": 1, "stream": "stdout", "text": "first\n"}],
+                }),
+                2 => json!({
+                    "terminal_id": "terminal_smoke",
+                    "status": "completed",
+                    "running": false,
+                    "exit_code": 0,
+                    "cursor": 2,
+                    "chunks": [{"sequence": 2, "stream": "stdout", "text": "second\n"}],
+                }),
+                _ => json!({
+                    "terminal_id": "terminal_smoke",
+                    "status": "completed",
+                    "running": false,
+                    "exit_code": 0,
+                    "cursor": 2,
+                    "chunks": [],
+                }),
+            };
+            write_json(&mut stream, payload)
+        }
         _ => write_response(
             &mut stream,
             "404 Not Found",
@@ -3637,6 +4007,35 @@ fn fake_agents_payload() -> Value {
                 "description": "Review code"
             }
         ]
+    })
+}
+
+fn fake_skills_payload() -> Value {
+    json!({
+        "skills": [
+            {
+                "name": "review",
+                "description": "Review project changes",
+                "location": "/workspace/.agents/skills/review/SKILL.md",
+                "scope": "project"
+            },
+            {
+                "name": "personal",
+                "description": "User writing preferences",
+                "location": "/home/.agents/skills/personal/SKILL.md",
+                "scope": "user"
+            },
+            {
+                "name": "openai-docs",
+                "description": "Bundled OpenAI documentation workflow",
+                "location": "/bundle/skill/openagent/openai-docs/SKILL.md",
+                "scope": "bundled"
+            }
+        ],
+        "scopes": {"project": 1, "user": 1, "bundled": 1},
+        "loaded_count": 3,
+        "invalid_count": 0,
+        "duplicate_count": 0
     })
 }
 
