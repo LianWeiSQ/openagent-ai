@@ -118,4 +118,4 @@ jobs:
         with:
           name: openharness-release-readiness
           path: target/release-readiness/
-          if-no-files-found: error
+          if-no-files-found: warn

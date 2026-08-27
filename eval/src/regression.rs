@@ -418,13 +418,12 @@ fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
             }
             current = current.get(&rest[..end])?;
             remaining = &rest[end..];
-        } else if let Some(rest) = remaining.strip_prefix('[') {
+        } else {
+            let rest = remaining.strip_prefix('[')?;
             let end = rest.find(']')?;
             let index = rest[..end].parse::<usize>().ok()?;
             current = current.get(index)?;
             remaining = &rest[end + 1..];
-        } else {
-            return None;
         }
     }
     Some(current)
